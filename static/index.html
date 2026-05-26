@@ -118,7 +118,187 @@
       content: "Свернуть";
     }
 
-    /* stepper */
+    /* ============ quiz-stepper (new-run form) ============ */
+    .stepper-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      max-width: 720px;
+      margin: 0 auto 40px;
+      padding: 18px 4px 22px;
+    }
+    .stepper-node {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      min-width: 84px;
+      flex-shrink: 0;
+    }
+    .stepper-dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--brand-bg-panel);
+      border: 1.5px solid var(--brand-border-strong);
+      transition: background 0.2s ease, border-color 0.2s ease, transform 0.15s ease, box-shadow 0.2s ease;
+      cursor: default;
+    }
+    .stepper-dot.is-current {
+      background: var(--brand-primary);
+      border-color: var(--brand-primary);
+      box-shadow: 0 0 0 4px rgba(255, 50, 75, 0.18);
+    }
+    .stepper-dot.is-done {
+      background: var(--brand-success);
+      border-color: var(--brand-success);
+      cursor: pointer;
+    }
+    .stepper-dot.is-done:hover {
+      transform: scale(1.15);
+    }
+    .stepper-dot.is-locked {
+      background: var(--brand-bg-panel);
+      border-color: var(--brand-border);
+    }
+    .stepper-label {
+      font-size: 10px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      font-weight: 600;
+      text-align: center;
+      line-height: 1.3;
+      transition: color 0.2s ease;
+    }
+    .stepper-label.is-current {
+      color: var(--brand-text);
+    }
+    .stepper-label.is-done {
+      color: var(--brand-text-muted);
+      cursor: pointer;
+    }
+    .stepper-line {
+      flex: 1 1 auto;
+      height: 2px;
+      background: var(--brand-border);
+      margin: 0 4px;
+      align-self: flex-start;
+      margin-top: 24px;
+      transition: background 0.25s ease;
+      min-width: 16px;
+    }
+    .stepper-line.is-done {
+      background: var(--brand-success);
+    }
+    @media (max-width: 640px) {
+      .stepper-indicator { padding: 14px 2px 18px; margin-bottom: 28px; }
+      .stepper-node { min-width: 56px; }
+      .stepper-label { font-size: 9px; letter-spacing: 0.1em; }
+    }
+
+    /* breadcrumb summaries for completed steps */
+    .stepper-breadcrumb-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 28px;
+    }
+    .stepper-breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border: 1px solid var(--brand-border);
+      border-left: 2px solid var(--brand-success);
+      background: var(--brand-bg-soft);
+      font-size: 12.5px;
+      color: var(--brand-text-muted);
+      line-height: 1.4;
+    }
+    .stepper-breadcrumb-ord {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      color: var(--brand-text-soft);
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .stepper-breadcrumb-body {
+      flex: 1;
+      color: var(--brand-text);
+    }
+    .stepper-breadcrumb-edit {
+      flex-shrink: 0;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      color: var(--brand-text-muted);
+      text-transform: uppercase;
+      border-bottom: 1px dotted var(--brand-text-soft);
+      cursor: pointer;
+      background: transparent;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+      padding: 0 0 2px;
+      transition: color 0.15s ease, border-color 0.15s ease;
+    }
+    .stepper-breadcrumb-edit:hover {
+      color: var(--brand-primary);
+      border-bottom-color: var(--brand-primary);
+    }
+
+    /* per-step container with smooth fade/slide */
+    .stepper-step {
+      will-change: opacity, transform;
+    }
+
+    /* "Дальше" button under each step */
+    .stepper-next-band {
+      margin-top: 64px;
+      padding-top: 28px;
+      border-top: 1px solid var(--brand-border);
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+    .stepper-next-btn {
+      background: var(--brand-primary);
+      color: #fff;
+      padding: 14px 24px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      transition: background 0.15s ease, transform 0.15s ease, opacity 0.2s ease;
+    }
+    .stepper-next-btn:hover:not(:disabled) {
+      background: var(--brand-primary-hover);
+      transform: translateX(2px);
+    }
+    .stepper-next-btn:disabled {
+      opacity: 0.32;
+      cursor: not-allowed;
+    }
+    .stepper-next-hint {
+      font-size: 12.5px;
+      color: var(--brand-text-soft);
+      line-height: 1.4;
+    }
+
+    /* methodology block when placed near the top */
+    .methodology-top-slot {
+      margin: 0 auto 32px;
+      max-width: 900px;
+    }
+
+    /* run-status stepper (active_run) */
     .step-circle { width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
                    font-weight: 600; font-size: 18px; transition: background 0.2s, color 0.2s, border-color 0.2s; position: relative; }
     .step-circle.idle    { background: var(--brand-bg-panel); color: var(--brand-text-soft); border: 1px solid var(--brand-border); }
@@ -365,6 +545,166 @@
       gap: 6px;
     }
 
+    /* crawler provider rows (chip-based redesign) */
+    .crawler-rows {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .crawler-row {
+      border: 1px solid var(--brand-border);
+      background: var(--brand-bg-soft);
+      padding: 14px 18px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .crawler-row.is-controls {
+      border-style: dashed;
+      border-color: var(--brand-border-strong);
+      background: transparent;
+    }
+    .crawler-row-head {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .crawler-row-name {
+      font-size: 11px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--brand-text);
+      font-weight: 700;
+    }
+    .crawler-row-count {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 10.5px;
+      color: var(--brand-text-soft);
+      letter-spacing: 0.08em;
+    }
+    .crawler-row-actions {
+      margin-left: auto;
+      display: inline-flex;
+      gap: 14px;
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .crawler-row-action {
+      color: var(--brand-text-muted);
+      cursor: pointer;
+      border-bottom: 1px dotted var(--brand-text-soft);
+      background: transparent;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+      padding: 0 0 2px;
+      transition: color 0.15s ease, border-color 0.15s ease;
+    }
+    .crawler-row-action:hover {
+      color: var(--brand-primary);
+      border-bottom-color: var(--brand-primary);
+    }
+    .crawler-row-note {
+      font-size: 11px;
+      line-height: 1.5;
+      color: var(--brand-text-muted);
+      border-left: 2px solid var(--brand-border-strong);
+      padding-left: 10px;
+      margin-top: 4px;
+    }
+    .crawler-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .crawler-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border: 1px solid var(--brand-border);
+      background: transparent;
+      color: var(--brand-text-muted);
+      font-size: 13px;
+      line-height: 1.2;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+      user-select: none;
+      font-family: inherit;
+    }
+    .crawler-chip:hover {
+      border-color: var(--brand-border-strong);
+      color: var(--brand-text);
+    }
+    .crawler-chip:focus { outline: none; }
+    .crawler-chip:focus-visible {
+      border-color: var(--brand-primary);
+      box-shadow: 0 0 0 2px rgba(255, 50, 75, 0.45);
+    }
+    .crawler-chip.is-selected {
+      background: var(--brand-bg-elevated);
+      border-color: var(--brand-primary);
+      color: var(--brand-text);
+    }
+    .crawler-chip-mark {
+      width: 12px;
+      height: 12px;
+      border-radius: 2px;
+      border: 1px solid var(--brand-border-strong);
+      background: transparent;
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 9px;
+      font-weight: 700;
+      line-height: 1;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .crawler-chip.is-selected .crawler-chip-mark {
+      background: var(--brand-primary);
+      border-color: var(--brand-primary);
+    }
+    .crawler-chip-label {
+      border-bottom: 1px dotted transparent;
+    }
+    .crawler-chip:hover .crawler-chip-label {
+      border-bottom-color: var(--brand-text-soft);
+    }
+    .crawler-chip-exp {
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--brand-warn);
+      margin-left: 2px;
+    }
+    .crawler-subgroup-label {
+      font-size: 9px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      font-weight: 600;
+      margin: 4px 0 -2px;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .crawler-subgroup-tag {
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 9px;
+      background: rgba(245, 158, 11, 0.12);
+      color: var(--brand-warn);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      letter-spacing: 0.06em;
+    }
+
     /* config row */
     .config-row {
       display: grid;
@@ -598,8 +938,119 @@
     <!-- ============ NEW RUN ============ -->
     <section x-show="tab === 'new_run'" class="editorial-wrap">
 
+      <!-- ====== Methodology (top, above stepper) ====== -->
+      <details class="methodology-panel rounded-lg border p-4 methodology-top-slot">
+        <summary class="methodology-summary cursor-pointer select-none">
+          <div class="flex items-center justify-between gap-4">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="methodology-caret text-sm">▶</span>
+                <h2 class="text-sm font-semibold text-[color:var(--brand-info)]">Как работает методика — Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</h2>
+              </div>
+              <p class="text-xs text-[color:var(--brand-text-muted)] mt-1 leading-relaxed">
+                Мы эмулируем <strong>реальные отпечатки AI-ботов</strong> и crawler/retrieval-агентов LLM-систем, чтобы проверить, может ли сайт стать источником знаний для AI-ответов.
+              </p>
+            </div>
+            <span class="methodology-toggle text-xs text-[color:var(--brand-info)] shrink-0"></span>
+          </div>
+        </summary>
+
+        <div class="mt-4 border-t border-[color:var(--brand-border)] pt-4 space-y-4">
+          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
+            Это нужно для проверки <strong>доступности веб-ресурсов как источников знаний LLM-систем</strong>: <strong>AI-видимость продуктов и брендов</strong> зависит от того, может ли crawler/retrieval-слой получить официальный контент. Если сайт закрыт для этого слоя, LLM может не увидеть описание продукта, актуальные цены, документацию, новости, условия, адреса и другие факты, даже если обычный пользователь открывает сайт в браузере.
+          </p>
+          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
+            Кратко о механике: когда пользователь задаёт вопрос, LLM-система может вызвать <strong>web search tool</strong> или внутренний поиск по индексу. Дальше <strong>retrieval</strong> (ретривел) собирает кандидатов: URL, сниппеты и фрагменты страниц. Затем <strong>rerank</strong> (реранк) пересортировывает кандидаты по релевантности, качеству и доступности. Лучшие фрагменты попадают в контекст модели как <strong>RAG</strong> - retrieval augmented generation, и уже на их основе формируется ответ. Если crawler видит captcha, гео-заглушку, пустой SPA-shell или запрет robots.txt, ресурс выпадает из этой цепочки или попадает в неё как некачественный источник.
+          </p>
+
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Реальные bot fingerprints</div>
+              <p>Для каждого домена отправляются запросы с конкретными <strong>User-Agent строками</strong>: GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, anthropic-ai, Claude-Web, PerplexityBot и Perplexity-User. DeepSeekBot и DeepSeek-User вынесены отдельно, потому что у DeepSeek нет официальной спецификации краулеров.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что именно эмулируется</div>
+              <p>Мы меняем идентификатор бота, но держим одинаковый HTTP-контекст: Accept для HTML/XML, Accept-Language: en-US,en;q=0.9, Accept-Encoding: gzip, deflate и Connection: keep-alive. Так видна разница между реакцией сайта на конкретного AI-краулера и на обычный запрос.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Контрольные отпечатки</div>
+              <p>Chrome-control имитирует обычный браузерный User-Agent, а empty-ua отправляет запрос без User-Agent. Если AI-бот получает отказ, а Chrome-control получает контент, это похоже на anti-AI фильтр. Если отказ получают все, это чаще WAF, TLS, гео- или инфраструктурное ограничение.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что фиксируется в ответе</div>
+              <p>Для каждой пробы сохраняются HTTP-статус, цепочка редиректов, TLS-результат, response headers, размер тела, sample HTML, признаки WAF/captcha/interstitial и объём текста, который можно извлечь без выполнения JavaScript.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Сетевые ограничения в России</div>
+              <p>Проверка идёт с серверной точки вне российской пользовательской сети. Российские WAF, блокировки зарубежных IP, гео-заглушки и сертификатные проблемы попадают в результат, потому что глобальные LLM чаще ходят за источниками не с IP конечного пользователя в РФ.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Почему результату можно доверять</div>
+              <p>Оценка строится на <strong>воспроизводимой матрице запросов</strong>: один домен, одинаковые сетевые условия, разные bot fingerprints и контрольные отпечатки. LLM-отчёт только интерпретирует эти измерения; первичные технические сигналы остаются в таблицах пробы.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- ====== Stepper progress indicator ====== -->
+      <div class="stepper-indicator" role="navigation" aria-label="Прогресс проверки">
+        <div class="stepper-node">
+          <span class="stepper-dot" :class="stepDotClass(1)"
+                @click="goToStep(1)"
+                role="button"
+                aria-label="Шаг 01 — Источники"></span>
+          <span class="stepper-label" :class="stepDotClass(1)"
+                @click="goToStep(1)">01 Источники</span>
+        </div>
+        <span class="stepper-line" :class="stepLineClass(1)"></span>
+        <div class="stepper-node">
+          <span class="stepper-dot" :class="stepDotClass(2)"
+                @click="goToStep(2)"
+                role="button"
+                aria-label="Шаг 02 — Краулеры"></span>
+          <span class="stepper-label" :class="stepDotClass(2)"
+                @click="goToStep(2)">02 Краулеры</span>
+        </div>
+        <span class="stepper-line" :class="stepLineClass(2)"></span>
+        <div class="stepper-node">
+          <span class="stepper-dot" :class="stepDotClass(3)"
+                @click="goToStep(3)"
+                role="button"
+                aria-label="Шаг 03 — Параметры"></span>
+          <span class="stepper-label" :class="stepDotClass(3)"
+                @click="goToStep(3)">03 Параметры</span>
+        </div>
+        <span class="stepper-line" :class="stepLineClass(3)"></span>
+        <div class="stepper-node">
+          <span class="stepper-dot" :class="stepDotClass(4)"
+                @click="goToStep(4)"
+                role="button"
+                aria-label="Шаг 04 — Запуск"></span>
+          <span class="stepper-label" :class="stepDotClass(4)"
+                @click="goToStep(4)">04 Запуск</span>
+        </div>
+      </div>
+
+      <!-- ====== Breadcrumbs (completed steps) ====== -->
+      <div class="stepper-breadcrumb-wrap" x-show="form.step > 1">
+        <template x-for="n in (form.step - 1)" :key="'bc-' + n">
+          <div class="stepper-breadcrumb">
+            <span class="stepper-breadcrumb-ord" x-text="'0' + n + ' —'"></span>
+            <span class="stepper-breadcrumb-body" x-text="breadcrumbTextFor(n)"></span>
+            <button type="button" class="stepper-breadcrumb-edit" @click="goToStep(n)">изменить</button>
+          </div>
+        </template>
+      </div>
+
       <!-- ====== Section 01 — Источники ====== -->
-      <div class="editorial-section">
+      <div class="editorial-section stepper-step"
+           x-show="form.step === 1"
+           x-transition:enter="transition ease-out duration-220"
+           x-transition:enter-start="opacity-0 translate-y-2"
+           x-transition:enter-end="opacity-100 translate-y-0"
+           x-transition:leave="transition ease-in duration-180"
+           x-transition:leave-start="opacity-100 translate-y-0"
+           x-transition:leave-end="opacity-0 -translate-y-2">
         <span class="editorial-number">01</span>
         <div class="editorial-hairline"></div>
         <div class="editorial-eyebrow">Шаг 01 / 04</div>
@@ -812,10 +1263,30 @@
 
           <div x-show="setsMeta.length === 0 && !setsLoadError" class="text-xs text-[color:var(--brand-text-soft)] mt-3">Наборы не настроены.</div>
         </div>
+
+        <div class="stepper-next-band">
+          <button type="button" class="stepper-next-btn"
+                  :disabled="!canAdvance()"
+                  @click="advanceStep()">
+            <span>Дальше</span>
+            <svg width="18" height="12" viewBox="0 0 18 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="0" y1="6" x2="16" y2="6"></line>
+              <polyline points="11,1 16,6 11,11"></polyline>
+            </svg>
+          </button>
+          <span class="stepper-next-hint" x-show="!canAdvance()" x-text="stepValidationHint"></span>
+        </div>
       </div>
 
       <!-- ====== Section 02 — Краулеры ====== -->
-      <div class="editorial-section">
+      <div class="editorial-section stepper-step"
+           x-show="form.step === 2"
+           x-transition:enter="transition ease-out duration-220"
+           x-transition:enter-start="opacity-0 translate-y-2"
+           x-transition:enter-end="opacity-100 translate-y-0"
+           x-transition:leave="transition ease-in duration-180"
+           x-transition:leave-start="opacity-100 translate-y-0"
+           x-transition:leave-end="opacity-0 -translate-y-2">
         <span class="editorial-number">02</span>
         <div class="editorial-hairline"></div>
         <div class="editorial-eyebrow">Шаг 02 / 04</div>
@@ -840,71 +1311,130 @@
         </div>
 
         <div class="editorial-body">
-          <div class="crawler-grid">
-            <template x-for="group in uaGroups" :key="group.provider">
-              <div class="crawler-col">
-                <div class="crawler-col-head">
-                  <span class="relative inline-block"
+          <div class="crawler-rows">
+            <!-- AI provider rows -->
+            <template x-for="group in aiProviderGroups" :key="group.provider">
+              <div class="crawler-row">
+                <div class="crawler-row-head">
+                  <span class="crawler-row-name relative inline-block"
                         :class="group.providerTip ? 'cursor-help' : ''"
                         x-data="{ show: false }"
                         @mouseenter="show = !!group.providerTip" @mouseleave="show = false">
                     <span x-text="group.providerRu"></span>
                     <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="group.providerTip || ''"></span>
                   </span>
-                  <span class="crawler-col-toggle" @click="toggleProviderUas(group)" x-text="providerAllSelected(group) ? 'снять' : 'выбрать'"></span>
+                  <span class="crawler-row-count"
+                        x-text="providerSelectedCount(group) + ' / ' + (_allLabelsForGroup(group).length) + ' выбрано'"></span>
+                  <span class="crawler-row-actions">
+                    <button type="button" class="crawler-row-action"
+                            @click="selectAllProviderUas(group)">Выбрать все</button>
+                    <button type="button" class="crawler-row-action"
+                            @click="clearProviderUas(group)">Очистить</button>
+                  </span>
                 </div>
-                <!-- flat group -->
+
+                <!-- flat group (no subgroups) -->
                 <template x-if="!group.subgroups">
-                  <div class="crawler-col-list">
+                  <div class="crawler-chips">
                     <template x-for="label in group.labels" :key="label">
-                      <label class="crawler-check">
-                        <input type="checkbox" x-model="form.uaSelected[label]"
-                               class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                        <span class="relative inline-block cursor-help"
-                              x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                          <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
-                          <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
-                        </span>
-                      </label>
+                      <button type="button" class="crawler-chip"
+                              :class="form.uaSelected[label] ? 'is-selected' : ''"
+                              @click="form.uaSelected[label] = !form.uaSelected[label]"
+                              x-data="{ show: false }"
+                              @mouseenter="show = true" @mouseleave="show = false">
+                        <span class="crawler-chip-mark" x-text="form.uaSelected[label] ? '✓' : ''"></span>
+                        <span class="crawler-chip-label" x-text="label"></span>
+                        <span x-show="isUaExperimental(label)" class="crawler-chip-exp">exp</span>
+                        <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                      </button>
                     </template>
                   </div>
                 </template>
-                <!-- subgroups (Google) -->
+
+                <!-- subgroup-aware (Google) — chips flow inline, subgroup label on its own line -->
                 <template x-if="group.subgroups">
-                  <div class="crawler-col-list">
+                  <div class="crawler-chips">
                     <template x-for="sub in group.subgroups" :key="sub.name">
-                      <div>
-                        <div class="crawler-subhead">
-                          <span x-text="sub.name"></span>
-                          <span x-show="sub.experimental"
-                                class="px-1 py-0 rounded text-[9px] bg-amber-950/60 text-amber-300 border border-amber-900 normal-case tracking-normal">exp</span>
-                        </div>
-                        <template x-for="label in sub.labels" :key="label">
-                          <label class="crawler-check">
-                            <input type="checkbox" x-model="form.uaSelected[label]"
-                                   class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                            <span class="relative inline-block cursor-help"
-                                  x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
-                              <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
-                            </span>
-                          </label>
-                        </template>
-                      </div>
+                      <template x-for="(label, lIdx) in sub.labels" :key="label">
+                        <button type="button" class="crawler-chip"
+                                :class="form.uaSelected[label] ? 'is-selected' : ''"
+                                @click="form.uaSelected[label] = !form.uaSelected[label]"
+                                x-data="{ show: false }"
+                                @mouseenter="show = true" @mouseleave="show = false">
+                          <span class="crawler-chip-mark" x-text="form.uaSelected[label] ? '✓' : ''"></span>
+                          <span class="crawler-chip-label" x-text="label"></span>
+                          <span x-show="isUaExperimental(label) || sub.experimental" class="crawler-chip-exp">exp</span>
+                          <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                        </button>
+                      </template>
                     </template>
-                    <div x-show="group.robotsOnlyNote"
-                         class="mt-2 text-[10.5px] leading-snug text-[color:var(--brand-text-muted)] border-l-2 border-[color:var(--brand-border-strong)] pl-2"
-                         x-text="group.robotsOnlyNote"></div>
                   </div>
                 </template>
+
+                <div x-show="group.robotsOnlyNote"
+                     class="crawler-row-note"
+                     x-text="group.robotsOnlyNote"></div>
+              </div>
+            </template>
+
+            <!-- Controls row (Chrome-control, empty-ua) -->
+            <template x-if="controlsGroup">
+              <div class="crawler-row is-controls">
+                <div class="crawler-row-head">
+                  <span class="crawler-row-name">Контроль</span>
+                  <span class="crawler-row-count"
+                        x-text="providerSelectedCount(controlsGroup) + ' / ' + (_allLabelsForGroup(controlsGroup).length) + ' выбрано'"></span>
+                  <span class="crawler-row-actions">
+                    <button type="button" class="crawler-row-action"
+                            @click="selectAllProviderUas(controlsGroup)">Выбрать все</button>
+                    <button type="button" class="crawler-row-action"
+                            @click="clearProviderUas(controlsGroup)">Очистить</button>
+                  </span>
+                </div>
+                <div class="crawler-chips">
+                  <template x-for="label in controlsGroup.labels" :key="label">
+                    <button type="button" class="crawler-chip"
+                            :class="form.uaSelected[label] ? 'is-selected' : ''"
+                            @click="form.uaSelected[label] = !form.uaSelected[label]"
+                            x-data="{ show: false }"
+                            @mouseenter="show = true" @mouseleave="show = false">
+                      <span class="crawler-chip-mark" x-text="form.uaSelected[label] ? '✓' : ''"></span>
+                      <span class="crawler-chip-label" x-text="label"></span>
+                      <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                    </button>
+                  </template>
+                </div>
+                <div class="crawler-row-note">
+                  Контрольные запросы помогают отличить anti-AI фильтр от общей блокировки. Chrome-control имитирует обычный браузер, empty-ua отправляет запрос без User-Agent.
+                </div>
               </div>
             </template>
           </div>
         </div>
+
+        <div class="stepper-next-band">
+          <button type="button" class="stepper-next-btn"
+                  :disabled="!canAdvance()"
+                  @click="advanceStep()">
+            <span>Дальше</span>
+            <svg width="18" height="12" viewBox="0 0 18 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="0" y1="6" x2="16" y2="6"></line>
+              <polyline points="11,1 16,6 11,11"></polyline>
+            </svg>
+          </button>
+          <span class="stepper-next-hint" x-show="!canAdvance()" x-text="stepValidationHint"></span>
+        </div>
       </div>
 
       <!-- ====== Section 03 — Настройка ====== -->
-      <div class="editorial-section">
+      <div class="editorial-section stepper-step"
+           x-show="form.step === 3"
+           x-transition:enter="transition ease-out duration-220"
+           x-transition:enter-start="opacity-0 translate-y-2"
+           x-transition:enter-end="opacity-100 translate-y-0"
+           x-transition:leave="transition ease-in duration-180"
+           x-transition:leave-start="opacity-100 translate-y-0"
+           x-transition:leave-end="opacity-0 -translate-y-2">
         <span class="editorial-number">03</span>
         <div class="editorial-hairline"></div>
         <div class="editorial-eyebrow">Шаг 03 / 04</div>
@@ -938,10 +1468,29 @@
             </div>
           </div>
         </div>
+
+        <div class="stepper-next-band">
+          <button type="button" class="stepper-next-btn"
+                  :disabled="!canAdvance()"
+                  @click="advanceStep()">
+            <span>Дальше</span>
+            <svg width="18" height="12" viewBox="0 0 18 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="0" y1="6" x2="16" y2="6"></line>
+              <polyline points="11,1 16,6 11,11"></polyline>
+            </svg>
+          </button>
+        </div>
       </div>
 
       <!-- ====== Section 04 — Запуск ====== -->
-      <div class="editorial-section">
+      <div class="editorial-section stepper-step"
+           x-show="form.step === 4"
+           x-transition:enter="transition ease-out duration-220"
+           x-transition:enter-start="opacity-0 translate-y-2"
+           x-transition:enter-end="opacity-100 translate-y-0"
+           x-transition:leave="transition ease-in duration-180"
+           x-transition:leave-start="opacity-100 translate-y-0"
+           x-transition:leave-end="opacity-0 -translate-y-2">
         <span class="editorial-number">04</span>
         <div class="editorial-hairline"></div>
         <div class="editorial-eyebrow">Шаг 04 / 04</div>
@@ -988,59 +1537,6 @@
         </div>
       </div>
 
-      <!-- ====== Methodology (collapsed) ====== -->
-      <details class="methodology-panel rounded-lg border p-4" style="margin-top: 80px;">
-        <summary class="methodology-summary cursor-pointer select-none">
-          <div class="flex items-center justify-between gap-4">
-            <div class="min-w-0">
-              <div class="flex items-center gap-2 flex-wrap">
-                <span class="methodology-caret text-sm">▶</span>
-                <h2 class="text-sm font-semibold text-[color:var(--brand-info)]">Как работает методика — Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</h2>
-              </div>
-              <p class="text-xs text-[color:var(--brand-text-muted)] mt-1 leading-relaxed">
-                Мы эмулируем <strong>реальные отпечатки AI-ботов</strong> и crawler/retrieval-агентов LLM-систем, чтобы проверить, может ли сайт стать источником знаний для AI-ответов.
-              </p>
-            </div>
-            <span class="methodology-toggle text-xs text-[color:var(--brand-info)] shrink-0"></span>
-          </div>
-        </summary>
-
-        <div class="mt-4 border-t border-[color:var(--brand-border)] pt-4 space-y-4">
-          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
-            Это нужно для проверки <strong>доступности веб-ресурсов как источников знаний LLM-систем</strong>: <strong>AI-видимость продуктов и брендов</strong> зависит от того, может ли crawler/retrieval-слой получить официальный контент. Если сайт закрыт для этого слоя, LLM может не увидеть описание продукта, актуальные цены, документацию, новости, условия, адреса и другие факты, даже если обычный пользователь открывает сайт в браузере.
-          </p>
-          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
-            Кратко о механике: когда пользователь задаёт вопрос, LLM-система может вызвать <strong>web search tool</strong> или внутренний поиск по индексу. Дальше <strong>retrieval</strong> (ретривел) собирает кандидатов: URL, сниппеты и фрагменты страниц. Затем <strong>rerank</strong> (реранк) пересортировывает кандидаты по релевантности, качеству и доступности. Лучшие фрагменты попадают в контекст модели как <strong>RAG</strong> - retrieval augmented generation, и уже на их основе формируется ответ. Если crawler видит captcha, гео-заглушку, пустой SPA-shell или запрет robots.txt, ресурс выпадает из этой цепочки или попадает в неё как некачественный источник.
-          </p>
-
-          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Реальные bot fingerprints</div>
-              <p>Для каждого домена отправляются запросы с конкретными <strong>User-Agent строками</strong>: GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, anthropic-ai, Claude-Web, PerplexityBot и Perplexity-User. DeepSeekBot и DeepSeek-User вынесены отдельно, потому что у DeepSeek нет официальной спецификации краулеров.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что именно эмулируется</div>
-              <p>Мы меняем идентификатор бота, но держим одинаковый HTTP-контекст: Accept для HTML/XML, Accept-Language: en-US,en;q=0.9, Accept-Encoding: gzip, deflate и Connection: keep-alive. Так видна разница между реакцией сайта на конкретного AI-краулера и на обычный запрос.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Контрольные отпечатки</div>
-              <p>Chrome-control имитирует обычный браузерный User-Agent, а empty-ua отправляет запрос без User-Agent. Если AI-бот получает отказ, а Chrome-control получает контент, это похоже на anti-AI фильтр. Если отказ получают все, это чаще WAF, TLS, гео- или инфраструктурное ограничение.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что фиксируется в ответе</div>
-              <p>Для каждой пробы сохраняются HTTP-статус, цепочка редиректов, TLS-результат, response headers, размер тела, sample HTML, признаки WAF/captcha/interstitial и объём текста, который можно извлечь без выполнения JavaScript.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Сетевые ограничения в России</div>
-              <p>Проверка идёт с серверной точки вне российской пользовательской сети. Российские WAF, блокировки зарубежных IP, гео-заглушки и сертификатные проблемы попадают в результат, потому что глобальные LLM чаще ходят за источниками не с IP конечного пользователя в РФ.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Почему результату можно доверять</div>
-              <p>Оценка строится на <strong>воспроизводимой матрице запросов</strong>: один домен, одинаковые сетевые условия, разные bot fingerprints и контрольные отпечатки. LLM-отчёт только интерпретирует эти измерения; первичные технические сигналы остаются в таблицах пробы.</p>
-            </div>
-          </div>
-        </div>
-      </details>
     </section>
 
     <!-- ============ ACTIVE RUN ============ -->
@@ -1404,6 +1900,13 @@
                                 ] },
       { provider: 'Controls',   providerRu: 'Контрольные запросы',             labels: ['Chrome-control', 'empty-ua'] },
     ];
+    // Labels treated as experimental (observed-only, no official spec). Used
+    // for the small "exp" badge next to chips on Step 02.
+    const EXPERIMENTAL_UA_LABELS = new Set([
+      'GoogleAgent-URLContext',
+      'Gemini-Deep-Research',
+    ]);
+
     // Default-enabled: every UA label except robots-fetcher (not in UA_GROUPS)
     // and empty-ua (control-only, opt-in stays).
     const UA_DEFAULTS = [
@@ -1543,6 +2046,8 @@
           uaSelected: {},
           concurrency: 8,
           timeoutSeconds: 15,
+          step: 1,
+          maxStepReached: 1,
         },
         formError: null,
         defaultsMessage: '',
@@ -2007,6 +2512,80 @@
             }
           }
         },
+
+        // ----- quiz-stepper navigation -----
+        canAdvance() {
+          const s = this.form.step;
+          if (s === 1) return this.form.sourceMode !== null && this.finalDomains.length > 0;
+          if (s === 2) return this.selectedUaCount > 0;
+          if (s === 3) return true;
+          return false;
+        },
+        get stepValidationHint() {
+          const s = this.form.step;
+          if (s === 1) {
+            if (this.form.sourceMode === null) return 'Выберите источник доменов';
+            if (this.finalDomains.length === 0) {
+              if (this.form.sourceMode === 'custom') return 'Введите хотя бы один домен в текстовое поле';
+              return 'Отметьте хотя бы один домен в наборе';
+            }
+            return '';
+          }
+          if (s === 2) {
+            if (this.selectedUaCount === 0) return 'Выберите хотя бы один AI-краулер';
+            return '';
+          }
+          return '';
+        },
+        advanceStep() {
+          if (!this.canAdvance()) return;
+          if (this.form.step >= 4) return;
+          this.form.step = this.form.step + 1;
+          if (this.form.step > this.form.maxStepReached) {
+            this.form.maxStepReached = this.form.step;
+          }
+        },
+        goToStep(n) {
+          if (n < 1 || n > 4) return;
+          if (n > this.form.maxStepReached) return;
+          this.form.step = n;
+        },
+        stepDotClass(n) {
+          if (n === this.form.step) return 'is-current';
+          if (n <= this.form.maxStepReached) return 'is-done';
+          return 'is-locked';
+        },
+        stepLineClass(n) {
+          if (n < this.form.maxStepReached) return 'is-done';
+          return '';
+        },
+        breadcrumbTextFor(n) {
+          if (n === 1) {
+            const mode = this.form.sourceMode;
+            let src = 'не выбран';
+            if (mode === 'custom') src = 'Мой список';
+            else if (mode === 'set1' || mode === 'set2' || mode === 'set3') {
+              const meta = this.setMetaById(this.setIdForMode(mode));
+              if (meta) src = this.setTitleRu(meta);
+            }
+            const count = this.finalDomains.length;
+            return 'Источник: ' + src + ' · ' + count + ' доменов';
+          }
+          if (n === 2) {
+            return 'Краулеры: ' + this.selectedUaCount + ' идентификаторов выбрано';
+          }
+          if (n === 3) {
+            return 'Параметры: concurrency ' + this.form.concurrency + ', timeout ' + this.form.timeoutSeconds + ' сек';
+          }
+          return '';
+        },
+        resetForm() {
+          this.form.step = 1;
+          this.form.maxStepReached = 1;
+          this.form.sourceMode = null;
+          this.form.domainsText = '';
+          this.formError = null;
+        },
         providerAllSelected(group) {
           const labels = this._allLabelsForGroup(group);
           if (labels.length === 0) return false;
@@ -2016,6 +2595,29 @@
           const labels = this._allLabelsForGroup(group);
           const allOn = this.providerAllSelected(group);
           for (const l of labels) this.form.uaSelected[l] = !allOn;
+        },
+        clearProviderUas(group) {
+          const labels = this._allLabelsForGroup(group);
+          for (const l of labels) this.form.uaSelected[l] = false;
+        },
+        selectAllProviderUas(group) {
+          const labels = this._allLabelsForGroup(group);
+          for (const l of labels) this.form.uaSelected[l] = true;
+        },
+        providerSelectedCount(group) {
+          const labels = this._allLabelsForGroup(group);
+          let n = 0;
+          for (const l of labels) if (this.form.uaSelected[l]) n += 1;
+          return n;
+        },
+        isUaExperimental(label) {
+          return EXPERIMENTAL_UA_LABELS.has(label);
+        },
+        get aiProviderGroups() {
+          return UA_GROUPS.filter(g => g.provider !== 'Controls');
+        },
+        get controlsGroup() {
+          return UA_GROUPS.find(g => g.provider === 'Controls') || null;
         },
         _allLabelsForGroup(group) {
           if (group.subgroups) {
