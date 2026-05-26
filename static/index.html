@@ -243,8 +243,39 @@
         <!-- Left column: sets + custom -->
         <div class="lg:col-span-2 space-y-5">
 
+          <!-- Domain mode toggle -->
+          <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-3 space-y-2">
+            <div class="text-xs font-medium text-[color:var(--brand-text)] uppercase tracking-wide">Режим выбора доменов</div>
+            <div class="flex flex-col sm:flex-row gap-2">
+              <label class="flex-1 flex items-start gap-2 cursor-pointer rounded border px-3 py-2 transition"
+                     :class="form.domainMode === 'mixed'
+                              ? 'border-[color:var(--brand-primary)] bg-[color:var(--brand-bg-panel)]'
+                              : 'border-[color:var(--brand-border)] hover:border-[color:var(--brand-border-strong)]'">
+                <input type="radio" name="domainMode" value="mixed" x-model="form.domainMode"
+                       class="mt-1 text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                <div class="text-xs leading-snug">
+                  <div class="font-medium text-[color:var(--brand-text)]">Готовые наборы + свои домены</div>
+                  <div class="text-[color:var(--brand-text-muted)] mt-0.5">Включённые наборы объединяются с вашим списком, дубли удаляются.</div>
+                </div>
+              </label>
+              <label class="flex-1 flex items-start gap-2 cursor-pointer rounded border px-3 py-2 transition"
+                     :class="form.domainMode === 'custom_only'
+                              ? 'border-[color:var(--brand-primary)] bg-[color:var(--brand-bg-panel)]'
+                              : 'border-[color:var(--brand-border)] hover:border-[color:var(--brand-border-strong)]'">
+                <input type="radio" name="domainMode" value="custom_only" x-model="form.domainMode"
+                       class="mt-1 text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                <div class="text-xs leading-snug">
+                  <div class="font-medium text-[color:var(--brand-text)]">Только мои домены</div>
+                  <div class="text-[color:var(--brand-text-muted)] mt-0.5">Наборы игнорируются — проверяется только то, что вы напишете ниже.</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
           <!-- Domain sets -->
-          <div class="space-y-3">
+          <div class="space-y-3 transition-opacity"
+               :class="form.domainMode === 'custom_only' ? 'opacity-40 pointer-events-none' : ''"
+               x-show="form.domainMode === 'mixed'">
             <div>
               <h2 class="text-sm font-semibold relative inline-block cursor-help"
                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
@@ -378,19 +409,31 @@
           <div class="space-y-2">
             <label class="text-sm font-medium relative inline-block cursor-help"
                    x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Свои домены</span>
+              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]"
+                    x-text="form.domainMode === 'custom_only' ? 'Мои домены' : 'Свои домены'"></span>
               <span x-show="show" x-transition class="rw-tip rw-tip-below">
-                Дополнительные домены поверх наборов. Перечисли через запятую. Без https:// и без путей.
+                Парсер сам уберёт нумерацию, маркеры списков, https://, www., пути и порты. Можно вставлять списки из Word, Excel, Markdown — построчно, через запятую или через пробел.
               </span>
             </label>
-            <p class="text-xs text-[color:var(--brand-text-muted)]">Перечисли через запятую: example.com, mysite.org, brand.ru</p>
+            <p class="text-xs text-[color:var(--brand-text-muted)]">
+              Любой формат: построчно, через запятую, нумерованный или маркированный список. URL'ы и www. — нормализуются автоматически.
+            </p>
             <textarea x-model="form.domainsText"
                       spellcheck="false"
-                      rows="4"
-                      placeholder="example.com, mysite.org, brand.ru"
+                      rows="5"
+                      placeholder="example.com, mysite.org, brand.ru&#10;1. https://www.test.com/path&#10;- foo.bar"
                       class="w-full bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded p-3 font-mono text-sm text-[color:var(--brand-text)] placeholder:text-[color:var(--brand-text-soft)] focus:outline-none focus:border-[color:var(--brand-primary)]"></textarea>
-            <div class="text-xs text-[color:var(--brand-text-muted)]">
-              <span x-text="'+' + customDomains.length + ' своих доменов'"></span>
+            <div class="text-xs flex items-center gap-2 flex-wrap">
+              <span class="text-[color:var(--brand-text-muted)]"
+                    x-text="'Распознано доменов: ' + customDomains.length"></span>
+              <span x-show="form.domainsText.trim() && customDomains.length === 0"
+                    class="text-[color:var(--brand-warn)]">
+                ничего не распознано — проверь формат
+              </span>
+              <span x-show="form.domainMode === 'custom_only' && customDomains.length > 0"
+                    class="px-1.5 py-0.5 rounded text-[10px] bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-text-soft)] border border-[color:var(--brand-border)]">
+                наборы выключены
+              </span>
             </div>
           </div>
         </div>
@@ -1009,6 +1052,7 @@
         ROBOTS_RULE_TIPS,
         form: {
           domainsText: '',
+          domainMode: 'mixed',
           uaSelected: {},
           concurrency: 8,
           timeoutSeconds: 15,
@@ -1137,24 +1181,57 @@
 
         // ----- form-side getters -----
         get customDomains() {
+          // Robust parser: handles numbered lists, bullets, URLs with paths,
+          // mixed comma/semicolon/whitespace/newline separators, IDN, BOM, etc.
           const seen = new Set(); const out = [];
-          // Accept comma, newline, semicolon, whitespace as separators.
-          const tokens = (this.form.domainsText || '').split(/[\s,;]+/);
-          for (let line of tokens) {
+          const raw = this.form.domainsText || '';
+          // Domain regex: allows ASCII + unicode letters (IDN), requires at least one dot.
+          const DOMAIN_RE = /^[a-z0-9¡-￿](?:[a-z0-9¡-￿-]*[a-z0-9¡-￿])?(?:\.[a-z0-9¡-￿](?:[a-z0-9¡-￿-]*[a-z0-9¡-￿])?)+$/;
+          const lines = raw.split(/\r?\n/);
+          for (let line of lines) {
+            // Strip BOM and zero-width chars.
+            line = line.replace(/[﻿​‌‍⁠]/g, '');
             line = line.trim();
             if (!line) continue;
-            line = line.replace(/^https?:\/\//i, '');
-            line = line.replace(/^www\./i, '');
-            const slash = line.indexOf('/');
-            if (slash !== -1) line = line.slice(0, slash);
-            line = line.toLowerCase();
-            if (!line || seen.has(line)) continue;
-            seen.add(line); out.push(line);
+            // Strip leading list markers: "1.", "1)", "1-", "-", "•", "*", ">", "—", "–".
+            line = line.replace(/^\s*(?:\d+\s*[\.\)\-]\s+|[-•‣◦⁃*>—–]\s+)/, '');
+            // Split on any whitespace/comma/semicolon/tab inside the line.
+            const tokens = line.split(/[\s,;]+/);
+            for (let tok of tokens) {
+              tok = tok.trim();
+              if (!tok) continue;
+              // Strip wrapping quotes / parens / angle brackets.
+              tok = tok.replace(/^[\"'`<\(\[]+/, '').replace(/[\"'`>\)\]]+$/, '');
+              // Strip trailing punctuation.
+              tok = tok.replace(/[.,;:!?]+$/, '');
+              // Strip mailto: / tel: prefixes.
+              tok = tok.replace(/^(?:mailto|tel):/i, '');
+              // Drop email user portion if present (foo@example.com -> example.com).
+              const at = tok.lastIndexOf('@');
+              if (at !== -1) tok = tok.slice(at + 1);
+              // Strip protocol.
+              tok = tok.replace(/^[a-z]+:\/\//i, '');
+              // Strip leading "www.".
+              tok = tok.replace(/^www\./i, '');
+              // Strip path/query/fragment.
+              const cut = tok.search(/[\/\?#]/);
+              if (cut !== -1) tok = tok.slice(0, cut);
+              // Strip port :NNNN.
+              tok = tok.replace(/:\d+$/, '');
+              tok = tok.toLowerCase();
+              if (!tok) continue;
+              if (!DOMAIN_RE.test(tok)) continue;
+              if (seen.has(tok)) continue;
+              seen.add(tok); out.push(tok);
+            }
           }
           return out;
         },
         get parsedDomains() { return this.finalDomains; },
         get finalDomains() {
+          if (this.form.domainMode === 'custom_only') {
+            return this.customDomains;
+          }
           const seen = new Set(); const out = [];
           for (const meta of this.setsMeta) {
             const st = this.setsState[meta.id];
@@ -1170,6 +1247,10 @@
           return out;
         },
         get sourceBreakdown() {
+          const custom = this.customDomains.length;
+          if (this.form.domainMode === 'custom_only') {
+            return { set1_selected: 0, set2_selected: 0, custom, deduplicated_removed: 0 };
+          }
           let s1 = 0, s2 = 0;
           for (const meta of this.setsMeta) {
             const st = this.setsState[meta.id];
@@ -1178,7 +1259,6 @@
             if (meta.id === 'set1_manual_research') s1 = n;
             else if (meta.id === 'set2_corpus_sources') s2 = n;
           }
-          const custom = this.customDomains.length;
           const raw = s1 + s2 + custom;
           const final = this.finalDomains.length;
           return { set1_selected: s1, set2_selected: s2, custom, deduplicated_removed: Math.max(0, raw - final) };
