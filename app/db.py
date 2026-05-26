@@ -28,6 +28,14 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:
 _ALTER_STATEMENTS: tuple[str, ...] = (
     "ALTER TABLE domain_probes ADD COLUMN content_extractable_text_length INTEGER",
     "ALTER TABLE domain_probes ADD COLUMN content_signals JSON",
+    # SQLite refuses inline UNIQUE on ALTER TABLE ADD COLUMN. Add the column
+    # plain, then enforce uniqueness through the UNIQUE INDEX below.
+    "ALTER TABLE runs ADD COLUMN share_token VARCHAR(64)",
+)
+
+
+_INDEX_STATEMENTS: tuple[str, ...] = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_runs_share_token ON runs(share_token)",
 )
 
 
@@ -37,6 +45,11 @@ async def init_db() -> None:
         # Idempotent column-add for pre-existing DBs. SQLite raises if the
         # column already exists; we swallow that and continue.
         for stmt in _ALTER_STATEMENTS:
+            try:
+                await conn.exec_driver_sql(stmt)
+            except Exception:
+                pass
+        for stmt in _INDEX_STATEMENTS:
             try:
                 await conn.exec_driver_sql(stmt)
             except Exception:

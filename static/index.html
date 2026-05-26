@@ -905,6 +905,162 @@
       font-weight: 700;
     }
 
+    /* ===== shareable reports ===== */
+    .share-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border: 1px solid var(--brand-primary);
+      border-radius: 3px;
+      background: rgba(255, 50, 75, 0.08);
+      color: var(--brand-primary);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+      font-family: inherit;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .share-btn:hover {
+      background: var(--brand-primary);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+    .share-btn:focus { outline: none; }
+    .share-btn:focus-visible { box-shadow: 0 0 0 2px rgba(255, 50, 75, 0.45); }
+    .share-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+      background: rgba(255, 50, 75, 0.04);
+    }
+    .share-btn:disabled:hover { background: rgba(255, 50, 75, 0.04); color: var(--brand-primary); }
+    .share-btn-mini {
+      padding: 3px 8px;
+      font-size: 10px;
+      letter-spacing: 0.1em;
+    }
+    .share-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--brand-primary);
+      box-shadow: 0 0 0 2px rgba(255, 50, 75, 0.25);
+    }
+    .share-panel {
+      border: 1px solid var(--brand-border);
+      border-left: 3px solid var(--brand-primary);
+      background: var(--brand-bg-soft);
+      border-radius: 4px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .share-panel-header {
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--brand-text-muted);
+      font-weight: 600;
+    }
+    .share-url-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .share-url-input {
+      flex: 1 1 320px;
+      min-width: 240px;
+      background: var(--brand-bg-panel);
+      border: 1px solid var(--brand-border-strong);
+      border-radius: 3px;
+      color: var(--brand-text);
+      padding: 6px 10px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .share-actions-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .share-hint {
+      font-size: 11px;
+      color: var(--brand-text-soft);
+    }
+    .shared-ribbon {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      background: rgba(255, 50, 75, 0.08);
+      border: 1px solid rgba(255, 50, 75, 0.35);
+      border-radius: 4px;
+      padding: 8px 14px;
+      font-size: 12px;
+      color: var(--brand-text-muted);
+      margin-bottom: 14px;
+    }
+    .shared-ribbon strong { color: var(--brand-text); font-weight: 600; }
+    .shared-toast {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 100;
+      padding: 8px 14px;
+      border-radius: 4px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+      transition: opacity 0.2s ease;
+    }
+    .shared-toast.kind-success {
+      background: rgba(34, 197, 94, 0.16);
+      border: 1px solid rgba(34, 197, 94, 0.6);
+      color: var(--brand-success);
+    }
+    .shared-toast.kind-error {
+      background: rgba(248, 113, 113, 0.16);
+      border: 1px solid rgba(248, 113, 113, 0.6);
+      color: var(--brand-error);
+    }
+    .shared-empty {
+      max-width: 520px;
+      margin: 80px auto;
+      text-align: center;
+      color: var(--brand-text-muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .shared-empty h2 {
+      color: var(--brand-text);
+      font-size: 1.4rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+    .shared-home-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--brand-text-muted);
+      text-decoration: none;
+      padding: 6px 10px;
+      border: 1px solid var(--brand-border);
+      border-radius: 3px;
+      transition: color 0.15s ease, border-color 0.15s ease;
+    }
+    .shared-home-link:hover {
+      color: var(--brand-primary);
+      border-color: var(--brand-primary);
+    }
+
     /* editorial textarea */
     .editorial-textarea {
       width: 100%;
@@ -1235,7 +1391,7 @@
 
     <!-- Header -->
     <header class="flex items-center justify-between border-b border-[color:var(--brand-border)] pb-4 mb-6">
-      <button type="button" @click="setTab('new_run')"
+      <button type="button" @click="onLogoClick()"
               class="flex items-center gap-3 text-left transition-opacity hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--brand-primary)] rounded"
               aria-label="На главную">
         <img src="/static/brand/logo-mark.svg" alt="RW+" class="h-9 w-9" />
@@ -1247,14 +1403,15 @@
       </button>
       <div class="flex items-center gap-4">
         <!-- proxy pool indicator: polls /api/healthz on load and every 60s -->
-        <div class="relative inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded border cursor-help"
+        <div x-show="tab !== 'shared_report'"
+             class="relative inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded border cursor-help"
              :class="proxyHealthClasses()"
              x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
           <span class="inline-block w-2 h-2 rounded-full" :class="proxyDotClass()"></span>
           <span x-text="proxyLabel()"></span>
           <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="proxyTooltip()"></span>
         </div>
-        <nav class="flex gap-1 text-sm">
+        <nav x-show="tab !== 'shared_report'" class="flex gap-1 text-sm">
           <button @click="setTab('new_run')"
                   :class="tab === 'new_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
                   class="px-3 py-1.5 rounded">Новая проверка</button>
@@ -1274,6 +1431,9 @@
             <span>Методика</span>
           </button>
         </nav>
+        <a x-show="tab === 'shared_report'" href="/" class="shared-home-link" rel="noopener">
+          <span>&larr; На главную aiv.rw.plus</span>
+        </a>
       </div>
     </header>
 
@@ -2172,6 +2332,47 @@
             Живой лог недоступен для прошлых проверок (события не сохраняются).
           </div>
 
+          <!-- Share management panel: visible only when run is completed -->
+          <div x-show="runStatus === 'completed' && runDetails" class="rounded-lg space-y-3">
+            <div class="flex items-center flex-wrap gap-3">
+              <button type="button"
+                      class="share-btn"
+                      :disabled="shareBusy || runStatus !== 'completed'"
+                      @click="onSharePrimary()"
+                      x-show="!shareState.token">
+                <span>Поделиться</span>
+              </button>
+              <span class="share-hint"
+                    x-show="!shareState.token && runStatus !== 'completed'">Доступно после завершения проверки.</span>
+              <span class="share-hint"
+                    x-show="!shareState.token && runStatus === 'completed'">Сгенерирует публичную ссылку и скопирует её в буфер обмена.</span>
+            </div>
+            <div class="share-panel" x-show="!!shareState.token">
+              <div class="share-panel-header">
+                <span class="share-dot" aria-hidden="true"></span>
+                <span class="ml-2">Активная shareable-ссылка</span>
+              </div>
+              <div class="share-url-row">
+                <input type="text"
+                       class="share-url-input"
+                       readonly
+                       :value="shareFullUrl()"
+                       @focus="$event.target.select()"
+                       @click="$event.target.select()" />
+                <button type="button" class="share-btn share-btn-mini"
+                        :disabled="shareBusy"
+                        @click="copyShareLink()">Скопировать</button>
+                <button type="button" class="share-btn share-btn-mini"
+                        :disabled="shareBusy"
+                        @click="onShareRegenerate()">Перевыпустить</button>
+                <button type="button" class="share-btn share-btn-mini"
+                        :disabled="shareBusy"
+                        @click="onShareRevoke()">Отозвать</button>
+              </div>
+              <div class="share-hint">Любой, у кого есть эта ссылка, увидит отчёт. Перевыпуск ломает старую ссылку. Отзыв полностью отключает доступ.</div>
+            </div>
+          </div>
+
           <!-- Results -->
           <div x-show="runStatus === 'completed' || runStatus === 'failed'" class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
             <div class="border-b border-[color:var(--brand-border)] px-3 py-2 flex items-center gap-1 text-sm">
@@ -2394,6 +2595,16 @@
                 <td class="px-3 py-1.5 text-right text-[color:var(--brand-text-muted)] font-mono" x-text="r.progress_current + ' / ' + r.progress_total"></td>
                 <td class="px-3 py-1.5 text-right space-x-2 text-xs">
                   <button @click="openRun(r.id)" class="text-[color:var(--brand-primary)] hover:underline">Открыть</button>
+                  <button type="button"
+                          class="share-btn share-btn-mini"
+                          x-show="r.status === 'completed'"
+                          :disabled="historyShareBusyId === r.id"
+                          :title="r.share_token ? 'Ссылка активна. Кликни чтобы скопировать.' : 'Сгенерировать публичную ссылку и скопировать в буфер.'"
+                          @click="onHistoryShare(r)">
+                    <span x-show="r.share_token" class="share-dot" aria-hidden="true"></span>
+                    <span x-show="r.share_token">Скопировать ссылку</span>
+                    <span x-show="!r.share_token">Поделиться</span>
+                  </button>
                   <button @click="deleteRun(r.id)" class="text-[color:var(--brand-error)] hover:underline">Удалить</button>
                 </td>
               </tr>
@@ -2405,6 +2616,169 @@
         </table>
       </div>
     </section>
+
+    <!-- ============ SHARED REPORT (public, read-only) ============ -->
+    <section x-show="tab === 'shared_report'" class="space-y-4">
+      <!-- empty / not-found state -->
+      <template x-if="sharedError">
+        <div class="shared-empty">
+          <h2>Ссылка недействительна</h2>
+          <p x-text="sharedError"></p>
+          <p class="mt-4">
+            <a href="/" class="text-[color:var(--brand-primary)] hover:underline">Открыть aiv.rw.plus</a>
+          </p>
+        </div>
+      </template>
+
+      <template x-if="!sharedError && sharedLoading">
+        <div class="shared-empty">
+          <p>Загружаем отчёт...</p>
+        </div>
+      </template>
+
+      <template x-if="!sharedError && !sharedLoading && runDetails">
+        <div class="space-y-4">
+          <!-- Ribbon -->
+          <div class="shared-ribbon">
+            Этот отчёт открыт по shareable-ссылке. Сгенерирован
+            <strong x-text="formatSharedDate(runDetails?.created_at)"></strong>.
+            Опубликован владельцем проверки для ознакомления.
+          </div>
+
+          <!-- Summary header (read-only) -->
+          <div class="flex items-end justify-between flex-wrap gap-3">
+            <div>
+              <div class="text-xs text-[color:var(--brand-text-muted)]">Отчёт <span class="font-mono" x-text="(runDetails?.id || '').slice(0,8)"></span></div>
+              <div class="text-2xl font-mono font-semibold mt-1 text-[color:var(--brand-success)]" x-text="'AI Visibility Report'"></div>
+            </div>
+            <div class="text-sm flex items-center gap-3 flex-wrap">
+              <span :class="statusBadgeClass(runDetails?.status)" class="px-2 py-0.5 rounded text-xs font-medium uppercase tracking-wide" x-text="statusLabelRu(runDetails?.status)"></span>
+              <span class="text-[color:var(--brand-text-muted)]" x-text="'Доменов: ' + ((runDetails?.config_json?.domains || []).length)"></span>
+              <span class="text-[color:var(--brand-text-muted)]" x-text="'AI-краулеров: ' + ((runDetails?.config_json?.user_agents || []).length)"></span>
+            </div>
+          </div>
+
+          <!-- Results panel (read-only — same tabs as owner view, minus Delete/Re-run) -->
+          <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
+            <div class="border-b border-[color:var(--brand-border)] px-3 py-2 flex items-center gap-1 text-sm">
+              <button @click="resultsTab = 'report'"
+                      :class="resultsTab === 'report' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                      class="px-3 py-1 rounded"
+                      :disabled="!runDetails?.analysis_markdown"
+                      x-show="!!runDetails?.analysis_markdown">Итоговый отчёт</button>
+              <button @click="resultsTab = 'probes'"
+                      :class="resultsTab === 'probes' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                      class="px-3 py-1 rounded">Таблица проб</button>
+              <button @click="resultsTab = 'robots'"
+                      :class="resultsTab === 'robots' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                      class="px-3 py-1 rounded">Правила robots.txt</button>
+              <span class="ml-3 text-xs text-[color:var(--brand-text-muted)]" x-show="runDetails?.probes">
+                <span x-text="(runDetails?.probes || []).length"></span> проб,
+                <span x-text="(runDetails?.robots_rules || []).length"></span> правил robots
+              </span>
+            </div>
+
+            <!-- Report markdown (read-only — no Delete) -->
+            <div x-show="resultsTab === 'report' && runDetails?.analysis_markdown" class="p-4 space-y-3">
+              <div class="flex gap-2 text-xs">
+                <button @click="copyMarkdown()" class="px-3 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Скопировать markdown</button>
+                <button @click="downloadMarkdown()" class="px-3 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Скачать .md</button>
+                <span x-show="copyToast" x-text="copyToast" class="text-[color:var(--brand-success)] self-center"></span>
+              </div>
+              <article class="prose prose-rwplus max-w-none" x-html="renderedReport"></article>
+            </div>
+
+            <!-- Probes (read-only) -->
+            <div x-show="resultsTab === 'probes'" class="p-4 space-y-3">
+              <input x-model="probesFilter" placeholder="Фильтр по домену или AI-краулеру..."
+                     class="w-full bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)] placeholder:text-[color:var(--brand-text-soft)]">
+              <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                  <thead>
+                    <tr class="border-b border-[color:var(--brand-border)] text-[color:var(--brand-text-muted)] text-left">
+                      <template x-for="col in probeColumns" :key="col.key">
+                        <th class="px-2 py-1.5 select-none whitespace-nowrap"
+                            @click="setProbesSort(col.key)">
+                          <span class="relative inline-flex items-center gap-1 cursor-pointer">
+                            <span x-text="col.label"></span>
+                            <span x-show="probesSort.col === col.key" x-text="probesSort.dir === 'asc' ? '▲' : '▼'" class="text-[color:var(--brand-text-soft)]"></span>
+                          </span>
+                        </th>
+                      </template>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="p in filteredProbes" :key="p.id">
+                      <tr class="border-b border-[color:var(--brand-border)] hover:bg-[color:var(--brand-bg-soft)]">
+                        <td class="px-2 py-1 font-mono" x-text="p.domain"></td>
+                        <td class="px-2 py-1" x-text="p.user_agent_label"></td>
+                        <td class="px-2 py-1 text-[color:var(--brand-text-soft)]" x-text="p.probe_type === 'main_page' ? 'главная' : p.probe_type"></td>
+                        <td class="px-2 py-1 font-mono">
+                          <span :class="statusColor(p.http_status, p.error_class)"
+                                x-text="p.http_status ?? (p.error_class || '-')"></span>
+                        </td>
+                        <td class="px-2 py-1 text-right" x-text="formatBytes(p.response_size_bytes)"></td>
+                        <td class="px-2 py-1 text-right" x-text="(p.content_extractable_text_length ?? '-') "></td>
+                        <td class="px-2 py-1 text-right" x-text="(p.total_time_ms ?? '-') + 'мс'"></td>
+                        <td class="px-2 py-1 text-right text-[color:var(--brand-text-soft)]" x-text="(p.ttfb_ms ?? '-')"></td>
+                        <td class="px-2 py-1 text-center"
+                            :class="p.tls_ok === false ? 'text-[color:var(--brand-error)]' : 'text-[color:var(--brand-text-soft)]'"
+                            x-text="p.tls_ok === null ? '-' : (p.tls_ok ? '✓' : '✗')"></td>
+                        <td class="px-2 py-1 text-[color:var(--brand-text-muted)]" x-html="renderMarkers(p.detected_protections)"></td>
+                        <td class="px-2 py-1 whitespace-nowrap" x-html="renderProxyCell(p)" :title="proxyCellTitle(p)"></td>
+                        <td class="px-2 py-1 font-mono text-[color:var(--brand-text-soft)] truncate max-w-[260px]" x-text="p.final_url || '-'" :title="p.final_url"></td>
+                      </tr>
+                    </template>
+                    <tr x-show="filteredProbes.length === 0">
+                      <td colspan="12" class="px-2 py-4 text-center text-[color:var(--brand-text-soft)]">Нет проб, удовлетворяющих фильтру.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- Robots (read-only) -->
+            <div x-show="resultsTab === 'robots'" class="p-4 space-y-4">
+              <template x-for="group in groupedRobots" :key="group.domain">
+                <div class="rounded border border-[color:var(--brand-border)] overflow-hidden">
+                  <div class="bg-[color:var(--brand-bg-panel)] px-3 py-1.5 font-mono text-sm" x-text="group.domain"></div>
+                  <table class="w-full text-xs">
+                    <thead class="text-[color:var(--brand-text-muted)] text-left">
+                      <tr class="border-b border-[color:var(--brand-border)]">
+                        <th class="px-3 py-1">Бот</th>
+                        <th class="px-3 py-1">Правило</th>
+                        <th class="px-3 py-1">Директивы</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="r in group.rules" :key="r.id">
+                        <tr class="border-b border-[color:var(--brand-border)]">
+                          <td class="px-3 py-1 font-mono" x-text="r.bot_name"></td>
+                          <td class="px-3 py-1">
+                            <span :class="ruleBadge(r.rule)"
+                                  class="px-2 py-0.5 rounded text-[10px] uppercase tracking-wide"
+                                  x-text="ruleLabelRu(r.rule)"></span>
+                          </td>
+                          <td class="px-3 py-1 text-[color:var(--brand-text-muted)]">
+                            <pre class="font-mono whitespace-pre-wrap" x-text="r.raw_directives || '-'"></pre>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </template>
+              <div x-show="groupedRobots.length === 0" class="text-[color:var(--brand-text-soft)] text-sm">Правил robots.txt не зафиксировано.</div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- Toast (global, fixed) -->
+    <template x-if="shareToast">
+      <div class="shared-toast" :class="'kind-' + (shareToast?.kind || 'success')" x-text="shareToast?.text"></div>
+    </template>
 
     <!-- Footer -->
     <footer class="mt-10 pt-4 border-t border-[color:var(--brand-border)] text-xs text-[color:var(--brand-text-soft)] flex items-center justify-between flex-wrap gap-2">
@@ -2642,11 +3016,32 @@
         proxy: { enabled: false, total: 0, healthy: 0, loaded: false, error: false },
         _proxyTimer: null,
 
+        // shareable reports
+        shareState: { token: null, busy: false },
+        shareBusy: false,
+        shareToast: null,
+        _shareToastTimer: null,
+        sharedToken: null,
+        sharedLoading: false,
+        sharedError: '',
+        historyShareBusyId: null,
+
         init() {
           for (const g of UA_GROUPS) {
             for (const lbl of g.labels) {
               this.form.uaSelected[lbl] = UA_DEFAULTS.includes(lbl);
             }
+          }
+          // Detect /r/<token> shareable-report URL before any other side-effects.
+          const path = (window.location && window.location.pathname) || '/';
+          const sharedMatch = path.match(/^\/r\/([A-Za-z0-9_\-]+)\/?$/);
+          if (sharedMatch) {
+            this.tab = 'shared_report';
+            this.sharedToken = sharedMatch[1];
+            this.loadSharedReport(this.sharedToken);
+            // Skip owner-only side-effects (proxy polling, set metadata, history refresh).
+            window.addEventListener('beforeunload', () => this.closeSSE());
+            return;
           }
           // 1s tick drives all live timers
           setInterval(() => { this._tick = (this._tick || 0) + 1; }, 1000);
@@ -2662,6 +3057,14 @@
           this.loadSetsMeta();
           this.refreshProxyStatus();
           this._proxyTimer = setInterval(() => this.refreshProxyStatus(), 60000);
+        },
+
+        onLogoClick() {
+          if (this.tab === 'shared_report') {
+            window.location.href = '/';
+            return;
+          }
+          this.setTab('new_run');
         },
 
         async refreshProxyStatus() {
@@ -3357,6 +3760,7 @@
           this.stepEndTs = {};
           this.stepStatusOverride = {};
           this.currentLlmKey = null;
+          this.shareState = { token: null, busy: false };
           this.tab = 'active_run';
 
           await this.fetchRunDetails(runId);
@@ -3533,6 +3937,7 @@
             if (!r.ok) return;
             const data = await r.json();
             this.runDetails = data;
+            this.shareState = { token: data && data.share_token ? data.share_token : null, busy: false };
             if (!this.runStartTs && data.created_at) this.runStartTs = Date.parse(data.created_at);
             if (data.status === 'completed' || data.status === 'failed') {
               this.runStatus = data.status;
@@ -3669,6 +4074,169 @@
               this.runDetails = null;
             }
           } catch (e) { alert('Не удалось удалить: ' + e.message); }
+        },
+
+        // ----- shareable reports -----
+        shareFullUrl(token) {
+          const t = token || this.shareState.token;
+          if (!t) return '';
+          const origin = (window.location && window.location.origin) || '';
+          return origin + '/r/' + t;
+        },
+        async copyToClipboard(text) {
+          if (!text) return false;
+          try {
+            if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+              await navigator.clipboard.writeText(text);
+              return true;
+            }
+            throw new Error('clipboard API unavailable');
+          } catch (e) {
+            try {
+              const ta = document.createElement('textarea');
+              ta.value = text;
+              ta.style.position = 'fixed';
+              ta.style.opacity = '0';
+              ta.style.left = '-9999px';
+              document.body.appendChild(ta);
+              ta.focus(); ta.select();
+              const ok = document.execCommand('copy');
+              ta.remove();
+              if (ok) return true;
+              throw new Error('execCommand copy failed');
+            } catch (e2) {
+              window.prompt('Скопируйте ссылку вручную:', text);
+              return false;
+            }
+          }
+        },
+        showShareToast(kind, text) {
+          this.shareToast = { kind, text };
+          if (this._shareToastTimer) clearTimeout(this._shareToastTimer);
+          this._shareToastTimer = setTimeout(() => { this.shareToast = null; }, 2400);
+        },
+        async onSharePrimary() {
+          if (!this.currentRunId) return;
+          this.shareBusy = true;
+          try {
+            const r = await fetch('/api/runs/' + this.currentRunId + '/share', { method: 'POST' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const data = await r.json();
+            this.shareState = { token: data.share_token, busy: false };
+            this._syncHistoryShareToken(this.currentRunId, data.share_token);
+            const full = this.shareFullUrl(data.share_token);
+            const copied = await this.copyToClipboard(full);
+            this.showShareToast('success', copied ? 'Ссылка скопирована' : 'Ссылка сгенерирована');
+          } catch (e) {
+            this.showShareToast('error', 'Не удалось сгенерировать ссылку');
+          } finally {
+            this.shareBusy = false;
+          }
+        },
+        async copyShareLink() {
+          const full = this.shareFullUrl();
+          if (!full) return;
+          const ok = await this.copyToClipboard(full);
+          this.showShareToast(ok ? 'success' : 'error', ok ? 'Ссылка скопирована' : 'Не удалось скопировать');
+        },
+        async onShareRegenerate() {
+          if (!this.currentRunId) return;
+          if (!confirm('Перевыпустить ссылку? Старая ссылка перестанет работать.')) return;
+          this.shareBusy = true;
+          try {
+            const r = await fetch('/api/runs/' + this.currentRunId + '/share/regenerate', { method: 'POST' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const data = await r.json();
+            this.shareState = { token: data.share_token, busy: false };
+            this._syncHistoryShareToken(this.currentRunId, data.share_token);
+            const full = this.shareFullUrl(data.share_token);
+            const copied = await this.copyToClipboard(full);
+            this.showShareToast('success', copied ? 'Ссылка обновлена и скопирована' : 'Ссылка обновлена');
+          } catch (e) {
+            this.showShareToast('error', 'Не удалось перевыпустить');
+          } finally {
+            this.shareBusy = false;
+          }
+        },
+        async onShareRevoke() {
+          if (!this.currentRunId) return;
+          if (!confirm('Отозвать ссылку? После отзыва получатели увидят страницу «недействительна».')) return;
+          this.shareBusy = true;
+          try {
+            const r = await fetch('/api/runs/' + this.currentRunId + '/share/revoke', { method: 'POST' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.shareState = { token: null, busy: false };
+            this._syncHistoryShareToken(this.currentRunId, null);
+            this.showShareToast('success', 'Ссылка отозвана');
+          } catch (e) {
+            this.showShareToast('error', 'Не удалось отозвать');
+          } finally {
+            this.shareBusy = false;
+          }
+        },
+        async onHistoryShare(row) {
+          if (!row || !row.id) return;
+          this.historyShareBusyId = row.id;
+          try {
+            let token = row.share_token;
+            if (!token) {
+              const r = await fetch('/api/runs/' + row.id + '/share', { method: 'POST' });
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              const data = await r.json();
+              token = data.share_token;
+              this._syncHistoryShareToken(row.id, token);
+              if (this.currentRunId === row.id) this.shareState = { token, busy: false };
+            }
+            const full = this.shareFullUrl(token);
+            const copied = await this.copyToClipboard(full);
+            this.showShareToast(copied ? 'success' : 'error', copied ? 'Ссылка скопирована' : 'Не удалось скопировать');
+          } catch (e) {
+            this.showShareToast('error', 'Не удалось получить ссылку');
+          } finally {
+            this.historyShareBusyId = null;
+          }
+        },
+        _syncHistoryShareToken(runId, token) {
+          this.historyList = this.historyList.map(row => row.id === runId ? Object.assign({}, row, { share_token: token }) : row);
+        },
+        async loadSharedReport(token) {
+          if (!token) {
+            this.sharedError = 'Ссылка пустая.';
+            return;
+          }
+          this.sharedLoading = true;
+          this.sharedError = '';
+          this.runDetails = null;
+          try {
+            const r = await fetch('/api/shared/' + encodeURIComponent(token));
+            if (r.status === 404) {
+              this.sharedError = 'Этот отчёт был отозван или ссылка указана неверно.';
+              return;
+            }
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const data = await r.json();
+            this.runDetails = data;
+            this.runStatus = data.status || 'completed';
+            this.resultsTab = 'report';
+          } catch (e) {
+            this.sharedError = 'Не удалось загрузить отчёт: ' + (e && e.message ? e.message : 'сеть');
+          } finally {
+            this.sharedLoading = false;
+          }
+        },
+        formatSharedDate(iso) {
+          if (!iso) return '—';
+          try {
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return iso;
+            const day = String(d.getDate()).padStart(2, '0');
+            const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+            const mon = months[d.getMonth()] || '';
+            const yr = d.getFullYear();
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mm = String(d.getMinutes()).padStart(2, '0');
+            return day + ' ' + mon + ' ' + yr + ' в ' + hh + ':' + mm;
+          } catch (e) { return iso; }
         },
 
         // ----- log rendering -----

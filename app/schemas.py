@@ -35,6 +35,7 @@ class RunSummary(BaseModel):
     status: RunStatus
     progress_current: int
     progress_total: int
+    share_token: str | None = None
 
 
 class DomainProbeOut(BaseModel):
@@ -86,5 +87,15 @@ class RunDetail(BaseModel):
     progress_total: int
     analysis_markdown: str | None
     error_message: str | None
+    share_token: str | None = None
     probes: list[DomainProbeOut]
     robots_rules: list[RobotsRuleOut]
+
+
+class ShareTokenResponse(BaseModel):
+    share_token: str
+    share_url: str
+
+
+class ShareRevokeResponse(BaseModel):
+    ok: bool

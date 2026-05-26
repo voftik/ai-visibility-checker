@@ -2,9 +2,11 @@ import unittest
 import uuid
 from pathlib import Path
 
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select, text
 
 from app.db import SessionLocal
+from app.main import app
 from app.models import DomainProbe, ProbeType, RobotsRule, Run, RunStatus
 from app.services import crawler
 from app.services.analyzer import _build_dataset_text
@@ -242,6 +244,145 @@ class AnalyzerDatasetSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.commit()
 
         self.assertLessEqual(meta["char_count"], 250_000)
+
+
+class ShareTokenTests(unittest.IsolatedAsyncioTestCase):
+    """Backend coverage for the shareable-report feature.
+
+    Hits the real ASGI app via httpx so that routing order (the public
+    /r/{token} page route, the /api/shared/{token} endpoint, and the
+    owner-side share endpoints) all stay wired up correctly.
+    """
+
+    async def _make_run(self) -> str:
+        run_id = f"test-share-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    status=RunStatus.completed,
+                    config_json={"domains": ["example.com"], "user_agents": ["GPTBot"]},
+                    progress_current=2,
+                    progress_total=2,
+                    analysis_markdown="# report",
+                )
+            )
+            session.add(
+                DomainProbe(
+                    run_id=run_id,
+                    domain="example.com",
+                    user_agent_label="GPTBot",
+                    user_agent_string="GPTBot",
+                    target_url="https://example.com/",
+                    probe_type=ProbeType.main_page,
+                    http_status=200,
+                    challenge_detected=False,
+                    body_looks_empty=False,
+                )
+            )
+            session.add(
+                RobotsRule(
+                    run_id=run_id,
+                    domain="example.com",
+                    bot_name="GPTBot",
+                    rule="allow_all",
+                )
+            )
+            await session.commit()
+        return run_id
+
+    async def _cleanup_run(self, run_id: str) -> None:
+        async with SessionLocal() as session:
+            await session.execute(delete(DomainProbe).where(DomainProbe.run_id == run_id))
+            await session.execute(delete(RobotsRule).where(RobotsRule.run_id == run_id))
+            await session.execute(delete(Run).where(Run.id == run_id))
+            await session.commit()
+
+    async def test_share_token_generated_and_unique(self) -> None:
+        run_a = await self._make_run()
+        run_b = await self._make_run()
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                r1 = await ac.post(f"/api/runs/{run_a}/share")
+                r2 = await ac.post(f"/api/runs/{run_b}/share")
+                self.assertEqual(r1.status_code, 200)
+                self.assertEqual(r2.status_code, 200)
+                t1 = r1.json()["share_token"]
+                t2 = r2.json()["share_token"]
+                self.assertNotEqual(t1, t2)
+                self.assertGreaterEqual(len(t1), 24)
+                self.assertLessEqual(len(t1), 64)
+                self.assertEqual(r1.json()["share_url"], f"/r/{t1}")
+
+                # Second call returns the same token (no churn).
+                r1b = await ac.post(f"/api/runs/{run_a}/share")
+                self.assertEqual(r1b.json()["share_token"], t1)
+        finally:
+            await self._cleanup_run(run_a)
+            await self._cleanup_run(run_b)
+
+    async def test_revoke_clears_token(self) -> None:
+        run_id = await self._make_run()
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                gen = await ac.post(f"/api/runs/{run_id}/share")
+                self.assertEqual(gen.status_code, 200)
+                rev = await ac.post(f"/api/runs/{run_id}/share/revoke")
+                self.assertEqual(rev.status_code, 200)
+                self.assertEqual(rev.json(), {"ok": True})
+
+            async with SessionLocal() as session:
+                run = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
+                self.assertIsNone(run.share_token)
+        finally:
+            await self._cleanup_run(run_id)
+
+    async def test_regenerate_invalidates_old(self) -> None:
+        run_id = await self._make_run()
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                r1 = await ac.post(f"/api/runs/{run_id}/share")
+                t1 = r1.json()["share_token"]
+                r2 = await ac.post(f"/api/runs/{run_id}/share/regenerate")
+                t2 = r2.json()["share_token"]
+                self.assertNotEqual(t1, t2)
+
+                # Old token no longer resolves.
+                old = await ac.get(f"/api/shared/{t1}")
+                self.assertEqual(old.status_code, 404)
+                # New one does.
+                new = await ac.get(f"/api/shared/{t2}")
+                self.assertEqual(new.status_code, 200)
+
+            async with SessionLocal() as session:
+                hit_old = (
+                    await session.execute(select(Run).where(Run.share_token == t1))
+                ).scalar_one_or_none()
+                self.assertIsNone(hit_old)
+        finally:
+            await self._cleanup_run(run_id)
+
+    async def test_get_shared_returns_run_for_valid_token(self) -> None:
+        run_id = await self._make_run()
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                gen = await ac.post(f"/api/runs/{run_id}/share")
+                token = gen.json()["share_token"]
+                resp = await ac.get(f"/api/shared/{token}")
+                self.assertEqual(resp.status_code, 200)
+                body = resp.json()
+                self.assertEqual(body["id"], run_id)
+                self.assertEqual(body["share_token"], token)
+                self.assertIn("probes", body)
+                self.assertIn("robots_rules", body)
+                self.assertEqual(body["analysis_markdown"], "# report")
+        finally:
+            await self._cleanup_run(run_id)
+
+    async def test_get_shared_404_for_unknown_token(self) -> None:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.get("/api/shared/does-not-exist-zzz")
+            self.assertEqual(resp.status_code, 404)
 
 
 class FrontendSafetyTests(unittest.TestCase):

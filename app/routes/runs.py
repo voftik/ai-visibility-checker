@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -13,9 +14,26 @@ from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.db import get_session
 from app.models import Run, RunStatus
-from app.schemas import CreateRunRequest, CreateRunResponse, RunDetail, RunSummary
+from app.schemas import (
+    CreateRunRequest,
+    CreateRunResponse,
+    RunDetail,
+    RunSummary,
+    ShareRevokeResponse,
+    ShareTokenResponse,
+)
 from app.services.crawler import USER_AGENT_STRINGS, normalize_domains, run_crawl
 from app.services.event_bus import bus
+
+
+def _share_url(token: str) -> str:
+    return f"/r/{token}"
+
+
+def _new_share_token() -> str:
+    # token_urlsafe(24) yields ~32 url-safe chars (no padding) — well within
+    # the 64-char column budget and impractical to brute-force.
+    return secrets.token_urlsafe(24)
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -146,6 +164,48 @@ async def delete_run(run_id: str, session: AsyncSession = Depends(get_session)) 
     await session.execute(delete(Run).where(Run.id == run_id))
     await session.commit()
     return {"ok": True}
+
+
+@router.post("/{run_id}/share", response_model=ShareTokenResponse)
+async def share_run(
+    run_id: str, session: AsyncSession = Depends(get_session)
+) -> ShareTokenResponse:
+    result = await session.execute(select(Run).where(Run.id == run_id))
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if not run.share_token:
+        run.share_token = _new_share_token()
+        await session.commit()
+        await session.refresh(run)
+    return ShareTokenResponse(share_token=run.share_token, share_url=_share_url(run.share_token))
+
+
+@router.post("/{run_id}/share/revoke", response_model=ShareRevokeResponse)
+async def revoke_share(
+    run_id: str, session: AsyncSession = Depends(get_session)
+) -> ShareRevokeResponse:
+    result = await session.execute(select(Run).where(Run.id == run_id))
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    run.share_token = None
+    await session.commit()
+    return ShareRevokeResponse(ok=True)
+
+
+@router.post("/{run_id}/share/regenerate", response_model=ShareTokenResponse)
+async def regenerate_share(
+    run_id: str, session: AsyncSession = Depends(get_session)
+) -> ShareTokenResponse:
+    result = await session.execute(select(Run).where(Run.id == run_id))
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    run.share_token = _new_share_token()
+    await session.commit()
+    await session.refresh(run)
+    return ShareTokenResponse(share_token=run.share_token, share_url=_share_url(run.share_token))
 
 
 @router.get("/{run_id}/events")

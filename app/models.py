@@ -55,6 +55,9 @@ class Run(Base):
     progress_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     analysis_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    share_token: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True, index=True
+    )
 
     probes: Mapped[list["DomainProbe"]] = relationship(
         back_populates="run", cascade="all, delete-orphan", passive_deletes=True
