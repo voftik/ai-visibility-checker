@@ -1,0 +1,95 @@
+{
+  "id": "set3_ru_fmcg_consumer",
+  "title": "Российский FMCG / consumer baseline (50 доменов)",
+  "description": "Набор из 50 российских доменов потребительских и FMCG-брендов. Цель — оценить видимость крупных российских ритейлеров, маркетплейсов и производителей в ответах LLM на запросы о шоппинге, брендах, ассортименте и потребительских новостях. Дополняет set1 (общий ландшафт) более узкой потребительской выборкой без пересечений.",
+  "categories": [
+    {
+      "name": "Retail / Marketplaces",
+      "domains": [
+        "lamoda.ru",
+        "kazanexpress.ru",
+        "market.yandex.ru",
+        "megamarket.ru",
+        "sbermegamarket.ru",
+        "aliexpress.ru",
+        "joom.ru",
+        "sima-land.ru"
+      ]
+    },
+    {
+      "name": "Beauty / Personal care",
+      "domains": [
+        "goldapple.ru",
+        "letu.ru",
+        "rivegauche.ru",
+        "podrygka.ru",
+        "ile-de-beaute.ru",
+        "magnit-cosmetic.ru"
+      ]
+    },
+    {
+      "name": "Food retail / Grocery",
+      "domains": [
+        "pyaterochka.ru",
+        "perekrestok.ru",
+        "magnit.ru",
+        "lenta.com",
+        "okeydostavka.ru",
+        "vkusvill.ru",
+        "miratorg.ru",
+        "cherkizovo.com",
+        "globus.ru",
+        "metro-cc.ru"
+      ]
+    },
+    {
+      "name": "Restaurants / Fast food",
+      "domains": [
+        "rosinter.ru",
+        "burgerking.ru",
+        "dodopizza.ru",
+        "tanuki.ru",
+        "vkusnoitochka.ru",
+        "shokoladnitsa.ru",
+        "teremok.ru"
+      ]
+    },
+    {
+      "name": "Electronics retail",
+      "domains": [
+        "mvideo.ru",
+        "eldorado.ru",
+        "dns-shop.ru",
+        "citilink.ru",
+        "restore.ru",
+        "technopark.ru"
+      ]
+    },
+    {
+      "name": "Beverages / Confectionery",
+      "domains": [
+        "baltika.ru",
+        "chernogolovka.com",
+        "bochkari.com",
+        "uniconf.ru",
+        "rot-front.ru",
+        "babaevsky.ru",
+        "krasnyoktyabr.ru",
+        "efko.ru"
+      ]
+    },
+    {
+      "name": "Home / DIY / Furniture",
+      "domains": [
+        "leroymerlin.ru",
+        "petrovich.ru",
+        "hoff.ru",
+        "mebelshara.ru",
+        "askona.ru",
+        "vseinstrumenti.ru",
+        "santehnika-online.ru"
+      ]
+    }
+  ],
+  "source": "Manually curated list of major Russian consumer-facing brand landing pages across retail, FMCG, beauty, grocery, foodservice, electronics, beverages, and home categories. Excludes domains already present in set1 (yandex.ru, ozon.ru, wildberries.ru, etc.)."
+}
