@@ -25,12 +25,14 @@ from urllib.parse import urlparse
 import httpx
 from sqlalchemy import select
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import DomainProbe, ProbeType, RobotsRule, Run, RunStatus
 from app.services.analyzer import analyze_run
 from app.services.content_extractor import extract_text_signals
 from app.services.event_bus import bus
 from app.services.protections import detect_protections
+from app.services.proxy_pool import get_pool
 from app.services.robots_parser import parse_robots, parse_robots_unavailable
 
 USER_AGENT_STRINGS: dict[str, str] = {
@@ -44,9 +46,115 @@ USER_AGENT_STRINGS: dict[str, str] = {
     "Perplexity-User": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user",
     "DeepSeekBot": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; DeepSeekBot/1.0; +https://deepseek.com",
     "DeepSeek-User": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; DeepSeek-User/1.0",
+    "Googlebot-smartphone": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Googlebot-desktop": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/131.0.0.0 Safari/537.36",
+    "GoogleOther-mobile": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 (compatible; GoogleOther)",
+    "GoogleOther-desktop": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GoogleOther) Chrome/131.0.0.0 Safari/537.36",
+    "Google-Agent-mobile": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 (compatible; Google-Agent; +https://developers.google.com/crawling/docs/crawlers-fetchers/google-agent)",
+    "Google-Agent-desktop": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko; compatible; Google-Agent; +https://developers.google.com/crawling/docs/crawlers-fetchers/google-agent) Chrome/131.0.0.0 Safari/537.36",
+    "Google-NotebookLM": "Google-NotebookLM",
+    "Google-CloudVertexBot": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.7559.132 Mobile Safari/537.36 (compatible; Google-CloudVertexBot; +https://cloud.google.com/enterprise-search)",
+    "GoogleAgent-URLContext": "GoogleAgent-URLContext",
+    "Gemini-Deep-Research": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Gemini-Deep-Research; +https://gemini.google/overview/deep-research/) Chrome/135.0.0.0 Safari/537.36",
     "Chrome-control": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "empty-ua": "",
     "robots-fetcher": "ai-visibility-checker/1.0 research bot",
+}
+
+# Metadata for UI labels and analytics. Keyed by the same labels as
+# USER_AGENT_STRINGS. Google-Extended is robots-only — it has no HTTP
+# user-agent string (http_fetch=False) and is intentionally absent from
+# USER_AGENT_STRINGS, but still appears here so the UI can offer it as a
+# robots.txt control token.
+USER_AGENT_PROFILES: dict[str, dict[str, Any]] = {
+    "Googlebot-smartphone": {
+        "provider": "Google",
+        "category": "search_indexing",
+        "ai_relevance": "ai_overviews_grounding",
+        "documentation_status": "official_current",
+        "robots_token": "Googlebot",
+        "http_fetch": True,
+    },
+    "Googlebot-desktop": {
+        "provider": "Google",
+        "category": "search_indexing",
+        "ai_relevance": "ai_overviews_grounding",
+        "documentation_status": "official_current",
+        "robots_token": "Googlebot",
+        "http_fetch": True,
+    },
+    "GoogleOther-mobile": {
+        "provider": "Google",
+        "category": "generic_google_crawler",
+        "ai_relevance": "internal_research_and_product_development",
+        "documentation_status": "official_current",
+        "robots_token": "GoogleOther",
+        "http_fetch": True,
+    },
+    "GoogleOther-desktop": {
+        "provider": "Google",
+        "category": "generic_google_crawler",
+        "ai_relevance": "internal_research_and_product_development",
+        "documentation_status": "official_current",
+        "robots_token": "GoogleOther",
+        "http_fetch": True,
+    },
+    "Google-Extended": {
+        "provider": "Google",
+        "category": "robots_txt_control_token",
+        "ai_relevance": "gemini_vertex_ai_training_and_grounding_control",
+        "documentation_status": "official_current",
+        "robots_token": "Google-Extended",
+        "http_fetch": False,
+    },
+    "Google-Agent-mobile": {
+        "provider": "Google",
+        "category": "user_triggered_ai_agent",
+        "ai_relevance": "gemini_agentic_actions",
+        "documentation_status": "official_current",
+        "robots_token": None,
+        "http_fetch": True,
+    },
+    "Google-Agent-desktop": {
+        "provider": "Google",
+        "category": "user_triggered_ai_agent",
+        "ai_relevance": "gemini_agentic_actions",
+        "documentation_status": "official_current",
+        "robots_token": None,
+        "http_fetch": True,
+    },
+    "Google-NotebookLM": {
+        "provider": "Google",
+        "category": "user_triggered_fetcher",
+        "ai_relevance": "notebooklm_user_requested_ingestion",
+        "documentation_status": "official_current",
+        "robots_token": "Google-NotebookLM",
+        "http_fetch": True,
+    },
+    "Google-CloudVertexBot": {
+        "provider": "Google",
+        "category": "google_cloud_agent_search",
+        "ai_relevance": "vertex_ai_enterprise_search_indexing",
+        "documentation_status": "official_current",
+        "robots_token": "Google-CloudVertexBot",
+        "http_fetch": True,
+    },
+    "GoogleAgent-URLContext": {
+        "provider": "Google",
+        "category": "gemini_api_url_context",
+        "ai_relevance": "gemini_api_url_context_tool",
+        "documentation_status": "observed_not_official",
+        "robots_token": None,
+        "http_fetch": True,
+    },
+    "Gemini-Deep-Research": {
+        "provider": "Google",
+        "category": "gemini_deep_research",
+        "ai_relevance": "gemini_deep_research_user_initiated",
+        "documentation_status": "observed_not_official",
+        "robots_token": None,
+        "http_fetch": True,
+    },
 }
 
 DEFAULT_HEADERS: dict[str, str] = {
@@ -84,6 +192,7 @@ class ProbeResult:
     content_type: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    proxy_info: dict[str, Any] | None = None
 
 
 def _classify_error(exc: BaseException) -> tuple[str, str]:
@@ -159,6 +268,7 @@ async def _do_probe(
     user_agent: str,
     timeout_seconds: int,
     concurrency: int,
+    proxy_url: str | None = None,
 ) -> ProbeResult:
     result = ProbeResult()
     redirects: list[dict[str, Any]] = []
@@ -192,6 +302,7 @@ async def _do_probe(
             limits=limits,
             verify=True,
             event_hooks={"response": [_on_response]},
+            proxy=proxy_url,
         ) as client:
             response = await client.get(url, headers=headers)
             elapsed_ms = int(response.elapsed.total_seconds() * 1000)
@@ -342,6 +453,9 @@ def _build_jobs(domains: list[str], ua_labels: list[str]) -> list[_Job]:
         ua_str = USER_AGENT_STRINGS.get(label)
         if ua_str is None:
             continue
+        profile = USER_AGENT_PROFILES.get(label)
+        if profile is not None and not profile.get("http_fetch", True):
+            continue
         for d_clean in norm:
             jobs.append(
                 _Job(
@@ -376,6 +490,26 @@ async def run_crawl(run_id: str) -> None:
             await session.commit()
 
         bus.publish(run_id, {"type": "phase_change", "phase": "crawling_started"})
+        pool = get_pool()
+        if pool is not None and pool.is_enabled:
+            status = pool.status()
+            bus.publish(
+                run_id,
+                {
+                    "type": "log",
+                    "level": "info",
+                    "message": f"Proxy pool: {status['healthy']}/{status['total']} healthy proxies",
+                },
+            )
+        else:
+            bus.publish(
+                run_id,
+                {
+                    "type": "log",
+                    "level": "info",
+                    "message": "Direct mode (no proxy pool configured)",
+                },
+            )
         bus.publish(
             run_id,
             {
@@ -429,6 +563,20 @@ async def run_crawl(run_id: str) -> None:
                             await asyncio.sleep(wait)
                     last_request_ts[job.domain] = time.monotonic()
 
+                # Pick a proxy for this request (or None for direct mode).
+                pool = get_pool()
+                proxy = pool.random_proxy() if pool is not None else None
+                if proxy is not None:
+                    proxy_url = proxy.url
+                    proxy_info: dict[str, Any] = {
+                        "used": True,
+                        "address": proxy.address,
+                        "country": proxy.country,
+                    }
+                else:
+                    proxy_url = None
+                    proxy_info = {"used": False}
+
                 bus.publish(
                     run_id,
                     {
@@ -442,7 +590,35 @@ async def run_crawl(run_id: str) -> None:
                     user_agent=job.user_agent_string,
                     timeout_seconds=timeout_seconds,
                     concurrency=concurrency,
+                    proxy_url=proxy_url,
                 )
+
+                # Proxy-related transport errors: cool down the proxy and
+                # optionally retry once directly so a single noisy upstream
+                # doesn't poison the run.
+                if (
+                    proxy_url is not None
+                    and probe.error_class in {"connect_timeout", "connection_refused", "tls_error", "pool_timeout"}
+                    and settings.PROXY_FALLBACK_DIRECT
+                ):
+                    if pool is not None:
+                        pool.mark_bad(proxy_url)
+                    bus.publish(
+                        run_id,
+                        {
+                            "type": "log",
+                            "level": "warn",
+                            "message": f"Proxy {proxy.address if proxy else '?'} failed for {job.domain}; retrying directly",
+                        },
+                    )
+                    probe = await _do_probe(
+                        url=job.target_url,
+                        user_agent=job.user_agent_string,
+                        timeout_seconds=timeout_seconds,
+                        concurrency=concurrency,
+                        proxy_url=None,
+                    )
+                    proxy_info["fallback_direct"] = True
 
                 body_text_for_detect = probe.body_sample if probe.body_sample and not probe.body_sample.startswith("<binary") else ""
 
@@ -464,6 +640,14 @@ async def run_crawl(run_id: str) -> None:
                     except Exception:
                         content_signals = None
                         content_extractable_len = None
+
+                # Stash proxy diagnostics on the probe row regardless of
+                # probe_type, so /api/healthz-style consumers can audit which
+                # upstream served each request.
+                if content_signals is None:
+                    content_signals = {"_proxy": proxy_info}
+                else:
+                    content_signals["_proxy"] = proxy_info
 
                 markers: list[str] = []
                 challenge = False
