@@ -1,0 +1,2478 @@
+{
+  "id": "set2_corpus_sources",
+  "title": "AI visibility research corpus sources (auto-extracted)",
+  "description": "Домены, встречавшиеся как источники в предыдущих исследованиях AI visibility - то есть URL, которые web search агенты LLM-систем цитировали в ответах. Частота встречаемости отражает, насколько часто этот домен попадает в retrieval-ответы LLM. Filtered to Russian TLDs only (.ru, .рф, .su)",
+  "extraction_meta": {
+    "source_file": "domens_collection/all_sources.csv",
+    "source_size_bytes": 7484789,
+    "total_urls_found": 63224,
+    "total_urls_after_filter": 42953,
+    "unique_domains": 490,
+    "filtered_domains_list": [
+      "youtube.com"
+    ],
+    "tld_filter_applied": true,
+    "allowed_tlds": [
+      ".ru",
+      ".рф",
+      ".xn--p1ai",
+      ".su"
+    ],
+    "dropped_by_tld_filter": 2493,
+    "min_frequency": 10,
+    "dropped_by_frequency_filter": 2710,
+    "extracted_at": "2026-04-28T23:59:39.627280+00:00"
+  },
+  "domains": [
+    {
+      "domain": "yandex.ru",
+      "frequency": 2261,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "vc.ru",
+      "frequency": 2078,
+      "category_guess": "media"
+    },
+    {
+      "domain": "banki.ru",
+      "frequency": 1539,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "sravni.ru",
+      "frequency": 1506,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "yabs.yandex.ru",
+      "frequency": 1388,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "sostav.ru",
+      "frequency": 1188,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bankiros.ru",
+      "frequency": 878,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "mainfin.ru",
+      "frequency": 848,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "ratingruneta.ru",
+      "frequency": 793,
+      "category_guess": "media"
+    },
+    {
+      "domain": "marketing-tech.ru",
+      "frequency": 784,
+      "category_guess": "media"
+    },
+    {
+      "domain": "ruward.ru",
+      "frequency": 668,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rutube.ru",
+      "frequency": 661,
+      "category_guess": "video"
+    },
+    {
+      "domain": "dzen.ru",
+      "frequency": 652,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rocketbank.ru",
+      "frequency": 651,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "alladvertising.ru",
+      "frequency": 596,
+      "category_guess": "media"
+    },
+    {
+      "domain": "workspace.ru",
+      "frequency": 572,
+      "category_guess": "media"
+    },
+    {
+      "domain": "adindex.ru",
+      "frequency": 572,
+      "category_guess": "media"
+    },
+    {
+      "domain": "1000bankov.ru",
+      "frequency": 562,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "vbr.ru",
+      "frequency": 507,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "vsezaimyonline.ru",
+      "frequency": 480,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "xvestor.ru",
+      "frequency": 477,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "market.yandex.ru",
+      "frequency": 466,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "passport.yandex.ru",
+      "frequency": 465,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "company.yandex.ru",
+      "frequency": 465,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "finuslugi.ru",
+      "frequency": 429,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "dtf.ru",
+      "frequency": 384,
+      "category_guess": "entertainment"
+    },
+    {
+      "domain": "iguides.ru",
+      "frequency": 360,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "brobank.ru",
+      "frequency": 355,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "elama.ru",
+      "frequency": 347,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "adpass.ru",
+      "frequency": 344,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rbc.ru",
+      "frequency": 340,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bankinform.ru",
+      "frequency": 317,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "tbank.ru",
+      "frequency": 292,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "forbes.ru",
+      "frequency": 274,
+      "category_guess": "media"
+    },
+    {
+      "domain": "practicum.yandex.ru",
+      "frequency": 269,
+      "category_guess": "education"
+    },
+    {
+      "domain": "skillbox.ru",
+      "frequency": 248,
+      "category_guess": "education"
+    },
+    {
+      "domain": "companies.rbc.ru",
+      "frequency": 235,
+      "category_guess": "media"
+    },
+    {
+      "domain": "direct.yandex.ru",
+      "frequency": 231,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "yagla.ru",
+      "frequency": 228,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "finforums.ru",
+      "frequency": 223,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "rocketbankru.ru",
+      "frequency": 221,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "ya.ru",
+      "frequency": 209,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "completo.ru",
+      "frequency": 204,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "t4ka.ru",
+      "frequency": 200,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "yak-studio.ru",
+      "frequency": 197,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "irecommend.ru",
+      "frequency": 194,
+      "category_guess": "services"
+    },
+    {
+      "domain": "calltouch.ru",
+      "frequency": 183,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "realweb.ru",
+      "frequency": 174,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "rustore.ru",
+      "frequency": 171,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "klerk.ru",
+      "frequency": 169,
+      "category_guess": "media"
+    },
+    {
+      "domain": "dreamjob.ru",
+      "frequency": 168,
+      "category_guess": "hr"
+    },
+    {
+      "domain": "rb.ru",
+      "frequency": 168,
+      "category_guess": "media"
+    },
+    {
+      "domain": "cossa.ru",
+      "frequency": 166,
+      "category_guess": "media"
+    },
+    {
+      "domain": "blog.click.ru",
+      "frequency": 166,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "2gis.ru",
+      "frequency": 160,
+      "category_guess": "maps"
+    },
+    {
+      "domain": "secrets.tbank.ru",
+      "frequency": 155,
+      "category_guess": "media"
+    },
+    {
+      "domain": "akarussia.ru",
+      "frequency": 152,
+      "category_guess": "media"
+    },
+    {
+      "domain": "t-j.ru",
+      "frequency": 149,
+      "category_guess": "media"
+    },
+    {
+      "domain": "1seller.ru",
+      "frequency": 145,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "vtb.ru",
+      "frequency": 145,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "special.klops.ru",
+      "frequency": 144,
+      "category_guess": "media"
+    },
+    {
+      "domain": "smart-lab.ru",
+      "frequency": 134,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "advertisingforum.ru",
+      "frequency": 130,
+      "category_guess": "media"
+    },
+    {
+      "domain": "pavezlo.ru",
+      "frequency": 129,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "andata.ru",
+      "frequency": 128,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "medianation.ru",
+      "frequency": 126,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "ingate.ru",
+      "frequency": 126,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "demis.ru",
+      "frequency": 118,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cmsmagazine.ru",
+      "frequency": 118,
+      "category_guess": "media"
+    },
+    {
+      "domain": "vedomosti.ru",
+      "frequency": 112,
+      "category_guess": "media"
+    },
+    {
+      "domain": "i-media.ru",
+      "frequency": 111,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cyberleninka.ru",
+      "frequency": 111,
+      "category_guess": "academic"
+    },
+    {
+      "domain": "pikabu.ru",
+      "frequency": 107,
+      "category_guess": "forum"
+    },
+    {
+      "domain": "sales-generator.ru",
+      "frequency": 105,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "netology.ru",
+      "frequency": 105,
+      "category_guess": "education"
+    },
+    {
+      "domain": "tadviser.ru",
+      "frequency": 104,
+      "category_guess": "media"
+    },
+    {
+      "domain": "gazprombank.ru",
+      "frequency": 102,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "seojazz.ru",
+      "frequency": 99,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "digitalstrategy.ru",
+      "frequency": 97,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "callibri.ru",
+      "frequency": 96,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "sberbank.ru",
+      "frequency": 94,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "crmindex.ru",
+      "frequency": 88,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "marketolog.mts.ru",
+      "frequency": 87,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "insales.ru",
+      "frequency": 85,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "cardsbanking.ru",
+      "frequency": 84,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "bankprofi.ru",
+      "frequency": 82,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "hranidengi.ru",
+      "frequency": 81,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "vse-dengy.ru",
+      "frequency": 81,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "tenchat.ru",
+      "frequency": 80,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "expert.ru",
+      "frequency": 80,
+      "category_guess": "media"
+    },
+    {
+      "domain": "journal.sovcombank.ru",
+      "frequency": 78,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "finance.rambler.ru",
+      "frequency": 78,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "alfabank.ru",
+      "frequency": 78,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "cmo-fractional.ru",
+      "frequency": 77,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "lockobank.ru",
+      "frequency": 76,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "molinos.ru",
+      "frequency": 75,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "audit-it.ru",
+      "frequency": 75,
+      "category_guess": "legal"
+    },
+    {
+      "domain": "mango-office.ru",
+      "frequency": 74,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "sovcombank.ru",
+      "frequency": 74,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "kp.ru",
+      "frequency": 72,
+      "category_guess": "media"
+    },
+    {
+      "domain": "otpbank.ru",
+      "frequency": 72,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "pay.yandex.ru",
+      "frequency": 71,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "au-agency.ru",
+      "frequency": 70,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "emailmatrix.ru",
+      "frequency": 70,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "psbank.ru",
+      "frequency": 70,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "digital-rank.ru",
+      "frequency": 69,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "web-canape.ru",
+      "frequency": 68,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "ux-journal.ru",
+      "frequency": 68,
+      "category_guess": "media"
+    },
+    {
+      "domain": "new-retail.ru",
+      "frequency": 67,
+      "category_guess": "media"
+    },
+    {
+      "domain": "deltaclick.ru",
+      "frequency": 66,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cashexpo.ru",
+      "frequency": 66,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "mnogo-kreditov.ru",
+      "frequency": 65,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "mediaguru.ru",
+      "frequency": 64,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "convertmonster.ru",
+      "frequency": 63,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "m.seonews.ru",
+      "frequency": 62,
+      "category_guess": "media"
+    },
+    {
+      "domain": "mymarilyn.ru",
+      "frequency": 62,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "investor100.ru",
+      "frequency": 62,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "synergy.ru",
+      "frequency": 61,
+      "category_guess": "education"
+    },
+    {
+      "domain": "digitalmarketingclub.ru",
+      "frequency": 61,
+      "category_guess": "media"
+    },
+    {
+      "domain": "spark.ru",
+      "frequency": 61,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "retailrocket.ru",
+      "frequency": 61,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "uiscom.ru",
+      "frequency": 60,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "texterra.ru",
+      "frequency": 60,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "1ps.ru",
+      "frequency": 60,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "rim-group.ru",
+      "frequency": 59,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "hh.ru",
+      "frequency": 59,
+      "category_guess": "hr"
+    },
+    {
+      "domain": "newbizservice.ru",
+      "frequency": 59,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "kommersant.ru",
+      "frequency": 57,
+      "category_guess": "media"
+    },
+    {
+      "domain": "lenta.ru",
+      "frequency": 57,
+      "category_guess": "media"
+    },
+    {
+      "domain": "tagline.ru",
+      "frequency": 56,
+      "category_guess": "media"
+    },
+    {
+      "domain": "finance.mail.ru",
+      "frequency": 55,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "icontext.ru",
+      "frequency": 54,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "up-advert.ru",
+      "frequency": 54,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "segmento.ru",
+      "frequency": 53,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "akm.ru",
+      "frequency": 53,
+      "category_guess": "media"
+    },
+    {
+      "domain": "3dnews.ru",
+      "frequency": 53,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "it-agency.ru",
+      "frequency": 52,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "a2is.ru",
+      "frequency": 50,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "axdigital.ru",
+      "frequency": 50,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mtsbank.ru",
+      "frequency": 50,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "profi.ru",
+      "frequency": 49,
+      "category_guess": "services"
+    },
+    {
+      "domain": "pixelplus.ru",
+      "frequency": 49,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "otvet.mail.ru",
+      "frequency": 49,
+      "category_guess": "forum"
+    },
+    {
+      "domain": "lpgenerator.ru",
+      "frequency": 48,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "marketing.hse.ru",
+      "frequency": 48,
+      "category_guess": "education"
+    },
+    {
+      "domain": "intervolga.ru",
+      "frequency": 48,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "vbi.ru",
+      "frequency": 47,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "investfuture.ru",
+      "frequency": 47,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "dobanka.ru",
+      "frequency": 47,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "raiffeisen.ru",
+      "frequency": 47,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "uralsib.ru",
+      "frequency": 47,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "arwm.ru",
+      "frequency": 46,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "online.hse.ru",
+      "frequency": 46,
+      "category_guess": "education"
+    },
+    {
+      "domain": "webolution.ru",
+      "frequency": 46,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "blog.promopult.ru",
+      "frequency": 46,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "kdelu.vtb.ru",
+      "frequency": 46,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "finabank.ru",
+      "frequency": 46,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "mindbox.ru",
+      "frequency": 45,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "grandawards.ru",
+      "frequency": 45,
+      "category_guess": "media"
+    },
+    {
+      "domain": "domrfbank.ru",
+      "frequency": 45,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "finepromo.ru",
+      "frequency": 43,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "k50.ru",
+      "frequency": 42,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "zoon.ru",
+      "frequency": 42,
+      "category_guess": "services"
+    },
+    {
+      "domain": "digitalchart.ru",
+      "frequency": 42,
+      "category_guess": "media"
+    },
+    {
+      "domain": "cnews.ru",
+      "frequency": 42,
+      "category_guess": "media"
+    },
+    {
+      "domain": "yalstudio.ru",
+      "frequency": 41,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "refinanc.ru",
+      "frequency": 41,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "mpagency.ru",
+      "frequency": 40,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "brief-media.ru",
+      "frequency": 40,
+      "category_guess": "media"
+    },
+    {
+      "domain": "pampadu.ru",
+      "frequency": 40,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "orocketbanke.ru",
+      "frequency": 40,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "tgstat.ru",
+      "frequency": 40,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "crmgroup.ru",
+      "frequency": 39,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "nimax.ru",
+      "frequency": 39,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "lifehacker.ru",
+      "frequency": 39,
+      "category_guess": "media"
+    },
+    {
+      "domain": "fpa.ru",
+      "frequency": 39,
+      "category_guess": "legal"
+    },
+    {
+      "domain": "interactivead.ru",
+      "frequency": 38,
+      "category_guess": "media"
+    },
+    {
+      "domain": "abernik.ru",
+      "frequency": 37,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "profitkit.ru",
+      "frequency": 37,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "ok.ru",
+      "frequency": 37,
+      "category_guess": "mailru_vk"
+    },
+    {
+      "domain": "retail.ru",
+      "frequency": 36,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rsb.ru",
+      "frequency": 36,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "inozemcevo.1000bankov.ru",
+      "frequency": 36,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "adventum.ru",
+      "frequency": 35,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "getcompass.ru",
+      "frequency": 35,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "ubrr.ru",
+      "frequency": 35,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "moskva.vbr.ru",
+      "frequency": 35,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "iq-adv.ru",
+      "frequency": 34,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "amdg.ru",
+      "frequency": 34,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mlg.ru",
+      "frequency": 34,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "synapse-studio.ru",
+      "frequency": 34,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mworks.ru",
+      "frequency": 33,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "reg.ru",
+      "frequency": 33,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "trends.rbc.ru",
+      "frequency": 33,
+      "category_guess": "media"
+    },
+    {
+      "domain": "ecomhub.ru",
+      "frequency": 33,
+      "category_guess": "media"
+    },
+    {
+      "domain": "pro-dgtl.ru",
+      "frequency": 33,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cashback2you.ru",
+      "frequency": 33,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "kokocgroup.ru",
+      "frequency": 32,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "docs.ozon.ru",
+      "frequency": 32,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "it-world.ru",
+      "frequency": 32,
+      "category_guess": "media"
+    },
+    {
+      "domain": "sberometer.ru",
+      "frequency": 32,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "blog.icontextgroup.ru",
+      "frequency": 31,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "ingobank.ru",
+      "frequency": 31,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "pravda-sotrudnikov.ru",
+      "frequency": 30,
+      "category_guess": "hr"
+    },
+    {
+      "domain": "darvindigital.ru",
+      "frequency": 30,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "work24.ru",
+      "frequency": 30,
+      "category_guess": "hr"
+    },
+    {
+      "domain": "ads.vk.ru",
+      "frequency": 30,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "intecweb.ru",
+      "frequency": 30,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "bg.ru",
+      "frequency": 30,
+      "category_guess": "media"
+    },
+    {
+      "domain": "ru.ruwiki.ru",
+      "frequency": 30,
+      "category_guess": "reference"
+    },
+    {
+      "domain": "cashbackcards.su",
+      "frequency": 30,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "ratings.sostav.ru",
+      "frequency": 29,
+      "category_guess": "media"
+    },
+    {
+      "domain": "searchindustrial.ru",
+      "frequency": 29,
+      "category_guess": "media"
+    },
+    {
+      "domain": "developers.sber.ru",
+      "frequency": 29,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "sendsay.ru",
+      "frequency": 29,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "action-market.ru",
+      "frequency": 29,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "b2b-creative.ru",
+      "frequency": 29,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "expobank.ru",
+      "frequency": 29,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "zaimi.ru",
+      "frequency": 29,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "currencyhistory.ru",
+      "frequency": 29,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "cleverdata.ru",
+      "frequency": 28,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "oborudunion.ru",
+      "frequency": 28,
+      "category_guess": "ecommerce"
+    },
+    {
+      "domain": "kod.ru",
+      "frequency": 28,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "baikalrosbank.ru",
+      "frequency": 28,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "rating.brand-hub.ru",
+      "frequency": 27,
+      "category_guess": "media"
+    },
+    {
+      "domain": "aaccent.ru",
+      "frequency": 27,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "omegait.ru",
+      "frequency": 27,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "emailsoldiers.ru",
+      "frequency": 27,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "makeallperfect.ru",
+      "frequency": 27,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "blog.ikraikra.ru",
+      "frequency": 26,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mbschool.ru",
+      "frequency": 26,
+      "category_guess": "education"
+    },
+    {
+      "domain": "nextlevel.ru",
+      "frequency": 26,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "exiterra.ru",
+      "frequency": 26,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "bitrix24.ru",
+      "frequency": 25,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "seonews.ru",
+      "frequency": 25,
+      "category_guess": "media"
+    },
+    {
+      "domain": "teamly.ru",
+      "frequency": 25,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "uslugi.yandex.ru",
+      "frequency": 25,
+      "category_guess": "services"
+    },
+    {
+      "domain": "xway.ru",
+      "frequency": 25,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "botfaqtor.ru",
+      "frequency": 25,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "markswebb.ru",
+      "frequency": 25,
+      "category_guess": "media"
+    },
+    {
+      "domain": "alfabank-info.ru",
+      "frequency": 25,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "ramku.ru",
+      "frequency": 24,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "perfectweb.ru",
+      "frequency": 24,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "profitads.ru",
+      "frequency": 24,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "all20.ru",
+      "frequency": 23,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "allseo.ru",
+      "frequency": 23,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "soroka-marketing.ru",
+      "frequency": 23,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "reklama-expo.ru",
+      "frequency": 23,
+      "category_guess": "media"
+    },
+    {
+      "domain": "mbk.ru",
+      "frequency": 23,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "my.mail.ru",
+      "frequency": 23,
+      "category_guess": "mailru_vk"
+    },
+    {
+      "domain": "ddsi.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mgcom.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "web-c.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "skyeng.ru",
+      "frequency": 22,
+      "category_guess": "education"
+    },
+    {
+      "domain": "target.vk.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "blog.skgroups.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "domodigital.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "sidorinlab.ru",
+      "frequency": 22,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "svoi.ru",
+      "frequency": 22,
+      "category_guess": "media"
+    },
+    {
+      "domain": "moneyzz.ru",
+      "frequency": 22,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "pro-adv.ru",
+      "frequency": 21,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "yummies.ru",
+      "frequency": 21,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "aspro.ru",
+      "frequency": 21,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "reddigital.ru",
+      "frequency": 21,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "1mbank.ru",
+      "frequency": 21,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "huntermob.ru",
+      "frequency": 20,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "advertpro.ru",
+      "frequency": 20,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "rocketdata.ru",
+      "frequency": 20,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "seller.ozon.ru",
+      "frequency": 20,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "news.pressfeed.ru",
+      "frequency": 20,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bfm.ru",
+      "frequency": 20,
+      "category_guess": "media"
+    },
+    {
+      "domain": "fondfinans.ru",
+      "frequency": 20,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "iphones.ru",
+      "frequency": 20,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "ferra.ru",
+      "frequency": 20,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "victoryagency.ru",
+      "frequency": 19,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "weekendagency.ru",
+      "frequency": 19,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "jobtrue.ru",
+      "frequency": 19,
+      "category_guess": "hr"
+    },
+    {
+      "domain": "adindustry.ru",
+      "frequency": 19,
+      "category_guess": "media"
+    },
+    {
+      "domain": "blog.callibri.ru",
+      "frequency": 19,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "kontur.ru",
+      "frequency": 19,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "marquiz.ru",
+      "frequency": 19,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "daily.afisha.ru",
+      "frequency": 19,
+      "category_guess": "entertainment"
+    },
+    {
+      "domain": "alice.yandex.ru",
+      "frequency": 19,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "slagaemye.ru",
+      "frequency": 19,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "promo.yoomoney.ru",
+      "frequency": 19,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "click-or-die.ru",
+      "frequency": 19,
+      "category_guess": "media"
+    },
+    {
+      "domain": "monety-redkie.ru",
+      "frequency": 19,
+      "category_guess": "ecommerce"
+    },
+    {
+      "domain": "dot.ru",
+      "frequency": 18,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mobio.ru",
+      "frequency": 18,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mosseo.ru",
+      "frequency": 18,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "seo.ru",
+      "frequency": 18,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "advertalyze.ru",
+      "frequency": 18,
+      "category_guess": "media"
+    },
+    {
+      "domain": "wowblogger.ru",
+      "frequency": 18,
+      "category_guess": "media"
+    },
+    {
+      "domain": "moysklad.ru",
+      "frequency": 18,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "leadmachine.ru",
+      "frequency": 18,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "frankmedia.ru",
+      "frequency": 18,
+      "category_guess": "media"
+    },
+    {
+      "domain": "sberbank-online1.ru",
+      "frequency": 18,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "news.ru",
+      "frequency": 18,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rshb.ru",
+      "frequency": 18,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "bosfera.ru",
+      "frequency": 18,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "misterbankir.ru",
+      "frequency": 18,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "kredity-tut.ru",
+      "frequency": 18,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "setka.ru",
+      "frequency": 17,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "avito.ru",
+      "frequency": 17,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "agima.ru",
+      "frequency": 17,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "manyletters.ru",
+      "frequency": 17,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "anastasia-rechanskaya.ru",
+      "frequency": 17,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "markway.ru",
+      "frequency": 17,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "skolkovo.ru",
+      "frequency": 17,
+      "category_guess": "education"
+    },
+    {
+      "domain": "biz360.ru",
+      "frequency": 17,
+      "category_guess": "media"
+    },
+    {
+      "domain": "megagroup.ru",
+      "frequency": 17,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "tpmag.ru",
+      "frequency": 17,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bryuhoveckaya.1000bankov.ru",
+      "frequency": 17,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "unicom24.ru",
+      "frequency": 17,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "rencredit.ru",
+      "frequency": 17,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "m.ok.ru",
+      "frequency": 17,
+      "category_guess": "mailru_vk"
+    },
+    {
+      "domain": "korusconsulting.ru",
+      "frequency": 16,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "sbertarget.ru",
+      "frequency": 16,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "luchshie-digital-agencstva.ru",
+      "frequency": 16,
+      "category_guess": "media"
+    },
+    {
+      "domain": "leadstartup.ru",
+      "frequency": 16,
+      "category_guess": "education"
+    },
+    {
+      "domain": "siteactiv.ru",
+      "frequency": 16,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "volna.adindex.ru",
+      "frequency": 16,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bewave.ru",
+      "frequency": 16,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "hsbi.hse.ru",
+      "frequency": 16,
+      "category_guess": "education"
+    },
+    {
+      "domain": "gtmediaspb.ru",
+      "frequency": 16,
+      "category_guess": "media"
+    },
+    {
+      "domain": "e-xecutive.ru",
+      "frequency": 16,
+      "category_guess": "media"
+    },
+    {
+      "domain": "miei.ru",
+      "frequency": 16,
+      "category_guess": "education"
+    },
+    {
+      "domain": "vagencyspb.ru",
+      "frequency": 16,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "hi-tech.mail.ru",
+      "frequency": 16,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "tgbanki.ru",
+      "frequency": 16,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "sankt-peterburg.vbr.ru",
+      "frequency": 16,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "mx.sotoguide.ru",
+      "frequency": 16,
+      "category_guess": "services"
+    },
+    {
+      "domain": "cbkg.ru",
+      "frequency": 16,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "performance.ozon.ru",
+      "frequency": 15,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "tools.pixelplus.ru",
+      "frequency": 15,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "datainsight.ru",
+      "frequency": 15,
+      "category_guess": "media"
+    },
+    {
+      "domain": "marketing.spb.ru",
+      "frequency": 15,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "atwinta.ru",
+      "frequency": 15,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "seller.wildberries.ru",
+      "frequency": 15,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "rookee.ru",
+      "frequency": 15,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "blog.skillfactory.ru",
+      "frequency": 15,
+      "category_guess": "education"
+    },
+    {
+      "domain": "key-client.ru",
+      "frequency": 15,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "incrussia.ru",
+      "frequency": 15,
+      "category_guess": "media"
+    },
+    {
+      "domain": "kt-team.ru",
+      "frequency": 15,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "blogs.forbes.ru",
+      "frequency": 15,
+      "category_guess": "media"
+    },
+    {
+      "domain": "dolmatov-studio.ru",
+      "frequency": 15,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "blog.nedigital.ru",
+      "frequency": 15,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "brodude.ru",
+      "frequency": 15,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bankiclub.ru",
+      "frequency": 15,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "createbrand.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "oohmag.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "onpeak.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cashruflow.ru",
+      "frequency": 14,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "soware.ru",
+      "frequency": 14,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "tr-page.yandex.ru",
+      "frequency": 14,
+      "category_guess": "yandex"
+    },
+    {
+      "domain": "media108.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rtb-media.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "neyiron.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "2m-agency.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "akiwa.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "kosatka-marketing.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "umi.ru",
+      "frequency": 14,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "real-directolog.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "programmatic.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "agrego.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "group4media.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "adesk.ru",
+      "frequency": 14,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "popsters.ru",
+      "frequency": 14,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "plusworld.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "cashbacks.ru",
+      "frequency": 14,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "openvorkuta.ru",
+      "frequency": 14,
+      "category_guess": "media"
+    },
+    {
+      "domain": "bolshoyvopros.ru",
+      "frequency": 14,
+      "category_guess": "forum"
+    },
+    {
+      "domain": "zenova.ru",
+      "frequency": 14,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "o2k.ru",
+      "frequency": 13,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "bigpicture.ru",
+      "frequency": 13,
+      "category_guess": "media"
+    },
+    {
+      "domain": "marpla.ru",
+      "frequency": 13,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "gb.ru",
+      "frequency": 13,
+      "category_guess": "education"
+    },
+    {
+      "domain": "olgood.ru",
+      "frequency": 13,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "mediacatalog.ru",
+      "frequency": 13,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rusprofile.ru",
+      "frequency": 13,
+      "category_guess": "services"
+    },
+    {
+      "domain": "tvreclama.ru",
+      "frequency": 13,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rashmedia.ru",
+      "frequency": 13,
+      "category_guess": "media"
+    },
+    {
+      "domain": "apptask.ru",
+      "frequency": 13,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "kurshub.ru",
+      "frequency": 13,
+      "category_guess": "education"
+    },
+    {
+      "domain": "britishdesign.ru",
+      "frequency": 13,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "e-pepper.ru",
+      "frequency": 13,
+      "category_guess": "media"
+    },
+    {
+      "domain": "rees46.ru",
+      "frequency": 13,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "delprof.ru",
+      "frequency": 13,
+      "category_guess": "legal"
+    },
+    {
+      "domain": "pochtabank.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "smartengines.ru",
+      "frequency": 13,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "regions.ru",
+      "frequency": 13,
+      "category_guess": "media"
+    },
+    {
+      "domain": "kompaskreditov.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "zenit.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "bbr.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "finambank.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "damoney.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "rocketr.ru",
+      "frequency": 13,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "otkazanet.ru",
+      "frequency": 13,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "rush-agency.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "sellerpro.ru",
+      "frequency": 12,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "lidzavod.ru",
+      "frequency": 12,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "whitepattern.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "raec.ru",
+      "frequency": 12,
+      "category_guess": "media"
+    },
+    {
+      "domain": "mibok.ru",
+      "frequency": 12,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "dstrategy.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "partner.market.yandex.ru",
+      "frequency": 12,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "astral.ru",
+      "frequency": 12,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "19agency84.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "we-support.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cetera.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "market.cnews.ru",
+      "frequency": 12,
+      "category_guess": "media"
+    },
+    {
+      "domain": "orenburg.1000bankov.ru",
+      "frequency": 12,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "arockets.ru",
+      "frequency": 12,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "promokodi.ru",
+      "frequency": 12,
+      "category_guess": "ecommerce"
+    },
+    {
+      "domain": "kupus.ru",
+      "frequency": 12,
+      "category_guess": "ecommerce"
+    },
+    {
+      "domain": "mirnov.ru",
+      "frequency": 12,
+      "category_guess": "media"
+    },
+    {
+      "domain": "tinkoff.ru",
+      "frequency": 12,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "finance.ozon.ru",
+      "frequency": 12,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "hicebank.ru",
+      "frequency": 12,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "cleverence.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "digital-academy.ru",
+      "frequency": 11,
+      "category_guess": "education"
+    },
+    {
+      "domain": "zg-brand.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "spectrium.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "seo-lebedev.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "apni.ru",
+      "frequency": 11,
+      "category_guess": "academic"
+    },
+    {
+      "domain": "d-agency.su",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "yard.yandex.ru",
+      "frequency": 11,
+      "category_guess": "classifieds"
+    },
+    {
+      "domain": "platformv.sbertech.ru",
+      "frequency": 11,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "anmarketing.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "retailcrm.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "kurs.alfabank.ru",
+      "frequency": 11,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "hybrid.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "dialweb.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "webstripe.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "storeland.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "blog.robobill.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "auto.makeagency.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "itctraining.ru",
+      "frequency": 11,
+      "category_guess": "education"
+    },
+    {
+      "domain": "blog.kinetica.su",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "upmetric.ru",
+      "frequency": 11,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "web.ruward.ru",
+      "frequency": 11,
+      "category_guess": "media"
+    },
+    {
+      "domain": "contenteam.ru",
+      "frequency": 11,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "aif.ru",
+      "frequency": 11,
+      "category_guess": "media"
+    },
+    {
+      "domain": "dk.ru",
+      "frequency": 11,
+      "category_guess": "media"
+    },
+    {
+      "domain": "life.ru",
+      "frequency": 11,
+      "category_guess": "media"
+    },
+    {
+      "domain": "finanzy.ru",
+      "frequency": 11,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "credit24.ru",
+      "frequency": 11,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "catrust.ru",
+      "frequency": 11,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "aiagency.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "tandemdigital.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "adequo.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "fine-mechanics.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "academy-of-capital.ru",
+      "frequency": 10,
+      "category_guess": "education"
+    },
+    {
+      "domain": "apollo-8.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "kinetica.su",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "tr4ck.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "spb.mworks.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "fireseo.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "spravochnick.ru",
+      "frequency": 10,
+      "category_guess": "education"
+    },
+    {
+      "domain": "crm2web.ru",
+      "frequency": 10,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "andreyex.ru",
+      "frequency": 10,
+      "category_guess": "tech"
+    },
+    {
+      "domain": "tellmi.ru",
+      "frequency": 10,
+      "category_guess": "services"
+    },
+    {
+      "domain": "pr-cy.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "tochnoagency.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "likeni.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "twiga.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "cosmos-web.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "alma-com.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "4rome.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "nika-web.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "advertology.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "1cbit.ru",
+      "frequency": 10,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "formula-advert.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "bartstudio.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "evemedia.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "outcode.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "smartplayer.ru",
+      "frequency": 10,
+      "category_guess": "saas"
+    },
+    {
+      "domain": "business.tpu.ru",
+      "frequency": 10,
+      "category_guess": "education"
+    },
+    {
+      "domain": "rg.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "finance.ru",
+      "frequency": 10,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "nbj.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "ntv.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "shop.indonet.ru",
+      "frequency": 10,
+      "category_guess": "ecommerce"
+    },
+    {
+      "domain": "sbersova.ru",
+      "frequency": 10,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "cellfix.ru",
+      "frequency": 10,
+      "category_guess": "services"
+    },
+    {
+      "domain": "review-zor.ru",
+      "frequency": 10,
+      "category_guess": "services"
+    },
+    {
+      "domain": "sbp.nspk.ru",
+      "frequency": 10,
+      "category_guess": "finance"
+    },
+    {
+      "domain": "dyvannyi-it.ru",
+      "frequency": 10,
+      "category_guess": "adtech"
+    },
+    {
+      "domain": "omsk.rbc.ru",
+      "frequency": 10,
+      "category_guess": "media"
+    },
+    {
+      "domain": "kanobu.ru",
+      "frequency": 10,
+      "category_guess": "entertainment"
+    }
+  ]
+}

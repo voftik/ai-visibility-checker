@@ -1,0 +1,1798 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RW+ AI Visibility Checker</title>
+  <link rel="icon" type="image/svg+xml" href="/static/brand/favicon.svg">
+  <link rel="stylesheet" href="/static/vendor/tailwind.css">
+  <style>
+    :root {
+      /* RW+ branding, dark theme */
+      --brand-primary: #FF324B;
+      --brand-primary-hover: #FF5A6E;
+      --brand-mark: #6A7B8F;
+      --brand-text: #F1F4F8;
+      --brand-text-muted: #B4BDC7;
+      --brand-text-soft: #8593A4;
+      --brand-bg: #101011;
+      --brand-bg-soft: #15171A;
+      --brand-bg-panel: #1B1E22;
+      --brand-bg-elevated: #22262B;
+      --brand-border: #2A2E34;
+      --brand-border-strong: #3A4048;
+      --brand-tooltip-bg: #F1F4F8;
+      --brand-tooltip-text: #101011;
+      --brand-success: #22C55E;
+      --brand-warn: #F59E0B;
+      --brand-error: #F87171;
+      --brand-info: #60A5FA;
+    }
+    [x-cloak] { display: none !important; }
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .log-line { white-space: pre-wrap; word-break: break-word; }
+
+    /* prose for the markdown report — dark theme, marketing-grade typography */
+    .prose-rwplus { font-size: 16px; line-height: 1.7; max-width: none; width: 100%; overflow-wrap: break-word; }
+    .prose-rwplus h1 { color: var(--brand-text); font-weight: 700; font-size: 1.875rem; line-height: 1.25; margin: 1.6em 0 0.8em; letter-spacing: -0.01em; }
+    .prose-rwplus h2 { color: var(--brand-text); font-weight: 700; font-size: 1.45rem; line-height: 1.3; margin: 2em 0 0.7em; padding-top: 0.4em; border-top: 1px solid var(--brand-border); }
+    .prose-rwplus h2:first-of-type { border-top: none; padding-top: 0; }
+    .prose-rwplus h3 { color: var(--brand-text); font-weight: 600; font-size: 1.15rem; line-height: 1.35; margin: 1.6em 0 0.5em; }
+    .prose-rwplus p, .prose-rwplus li, .prose-rwplus td { color: var(--brand-text-muted); }
+    .prose-rwplus p { margin: 0.9em 0; }
+    .prose-rwplus li { margin: 0.35em 0; }
+    .prose-rwplus strong { color: var(--brand-text); font-weight: 600; }
+    .prose-rwplus em { color: var(--brand-text); font-style: italic; }
+    .prose-rwplus a { color: var(--brand-primary); text-decoration: none; border-bottom: 1px dotted var(--brand-primary); }
+    .prose-rwplus a:hover { border-bottom-style: solid; }
+    .prose-rwplus blockquote {
+      margin: 1.2em 0;
+      padding: 0.6em 0 0.6em 1.1em;
+      color: var(--brand-text);
+      font-size: 1.05em;
+      font-weight: 500;
+      font-style: normal;
+      border-left: 3px solid var(--brand-primary);
+      background: linear-gradient(90deg, rgba(255,50,75,0.06), rgba(255,50,75,0));
+    }
+    .prose-rwplus blockquote p { color: var(--brand-text); margin: 0.3em 0; }
+    .prose-rwplus blockquote::before, .prose-rwplus blockquote::after { content: ''; }
+    .prose-rwplus code { color: var(--brand-text); background: var(--brand-bg-panel); padding: 1px 6px; border-radius: 4px; font-size: 0.9em; }
+    .prose-rwplus pre { background: var(--brand-bg-panel); border: 1px solid var(--brand-border); border-radius: 6px; padding: 0.9em 1em; overflow-x: auto; }
+    .prose-rwplus pre code { background: transparent; padding: 0; }
+    .prose-rwplus table { width: 100%; border-collapse: collapse; margin: 1.2em 0; font-size: 0.92em; table-layout: auto; }
+    .prose-rwplus th { background: var(--brand-bg-panel); color: var(--brand-text); font-weight: 600; padding: 0.5em 0.75em; border-bottom: 1px solid var(--brand-border-strong); text-align: left; }
+    .prose-rwplus td { padding: 0.45em 0.75em; border-bottom: 1px solid var(--brand-border); vertical-align: top; }
+    .prose-rwplus tr:hover td { background: var(--brand-bg-soft); }
+    .prose-rwplus hr { border: none; border-top: 1px solid var(--brand-border); margin: 2em 0; }
+
+    /* tooltip — light pill on dark UI, attached to any hover-target */
+    .rw-tip-anchor { position: relative; }
+    .rw-tip {
+      position: absolute;
+      z-index: 50;
+      background: var(--brand-tooltip-bg);
+      color: var(--brand-tooltip-text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.45;
+      font-weight: 400;
+      max-width: 340px;
+      width: max-content;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+      pointer-events: none;
+    }
+    .rw-tip-below { top: 100%; left: 50%; transform: translateX(-50%); margin-top: 8px; }
+    .rw-tip-above { bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: 8px; }
+    .rw-tip-right { left: 100%; top: 50%; transform: translateY(-50%); margin-left: 8px; }
+    .rw-tip-left  { right: 100%; top: 50%; transform: translateY(-50%); margin-right: 8px; }
+
+    .methodology-panel {
+      border-color: rgba(96, 165, 250, 0.48);
+      background: linear-gradient(180deg, rgba(96, 165, 250, 0.09), rgba(34, 197, 94, 0.035));
+      box-shadow: inset 4px 0 0 var(--brand-info);
+    }
+    .methodology-summary {
+      list-style: none;
+    }
+    .methodology-summary::-webkit-details-marker {
+      display: none;
+    }
+    .methodology-caret {
+      color: var(--brand-info);
+      transform: rotate(0deg);
+      transition: transform 0.15s ease-in-out;
+    }
+    .methodology-panel strong {
+      color: var(--brand-text);
+      font-weight: 600;
+    }
+    .methodology-panel[open] .methodology-caret {
+      transform: rotate(90deg);
+    }
+    .methodology-toggle::after {
+      content: "Раскрыть";
+    }
+    .methodology-panel[open] .methodology-toggle::after {
+      content: "Свернуть";
+    }
+
+    /* stepper */
+    .step-circle { width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+                   font-weight: 600; font-size: 18px; transition: background 0.2s, color 0.2s, border-color 0.2s; position: relative; }
+    .step-circle.idle    { background: var(--brand-bg-panel); color: var(--brand-text-soft); border: 1px solid var(--brand-border); }
+    .step-circle.active  { background: var(--brand-bg-elevated); color: var(--brand-primary); border: 2px solid var(--brand-primary); }
+    .step-circle.done    { background: var(--brand-success); color: #0B0B0C; border: 1px solid var(--brand-success); }
+    .step-circle.failed  { background: var(--brand-error); color: #0B0B0C; border: 1px solid var(--brand-error); }
+    .step-circle.active::after {
+      content: ""; position: absolute; inset: -4px; border-radius: 50%;
+      border: 2px solid transparent; border-top-color: var(--brand-primary);
+      animation: rw-spin 1s linear infinite;
+    }
+    @keyframes rw-spin { to { transform: rotate(360deg); } }
+    .step-line { flex: 1; height: 2px; background: var(--brand-border); margin: 0 8px; align-self: center; min-width: 24px; }
+    .step-line.done { background: var(--brand-success); }
+
+    .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--brand-primary); display: inline-block; margin: 0 3px;
+      animation: rw-pulse 1.4s infinite ease-in-out both;
+    }
+    .pulse-dot:nth-child(2) { animation-delay: 0.2s; }
+    .pulse-dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes rw-pulse { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+  </style>
+</head>
+<body class="bg-[color:var(--brand-bg)] text-[color:var(--brand-text)] min-h-screen">
+  <div x-data="app()" x-init="init()" x-cloak class="max-w-6xl mx-auto px-6 py-6">
+
+    <!-- Header -->
+    <header class="flex items-center justify-between border-b border-[color:var(--brand-border)] pb-4 mb-6">
+      <div class="flex items-center gap-3">
+        <img src="/static/brand/logo-mark.svg" alt="RW+" class="h-9 w-9" />
+        <div class="h-9 w-px bg-[color:var(--brand-border)]"></div>
+        <div>
+          <h1 class="text-xl font-semibold tracking-tight">AI Visibility Checker</h1>
+          <p class="text-xs text-[color:var(--brand-text-muted)] mt-0.5">Утилита RW+ для исследования доступности российских web-ресурсов для AI-поиска</p>
+        </div>
+      </div>
+      <nav class="flex gap-1 text-sm">
+        <button @click="setTab('new_run')"
+                :class="tab === 'new_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                class="px-3 py-1.5 rounded">Новая проверка</button>
+        <button @click="setTab('active_run')"
+                :class="tab === 'active_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                :disabled="!currentRunId"
+                class="px-3 py-1.5 rounded disabled:opacity-40 disabled:hover:text-[color:var(--brand-text-muted)]">
+          Текущая проверка
+          <span x-show="currentRunId" x-text="'· ' + (currentRunId || '').slice(0,8)" class="text-xs text-[color:var(--brand-text-soft)]"></span>
+        </button>
+        <button @click="setTab('history')"
+                :class="tab === 'history' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                class="px-3 py-1.5 rounded">История</button>
+      </nav>
+    </header>
+
+    <!-- ============ NEW RUN ============ -->
+    <section x-show="tab === 'new_run'" class="space-y-6">
+      <details class="methodology-panel rounded-lg border p-4">
+        <summary class="methodology-summary cursor-pointer select-none">
+          <div class="flex items-center justify-between gap-4">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="methodology-caret text-sm">▶</span>
+                <h2 class="text-sm font-semibold text-[color:var(--brand-info)]">Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</h2>
+              </div>
+              <p class="text-xs text-[color:var(--brand-text-muted)] mt-1 leading-relaxed">
+                Мы эмулируем <strong>реальные отпечатки AI-ботов</strong> и crawler/retrieval-агентов LLM-систем, чтобы проверить, может ли сайт стать источником знаний для AI-ответов.
+              </p>
+            </div>
+            <span class="methodology-toggle text-xs text-[color:var(--brand-info)] shrink-0"></span>
+          </div>
+        </summary>
+
+        <div class="mt-4 border-t border-[color:var(--brand-border)] pt-4 space-y-4">
+          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
+            Это нужно для проверки <strong>доступности веб-ресурсов как источников знаний LLM-систем</strong>: <strong>AI-видимость продуктов и брендов</strong> зависит от того, может ли crawler/retrieval-слой получить официальный контент. Если сайт закрыт для этого слоя, LLM может не увидеть описание продукта, актуальные цены, документацию, новости, условия, адреса и другие факты, даже если обычный пользователь открывает сайт в браузере.
+          </p>
+          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
+            Кратко о механике: когда пользователь задаёт вопрос, LLM-система может вызвать <strong>web search tool</strong> или внутренний поиск по индексу. Дальше <strong>retrieval</strong> (ретривел) собирает кандидатов: URL, сниппеты и фрагменты страниц. Затем <strong>rerank</strong> (реранк) пересортировывает кандидаты по релевантности, качеству и доступности. Лучшие фрагменты попадают в контекст модели как <strong>RAG</strong> - retrieval augmented generation, и уже на их основе формируется ответ. Если crawler видит captcha, гео-заглушку, пустой SPA-shell или запрет robots.txt, ресурс выпадает из этой цепочки или попадает в неё как некачественный источник.
+          </p>
+
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Реальные bot fingerprints</div>
+              <p>Для каждого домена отправляются запросы с конкретными <strong>User-Agent строками</strong>: GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, anthropic-ai, Claude-Web, PerplexityBot и Perplexity-User. DeepSeekBot и DeepSeek-User вынесены отдельно, потому что у DeepSeek нет официальной спецификации краулеров.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что именно эмулируется</div>
+              <p>Мы меняем идентификатор бота, но держим одинаковый HTTP-контекст: Accept для HTML/XML, Accept-Language: en-US,en;q=0.9, Accept-Encoding: gzip, deflate и Connection: keep-alive. Так видна разница между реакцией сайта на конкретного AI-краулера и на обычный запрос.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Контрольные отпечатки</div>
+              <p>Chrome-control имитирует обычный браузерный User-Agent, а empty-ua отправляет запрос без User-Agent. Если AI-бот получает отказ, а Chrome-control получает контент, это похоже на anti-AI фильтр. Если отказ получают все, это чаще WAF, TLS, гео- или инфраструктурное ограничение.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что фиксируется в ответе</div>
+              <p>Для каждой пробы сохраняются HTTP-статус, цепочка редиректов, TLS-результат, response headers, размер тела, sample HTML, признаки WAF/captcha/interstitial и объём текста, который можно извлечь без выполнения JavaScript.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Сетевые ограничения в России</div>
+              <p>Проверка идёт с серверной точки вне российской пользовательской сети. Российские WAF, блокировки зарубежных IP, гео-заглушки и сертификатные проблемы попадают в результат, потому что глобальные LLM чаще ходят за источниками не с IP конечного пользователя в РФ.</p>
+            </div>
+            <div>
+              <div class="font-medium text-[color:var(--brand-text)] mb-1">Почему результату можно доверять</div>
+              <p>Оценка строится на <strong>воспроизводимой матрице запросов</strong>: один домен, одинаковые сетевые условия, разные bot fingerprints и контрольные отпечатки. LLM-отчёт только интерпретирует эти измерения; первичные технические сигналы остаются в таблицах пробы.</p>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <!-- Left column: sets + custom -->
+        <div class="lg:col-span-2 space-y-5">
+
+          <!-- Domain sets -->
+          <div class="space-y-3">
+            <div>
+              <h2 class="text-sm font-semibold relative inline-block cursor-help"
+                  x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Наборы доменов</span>
+                <span x-show="show" x-transition class="rw-tip rw-tip-below">
+                  Готовые подборки доменов для проверки. Можно включить один или оба набора, плюс добавить свои домены ниже. Перед стартом список объединяется и дедуплицируется.
+                </span>
+              </h2>
+              <p class="text-xs text-[color:var(--brand-text-muted)] mt-0.5">
+                Выбери один или оба набора, по желанию добавь свои домены ниже. Итоговый список перед запуском дедуплицируется.
+              </p>
+            </div>
+
+            <div x-show="setsLoadError" x-text="setsLoadError" class="text-xs text-[color:var(--brand-warn)]"></div>
+
+            <template x-for="meta in setsMeta" :key="meta.id">
+              <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
+                <div class="flex items-start gap-3 p-3">
+                  <input type="checkbox"
+                         class="mt-1 rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                         :checked="setsState[meta.id]?.enabled"
+                         @change="toggleSetEnabled(meta.id, $event.target.checked)">
+                  <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="font-medium relative inline-block cursor-help"
+                            x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                        <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="setTitleRu(meta)"></span>
+                        <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="setHelpRu(meta)"></span>
+                      </span>
+                      <span class="text-xs text-[color:var(--brand-text-soft)]" x-text="meta.kind === 'categorical' ? 'категориальный' : 'плоский'"></span>
+                    </div>
+                    <p class="text-xs text-[color:var(--brand-text-muted)] mt-1" x-text="meta.description"></p>
+                    <div class="text-xs text-[color:var(--brand-text-muted)] mt-2 flex items-center gap-4 flex-wrap">
+                      <span x-text="meta.domain_count + ' доменов'"></span>
+                      <span x-text="setSelectedCount(meta.id) + ' выбрано'"
+                            :class="setsState[meta.id]?.enabled ? 'text-[color:var(--brand-primary)] font-medium' : 'text-[color:var(--brand-text-soft)]'"></span>
+                      <button @click="toggleSetExpanded(meta.id)"
+                              class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]">
+                        <span x-show="!setsState[meta.id]?.expanded">Показать детали ▾</span>
+                        <span x-show="setsState[meta.id]?.expanded">Скрыть детали ▴</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div x-show="setsState[meta.id]?.expanded" class="border-t border-[color:var(--brand-border)] p-3 space-y-3">
+                  <div class="flex items-center gap-3 text-xs">
+                    <button @click="selectAllInSet(meta.id)" class="px-2 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Выбрать всё в наборе</button>
+                    <button @click="deselectAllInSet(meta.id)" class="px-2 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Снять всё в наборе</button>
+                    <span class="text-[color:var(--brand-text-muted)]" x-text="setSelectedCount(meta.id) + ' из ' + meta.domain_count + ' выбрано'"></span>
+                  </div>
+
+                  <template x-if="meta.kind === 'categorical' && setsState[meta.id]?.data">
+                    <div class="space-y-3">
+                      <template x-for="cat in setsState[meta.id].data.categories" :key="cat.name">
+                        <div class="rounded border border-[color:var(--brand-border)]">
+                          <div class="flex items-center gap-2 px-2 py-1 bg-[color:var(--brand-bg-panel)]">
+                            <input type="checkbox"
+                                   class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                                   :checked="categoryAllSelected(meta.id, cat)"
+                                   @change="toggleCategory(meta.id, cat, $event.target.checked)">
+                            <span class="text-sm font-medium" x-text="cat.name"></span>
+                            <span class="text-xs text-[color:var(--brand-text-soft)] ml-auto" x-text="cat.domains.length + ' доменов'"></span>
+                          </div>
+                          <div class="px-3 py-2 space-y-0.5 bg-[color:var(--brand-bg-soft)]">
+                            <template x-for="dom in cat.domains" :key="dom">
+                              <label class="flex items-start gap-2 text-xs cursor-pointer">
+                                <input type="checkbox"
+                                       class="mt-0.5 rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                                       :checked="setsState[meta.id].selected.has(dom)"
+                                       @change="toggleSetDomain(meta.id, dom, $event.target.checked)">
+                                <span class="font-mono w-32 shrink-0" x-text="dom"></span>
+                                <span class="text-[color:var(--brand-text-muted)] break-words" x-text="setsState[meta.id].data.annotations?.[dom] || ''"></span>
+                              </label>
+                            </template>
+                          </div>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+
+                  <template x-if="meta.kind === 'flat' && setsState[meta.id]?.data">
+                    <div class="space-y-2">
+                      <div class="flex items-center gap-2 flex-wrap text-xs">
+                        <input type="text" placeholder="Фильтр по домену..."
+                               class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-[color:var(--brand-text)]"
+                               :value="setsState[meta.id].filter"
+                               @input="setsState[meta.id].filter = $event.target.value">
+                        <select class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-[color:var(--brand-text)]"
+                                :value="setsState[meta.id].catFilter"
+                                @change="setsState[meta.id].catFilter = $event.target.value">
+                          <option value="all">Все категории</option>
+                          <template x-for="c in flatCategoryOptions(meta.id)" :key="c">
+                            <option :value="c" x-text="c"></option>
+                          </template>
+                        </select>
+                        <span class="text-[color:var(--brand-text-muted)]" x-text="flatVisibleDomains(meta.id).length + ' видно'"></span>
+                      </div>
+                      <div class="rounded border border-[color:var(--brand-border)] max-h-[55vh] overflow-y-auto bg-[color:var(--brand-bg-soft)]">
+                        <template x-for="dom in flatRenderedDomains(meta.id)" :key="dom.domain">
+                          <label class="flex items-center gap-2 px-3 py-1 hover:bg-[color:var(--brand-bg-soft)] cursor-pointer text-xs border-b border-[color:var(--brand-border)] last:border-b-0">
+                            <input type="checkbox"
+                                   class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                                   :checked="setsState[meta.id].selected.has(dom.domain)"
+                                   @change="toggleSetDomain(meta.id, dom.domain, $event.target.checked)">
+                            <span class="font-mono flex-1 truncate" x-text="dom.domain"></span>
+                            <span class="text-[color:var(--brand-text-soft)] w-20 truncate" x-text="dom.category_guess || ''"></span>
+                            <span class="text-[color:var(--brand-text-soft)] w-12 text-right" x-text="'×' + dom.frequency"></span>
+                          </label>
+                        </template>
+                        <div x-show="flatVisibleDomains(meta.id).length === 0" class="px-3 py-2 text-[color:var(--brand-text-soft)] text-xs">Ничего не найдено.</div>
+                      </div>
+                      <div x-show="flatHasMore(meta.id)" class="text-xs">
+                        <button @click="setsState[meta.id].showAll = true"
+                                class="text-[color:var(--brand-primary)] hover:underline"
+                                x-text="'Показать все (ещё ' + (flatVisibleDomains(meta.id).length - 100) + ')'"></button>
+                      </div>
+                    </div>
+                  </template>
+
+                  <div x-show="setsState[meta.id]?.loading" class="text-xs text-[color:var(--brand-text-muted)]">Загрузка...</div>
+                  <div x-show="setsState[meta.id]?.error" x-text="setsState[meta.id]?.error" class="text-xs text-[color:var(--brand-error)]"></div>
+                </div>
+              </div>
+            </template>
+
+            <div x-show="setsMeta.length === 0 && !setsLoadError" class="text-xs text-[color:var(--brand-text-soft)]">Наборы не настроены.</div>
+          </div>
+
+          <!-- Custom domains -->
+          <div class="space-y-2">
+            <label class="text-sm font-medium relative inline-block cursor-help"
+                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Свои домены</span>
+              <span x-show="show" x-transition class="rw-tip rw-tip-below">
+                Дополнительные домены поверх наборов. Перечисли через запятую. Без https:// и без путей.
+              </span>
+            </label>
+            <p class="text-xs text-[color:var(--brand-text-muted)]">Перечисли через запятую: example.com, mysite.org, brand.ru</p>
+            <textarea x-model="form.domainsText"
+                      spellcheck="false"
+                      rows="4"
+                      placeholder="example.com, mysite.org, brand.ru"
+                      class="w-full bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded p-3 font-mono text-sm text-[color:var(--brand-text)] placeholder:text-[color:var(--brand-text-soft)] focus:outline-none focus:border-[color:var(--brand-primary)]"></textarea>
+            <div class="text-xs text-[color:var(--brand-text-muted)]">
+              <span x-text="'+' + customDomains.length + ' своих доменов'"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right column: UAs + numbers -->
+        <div class="space-y-4">
+          <div>
+            <div class="mb-2">
+              <label class="text-sm font-medium relative inline-block cursor-help"
+                     x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Идентификаторы AI-краулеров</span>
+                <span x-show="show" x-transition class="rw-tip rw-tip-left">
+                  AI-сервисы (ChatGPT, Claude, Perplexity и другие) ходят по сайтам через специальных программных агентов, которых можно отличить по уникальной строке-визитке - User-Agent. Мы притворяемся каждым из этих агентов по очереди и смотрим, как сайт отвечает.
+                </span>
+              </label>
+            </div>
+            <div class="space-y-3">
+              <template x-for="group in uaGroups" :key="group.provider">
+                <div>
+                  <div class="text-xs text-[color:var(--brand-text-soft)] uppercase tracking-wide mb-1 relative inline-block"
+                       :class="group.providerTip ? 'cursor-help' : ''"
+                       x-data="{ show: false }"
+                       @mouseenter="show = !!group.providerTip" @mouseleave="show = false">
+                    <span :class="group.providerTip ? 'border-b border-dotted border-[color:var(--brand-text-soft)]' : ''" x-text="group.providerRu"></span>
+                    <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="group.providerTip || ''"></span>
+                  </div>
+                  <div class="space-y-1 ml-1">
+                    <template x-for="label in group.labels" :key="label">
+                      <label class="flex items-center gap-2 text-sm cursor-pointer">
+                        <input type="checkbox" x-model="form.uaSelected[label]"
+                               class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                        <span class="relative inline-block cursor-help"
+                              x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                          <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
+                          <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="UA_TOOLTIPS[label] || ''"></span>
+                        </span>
+                      </label>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div>
+            <label class="text-sm font-medium relative inline-block cursor-help mb-1"
+                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Параллельность запросов</span>
+              <span x-show="show" x-transition class="rw-tip rw-tip-left">
+                Сколько проверок выполняется одновременно. Выше - быстрее общее время, но больше нагрузка на сеть и риск быть заблокированным сайтом за слишком частые запросы.
+              </span>
+            </label>
+            <input type="number" x-model.number="form.concurrency" min="1" max="32"
+                   class="w-24 bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)]">
+          </div>
+
+          <div>
+            <label class="text-sm font-medium relative inline-block cursor-help mb-1"
+                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Таймаут (секунды)</span>
+              <span x-show="show" x-transition class="rw-tip rw-tip-left">
+                Сколько ждать ответа от каждого сайта прежде чем считать запрос неуспешным. 15 секунд достаточно для большинства сайтов; для медленных можно увеличить до 30.
+              </span>
+            </label>
+            <input type="number" x-model.number="form.timeoutSeconds" min="5" max="60"
+                   class="w-24 bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)]">
+          </div>
+        </div>
+      </div>
+
+      <!-- Final summary + start -->
+      <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-4 flex flex-col gap-3">
+        <div class="space-y-1">
+          <div class="text-sm">
+            <span class="text-[color:var(--brand-text-muted)]">Итоговый список: </span>
+            <span class="font-semibold" x-text="finalDomains.length + ' уникальных доменов'"></span>
+          </div>
+          <div class="text-xs text-[color:var(--brand-text-muted)]" x-text="
+            'Набор 1: ' + sourceBreakdown.set1_selected
+            + ' · Набор 2: ' + sourceBreakdown.set2_selected
+            + ' · своих: ' + sourceBreakdown.custom
+            + (sourceBreakdown.deduplicated_removed > 0
+                ? ' · удалено дублей: ' + sourceBreakdown.deduplicated_removed
+                : '')
+          "></div>
+          <div class="text-xs text-[color:var(--brand-text-muted)] mt-2">
+            <span x-text="'Будет выполнено ' + totalProbeEstimate + ' проб (' + finalDomains.length + ' × (' + selectedUaCount + ' идентификаторов + 1 robots.txt))'"></span>
+            <span class="text-[color:var(--brand-text-soft)] mx-1">·</span>
+            <span x-text="'Примерное время: ' + timeEstimateText"></span>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <button @click="startRun()"
+                  :disabled="setsLoading || submitting || finalDomains.length === 0 || selectedUaCount === 0"
+                  class="px-4 py-2 rounded bg-[color:var(--brand-primary)] hover:bg-[color:var(--brand-primary-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium">
+            <span x-show="!submitting">Запустить проверку</span>
+            <span x-show="submitting">Запускаю...</span>
+          </button>
+          <span x-show="formError" x-text="formError" class="text-sm text-[color:var(--brand-error)]"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ ACTIVE RUN ============ -->
+    <section x-show="tab === 'active_run'" class="space-y-4">
+
+      <div x-show="!currentRunId" class="text-[color:var(--brand-text-soft)] text-sm">Активной проверки нет. Запустите новую или откройте из истории.</div>
+
+      <template x-if="currentRunId">
+        <div class="space-y-4">
+
+          <!-- Top row: total timer + run id -->
+          <div class="flex items-end justify-between flex-wrap gap-3">
+            <div>
+              <div class="text-xs text-[color:var(--brand-text-muted)]">Проверка <span class="font-mono" x-text="(currentRunId || '').slice(0,8)"></span></div>
+              <div class="text-2xl font-mono font-semibold mt-1">
+                <span x-show="runStatus !== 'completed' && runStatus !== 'failed'" x-text="'Общее время: ' + formatHMS(totalElapsedSec)"></span>
+                <span x-show="runStatus === 'completed'" class="text-[color:var(--brand-success)]" x-text="'Завершено за ' + formatHMS(totalElapsedSec)"></span>
+                <span x-show="runStatus === 'failed'" class="text-[color:var(--brand-error)]" x-text="'Прервано на ' + formatHMS(totalElapsedSec)"></span>
+              </div>
+            </div>
+            <div class="text-sm flex items-center gap-3">
+              <span class="text-[color:var(--brand-text-muted)]">Статус</span>
+              <span :class="statusBadgeClass(runStatus)" class="px-2 py-0.5 rounded text-xs font-medium uppercase tracking-wide" x-text="statusLabelRu(runStatus)"></span>
+              <span x-show="runDetails" class="text-[color:var(--brand-text-muted)]" x-text="'Доменов: ' + ((runDetails?.config_json?.domains || []).length)"></span>
+              <span x-show="runDetails" class="text-[color:var(--brand-text-muted)]" x-text="'AI-краулеров: ' + ((runDetails?.config_json?.user_agents || []).length)"></span>
+            </div>
+          </div>
+
+          <!-- Stepper -->
+          <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-4">
+            <div class="flex items-start gap-0 overflow-x-auto">
+              <template x-for="(s, i) in stepperState" :key="s.key">
+                <div class="flex items-start" :class="i === 0 ? '' : 'flex-1'" style="min-width: 0;">
+                  <div x-show="i > 0" class="step-line" :class="s.status === 'done' || s.status === 'active' || s.status === 'failed' ? 'done' : ''" style="margin-top: 28px;"></div>
+                  <div class="flex flex-col items-center text-center px-2" style="min-width: 120px;">
+                    <div class="step-circle" :class="s.status">
+                      <template x-if="s.status === 'done'"><span>✓</span></template>
+                      <template x-if="s.status === 'failed'"><span>✕</span></template>
+                      <template x-if="s.status === 'idle' || s.status === 'active'"><span x-text="(i+1)"></span></template>
+                    </div>
+                    <div class="text-xs font-medium mt-2" x-text="s.label"></div>
+                    <div class="text-[10px] text-[color:var(--brand-text-muted)] mt-0.5" x-text="stepHint(s)"></div>
+                  </div>
+                </div>
+              </template>
+            </div>
+
+            <!-- LLM friendly status -->
+            <div x-show="isLlmActive" class="mt-5 rounded border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-3">
+              <div class="flex items-center gap-3">
+                <div class="flex">
+                  <span class="pulse-dot"></span>
+                  <span class="pulse-dot"></span>
+                  <span class="pulse-dot"></span>
+                </div>
+                <div class="text-sm text-[color:var(--brand-text)]" x-text="llmFriendlyMessage"></div>
+              </div>
+              <div class="text-xs text-[color:var(--brand-text-muted)] mt-2" x-text="'Прошло ' + formatHMS(llmStepElapsedSec) + ', обычно занимает ' + currentLlmStepEstimate"></div>
+            </div>
+
+            <!-- Failed message -->
+            <div x-show="runStatus === 'failed' && runDetails?.error_message" class="mt-4 text-xs text-[color:var(--brand-error)] bg-red-950/40 border border-red-900 rounded p-2 font-mono whitespace-pre-wrap" x-text="runDetails?.error_message"></div>
+          </div>
+
+          <!-- Log panel -->
+          <div x-show="logEntries.length > 0 || isLiveRun" class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
+            <div class="flex items-center justify-between px-3 py-2 border-b border-[color:var(--brand-border)] text-xs">
+              <div class="flex gap-3 text-[color:var(--brand-text-muted)]">
+                <label class="flex items-center gap-1 cursor-pointer">
+                  <input type="checkbox" x-model="logFilters.INFO" class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)]">
+                  <span>INFO</span>
+                </label>
+                <label class="flex items-center gap-1 cursor-pointer">
+                  <input type="checkbox" x-model="logFilters.PROBE" class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)]">
+                  <span>ПРОБА</span>
+                </label>
+                <label class="flex items-center gap-1 cursor-pointer">
+                  <input type="checkbox" x-model="logFilters.PHASE" class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)]">
+                  <span>ФАЗА</span>
+                </label>
+                <span class="text-[color:var(--brand-text-soft)]" x-show="!autoscrollOn">(автопрокрутка остановлена)</span>
+              </div>
+              <div class="flex gap-2">
+                <button @click="copyLog()" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]">Скопировать лог</button>
+              </div>
+            </div>
+            <div x-ref="logPanel" @scroll="onLogScroll($event)"
+                 class="h-[50vh] overflow-y-auto bg-[color:var(--brand-bg-soft)] px-3 py-2 font-mono text-xs leading-relaxed">
+              <template x-for="(e, idx) in logEntries" :key="idx">
+                <div x-show="logFilters[logCategory(e)]" class="log-line" x-html="renderLogLine(e)"></div>
+              </template>
+              <div x-show="logEntries.length === 0" class="text-[color:var(--brand-text-soft)]">Ожидание событий...</div>
+            </div>
+          </div>
+
+          <div x-show="!isLiveRun && logEntries.length === 0" class="text-xs text-[color:var(--brand-text-soft)] italic">
+            Живой лог недоступен для прошлых проверок (события не сохраняются).
+          </div>
+
+          <!-- Results -->
+          <div x-show="runStatus === 'completed' || runStatus === 'failed'" class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
+            <div class="border-b border-[color:var(--brand-border)] px-3 py-2 flex items-center gap-1 text-sm">
+              <button @click="resultsTab = 'report'"
+                      :class="resultsTab === 'report' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                      class="px-3 py-1 rounded"
+                      :disabled="runStatus === 'failed' || !runDetails?.analysis_markdown"
+                      x-show="runStatus === 'completed' && runDetails?.analysis_markdown">Итоговый отчёт</button>
+              <button @click="resultsTab = 'probes'"
+                      :class="resultsTab === 'probes' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                      class="px-3 py-1 rounded">Таблица проб</button>
+              <button @click="resultsTab = 'robots'"
+                      :class="resultsTab === 'robots' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                      class="px-3 py-1 rounded">Правила robots.txt</button>
+              <span class="ml-3 text-xs text-[color:var(--brand-text-muted)]" x-show="runDetails?.probes">
+                <span x-text="(runDetails?.probes || []).length"></span> проб,
+                <span x-text="(runDetails?.robots_rules || []).length"></span> правил robots
+              </span>
+            </div>
+
+            <div x-show="runStatus === 'failed'" class="p-4">
+              <div class="rounded border border-red-900 bg-red-950/40 text-[color:var(--brand-error)] p-3 text-sm">
+                <div class="font-medium">Проверка завершилась с ошибкой</div>
+                <div class="mt-1 text-xs font-mono whitespace-pre-wrap" x-text="runDetails?.error_message || 'неизвестная ошибка'"></div>
+              </div>
+            </div>
+
+            <!-- Report -->
+            <div x-show="resultsTab === 'report' && runStatus === 'completed' && runDetails?.analysis_markdown" class="p-4 space-y-3">
+              <div class="flex gap-2 text-xs">
+                <button @click="copyMarkdown()" class="px-3 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Скопировать markdown</button>
+                <button @click="downloadMarkdown()" class="px-3 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Скачать .md</button>
+                <span x-show="copyToast" x-text="copyToast" class="text-[color:var(--brand-success)] self-center"></span>
+              </div>
+              <article class="prose prose-rwplus max-w-none" x-html="renderedReport"></article>
+            </div>
+
+            <!-- Probes -->
+            <div x-show="resultsTab === 'probes'" class="p-4 space-y-3">
+              <input x-model="probesFilter" placeholder="Фильтр по домену или AI-краулеру..."
+                     class="w-full bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)] placeholder:text-[color:var(--brand-text-soft)]">
+              <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                  <thead>
+                    <tr class="border-b border-[color:var(--brand-border)] text-[color:var(--brand-text-muted)] text-left">
+                      <template x-for="col in probeColumns" :key="col.key">
+                        <th class="px-2 py-1.5 select-none whitespace-nowrap"
+                            @click="setProbesSort(col.key)">
+                          <span class="relative inline-flex items-center gap-1 cursor-pointer"
+                                x-data="{ show: false }"
+                                @mouseenter="show = !!col.tip" @mouseleave="show = false">
+                            <span :class="col.tip ? 'border-b border-dotted border-[color:var(--brand-text-soft)]' : ''" x-text="col.label"></span>
+                            <span x-show="probesSort.col === col.key" x-text="probesSort.dir === 'asc' ? '▲' : '▼'" class="text-[color:var(--brand-text-soft)]"></span>
+                            <span x-show="show && col.tip" x-transition class="rw-tip rw-tip-below" x-text="col.tip"></span>
+                          </span>
+                        </th>
+                      </template>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="p in filteredProbes" :key="p.id">
+                      <tr @click="toggleProbe(p.id)" class="border-b border-[color:var(--brand-border)] hover:bg-[color:var(--brand-bg-soft)] cursor-pointer">
+                        <td class="px-2 py-1 font-mono">
+                          <span class="relative inline-block"
+                                :class="set1AnnotMap[p.domain] ? 'cursor-help' : ''"
+                                x-data="{ show: false }"
+                                @mouseenter="show = !!set1AnnotMap[p.domain]" @mouseleave="show = false">
+                            <span :class="set1AnnotMap[p.domain] ? 'border-b border-dotted border-[color:var(--brand-text-soft)]' : ''" x-text="p.domain"></span>
+                            <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="set1AnnotMap[p.domain] || ''"></span>
+                          </span>
+                        </td>
+                        <td class="px-2 py-1" x-text="p.user_agent_label"></td>
+                        <td class="px-2 py-1 text-[color:var(--brand-text-soft)]" x-text="p.probe_type === 'main_page' ? 'главная' : p.probe_type"></td>
+                        <td class="px-2 py-1 font-mono">
+                          <span :class="statusColor(p.http_status, p.error_class)"
+                                x-text="p.http_status ?? (p.error_class || '-')"></span>
+                        </td>
+                        <td class="px-2 py-1 text-right" x-text="formatBytes(p.response_size_bytes)"></td>
+                        <td class="px-2 py-1 text-right" x-text="(p.content_extractable_text_length ?? '-') "></td>
+                        <td class="px-2 py-1 text-right" x-text="(p.total_time_ms ?? '-') + 'мс'"></td>
+                        <td class="px-2 py-1 text-right text-[color:var(--brand-text-soft)]" x-text="(p.ttfb_ms ?? '-')"></td>
+                        <td class="px-2 py-1 text-center"
+                            :class="p.tls_ok === false ? 'text-[color:var(--brand-error)]' : 'text-[color:var(--brand-text-soft)]'"
+                            x-text="p.tls_ok === null ? '-' : (p.tls_ok ? '✓' : '✗')"></td>
+                        <td class="px-2 py-1 text-[color:var(--brand-text-muted)]" x-html="renderMarkers(p.detected_protections)"></td>
+                        <td class="px-2 py-1 font-mono text-[color:var(--brand-text-soft)] truncate max-w-[260px]" x-text="p.final_url || '-'" :title="p.final_url"></td>
+                      </tr>
+                    </template>
+                    <tr x-show="filteredProbes.length === 0">
+                      <td colspan="11" class="px-2 py-4 text-center text-[color:var(--brand-text-soft)]">Нет проб, удовлетворяющих фильтру.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <template x-if="expandedProbeId !== null">
+                <div class="rounded border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-3 text-xs space-y-2">
+                  <div class="flex items-center justify-between">
+                    <div class="font-medium">
+                      <span x-text="expandedProbe?.domain"></span>
+                      ·
+                      <span x-text="expandedProbe?.user_agent_label"></span>
+                    </div>
+                    <button @click="expandedProbeId = null" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]">закрыть</button>
+                  </div>
+                  <div x-show="expandedProbe?.error_class" class="text-[color:var(--brand-error)]">
+                    <span class="text-[color:var(--brand-text-muted)]">ошибка: </span>
+                    <span class="font-mono" x-text="expandedProbe?.error_class"></span>
+                    <span class="font-mono ml-2" x-text="expandedProbe?.error_message"></span>
+                  </div>
+                  <div>
+                    <div class="text-[color:var(--brand-text-muted)]">final_url:</div>
+                    <div class="font-mono break-all" x-text="expandedProbe?.final_url || '-'"></div>
+                  </div>
+                  <div x-show="expandedProbe?.content_signals">
+                    <div class="text-[color:var(--brand-text-muted)]">content_signals:</div>
+                    <pre class="font-mono whitespace-pre-wrap" x-text="JSON.stringify(expandedProbe?.content_signals || {}, null, 2)"></pre>
+                  </div>
+                  <div x-show="expandedProbe?.redirect_chain && expandedProbe.redirect_chain.length > 0">
+                    <div class="text-[color:var(--brand-text-muted)]">редиректы:</div>
+                    <pre class="font-mono whitespace-pre-wrap" x-text="JSON.stringify(expandedProbe?.redirect_chain || [], null, 2)"></pre>
+                  </div>
+                  <div>
+                    <div class="text-[color:var(--brand-text-muted)]">response_headers:</div>
+                    <pre class="font-mono whitespace-pre-wrap max-h-48 overflow-y-auto" x-text="JSON.stringify(expandedProbe?.response_headers || {}, null, 2)"></pre>
+                  </div>
+                  <div>
+                    <div class="text-[color:var(--brand-text-muted)]">body_sample (первые 2KB):</div>
+                    <pre class="font-mono whitespace-pre-wrap max-h-64 overflow-y-auto" x-text="(expandedProbe?.body_sample || '').slice(0,2048)"></pre>
+                  </div>
+                </div>
+              </template>
+            </div>
+
+            <!-- Robots -->
+            <div x-show="resultsTab === 'robots'" class="p-4 space-y-4">
+              <template x-for="group in groupedRobots" :key="group.domain">
+                <div class="rounded border border-[color:var(--brand-border)] overflow-hidden">
+                  <div class="bg-[color:var(--brand-bg-panel)] px-3 py-1.5 font-mono text-sm" x-text="group.domain"></div>
+                  <table class="w-full text-xs">
+                    <thead class="text-[color:var(--brand-text-muted)] text-left">
+                      <tr class="border-b border-[color:var(--brand-border)]">
+                        <th class="px-3 py-1">Бот</th>
+                        <th class="px-3 py-1">Правило</th>
+                        <th class="px-3 py-1">Директивы</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="r in group.rules" :key="r.id">
+                        <tr class="border-b border-[color:var(--brand-border)]">
+                          <td class="px-3 py-1 font-mono" x-text="r.bot_name"></td>
+                          <td class="px-3 py-1">
+                            <span class="relative inline-block cursor-help"
+                                  x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                              <span :class="ruleBadge(r.rule)"
+                                    class="px-2 py-0.5 rounded text-[10px] uppercase tracking-wide"
+                                    x-text="ruleLabelRu(r.rule)"></span>
+                              <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="ROBOTS_RULE_TIPS[r.rule] || ''"></span>
+                            </span>
+                          </td>
+                          <td class="px-3 py-1 text-[color:var(--brand-text-muted)]">
+                            <pre class="font-mono whitespace-pre-wrap" x-text="r.raw_directives || '-'"></pre>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </template>
+              <div x-show="groupedRobots.length === 0" class="text-[color:var(--brand-text-soft)] text-sm">Правил robots.txt не зафиксировано.</div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- ============ HISTORY ============ -->
+    <section x-show="tab === 'history'" class="space-y-3">
+      <div class="flex items-center gap-3 text-sm">
+        <button @click="refreshHistory()" class="px-3 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">
+          <span x-show="!historyLoading">Обновить</span>
+          <span x-show="historyLoading">Обновляю...</span>
+        </button>
+        <select x-model="historyStatusFilter"
+                class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)]">
+          <option value="all">Все статусы</option>
+          <option value="completed">Завершено</option>
+          <option value="failed">Ошибка</option>
+          <option value="crawling">Обход доменов</option>
+          <option value="analyzing">Анализ через LLM</option>
+          <option value="pending">Ожидание</option>
+        </select>
+        <span class="text-xs text-[color:var(--brand-text-muted)]" x-text="filteredHistory.length + ' проверок'"></span>
+        <span class="text-xs text-[color:var(--brand-text-soft)]" x-show="lastRefreshRel" x-text="'обновлено ' + lastRefreshRel"></span>
+      </div>
+
+      <div class="overflow-x-auto rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
+        <table class="w-full text-sm">
+          <thead class="text-[color:var(--brand-text-muted)] text-left">
+            <tr class="border-b border-[color:var(--brand-border)]">
+              <th class="px-3 py-2">Когда</th>
+              <th class="px-3 py-2">ID</th>
+              <th class="px-3 py-2">Статус</th>
+              <th class="px-3 py-2 text-right">Прогресс</th>
+              <th class="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="r in filteredHistory" :key="r.id">
+              <tr class="border-b border-[color:var(--brand-border)] hover:bg-[color:var(--brand-bg-soft)]">
+                <td class="px-3 py-1.5">
+                  <span x-text="relTime(r.created_at)"></span>
+                  <span class="text-[color:var(--brand-text-soft)] text-xs ml-1" :title="r.created_at" x-text="absTime(r.created_at)"></span>
+                </td>
+                <td class="px-3 py-1.5 font-mono text-xs" x-text="r.id.slice(0,8)"></td>
+                <td class="px-3 py-1.5">
+                  <span :class="statusBadgeClass(r.status)" class="px-2 py-0.5 rounded text-xs uppercase tracking-wide" x-text="statusLabelRu(r.status)"></span>
+                </td>
+                <td class="px-3 py-1.5 text-right text-[color:var(--brand-text-muted)] font-mono" x-text="r.progress_current + ' / ' + r.progress_total"></td>
+                <td class="px-3 py-1.5 text-right space-x-2 text-xs">
+                  <button @click="openRun(r.id)" class="text-[color:var(--brand-primary)] hover:underline">Открыть</button>
+                  <button @click="deleteRun(r.id)" class="text-[color:var(--brand-error)] hover:underline">Удалить</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="filteredHistory.length === 0">
+              <td colspan="5" class="px-3 py-6 text-center text-[color:var(--brand-text-soft)]">Проверок нет.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="mt-10 pt-4 border-t border-[color:var(--brand-border)] text-xs text-[color:var(--brand-text-soft)] flex items-center justify-between flex-wrap gap-2">
+      <div>© 2026 RW+. AI Visibility research toolkit</div>
+      <a href="https://rw.plus" target="_blank" rel="noopener" class="hover:text-[color:var(--brand-primary)]">rw.plus</a>
+    </footer>
+
+  </div>
+
+  <script src="/static/vendor/marked.min.js"></script>
+
+  <script>
+    const UA_GROUPS = [
+      { provider: 'OpenAI',     providerRu: 'OpenAI',                          labels: ['GPTBot', 'OAI-SearchBot', 'ChatGPT-User'] },
+      { provider: 'Anthropic',  providerRu: 'Anthropic',                       labels: ['ClaudeBot', 'anthropic-ai', 'Claude-Web'] },
+      { provider: 'Perplexity', providerRu: 'Perplexity',                      labels: ['PerplexityBot', 'Perplexity-User'] },
+      { provider: 'DeepSeek',   providerRu: 'DeepSeek (без официальной документации)',
+                                providerTip: 'Китайский AI-сервис, чей краулер не имеет официальной документации (в отличие от OpenAI, Anthropic, Perplexity, которые публично описывают свои боты). Имена DeepSeekBot и DeepSeek-User идентифицированы по наблюдениям сообщества - они массово встречаются в block-листах сайтов. Имитация менее достоверна чем для других провайдеров, но многие сайты явно блокируют именно эти имена, поэтому проверка имеет смысл. По умолчанию выключены - включайте если хотите учесть DeepSeek в анализе.',
+                                labels: ['DeepSeekBot', 'DeepSeek-User'] },
+      { provider: 'Controls',   providerRu: 'Контрольные запросы',             labels: ['Chrome-control', 'empty-ua'] },
+    ];
+    const UA_DEFAULTS = ['GPTBot', 'OAI-SearchBot', 'ClaudeBot', 'PerplexityBot', 'Chrome-control'];
+
+    const UA_TOOLTIPS = {
+      'GPTBot': 'Бот OpenAI, собирающий контент для обучения новых версий ChatGPT и для базы знаний модели.',
+      'OAI-SearchBot': 'Бот OpenAI, который ходит на сайты в момент когда пользователь задаёт ChatGPT вопрос с включённым поиском по интернету. От его доступа зависит, попадёт ли сайт в источники под ответом ChatGPT.',
+      'ChatGPT-User': 'Бот OpenAI, представляющий действия пользователя ChatGPT (когда ChatGPT по запросу пользователя открывает конкретный URL). Похож на OAI-SearchBot, но активируется иначе.',
+      'ClaudeBot': 'Бот Anthropic для обучения моделей Claude. Аналог GPTBot.',
+      'anthropic-ai': 'Старое имя бота Anthropic. Многие сайты блокируют именно его, не зная что есть и более новый ClaudeBot.',
+      'Claude-Web': 'Бот Anthropic для веб-поиска во время ответа Claude пользователю.',
+      'PerplexityBot': 'Бот Perplexity для индексации сайтов в их поисковую базу.',
+      'Perplexity-User': 'Бот Perplexity, активирующийся в момент запроса пользователя.',
+      'DeepSeekBot': 'Бот, предположительно используемый DeepSeek для тренировочного краулинга (аналог GPTBot и ClaudeBot). Имя идентифицировано по block-листам, не подтверждено официально.',
+      'DeepSeek-User': 'Предположительный бот для веб-поиска в момент ответа DeepSeek пользователю (аналог ChatGPT-User и Perplexity-User). Имя сконструировано по аналогии с другими провайдерами и логикой DeepSeek R1, который выполняет двухэтапный поиск (индекс плюс real-time crawling). Существование не подтверждено официально.',
+      'Chrome-control': 'Контрольный запрос обычным браузером (Chrome). Нужен чтобы сравнить - блокирует ли сайт именно AI-ботов или вообще любой нерезидентный трафик. Если Chrome тоже не пускают - значит проблема не в anti-AI политике, а в общей блокировке (часто гео-блокировка).',
+      'empty-ua': 'Запрос с пустой строкой User-Agent. Помогает выявить блокировки которые не зависят от конкретного бота.',
+    };
+
+    const SET_TITLES_RU = {
+      'set1_manual_research': 'Набор 1: Российская выборка из ручного исследования',
+      'set2_corpus_sources':  'Набор 2: Источники из корпуса исследований AI visibility',
+    };
+    const SET_HELP_RU = {
+      'set1_manual_research': '40 ключевых российских ресурсов из исходного исследования AI visibility - государственные порталы, медиа, e-commerce, экосистема Яндекса. Каждый домен имеет аннотацию о том что наблюдалось ранее.',
+      'set2_corpus_sources':  'Домены, которые ChatGPT, Claude и Perplexity цитировали как источники в реальных пользовательских запросах. Чем чаще встречается домен - тем более типичен он как источник для AI-помощников.',
+    };
+
+    const PROBE_COL_TIPS = {
+      'http_status':                     'HTTP-статус ответа сайта. 200 - OK, 4xx - клиентская ошибка / блок, 5xx - серверная ошибка.',
+      'response_size_bytes':             'Сколько байт сервер прислал в ответ. Большой размер обычно означает реальный контент, маленький - часто оболочку без контента (SPA-shell, captcha-страница, редирект).',
+      'content_extractable_text_length': 'Сколько символов осмысленного текста удалось извлечь из ответа без выполнения JavaScript. Главный показатель того, увидит ли AI реальный контент - если эта цифра меньше 500, то даже при HTTP 200 от сайта функционально это пустая страница.',
+      'total_time_ms':                   'Сколько миллисекунд заняла вся проверка - от старта запроса до получения тела ответа.',
+      'ttfb_ms':                         'Time to first byte - сколько миллисекунд прошло от отправки запроса до получения первого байта ответа. Косвенный показатель скорости и здоровья сайта.',
+      'detected_protections':            'Какие технические системы защиты сработали при запросе - WAF (Cloudflare, Qrator, DDoS-Guard, Variti), captcha (Yandex SmartCaptcha), редиректы, и так далее.',
+      'tls_ok':                          'Удалось ли установить безопасное TLS-соединение с сайтом. ✗ означает что сертификат не прошёл проверку - типично для российских сайтов с сертификатами Минцифры из-за рубежа.',
+    };
+
+    const ROBOTS_RULE_TIPS = {
+      'allow_all':     'Сайт явно разрешает этому боту ходить по всем страницам.',
+      'disallow_all':  'Сайт явно запрещает этому боту индексацию полностью.',
+      'partial':       'Сайт разрешает боту часть сайта, а часть запрещает.',
+      'not_mentioned': 'Сайт не упоминает этого бота вообще - значит, по умолчанию бот может ходить по сайту, никаких специальных правил для него нет.',
+    };
+
+    // Stepper definition: 5 visible steps. Backend has 4 LLM sub-steps that we
+    // collapse into 3 stepper entries (structural, categorical+visibility, final).
+    const STEPS = [
+      { key: 'prep',         label: 'Подготовка',            estimateLow: 1,   estimateHigh: 3,   estimateText: 'обычно ~2 сек' },
+      { key: 'crawl',        label: 'Обход доменов',         estimateLow: 5,   estimateHigh: 120, estimateText: 'зависит от числа доменов и параллельности' },
+      { key: 'llm_struct',   label: 'Структурный анализ',    estimateLow: 60,  estimateHigh: 300, estimateText: 'обычно 1-5 минут, на больших выборках до 7' },
+      { key: 'llm_cat',      label: 'Категориальный анализ', estimateLow: 120, estimateHigh: 360, estimateText: 'обычно 2-6 минут' },
+      { key: 'llm_final',    label: 'Финальный отчёт',       estimateLow: 180, estimateHigh: 600, estimateText: 'обычно 3-10 минут, для больших выборок до 15' },
+    ];
+
+    const LLM_FRIENDLY_PHRASES = {
+      'llm_struct': [
+        'Считаем сколько доменов открыто, сколько заблокировано...',
+        'Группируем сигналы по WAF-вендорам (Cloudflare, Qrator, Variti)...',
+        'Вычисляем распределение AI-visibility по выборке...',
+        'Находим выбросы и нестандартные паттерны...',
+        'Сводим robots.txt-декларации по каждому AI-боту...',
+        'Считаем долю формально-открытых, но фактически пустых доменов...',
+        'Раскладываем TLS-проблемы и связи с российскими сертификатами Минцифры...',
+        'Сопоставляем браузерные ответы и ответы AI-краулерам...',
+        'Ищем UA-conditional блокировки (где Chrome пускают, AI-ботов нет)...',
+        'Готовим JSON со структурой данных для следующего шага...',
+      ],
+      'llm_cat': [
+        'Группируем домены по функциональным категориям...',
+        'Анализируем паттерны доступности по категориям...',
+        'Сравниваем поведение разных AI-ботов на одних и тех же доменах...',
+        'Идентифицируем кросс-доменные тренды...',
+        'Думаем про маркетинговые последствия для каждой категории...',
+        'Разделяем госпорталы на доступные с зарубежного IP и недоступные...',
+        'Рассматриваем экосистему Яндекса как отдельный кейс...',
+        'Сопоставляем деловые медиа, классифайды и UGC-площадки...',
+        'Оцениваем эффект для PR, контент-стратегии и performance-маркетинга...',
+        'Формулируем гипотезу замещения: какие источники получат share of voice...',
+        'Проверяем гипотезы цифрами из исходных данных...',
+      ],
+      'llm_final': [
+        'Собираем управленческий вывод первым абзацем...',
+        'Пишем сводную таблицу по доменам с маркетинговым сигналом...',
+        'Раскрываем главный вывод для CMO...',
+        'Описываем разрезы по категориям с переплетением техники и маркетинга...',
+        'Описываем технический слой защиты простым языком...',
+        'Формулируем эффект замещения и кто выигрывает в AI-ответах...',
+        'Прорабатываем асимметрию между OpenAI, Anthropic, Perplexity, DeepSeek...',
+        'Готовим практические рекомендации по ролям (CMO, контент, performance, PR)...',
+        'Перевожу технические наблюдения в маркетинговые последствия...',
+        'Объясняем технические термины для маркетингового читателя...',
+        'Проверяем стиль: убираю шаблонные обороты и LLM-tells...',
+        'Финализируем отчёт и проверяю длину разделов...',
+      ],
+    };
+
+    function htmlEscape(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function app() {
+      return {
+        // tabs
+        tab: 'new_run',
+
+        // form
+        uaGroups: UA_GROUPS,
+        UA_TOOLTIPS,
+        ROBOTS_RULE_TIPS,
+        form: {
+          domainsText: '',
+          uaSelected: {},
+          concurrency: 8,
+          timeoutSeconds: 15,
+        },
+        formError: null,
+        defaultsMessage: '',
+        submitting: false,
+
+        // active run
+        currentRunId: null,
+        runDetails: null,
+        runStatus: 'pending',
+        progress: { current: 0, total: 0 },
+        progressPhase: null,
+        runStartTs: null,
+        runEndTs: null,
+        isLiveRun: false,
+        eventSource: null,
+        // (reconnect handled natively by EventSource via Last-Event-ID)
+
+        // log
+        logEntries: [],
+        logFilters: { INFO: true, PROBE: true, PHASE: true },
+        autoscrollOn: true,
+
+        // results
+        resultsTab: 'report',
+        probesFilter: '',
+        probesSort: { col: 'domain', dir: 'asc' },
+        expandedProbeId: null,
+        copyToast: '',
+
+        // history
+        historyList: [],
+        historyStatusFilter: 'all',
+        historyRefreshTimer: null,
+        historyLoading: false,
+        lastRefreshTs: null,
+
+        // sets
+        setsMeta: [],
+        setsState: {},
+        setsLoadError: '',
+        set1AnnotMap: {},
+
+        // stepper / timers
+        stepStartTs: {},     // key -> ms
+        stepEndTs: {},       // key -> ms
+        stepStatusOverride: {}, // 'failed' for the step that failed
+        currentLlmKey: null, // 'llm_struct' | 'llm_cat' | 'llm_final'
+        llmFriendlyPhraseIdx: 0,
+        llmFriendlyMessage: '',
+        _llmPhraseTimer: null,
+
+        // tick
+        _tick: 0,
+
+        init() {
+          for (const g of UA_GROUPS) {
+            for (const lbl of g.labels) {
+              this.form.uaSelected[lbl] = UA_DEFAULTS.includes(lbl);
+            }
+          }
+          // 1s tick drives all live timers
+          setInterval(() => { this._tick = (this._tick || 0) + 1; }, 1000);
+          window.addEventListener('beforeunload', () => this.closeSSE());
+          this.$watch('tab', (t) => {
+            if (t === 'history') {
+              this.refreshHistory();
+              this.startHistoryAutoRefresh();
+            } else {
+              this.stopHistoryAutoRefresh();
+            }
+          });
+          this.loadSetsMeta();
+        },
+
+        // ----- form-side getters -----
+        get customDomains() {
+          const seen = new Set(); const out = [];
+          // Accept comma, newline, semicolon, whitespace as separators.
+          const tokens = (this.form.domainsText || '').split(/[\s,;]+/);
+          for (let line of tokens) {
+            line = line.trim();
+            if (!line) continue;
+            line = line.replace(/^https?:\/\//i, '');
+            line = line.replace(/^www\./i, '');
+            const slash = line.indexOf('/');
+            if (slash !== -1) line = line.slice(0, slash);
+            line = line.toLowerCase();
+            if (!line || seen.has(line)) continue;
+            seen.add(line); out.push(line);
+          }
+          return out;
+        },
+        get parsedDomains() { return this.finalDomains; },
+        get finalDomains() {
+          const seen = new Set(); const out = [];
+          for (const meta of this.setsMeta) {
+            const st = this.setsState[meta.id];
+            if (!st || !st.enabled) continue;
+            for (const d of st.selected) {
+              const norm = (d || '').toLowerCase().replace(/^www\./, '');
+              if (norm && !seen.has(norm)) { seen.add(norm); out.push(norm); }
+            }
+          }
+          for (const d of this.customDomains) {
+            if (!seen.has(d)) { seen.add(d); out.push(d); }
+          }
+          return out;
+        },
+        get sourceBreakdown() {
+          let s1 = 0, s2 = 0;
+          for (const meta of this.setsMeta) {
+            const st = this.setsState[meta.id];
+            if (!st || !st.enabled) continue;
+            const n = st.selected.size;
+            if (meta.id === 'set1_manual_research') s1 = n;
+            else if (meta.id === 'set2_corpus_sources') s2 = n;
+          }
+          const custom = this.customDomains.length;
+          const raw = s1 + s2 + custom;
+          const final = this.finalDomains.length;
+          return { set1_selected: s1, set2_selected: s2, custom, deduplicated_removed: Math.max(0, raw - final) };
+        },
+        get setsLoading() {
+          return Object.values(this.setsState).some(st => st && st.enabled && st.loading);
+        },
+        get selectedUaCount() {
+          return Object.values(this.form.uaSelected).filter(Boolean).length;
+        },
+        get totalProbeEstimate() {
+          return this.finalDomains.length * (this.selectedUaCount + 1);
+        },
+        get timeEstimateText() {
+          const base = Math.ceil(this.totalProbeEstimate / Math.max(1, this.form.concurrency) * 1.5);
+          const total = base + 60;
+          if (total < 60) return total + ' сек';
+          return Math.ceil(total / 60) + ' мин';
+        },
+
+        // ----- run timers -----
+        get totalElapsedSec() {
+          this._tick;
+          if (!this.runStartTs) return 0;
+          const end = this.runEndTs || Date.now();
+          return Math.max(0, Math.round((end - this.runStartTs) / 1000));
+        },
+        get llmStepElapsedSec() {
+          this._tick;
+          if (!this.currentLlmKey) return 0;
+          const t0 = this.stepStartTs[this.currentLlmKey];
+          if (!t0) return 0;
+          const t1 = this.stepEndTs[this.currentLlmKey] || Date.now();
+          return Math.max(0, Math.round((t1 - t0) / 1000));
+        },
+        get isLlmActive() {
+          return this.currentLlmKey !== null && this.runStatus === 'analyzing';
+        },
+        get currentLlmStepEstimate() {
+          const def = STEPS.find(s => s.key === this.currentLlmKey);
+          return def ? def.estimateText : '';
+        },
+        get stepperState() {
+          this._tick;
+          // Compute status per step from start/end timestamps.
+          const out = [];
+          for (const def of STEPS) {
+            let status = 'idle';
+            if (this.stepStatusOverride[def.key] === 'failed') status = 'failed';
+            else if (this.stepEndTs[def.key]) status = 'done';
+            else if (this.stepStartTs[def.key]) status = 'active';
+            out.push({
+              key: def.key,
+              label: def.label,
+              estimateLow: def.estimateLow,
+              estimateHigh: def.estimateHigh,
+              estimateText: def.estimateText,
+              status,
+            });
+          }
+          return out;
+        },
+        stepHint(s) {
+          const t0 = this.stepStartTs[s.key];
+          const t1 = this.stepEndTs[s.key];
+          if (s.status === 'idle') return '';
+          if (s.status === 'done' && t0 && t1) {
+            const sec = Math.round((t1 - t0) / 1000);
+            return 'завершено за ' + sec + ' сек';
+          }
+          if (s.status === 'failed') return 'не удалось';
+          if (s.status === 'active' && t0) {
+            this._tick;
+            const sec = Math.round((Date.now() - t0) / 1000);
+            if (sec > s.estimateHigh * 2) return 'идёт ' + sec + ' сек / необычно долго';
+            if (sec > s.estimateHigh) return 'идёт ' + sec + ' сек / ' + s.estimateText + ', но может занять дольше';
+            return 'идёт ' + sec + ' сек / ' + s.estimateText;
+          }
+          return '';
+        },
+
+        // ----- helpers (i18n / branding) -----
+        statusLabelRu(s) {
+          return ({
+            crawling: 'Обход доменов',
+            analyzing: 'Анализ через LLM',
+            completed: 'Завершено',
+            failed: 'Ошибка',
+            pending: 'Ожидание запуска',
+          })[s] || s;
+        },
+        ruleLabelRu(rule) {
+          return ({
+            allow_all:     'разрешено',
+            disallow_all:  'запрещено',
+            partial:       'частично',
+            not_mentioned: 'не упомянут',
+          })[rule] || rule;
+        },
+        statusBadgeClass(s) {
+          return ({
+            crawling:  'bg-blue-950/60 text-blue-300 border border-blue-900',
+            analyzing: 'bg-purple-950/60 text-purple-300 border border-purple-900',
+            completed: 'bg-emerald-950/60 text-emerald-300 border border-emerald-900',
+            failed:    'bg-red-950/60 text-red-300 border border-red-900',
+            pending:   'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-text-soft)] border border-[color:var(--brand-border)]',
+          })[s] || 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-text-soft)]';
+        },
+        statusColor(status, errorClass) {
+          if (errorClass) return 'text-[color:var(--brand-error)]';
+          if (status == null) return 'text-[color:var(--brand-text-soft)]';
+          if (status >= 200 && status < 300) return 'text-[color:var(--brand-success)]';
+          if (status >= 300 && status < 400) return 'text-[color:var(--brand-info)]';
+          if (status >= 400 && status < 500) return 'text-[color:var(--brand-warn)]';
+          if (status >= 500) return 'text-[color:var(--brand-error)]';
+          return '';
+        },
+        ruleBadge(rule) {
+          return ({
+            disallow_all: 'bg-red-950/60 text-red-300 border border-red-900',
+            partial:      'bg-amber-950/60 text-amber-300 border border-amber-900',
+            allow_all:    'bg-emerald-950/60 text-emerald-300 border border-emerald-900',
+            not_mentioned:'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-text-soft)] border border-[color:var(--brand-border)]',
+          })[rule] || 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-text-soft)]';
+        },
+        renderMarkers(markers) {
+          if (!markers || !markers.length) return '<span class="text-[color:var(--brand-text-soft)]">-</span>';
+          return markers.map(m => {
+            const bad = /challenge|ua-conditional|tls-block|empty-shell|content-shell|content-login-wall/.test(m);
+            const cls = bad ? 'text-[color:var(--brand-error)]' : 'text-[color:var(--brand-text-muted)]';
+            return '<span class="' + cls + '">' + htmlEscape(m) + '</span>';
+          }).join('<span class="text-[color:var(--brand-text-soft)]">, </span>');
+        },
+        formatBytes(n) {
+          if (n == null) return '-';
+          if (n < 1024) return n + 'B';
+          if (n < 1024*1024) return (n/1024).toFixed(0) + 'KB';
+          return (n/1024/1024).toFixed(1) + 'MB';
+        },
+        formatHMS(s) {
+          s = Math.max(0, Math.round(s));
+          const m = Math.floor(s/60);
+          const sec = s % 60;
+          if (m < 60) return m + ':' + String(sec).padStart(2,'0');
+          const h = Math.floor(m/60);
+          return h + ':' + String(m%60).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
+        },
+        relTime(iso) {
+          this._tick;
+          const t = typeof iso === 'string' ? Date.parse(iso) : iso;
+          if (!t) return '-';
+          const s = Math.round((Date.now() - t) / 1000);
+          if (s < 5) return 'только что';
+          if (s < 60) return s + ' сек назад';
+          if (s < 3600) return Math.floor(s/60) + ' мин назад';
+          if (s < 86400) return Math.floor(s/3600) + ' ч назад';
+          return Math.floor(s/86400) + ' д назад';
+        },
+        absTime(iso) {
+          if (!iso) return '';
+          return new Date(iso).toLocaleString('ru-RU');
+        },
+        get lastRefreshRel() {
+          if (!this.lastRefreshTs) return '';
+          this._tick;
+          const s = Math.round((Date.now() - this.lastRefreshTs) / 1000);
+          if (s < 5) return 'только что';
+          if (s < 60) return s + ' сек назад';
+          if (s < 3600) return Math.floor(s/60) + ' мин назад';
+          return Math.floor(s/3600) + ' ч назад';
+        },
+
+        // ----- sets -----
+        setTitleRu(meta) { return SET_TITLES_RU[meta.id] || meta.title; },
+        setHelpRu(meta)  { return SET_HELP_RU[meta.id] || meta.description || ''; },
+        async loadSetsMeta() {
+          this.setsLoadError = '';
+          try {
+            const r = await fetch('/api/sets');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.setsMeta = await r.json();
+            for (const m of this.setsMeta) {
+              if (!this.setsState[m.id]) {
+                this.setsState[m.id] = {
+                  enabled: m.id === 'set1_manual_research',
+                  expanded: false,
+                  loading: false, error: '', data: null,
+                  selected: new Set(), filter: '', catFilter: 'all', showAll: false,
+                };
+              }
+            }
+            const def = this.setsMeta.find(m => m.id === 'set1_manual_research');
+            if (def && this.setsState[def.id].enabled) await this.ensureSetData(def.id);
+          } catch (e) {
+            this.setsLoadError = 'Не удалось загрузить наборы: ' + e.message;
+          }
+        },
+        async ensureSetData(setId) {
+          const st = this.setsState[setId];
+          if (!st || st.data || st.loading) return;
+          st.loading = true; st.error = '';
+          try {
+            const r = await fetch('/api/sets/' + encodeURIComponent(setId));
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const data = await r.json();
+            st.data = data;
+            st.selected = new Set(this.allDomainsForSet(data));
+            if (setId === 'set1_manual_research' && data.annotations) {
+              this.set1AnnotMap = Object.assign({}, data.annotations);
+            }
+          } catch (e) {
+            st.error = 'Не удалось загрузить: ' + e.message;
+          } finally {
+            st.loading = false;
+          }
+        },
+        allDomainsForSet(data) {
+          if (!data) return [];
+          if (Array.isArray(data.categories)) {
+            const out = [];
+            for (const c of data.categories) for (const d of (c.domains || [])) out.push(d);
+            return out;
+          }
+          if (Array.isArray(data.domains)) {
+            return data.domains.map(d => typeof d === 'string' ? d : d.domain);
+          }
+          return [];
+        },
+        async toggleSetExpanded(setId) {
+          const st = this.setsState[setId];
+          if (!st) return;
+          st.expanded = !st.expanded;
+          if (st.expanded) await this.ensureSetData(setId);
+        },
+        async toggleSetEnabled(setId, enabled) {
+          const st = this.setsState[setId];
+          if (!st) return;
+          st.enabled = enabled;
+          if (enabled) await this.ensureSetData(setId);
+        },
+        setSelectedCount(setId) {
+          const st = this.setsState[setId];
+          if (!st) return 0;
+          if (!st.enabled) return 0;
+          if (st.data) return st.selected.size;
+          const meta = this.setsMeta.find(m => m.id === setId);
+          return meta ? meta.domain_count : 0;
+        },
+        toggleSetDomain(setId, domain, on) {
+          const st = this.setsState[setId];
+          if (!st) return;
+          const next = new Set(st.selected);
+          if (on) next.add(domain); else next.delete(domain);
+          st.selected = next;
+        },
+        selectAllInSet(setId) {
+          const st = this.setsState[setId];
+          if (!st || !st.data) return;
+          st.selected = new Set(this.allDomainsForSet(st.data));
+        },
+        deselectAllInSet(setId) {
+          const st = this.setsState[setId];
+          if (!st) return;
+          st.selected = new Set();
+        },
+        categoryAllSelected(setId, cat) {
+          const st = this.setsState[setId];
+          if (!st) return false;
+          for (const d of (cat.domains || [])) if (!st.selected.has(d)) return false;
+          return (cat.domains || []).length > 0;
+        },
+        toggleCategory(setId, cat, on) {
+          const st = this.setsState[setId];
+          if (!st) return;
+          const next = new Set(st.selected);
+          for (const d of (cat.domains || [])) {
+            if (on) next.add(d); else next.delete(d);
+          }
+          st.selected = next;
+        },
+        flatCategoryOptions(setId) {
+          const st = this.setsState[setId];
+          if (!st || !st.data || !Array.isArray(st.data.domains)) return [];
+          const cats = new Set();
+          for (const d of st.data.domains) cats.add(d.category_guess || '(без категории)');
+          return Array.from(cats).sort();
+        },
+        flatVisibleDomains(setId) {
+          const st = this.setsState[setId];
+          if (!st || !st.data || !Array.isArray(st.data.domains)) return [];
+          const q = (st.filter || '').trim().toLowerCase();
+          const cf = st.catFilter || 'all';
+          let arr = st.data.domains;
+          if (q) arr = arr.filter(d => d.domain.toLowerCase().includes(q));
+          if (cf !== 'all') arr = arr.filter(d => (d.category_guess || '(без категории)') === cf);
+          return arr;
+        },
+        flatRenderedDomains(setId) {
+          const st = this.setsState[setId];
+          const arr = this.flatVisibleDomains(setId);
+          if (!st || st.showAll) return arr;
+          if (arr.length <= 100) return arr;
+          return arr.slice(0, 100);
+        },
+        flatHasMore(setId) {
+          const st = this.setsState[setId];
+          if (!st || st.showAll) return false;
+          return this.flatVisibleDomains(setId).length > 100;
+        },
+
+        // ----- form actions -----
+        selectAllUas() {
+          for (const g of UA_GROUPS) for (const l of g.labels) this.form.uaSelected[l] = true;
+        },
+        resetUasToDefaults() {
+          for (const g of UA_GROUPS) for (const l of g.labels) this.form.uaSelected[l] = UA_DEFAULTS.includes(l);
+        },
+        async startRun() {
+          this.formError = null;
+          if (this.setsLoading) { this.formError = 'Дождитесь загрузки выбранных наборов.'; return; }
+          if (this.finalDomains.length === 0) { this.formError = 'Нужен хотя бы один домен.'; return; }
+          if (this.selectedUaCount === 0) { this.formError = 'Выберите хотя бы один AI-краулер.'; return; }
+          this.submitting = true;
+          try {
+            const uas = [];
+            for (const g of UA_GROUPS) for (const l of g.labels) if (this.form.uaSelected[l]) uas.push(l);
+            const payload = {
+              domains: this.finalDomains,
+              user_agents: uas,
+              concurrency: this.form.concurrency,
+              timeout_seconds: this.form.timeoutSeconds,
+              source_breakdown: this.sourceBreakdown,
+            };
+            const r = await fetch('/api/runs', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify(payload),
+            });
+            if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0, 200));
+            const data = await r.json();
+            await this.openRun(data.run_id, { live: true });
+          } catch (e) {
+            this.formError = 'Не удалось запустить проверку: ' + e.message;
+          } finally {
+            this.submitting = false;
+          }
+        },
+
+        // ----- run open / SSE -----
+        setTab(t) { this.tab = t; },
+        async openRun(runId, opts = {}) {
+          this.closeSSE();
+          this._stopPhraseRotator();
+          this.currentRunId = runId;
+          this.runDetails = null;
+          this.runStatus = 'pending';
+          this.progress = { current: 0, total: 0 };
+          this.progressPhase = null;
+          this.runStartTs = null;
+          this.runEndTs = null;
+          this.logEntries = [];
+          this.expandedProbeId = null;
+          this.resultsTab = 'report';
+          this.probesFilter = '';
+          this.copyToast = '';
+          this.stepStartTs = {};
+          this.stepEndTs = {};
+          this.stepStatusOverride = {};
+          this.currentLlmKey = null;
+          this.tab = 'active_run';
+
+          await this.fetchRunDetails(runId);
+
+          const live = opts.live === true || (this.runDetails && (this.runDetails.status === 'pending' || this.runDetails.status === 'crawling' || this.runDetails.status === 'analyzing'));
+          this.isLiveRun = !!live;
+          if (live) {
+            // mark prep as instant-done at start
+            this.runStartTs = Date.now();
+            this.stepStartTs.prep = this.runStartTs;
+            this.stepEndTs.prep = this.runStartTs;
+            this.connectSSE(runId);
+          } else if (this.runDetails) {
+            this.runStatus = this.runDetails.status;
+            this.progress = { current: this.runDetails.progress_current, total: this.runDetails.progress_total };
+            this.progressPhase = null;
+            this.runStartTs = this.runDetails.created_at ? Date.parse(this.runDetails.created_at) : null;
+            this.runEndTs = this.runStartTs;
+            // Mark completed runs all-done in stepper for visual continuity.
+            if (this.runStatus === 'completed') {
+              const now = this.runStartTs || Date.now();
+              for (const s of STEPS) { this.stepStartTs[s.key] = now; this.stepEndTs[s.key] = now; }
+            } else if (this.runStatus === 'failed') {
+              this.stepStatusOverride['llm_final'] = 'failed';
+            }
+          }
+        },
+        closeSSE() {
+          if (this.eventSource) { this.eventSource.close(); this.eventSource = null; }
+        },
+        connectSSE(runId) {
+          this.closeSSE();
+          // Native EventSource handles reconnect itself and automatically
+          // includes Last-Event-ID on each reconnect attempt. The backend
+          // (event_bus history + replay in /api/runs/{id}/events) uses that
+          // header to redeliver events missed during a network blip. We only
+          // close the connection explicitly when a `final` event arrives or
+          // the user navigates away — never on onerror.
+          const es = new EventSource('/api/runs/' + runId + '/events');
+          es.onmessage = (ev) => {
+            try { this.handleEvent(JSON.parse(ev.data)); } catch (e) {}
+          };
+          es.onerror = () => {
+            // Do nothing. Native EventSource will reconnect with Last-Event-ID
+            // and the server will replay missed events from its ring buffer.
+          };
+          this.eventSource = es;
+        },
+        handleEvent(evt) {
+          // text-based detection of LLM sub-step transitions.
+          // UI step "llm_cat" wraps TWO backend sub-steps: categorical-analysis
+          // and ai-visibility-implications. We start it on the first sub-step's
+          // "starting" log and only close it on the second sub-step's "done"
+          // log — otherwise the stepper would visually finish llm_cat midway
+          // and leave a 60-100s gap with no active step before final-report.
+          if (evt.type === 'log' && typeof evt.message === 'string') {
+            const m = evt.message;
+            if (m.includes('LLM step: structural-analysis starting')) this._startStep('llm_struct');
+            if (m.includes('LLM step: structural-analysis done'))     this._finishStep('llm_struct');
+            if (m.includes('LLM step: categorical-analysis starting')) this._startStep('llm_cat');
+            // ignore 'categorical-analysis done' and 'ai-visibility-implications starting' —
+            // they are internal transitions inside the llm_cat UI step.
+            if (m.includes('LLM step: ai-visibility-implications done')) this._finishStep('llm_cat');
+            if (m.includes('LLM step: final-report starting')) this._startStep('llm_final');
+            if (m.includes('LLM step: final-report done'))     this._finishStep('llm_final');
+          }
+          switch (evt.type) {
+            case 'log':
+            case 'probe_done':
+            case 'phase_change':
+              this.pushLog(evt);
+              break;
+            case 'progress':
+              this.progress = { current: evt.current, total: evt.total };
+              this.progressPhase = evt.phase;
+              break;
+            case 'final':
+              this.runStatus = evt.status === 'completed' ? 'completed' : 'failed';
+              this.runEndTs = Date.now();
+              if (this.runStatus === 'completed') {
+                // make sure all 5 steps look done
+                for (const s of STEPS) {
+                  if (!this.stepStartTs[s.key]) this.stepStartTs[s.key] = this.runEndTs;
+                  if (!this.stepEndTs[s.key]) this.stepEndTs[s.key] = this.runEndTs;
+                }
+                this.currentLlmKey = null;
+                this._stopPhraseRotator();
+              } else {
+                // mark whichever LLM step was active as failed
+                if (this.currentLlmKey) {
+                  this.stepStatusOverride[this.currentLlmKey] = 'failed';
+                }
+                this._stopPhraseRotator();
+              }
+              this.closeSSE();
+              this.fetchRunDetails(this.currentRunId);
+              return;
+          }
+          if (evt.type === 'phase_change') {
+            const phase = evt.phase;
+            if (phase === 'crawling_started') {
+              this.runStatus = 'crawling'; this.progressPhase = 'crawling';
+              if (!this.runStartTs) this.runStartTs = Date.now();
+              this._startStep('crawl');
+            } else if (phase === 'crawling_done') {
+              this._finishStep('crawl');
+            } else if (phase === 'analyzing_started') {
+              this.runStatus = 'analyzing'; this.progressPhase = 'analyzing';
+              this.progress = { current: 0, total: 4 };
+            } else if (phase === 'analyzing_done') {
+              // followed by 'completed' phase shortly
+            } else if (phase === 'completed') {
+              this.runStatus = 'completed';
+              if (this.currentLlmKey) this._finishStep(this.currentLlmKey);
+              this.currentLlmKey = null;
+              this._stopPhraseRotator();
+            } else if (phase === 'failed') {
+              this.runStatus = 'failed';
+              if (this.currentLlmKey) this.stepStatusOverride[this.currentLlmKey] = 'failed';
+              this._stopPhraseRotator();
+            }
+          }
+          if (evt.type === 'log' && this.runStartTs == null) this.runStartTs = Date.now();
+        },
+        _startStep(key) {
+          if (!this.stepStartTs[key]) this.stepStartTs[key] = Date.now();
+          // promote to currentLlmKey for friendly-message rotator
+          if (key === 'llm_struct' || key === 'llm_cat' || key === 'llm_final') {
+            this.currentLlmKey = key;
+            this._restartPhraseRotator();
+          }
+        },
+        _finishStep(key) {
+          if (!this.stepStartTs[key]) this.stepStartTs[key] = Date.now();
+          this.stepEndTs[key] = Date.now();
+          if (this.currentLlmKey === key) {
+            this.currentLlmKey = null;
+            this._stopPhraseRotator();
+          }
+        },
+        _restartPhraseRotator() {
+          this._stopPhraseRotator();
+          this.llmFriendlyPhraseIdx = 0;
+          const tick = () => {
+            const phrases = LLM_FRIENDLY_PHRASES[this.currentLlmKey] || [];
+            if (!phrases.length) return;
+            this.llmFriendlyMessage = phrases[this.llmFriendlyPhraseIdx % phrases.length];
+            this.llmFriendlyPhraseIdx++;
+          };
+          tick();
+          this._llmPhraseTimer = setInterval(tick, 10000);
+        },
+        _stopPhraseRotator() {
+          if (this._llmPhraseTimer) { clearInterval(this._llmPhraseTimer); this._llmPhraseTimer = null; }
+          this.llmFriendlyMessage = '';
+        },
+        pushLog(evt) {
+          this.logEntries.push(evt);
+          if (this.logEntries.length > 5000) this.logEntries.splice(0, this.logEntries.length - 5000);
+          if (this.autoscrollOn) {
+            this.$nextTick(() => {
+              const p = this.$refs.logPanel;
+              if (p) p.scrollTop = p.scrollHeight;
+            });
+          }
+        },
+        onLogScroll(ev) {
+          const el = ev.target;
+          this.autoscrollOn = (el.scrollHeight - el.scrollTop - el.clientHeight) < 50;
+        },
+        async fetchRunDetails(runId) {
+          try {
+            const r = await fetch('/api/runs/' + runId);
+            if (!r.ok) return;
+            const data = await r.json();
+            this.runDetails = data;
+            if (!this.runStartTs && data.created_at) this.runStartTs = Date.parse(data.created_at);
+            if (data.status === 'completed' || data.status === 'failed') {
+              this.runStatus = data.status;
+              this.progress = { current: data.progress_current, total: data.progress_total };
+            }
+          } catch (e) {}
+        },
+
+        // ----- results actions -----
+        copyLog() {
+          const text = this.logEntries.map(e => this.logLineText(e)).join('\n');
+          navigator.clipboard.writeText(text).then(() => this.flashToast('Лог скопирован'));
+        },
+        copyMarkdown() {
+          const md = this.runDetails?.analysis_markdown || '';
+          navigator.clipboard.writeText(md).then(() => this.flashToast('Markdown скопирован'));
+        },
+        downloadMarkdown() {
+          const md = this.runDetails?.analysis_markdown || '';
+          const blob = new Blob([md], { type: 'text/markdown' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'rwplus-ai-visibility-' + (this.currentRunId || 'run').slice(0,8) + '.md';
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(url);
+        },
+        flashToast(msg) {
+          this.copyToast = msg;
+          setTimeout(() => { this.copyToast = ''; }, 2000);
+        },
+        toggleProbe(id) { this.expandedProbeId = this.expandedProbeId === id ? null : id; },
+        setProbesSort(col) {
+          if (this.probesSort.col === col) {
+            this.probesSort.dir = this.probesSort.dir === 'asc' ? 'desc' : 'asc';
+          } else {
+            this.probesSort = { col, dir: 'asc' };
+          }
+        },
+        get probeColumns() {
+          return [
+            { key: 'domain',                            label: 'Домен',     tip: null },
+            { key: 'user_agent_label',                  label: 'AI-краулер', tip: null },
+            { key: 'probe_type',                        label: 'Тип',        tip: null },
+            { key: 'http_status',                       label: 'HTTP',       tip: PROBE_COL_TIPS.http_status },
+            { key: 'response_size_bytes',               label: 'Размер',     tip: PROBE_COL_TIPS.response_size_bytes },
+            { key: 'content_extractable_text_length',   label: 'Текст',      tip: PROBE_COL_TIPS.content_extractable_text_length },
+            { key: 'total_time_ms',                     label: 'Время',      tip: PROBE_COL_TIPS.total_time_ms },
+            { key: 'ttfb_ms',                           label: 'TTFB',       tip: PROBE_COL_TIPS.ttfb_ms },
+            { key: 'tls_ok',                            label: 'TLS',        tip: PROBE_COL_TIPS.tls_ok },
+            { key: 'detected_protections',              label: 'Защиты',     tip: PROBE_COL_TIPS.detected_protections },
+            { key: 'final_url',                         label: 'Финальный URL', tip: null },
+          ];
+        },
+        get filteredProbes() {
+          let arr = (this.runDetails?.probes || []).slice();
+          const q = this.probesFilter.trim().toLowerCase();
+          if (q) {
+            arr = arr.filter(p =>
+              (p.domain || '').toLowerCase().includes(q) ||
+              (p.user_agent_label || '').toLowerCase().includes(q));
+          }
+          const { col, dir } = this.probesSort;
+          arr.sort((a, b) => {
+            let av = a[col], bv = b[col];
+            if (av == null) av = '';
+            if (bv == null) bv = '';
+            if (typeof av === 'number' && typeof bv === 'number') return dir === 'asc' ? av - bv : bv - av;
+            av = String(av); bv = String(bv);
+            return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+          });
+          return arr;
+        },
+        get expandedProbe() {
+          if (this.expandedProbeId == null) return null;
+          return (this.runDetails?.probes || []).find(p => p.id === this.expandedProbeId) || null;
+        },
+        get groupedRobots() {
+          const m = new Map();
+          for (const r of (this.runDetails?.robots_rules || [])) {
+            if (!m.has(r.domain)) m.set(r.domain, []);
+            m.get(r.domain).push(r);
+          }
+          return Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([domain, rules]) => ({ domain, rules }));
+        },
+        get filteredHistory() {
+          let arr = this.historyList.slice();
+          if (this.historyStatusFilter !== 'all') arr = arr.filter(r => r.status === this.historyStatusFilter);
+          return arr;
+        },
+        get renderedReport() {
+          const md = this.runDetails?.analysis_markdown || '';
+          if (!md) return '';
+          try { return marked.parse(md); } catch { return htmlEscape(md); }
+        },
+
+        // ----- history -----
+        async refreshHistory() {
+          this.historyLoading = true;
+          try {
+            const r = await fetch('/api/runs');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.historyList = await r.json();
+            this.lastRefreshTs = Date.now();
+          } catch (e) {} finally { this.historyLoading = false; }
+        },
+        startHistoryAutoRefresh() {
+          this.stopHistoryAutoRefresh();
+          this.historyRefreshTimer = setInterval(() => this.refreshHistory(), 30000);
+        },
+        stopHistoryAutoRefresh() {
+          if (this.historyRefreshTimer) { clearInterval(this.historyRefreshTimer); this.historyRefreshTimer = null; }
+        },
+        async deleteRun(id) {
+          if (!confirm('Удалить проверку ' + id.slice(0,8) + '?')) return;
+          try {
+            const r = await fetch('/api/runs/' + id, { method: 'DELETE' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.historyList = this.historyList.filter(x => x.id !== id);
+            if (this.currentRunId === id) {
+              this.closeSSE();
+              this.currentRunId = null;
+              this.runDetails = null;
+            }
+          } catch (e) { alert('Не удалось удалить: ' + e.message); }
+        },
+
+        // ----- log rendering -----
+        logCategory(e) {
+          if (e.type === 'probe_done') return 'PROBE';
+          if (e.type === 'phase_change') return 'PHASE';
+          return 'INFO';
+        },
+        logTimestamp(e) {
+          if (!e.ts) return '';
+          const d = new Date(e.ts);
+          const hh = String(d.getHours()).padStart(2, '0');
+          const mm = String(d.getMinutes()).padStart(2, '0');
+          const ss = String(d.getSeconds()).padStart(2, '0');
+          const ms = String(d.getMilliseconds()).padStart(3, '0');
+          return hh + ':' + mm + ':' + ss + '.' + ms;
+        },
+        logLineText(e) {
+          const ts = this.logTimestamp(e);
+          if (e.type === 'phase_change') return ts + '  PHASE  --- ' + e.phase + ' ---';
+          if (e.type === 'probe_done') {
+            return ts + '  PROBE  ' + (e.domain || '').padEnd(22, ' ')
+              + ' ' + (e.user_agent_label || '').padEnd(15, ' ')
+              + ' ' + (e.http_status ?? '-')
+              + '  ' + (e.summary || '');
+          }
+          return ts + '  ' + (e.level || 'info').toUpperCase().padEnd(6, ' ') + ' ' + (e.message || '');
+        },
+        renderLogLine(e) {
+          const ts = '<span class="text-[color:var(--brand-text-soft)]">' + htmlEscape(this.logTimestamp(e)) + '</span>';
+          if (e.type === 'phase_change') {
+            return '<div class="border-t border-[color:var(--brand-border)] mt-2 pt-1 text-purple-700">'
+              + ts + '  <span class="font-semibold">ФАЗА</span>  --- ' + htmlEscape(e.phase || '') + ' ---</div>';
+          }
+          if (e.type === 'probe_done') {
+            const status = e.http_status;
+            const statusCls = this.statusColor(status, null);
+            const dom = htmlEscape((e.domain || '').padEnd(22, ' ').slice(0, 28));
+            const ua = htmlEscape((e.user_agent_label || '').padEnd(15, ' ').slice(0, 18));
+            return ts + '  <span class="text-[color:var(--brand-text-soft)]">PROBE</span>  '
+              + '<span>' + dom + '</span> '
+              + '<span class="text-[color:var(--brand-text-muted)]">' + ua + '</span> '
+              + '<span class="' + statusCls + ' font-semibold">' + htmlEscape(status ?? '-') + '</span>  '
+              + '<span class="text-[color:var(--brand-text-muted)]">' + htmlEscape(e.summary || '') + '</span>';
+          }
+          const lvl = (e.level || 'info').toLowerCase();
+          const lvlMap = { info: 'text-[color:var(--brand-text-muted)]', warn: 'text-[color:var(--brand-warn)]', error: 'text-[color:var(--brand-error)]' };
+          const lvlCls = lvlMap[lvl] || 'text-[color:var(--brand-text-muted)]';
+          const lvlStr = lvl.toUpperCase().padEnd(5, ' ');
+          return ts + '  <span class="' + lvlCls + '">' + htmlEscape(lvlStr) + '</span>  '
+            + '<span>' + htmlEscape(e.message || '') + '</span>';
+        },
+      };
+    }
+  </script>
+
+  <script defer src="/static/vendor/alpine.min.js"></script>
+</body>
+</html>

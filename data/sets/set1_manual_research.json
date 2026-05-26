@@ -1,0 +1,98 @@
+{
+  "id": "set1_manual_research",
+  "title": "Manual research baseline (40 RU domains)",
+  "description": "Это базовый набор доменов для общего анализа ландшафта доступности российских ресурсов для краулеров и AI-видимости источников. Используется как отправная выборка, чтобы увидеть, какие типы сайтов открыты, частично доступны или функционально невидимы для AI-поиска и retrieval-инфраструктуры.",
+  "categories": [
+    {
+      "name": "Yandex ecosystem",
+      "domains": ["yandex.ru", "ya.ru", "dzen.ru", "kinopoisk.ru", "afisha.ru", "auto.ru"]
+    },
+    {
+      "name": "VK / Mail.ru",
+      "domains": ["mail.ru", "vk.com", "ok.ru"]
+    },
+    {
+      "name": "Government and official",
+      "domains": ["gosuslugi.ru", "mos.ru", "kremlin.ru", "duma.gov.ru", "cbr.ru", "nalog.gov.ru", "мвд.рф"]
+    },
+    {
+      "name": "State and pro-state media",
+      "domains": ["ria.ru", "tass.ru", "rt.com", "sputniknews.ru", "lenta.ru"]
+    },
+    {
+      "name": "Business media",
+      "domains": ["rbc.ru", "kommersant.ru", "vedomosti.ru", "vc.ru", "interfax.ru"]
+    },
+    {
+      "name": "Tabloid and general media",
+      "domains": ["kp.ru", "gazeta.ru"]
+    },
+    {
+      "name": "Independent media",
+      "domains": ["meduza.io"]
+    },
+    {
+      "name": "E-commerce and classifieds",
+      "domains": ["avito.ru", "ozon.ru", "wildberries.ru", "cian.ru", "drom.ru"]
+    },
+    {
+      "name": "IT and UGC",
+      "domains": ["habr.com", "pikabu.ru"]
+    },
+    {
+      "name": "Sports",
+      "domains": ["championat.com", "sports.ru"]
+    },
+    {
+      "name": "Finance",
+      "domains": ["sberbank.ru"]
+    },
+    {
+      "name": "Maps and local",
+      "domains": ["2gis.ru"]
+    }
+  ],
+  "annotations": {
+    "yandex.ru": "Yandex SmartCaptcha. Ранее: ROBOTS_DISALLOWED через web_fetch Claude.",
+    "ya.ru": "Yandex SmartCaptcha. Ранее: robots.txt полностью получен.",
+    "dzen.ru": "Единственный домен в выборке с явным AI-блоком в robots.txt: GPTBot Disallow: /",
+    "kinopoisk.ru": "Прямой 403 + Yandex SmartCaptcha.",
+    "afisha.ru": "Полный fetch проходит, robots.txt ранее не получен.",
+    "auto.ru": "Geo-confirmation interstitial. HTTP 200, но контент - заглушка.",
+    "mail.ru": "ROBOTS_DISALLOWED на корне - косвенный признак блока ClaudeBot или wildcard в robots.txt.",
+    "vk.com": "Не индексируется в публичном поиске. Возможен redirect на vk.ru с другой политикой.",
+    "ok.ru": "Лендинг доступен, контент за логином.",
+    "gosuslugi.ru": "JS-интерстициал. Полный robots.txt без AI-правил.",
+    "mos.ru": "Доступ через /en/. Robots.txt частично виден на subdomains.",
+    "kremlin.ru": "Полностью открыт. Robots.txt 17 строк, без AI-правил.",
+    "duma.gov.ru": "Полностью открыт. Robots.txt 3 Disallow строки, без AI-правил.",
+    "cbr.ru": "Доступ через /eng/. Robots.txt без AI-правил.",
+    "nalog.gov.ru": "Полный fetch проходит.",
+    "мвд.рф": "IDN-домен. ConnectTimeout - возможна фильтрация исходящего трафика.",
+    "ria.ru": "Полный fetch проходит.",
+    "tass.ru": "HTTP 403 - WAF-уровневый бан.",
+    "rt.com": "Полный fetch проходит.",
+    "sputniknews.ru": "Полный fetch проходит.",
+    "lenta.ru": "Полный fetch проходит.",
+    "rbc.ru": "HTTP 401 - требует авторизацию даже на главной.",
+    "kommersant.ru": "Полный fetch проходит.",
+    "vedomosti.ru": "Полный fetch проходит.",
+    "vc.ru": "Полный fetch проходит.",
+    "interfax.ru": "Полный fetch проходит.",
+    "kp.ru": "Binary garbage от WAF - UA-conditional.",
+    "gazeta.ru": "SPA без SSR. Пустой HTML-shell, контент только в браузере.",
+    "meduza.io": "Полный fetch проходит.",
+    "avito.ru": "Не индексируется в публичном поиске. Агрессивный антибот-стек.",
+    "ozon.ru": "ROBOTS_DISALLOWED + redirect loop.",
+    "wildberries.ru": "HTTP 498 от Variti - российский антибот-вендор.",
+    "cian.ru": "Server error на страницах, robots.txt 50KB без AI-правил.",
+    "drom.ru": "Полностью открыт. Robots.txt без AI-правил.",
+    "habr.com": "Qrator. Полный fetch проходит.",
+    "pikabu.ru": "Полный robots.txt с ASCII-арт шуткой. Cp1251 кодировка ломает наивный decode.",
+    "championat.com": "Полный fetch проходит.",
+    "sports.ru": "Полный robots.txt без AI-правил. Очень свежий контент.",
+    "sberbank.ru": "TLS-блок через сертификат Минцифры РФ. Из Frankfurt не воспроизводится.",
+    "2gis.ru": "Полный fetch проходит."
+  },
+  "source": "Manual research conducted via Claude web_search and web_fetch tools."
+}

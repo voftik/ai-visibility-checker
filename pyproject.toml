@@ -1,0 +1,19 @@
+[project]
+name = "ai-visibility-checker"
+version = "0.1.0"
+description = "Check website availability for AI crawlers (GPTBot, ClaudeBot, etc.) and analyze results via LLM"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy>=2.0.36",
+    "aiosqlite>=0.20.0",
+    "httpx[http2]>=0.27.2",
+    "pydantic>=2.9.2",
+    "pydantic-settings>=2.6.0",
+    "sse-starlette>=2.1.3",
+    "python-multipart>=0.0.12",
+]
+
+[tool.uv]
+package = false

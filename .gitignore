@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Secrets
+.env
+
+# SQLite runtime
+sqlite.db
+sqlite.db-journal
+sqlite.db-wal
+sqlite.db-shm
+
+# Proxy cache (runtime artifact)
+.proxy_cache.json
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code / OMC local state
+.claude/
+.omc/
+
+# Macros from Yandex.Disk (the directory is mounted there)
+.YaCheckers
+.icon
+*.YaSync.tmp
