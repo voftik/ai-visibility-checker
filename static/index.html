@@ -238,44 +238,60 @@
         </div>
       </details>
 
+      <!-- Phase 1: mode picker — shown only when domainMode is null -->
+      <div x-show="form.domainMode === null" class="space-y-3">
+        <div class="text-sm font-medium text-[color:var(--brand-text)]">Откуда взять домены для проверки?</div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <button @click="form.domainMode = 'sets'" type="button"
+                  class="text-left rounded-xl border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-6 transition hover:border-[color:var(--brand-primary)] hover:bg-[color:var(--brand-bg-panel)] focus:outline-none focus:border-[color:var(--brand-primary)] group">
+            <div class="flex items-center gap-3 mb-3">
+              <span class="text-3xl">📦</span>
+              <span class="text-lg font-semibold text-[color:var(--brand-text)] group-hover:text-[color:var(--brand-primary)]">Готовые наборы</span>
+            </div>
+            <p class="text-sm text-[color:var(--brand-text-muted)] leading-relaxed mb-3">
+              Использовать предустановленные подборки доменов с аннотациями и категориями.
+            </p>
+            <div class="text-xs text-[color:var(--brand-text-soft)]">
+              <span x-text="setsMeta.length + ' набора: ' + setsMeta.map(m => m.title || m.id).join(', ')"></span>
+            </div>
+          </button>
+          <button @click="form.domainMode = 'custom'" type="button"
+                  class="text-left rounded-xl border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-6 transition hover:border-[color:var(--brand-primary)] hover:bg-[color:var(--brand-bg-panel)] focus:outline-none focus:border-[color:var(--brand-primary)] group">
+            <div class="flex items-center gap-3 mb-3">
+              <span class="text-3xl">✍️</span>
+              <span class="text-lg font-semibold text-[color:var(--brand-text)] group-hover:text-[color:var(--brand-primary)]">Мои домены</span>
+            </div>
+            <p class="text-sm text-[color:var(--brand-text-muted)] leading-relaxed mb-3">
+              Ввести произвольный список доменов вручную.
+            </p>
+            <div class="text-xs text-[color:var(--brand-text-soft)]">
+              Любой формат — нумерация, маркеры, CSV, URL'ы
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- Phase 2: breadcrumb + content -->
+      <div x-show="form.domainMode !== null" class="space-y-4">
+        <!-- Breadcrumb mode indicator -->
+        <div class="flex items-center justify-between gap-3 rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] px-3 py-2 text-xs">
+          <div class="flex items-center gap-2">
+            <span class="text-[color:var(--brand-text-muted)]">Режим:</span>
+            <span class="font-medium text-[color:var(--brand-text)]"
+                  x-text="form.domainMode === 'sets' ? '📦 Готовые наборы' : '✍️ Мои домены'"></span>
+          </div>
+          <button @click="form.domainMode = null" type="button"
+                  class="text-[color:var(--brand-primary)] hover:underline">← изменить режим</button>
+        </div>
+
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-        <!-- Left column: sets + custom -->
+        <!-- Left column: sets OR custom -->
         <div class="lg:col-span-2 space-y-5">
 
-          <!-- Domain mode toggle -->
-          <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-3 space-y-2">
-            <div class="text-xs font-medium text-[color:var(--brand-text)] uppercase tracking-wide">Режим выбора доменов</div>
-            <div class="flex flex-col sm:flex-row gap-2">
-              <label class="flex-1 flex items-start gap-2 cursor-pointer rounded border px-3 py-2 transition"
-                     :class="form.domainMode === 'mixed'
-                              ? 'border-[color:var(--brand-primary)] bg-[color:var(--brand-bg-panel)]'
-                              : 'border-[color:var(--brand-border)] hover:border-[color:var(--brand-border-strong)]'">
-                <input type="radio" name="domainMode" value="mixed" x-model="form.domainMode"
-                       class="mt-1 text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                <div class="text-xs leading-snug">
-                  <div class="font-medium text-[color:var(--brand-text)]">Готовые наборы + свои домены</div>
-                  <div class="text-[color:var(--brand-text-muted)] mt-0.5">Включённые наборы объединяются с вашим списком, дубли удаляются.</div>
-                </div>
-              </label>
-              <label class="flex-1 flex items-start gap-2 cursor-pointer rounded border px-3 py-2 transition"
-                     :class="form.domainMode === 'custom_only'
-                              ? 'border-[color:var(--brand-primary)] bg-[color:var(--brand-bg-panel)]'
-                              : 'border-[color:var(--brand-border)] hover:border-[color:var(--brand-border-strong)]'">
-                <input type="radio" name="domainMode" value="custom_only" x-model="form.domainMode"
-                       class="mt-1 text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                <div class="text-xs leading-snug">
-                  <div class="font-medium text-[color:var(--brand-text)]">Только мои домены</div>
-                  <div class="text-[color:var(--brand-text-muted)] mt-0.5">Наборы игнорируются — проверяется только то, что вы напишете ниже.</div>
-                </div>
-              </label>
-            </div>
-          </div>
-
-          <!-- Domain sets -->
-          <div class="space-y-3 transition-opacity"
-               :class="form.domainMode === 'custom_only' ? 'opacity-40 pointer-events-none' : ''"
-               x-show="form.domainMode === 'mixed'">
+          <!-- Domain sets (sets mode only) -->
+          <div class="space-y-3"
+               x-show="form.domainMode === 'sets'">
             <div>
               <h2 class="text-sm font-semibold relative inline-block cursor-help"
                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
@@ -405,22 +421,21 @@
             <div x-show="setsMeta.length === 0 && !setsLoadError" class="text-xs text-[color:var(--brand-text-soft)]">Наборы не настроены.</div>
           </div>
 
-          <!-- Custom domains -->
-          <div class="space-y-2">
+          <!-- Custom domains (custom mode only, full-width) -->
+          <div class="space-y-2" x-show="form.domainMode === 'custom'">
             <label class="text-sm font-medium relative inline-block cursor-help"
                    x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]"
-                    x-text="form.domainMode === 'custom_only' ? 'Мои домены' : 'Свои домены'"></span>
+              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Мои домены</span>
               <span x-show="show" x-transition class="rw-tip rw-tip-below">
                 Парсер сам уберёт нумерацию, маркеры списков, https://, www., пути и порты. Можно вставлять списки из Word, Excel, Markdown — построчно, через запятую или через пробел.
               </span>
             </label>
             <p class="text-xs text-[color:var(--brand-text-muted)]">
-              Любой формат: построчно, через запятую, нумерованный или маркированный список. URL'ы и www. — нормализуются автоматически.
+              Любой формат: построчно, через запятую, нумерованный или маркированный список.
             </p>
             <textarea x-model="form.domainsText"
                       spellcheck="false"
-                      rows="5"
+                      rows="10"
                       placeholder="example.com, mysite.org, brand.ru&#10;1. https://www.test.com/path&#10;- foo.bar"
                       class="w-full bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded p-3 font-mono text-sm text-[color:var(--brand-text)] placeholder:text-[color:var(--brand-text-soft)] focus:outline-none focus:border-[color:var(--brand-primary)]"></textarea>
             <div class="text-xs flex items-center gap-2 flex-wrap">
@@ -429,10 +444,6 @@
               <span x-show="form.domainsText.trim() && customDomains.length === 0"
                     class="text-[color:var(--brand-warn)]">
                 ничего не распознано — проверь формат
-              </span>
-              <span x-show="form.domainMode === 'custom_only' && customDomains.length > 0"
-                    class="px-1.5 py-0.5 rounded text-[10px] bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-text-soft)] border border-[color:var(--brand-border)]">
-                наборы выключены
               </span>
             </div>
           </div>
@@ -534,9 +545,11 @@
           </div>
         </div>
       </div>
+      </div>
 
-      <!-- Final summary + start -->
-      <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-4 flex flex-col gap-3">
+      <!-- Final summary + start (full-width, sticky bottom while Phase 2 active) -->
+      <div x-show="form.domainMode !== null"
+           class="sticky bottom-0 z-30 rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-panel)] p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 shadow-[0_-8px_24px_-12px_rgba(0,0,0,0.6)]">
         <div class="space-y-1">
           <div class="text-sm">
             <span class="text-[color:var(--brand-text-muted)]">Итоговый список: </span>
@@ -545,25 +558,26 @@
           <div class="text-xs text-[color:var(--brand-text-muted)]" x-text="
             'Набор 1: ' + sourceBreakdown.set1_selected
             + ' · Набор 2: ' + sourceBreakdown.set2_selected
+            + (sourceBreakdown.set3_selected ? ' · Набор 3: ' + sourceBreakdown.set3_selected : '')
             + ' · своих: ' + sourceBreakdown.custom
             + (sourceBreakdown.deduplicated_removed > 0
                 ? ' · удалено дублей: ' + sourceBreakdown.deduplicated_removed
                 : '')
           "></div>
-          <div class="text-xs text-[color:var(--brand-text-muted)] mt-2">
+          <div class="text-xs text-[color:var(--brand-text-muted)]">
             <span x-text="'Будет выполнено ' + totalProbeEstimate + ' проб (' + finalDomains.length + ' × (' + selectedUaCount + ' идентификаторов + 1 robots.txt))'"></span>
             <span class="text-[color:var(--brand-text-soft)] mx-1">·</span>
             <span x-text="'Примерное время: ' + timeEstimateText"></span>
           </div>
         </div>
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-3 shrink-0">
+          <span x-show="formError" x-text="formError" class="text-sm text-[color:var(--brand-error)]"></span>
           <button @click="startRun()"
                   :disabled="setsLoading || submitting || finalDomains.length === 0 || selectedUaCount === 0"
-                  class="px-4 py-2 rounded bg-[color:var(--brand-primary)] hover:bg-[color:var(--brand-primary-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium">
+                  class="px-5 py-2.5 rounded bg-[color:var(--brand-primary)] hover:bg-[color:var(--brand-primary-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium">
             <span x-show="!submitting">Запустить проверку</span>
             <span x-show="submitting">Запускаю...</span>
           </button>
-          <span x-show="formError" x-text="formError" class="text-sm text-[color:var(--brand-error)]"></span>
         </div>
       </div>
     </section>
@@ -914,8 +928,8 @@
       { provider: 'OpenAI',     providerRu: 'OpenAI',                          labels: ['GPTBot', 'OAI-SearchBot', 'ChatGPT-User'] },
       { provider: 'Anthropic',  providerRu: 'Anthropic',                       labels: ['ClaudeBot', 'anthropic-ai', 'Claude-Web'] },
       { provider: 'Perplexity', providerRu: 'Perplexity',                      labels: ['PerplexityBot', 'Perplexity-User'] },
-      { provider: 'DeepSeek',   providerRu: 'DeepSeek (без официальной документации)',
-                                providerTip: 'Китайский AI-сервис, чей краулер не имеет официальной документации (в отличие от OpenAI, Anthropic, Perplexity, которые публично описывают свои боты). Имена DeepSeekBot и DeepSeek-User идентифицированы по наблюдениям сообщества - они массово встречаются в block-листах сайтов. Имитация менее достоверна чем для других провайдеров, но многие сайты явно блокируют именно эти имена, поэтому проверка имеет смысл. По умолчанию выключены - включайте если хотите учесть DeepSeek в анализе.',
+      { provider: 'DeepSeek',   providerRu: 'DeepSeek',
+                                providerTip: 'Китайский AI-сервис. Имена DeepSeekBot и DeepSeek-User идентифицированы по наблюдениям сообщества - они массово встречаются в block-листах сайтов. Имитация менее достоверна чем для других провайдеров, но многие сайты явно блокируют именно эти имена, поэтому проверка имеет смысл.',
                                 labels: ['DeepSeekBot', 'DeepSeek-User'] },
       { provider: 'Google',     providerRu: 'Google (поиск, AI Overviews, Gemini, Vertex AI)',
                                 providerTip: 'Экосистема Google-краулеров. Googlebot индексирует сайты для классического поиска и AI Overviews. GoogleOther — для внутренних исследований и продуктов. Google-Agent, NotebookLM, CloudVertexBot — user-triggered и enterprise AI-агенты. По умолчанию выключены — включайте, если интересует видимость в Google AI Overviews, Gemini и Vertex AI.',
@@ -925,12 +939,24 @@
                                   { name: 'Generic Google crawler',   labels: ['GoogleOther-mobile', 'GoogleOther-desktop'] },
                                   { name: 'User-triggered AI-агенты', labels: ['Google-Agent-mobile', 'Google-Agent-desktop', 'Google-NotebookLM'] },
                                   { name: 'Enterprise / RAG',         labels: ['Google-CloudVertexBot'] },
-                                  { name: 'Observed (experimental)',  labels: ['GoogleAgent-URLContext', 'Gemini-Deep-Research'], experimental: true },
-                                ],
-                                robotsOnlyNote: 'Google-Extended — policy-токен для robots.txt (контроль обучения Gemini/Vertex AI). HTTP-запросов от него не бывает: проверка отображается в секции robots.txt отчёта, отдельного чекбокса не нужно.' },
+                                  { name: 'Observed',                 labels: ['GoogleAgent-URLContext', 'Gemini-Deep-Research'], experimental: true },
+                                ] },
       { provider: 'Controls',   providerRu: 'Контрольные запросы',             labels: ['Chrome-control', 'empty-ua'] },
     ];
-    const UA_DEFAULTS = ['GPTBot', 'OAI-SearchBot', 'ClaudeBot', 'PerplexityBot', 'Chrome-control'];
+    // Default-enabled: every UA label except robots-fetcher (not in UA_GROUPS)
+    // and empty-ua (control-only, opt-in stays).
+    const UA_DEFAULTS = [
+      'GPTBot', 'OAI-SearchBot', 'ChatGPT-User',
+      'ClaudeBot', 'anthropic-ai', 'Claude-Web',
+      'PerplexityBot', 'Perplexity-User',
+      'DeepSeekBot', 'DeepSeek-User',
+      'Googlebot-smartphone', 'Googlebot-desktop',
+      'GoogleOther-mobile', 'GoogleOther-desktop',
+      'Google-Agent-mobile', 'Google-Agent-desktop',
+      'Google-NotebookLM', 'Google-CloudVertexBot',
+      'GoogleAgent-URLContext', 'Gemini-Deep-Research',
+      'Chrome-control',
+    ];
 
     const UA_TOOLTIPS = {
       'GPTBot': 'Бот OpenAI, собирающий контент для обучения новых версий ChatGPT и для базы знаний модели.',
@@ -1052,7 +1078,7 @@
         ROBOTS_RULE_TIPS,
         form: {
           domainsText: '',
-          domainMode: 'mixed',
+          domainMode: null,
           uaSelected: {},
           concurrency: 8,
           timeoutSeconds: 15,
@@ -1229,39 +1255,44 @@
         },
         get parsedDomains() { return this.finalDomains; },
         get finalDomains() {
-          if (this.form.domainMode === 'custom_only') {
+          if (this.form.domainMode === 'custom') {
             return this.customDomains;
           }
-          const seen = new Set(); const out = [];
-          for (const meta of this.setsMeta) {
-            const st = this.setsState[meta.id];
-            if (!st || !st.enabled) continue;
-            for (const d of st.selected) {
-              const norm = (d || '').toLowerCase().replace(/^www\./, '');
-              if (norm && !seen.has(norm)) { seen.add(norm); out.push(norm); }
+          if (this.form.domainMode === 'sets') {
+            const seen = new Set(); const out = [];
+            for (const meta of this.setsMeta) {
+              const st = this.setsState[meta.id];
+              if (!st || !st.enabled) continue;
+              for (const d of st.selected) {
+                const norm = (d || '').toLowerCase().replace(/^www\./, '');
+                if (norm && !seen.has(norm)) { seen.add(norm); out.push(norm); }
+              }
             }
+            return out;
           }
-          for (const d of this.customDomains) {
-            if (!seen.has(d)) { seen.add(d); out.push(d); }
-          }
-          return out;
+          // picker phase (domainMode === null) — submit disabled
+          return [];
         },
         get sourceBreakdown() {
           const custom = this.customDomains.length;
-          if (this.form.domainMode === 'custom_only') {
-            return { set1_selected: 0, set2_selected: 0, custom, deduplicated_removed: 0 };
+          if (this.form.domainMode === 'custom') {
+            return { set1_selected: 0, set2_selected: 0, set3_selected: 0, custom, deduplicated_removed: 0 };
           }
-          let s1 = 0, s2 = 0;
-          for (const meta of this.setsMeta) {
-            const st = this.setsState[meta.id];
-            if (!st || !st.enabled) continue;
-            const n = st.selected.size;
-            if (meta.id === 'set1_manual_research') s1 = n;
-            else if (meta.id === 'set2_corpus_sources') s2 = n;
+          if (this.form.domainMode === 'sets') {
+            let s1 = 0, s2 = 0, s3 = 0;
+            for (const meta of this.setsMeta) {
+              const st = this.setsState[meta.id];
+              if (!st || !st.enabled) continue;
+              const n = st.selected.size;
+              if (meta.id === 'set1_manual_research') s1 = n;
+              else if (meta.id === 'set2_corpus_sources') s2 = n;
+              else if (meta.id === 'set3_ru_fmcg_consumer') s3 = n;
+            }
+            const raw = s1 + s2 + s3;
+            const final = this.finalDomains.length;
+            return { set1_selected: s1, set2_selected: s2, set3_selected: s3, custom: 0, deduplicated_removed: Math.max(0, raw - final) };
           }
-          const raw = s1 + s2 + custom;
-          const final = this.finalDomains.length;
-          return { set1_selected: s1, set2_selected: s2, custom, deduplicated_removed: Math.max(0, raw - final) };
+          return { set1_selected: 0, set2_selected: 0, set3_selected: 0, custom: 0, deduplicated_removed: 0 };
         },
         get setsLoading() {
           return Object.values(this.setsState).some(st => st && st.enabled && st.loading);
