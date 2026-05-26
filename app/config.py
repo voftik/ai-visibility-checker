@@ -11,5 +11,17 @@ class Settings(BaseSettings):
     DEFAULT_CONCURRENCY: int = 8
     DEFAULT_TIMEOUT_SECONDS: int = 15
 
+    # --- Outbound proxy pool (webshare.io) ---
+    # Empty key disables proxying entirely; the crawler then talks directly,
+    # which is the pre-existing behaviour.
+    WEBSHARE_API_KEY: str = ""
+    PROXY_ENABLED: bool = True
+    PROXY_REFRESH_INTERVAL_SECONDS: int = 3600
+    # When a proxied request errors out for connection/TLS reasons, retry the
+    # same probe directly (no proxy). Keeps a single noisy proxy from poisoning
+    # an entire run.
+    PROXY_FALLBACK_DIRECT: bool = True
+    PROXY_COOLDOWN_SECONDS: int = 300
+
 
 settings = Settings()
