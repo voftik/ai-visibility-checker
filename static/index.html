@@ -141,6 +141,418 @@
     .pulse-dot:nth-child(2) { animation-delay: 0.2s; }
     .pulse-dot:nth-child(3) { animation-delay: 0.4s; }
     @keyframes rw-pulse { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+
+    /* ============ editorial new-run ============ */
+    .editorial-wrap {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 8px 0 120px;
+    }
+    .editorial-section {
+      position: relative;
+      padding: 56px 0 0;
+    }
+    .editorial-section + .editorial-section {
+      padding-top: 80px;
+    }
+    @media (max-width: 720px) {
+      .editorial-section + .editorial-section { padding-top: 56px; }
+    }
+    .editorial-hairline {
+      width: 32px;
+      height: 2px;
+      background: var(--brand-primary);
+      display: block;
+      margin-bottom: 18px;
+    }
+    .editorial-eyebrow {
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .editorial-number {
+      position: absolute;
+      top: 38px;
+      right: 0;
+      font-size: 5rem;
+      line-height: 1;
+      font-weight: 700;
+      color: var(--brand-text-soft);
+      opacity: 0.18;
+      letter-spacing: -0.04em;
+      pointer-events: none;
+      user-select: none;
+    }
+    @media (max-width: 720px) {
+      .editorial-number { font-size: 3.4rem; top: 30px; }
+    }
+    .editorial-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+      margin-bottom: 28px;
+    }
+    .editorial-svg {
+      flex-shrink: 0;
+      width: 64px;
+      height: 64px;
+      color: var(--brand-primary);
+    }
+    .editorial-title {
+      font-size: 1.6rem;
+      line-height: 1.2;
+      font-weight: 600;
+      color: var(--brand-text);
+      letter-spacing: -0.015em;
+      margin: 4px 0 6px;
+    }
+    .editorial-lede {
+      font-size: 14px;
+      line-height: 1.65;
+      color: var(--brand-text-muted);
+      max-width: 600px;
+      margin: 0;
+    }
+    .editorial-body {
+      margin-top: 4px;
+    }
+
+    /* source picker cards */
+    .source-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+    }
+    @media (max-width: 720px) {
+      .source-grid { grid-template-columns: 1fr; }
+    }
+    .source-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 22px 22px 20px;
+      border: 1px solid var(--brand-border);
+      background: var(--brand-bg-soft);
+      border-left: 3px solid transparent;
+      text-align: left;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+    }
+    .source-card:hover {
+      background: var(--brand-bg-panel);
+      border-color: var(--brand-border-strong);
+    }
+    .source-card:focus { outline: none; }
+    .source-card:focus-visible {
+      border-color: var(--brand-primary);
+    }
+    .source-card.is-active {
+      border-left-color: var(--brand-primary);
+      background: var(--brand-bg-panel);
+    }
+    .source-card-ordinal {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 10px;
+      letter-spacing: 0.15em;
+      color: var(--brand-text-soft);
+    }
+    .source-card-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--brand-text);
+      line-height: 1.3;
+    }
+    .source-card.is-active .source-card-title { color: var(--brand-primary); }
+    .source-card-desc {
+      font-size: 12.5px;
+      color: var(--brand-text-muted);
+      line-height: 1.55;
+      flex: 1;
+    }
+    .source-card-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 11px;
+      color: var(--brand-text-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-weight: 600;
+      padding-top: 8px;
+      border-top: 1px solid var(--brand-border);
+      margin-top: 4px;
+    }
+    .source-card-cta {
+      color: var(--brand-text-muted);
+    }
+    .source-card.is-active .source-card-cta {
+      color: var(--brand-primary);
+    }
+
+    /* crawler provider columns */
+    .crawler-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 22px;
+    }
+    @media (max-width: 900px) {
+      .crawler-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 480px) {
+      .crawler-grid { grid-template-columns: 1fr; }
+    }
+    .crawler-col {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .crawler-col-head {
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      font-weight: 700;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--brand-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .crawler-col-toggle {
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      color: var(--brand-text-muted);
+      cursor: pointer;
+      text-decoration: none;
+      border-bottom: 1px dotted var(--brand-text-soft);
+    }
+    .crawler-col-toggle:hover { color: var(--brand-primary); border-bottom-color: var(--brand-primary); }
+    .crawler-col-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .crawler-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12.5px;
+      color: var(--brand-text);
+      cursor: pointer;
+      padding: 2px 0;
+    }
+    .crawler-check-sub {
+      margin-top: 4px;
+      padding-top: 4px;
+      border-top: 1px dashed var(--brand-border);
+    }
+    .crawler-subhead {
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      margin-top: 6px;
+      margin-bottom: 2px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* config row */
+    .config-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+    }
+    @media (max-width: 600px) {
+      .config-row { grid-template-columns: 1fr; gap: 24px; }
+    }
+    .config-field { display: flex; flex-direction: column; gap: 6px; }
+    .config-label {
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      font-weight: 600;
+    }
+    .config-input {
+      background: transparent;
+      border: none;
+      border-bottom: 1px solid var(--brand-border-strong);
+      color: var(--brand-text);
+      font-size: 1.6rem;
+      font-weight: 300;
+      padding: 4px 0 6px;
+      width: 100%;
+      letter-spacing: -0.01em;
+    }
+    .config-input:focus {
+      outline: none;
+      border-bottom-color: var(--brand-primary);
+    }
+    .config-hint {
+      font-size: 12px;
+      color: var(--brand-text-muted);
+      line-height: 1.55;
+    }
+
+    /* launch band */
+    .launch-band {
+      margin-top: 80px;
+      border-top: 2px solid var(--brand-primary);
+      padding-top: 28px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 24px;
+      align-items: center;
+    }
+    @media (max-width: 720px) {
+      .launch-band {
+        grid-template-columns: 1fr;
+        margin-top: 56px;
+      }
+    }
+    .launch-summary-eq {
+      font-size: 1.7rem;
+      line-height: 1.25;
+      color: var(--brand-text);
+      font-weight: 300;
+      letter-spacing: -0.015em;
+    }
+    .launch-summary-eq strong {
+      color: var(--brand-primary);
+      font-weight: 600;
+    }
+    .launch-meta {
+      font-size: 12.5px;
+      color: var(--brand-text-muted);
+      margin-top: 8px;
+      line-height: 1.55;
+    }
+    .launch-cta {
+      background: var(--brand-primary);
+      color: #fff;
+      padding: 16px 26px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      transition: background 0.15s ease, transform 0.15s ease;
+      white-space: nowrap;
+    }
+    .launch-cta:hover:not(:disabled) {
+      background: var(--brand-primary-hover);
+      transform: translateX(2px);
+    }
+    .launch-cta:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .launch-cta-arrow {
+      width: 18px;
+      height: 12px;
+    }
+
+    /* compact set details (subset picker / textarea wrapper) */
+    .editorial-detail {
+      margin-top: 18px;
+      border-left: 2px solid var(--brand-border);
+      padding-left: 18px;
+    }
+
+    /* editorial textarea */
+    .editorial-textarea {
+      width: 100%;
+      background: var(--brand-bg-soft);
+      border: 1px solid var(--brand-border);
+      border-left: 2px solid var(--brand-border-strong);
+      color: var(--brand-text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      padding: 14px 16px;
+      resize: vertical;
+    }
+    .editorial-textarea:focus {
+      outline: none;
+      border-color: var(--brand-border-strong);
+      border-left-color: var(--brand-primary);
+    }
+
+    /* inline SVG animations — only when motion is allowed */
+    @media (prefers-reduced-motion: no-preference) {
+      .svg-anim-stack rect {
+        animation: stack-fade 3.2s ease-in-out infinite;
+        transform-origin: center;
+      }
+      .svg-anim-stack rect:nth-child(1) { animation-delay: 0s; }
+      .svg-anim-stack rect:nth-child(2) { animation-delay: 0.35s; }
+      .svg-anim-stack rect:nth-child(3) { animation-delay: 0.7s; }
+      @keyframes stack-fade {
+        0%, 100% { opacity: 0.35; transform: translateY(0); }
+        40% { opacity: 1; transform: translateY(-1.5px); }
+      }
+
+      .svg-anim-network line { animation: network-pulse 2.6s ease-in-out infinite; }
+      .svg-anim-network line:nth-child(1) { animation-delay: 0s; }
+      .svg-anim-network line:nth-child(2) { animation-delay: 0.3s; }
+      .svg-anim-network line:nth-child(3) { animation-delay: 0.6s; }
+      .svg-anim-network line:nth-child(4) { animation-delay: 0.9s; }
+      .svg-anim-network line:nth-child(5) { animation-delay: 1.2s; }
+      @keyframes network-pulse {
+        0%, 100% { opacity: 0.3; }
+        50% { opacity: 1; }
+      }
+      .svg-anim-network .satellite { animation: satellite-glow 2.6s ease-in-out infinite; }
+      .svg-anim-network .satellite:nth-child(6) { animation-delay: 0s; }
+      .svg-anim-network .satellite:nth-child(7) { animation-delay: 0.3s; }
+      .svg-anim-network .satellite:nth-child(8) { animation-delay: 0.6s; }
+      .svg-anim-network .satellite:nth-child(9) { animation-delay: 0.9s; }
+      .svg-anim-network .satellite:nth-child(10) { animation-delay: 1.2s; }
+      @keyframes satellite-glow {
+        0%, 100% { opacity: 0.5; r: 3; }
+        50% { opacity: 1; r: 4; }
+      }
+
+      .svg-anim-dial .tick {
+        transform-origin: 32px 32px;
+        animation: dial-rotate 4s linear infinite;
+      }
+      @keyframes dial-rotate {
+        from { transform: rotate(-110deg); }
+        to { transform: rotate(250deg); }
+      }
+
+      .svg-anim-arrow .dot {
+        animation: arrow-travel 2.4s ease-in-out infinite;
+      }
+      @keyframes arrow-travel {
+        0% { opacity: 0; transform: translate(-12px, 12px); }
+        20% { opacity: 1; }
+        80% { opacity: 1; }
+        100% { opacity: 0; transform: translate(12px, -12px); }
+      }
+    }
+
+    .source-card-svg {
+      width: 22px;
+      height: 22px;
+      color: var(--brand-text-soft);
+      flex-shrink: 0;
+    }
+    .source-card.is-active .source-card-svg { color: var(--brand-primary); }
   </style>
 </head>
 <body class="bg-[color:var(--brand-bg)] text-[color:var(--brand-text)] min-h-screen">
@@ -184,14 +596,406 @@
     </header>
 
     <!-- ============ NEW RUN ============ -->
-    <section x-show="tab === 'new_run'" class="space-y-6">
-      <details class="methodology-panel rounded-lg border p-4">
+    <section x-show="tab === 'new_run'" class="editorial-wrap">
+
+      <!-- ====== Section 01 — Источники ====== -->
+      <div class="editorial-section">
+        <span class="editorial-number">01</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Шаг 01 / 04</div>
+        <div class="editorial-header">
+          <svg class="editorial-svg svg-anim-stack" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="10" y="14" width="44" height="10" rx="1.5"></rect>
+            <rect x="10" y="28" width="44" height="10" rx="1.5"></rect>
+            <rect x="10" y="42" width="44" height="10" rx="1.5"></rect>
+          </svg>
+          <div>
+            <h2 class="editorial-title">Источники доменов</h2>
+            <p class="editorial-lede">Выберите ровно один источник: один из готовых наборов или собственный список. Источники не смешиваются — итоговая выборка остаётся однородной и воспроизводимой.</p>
+          </div>
+        </div>
+
+        <div class="editorial-body">
+          <div x-show="setsLoadError" x-text="setsLoadError" class="text-xs text-[color:var(--brand-warn)] mb-3"></div>
+
+          <div class="source-grid">
+            <!-- Set 1 -->
+            <template x-if="setMetaById('set1_manual_research')">
+              <button type="button" class="source-card" :class="form.sourceMode === 'set1' ? 'is-active' : ''"
+                      @click="pickSource('set1')">
+                <div class="source-card-ordinal">01 / 04 · Набор</div>
+                <div class="flex items-start gap-3">
+                  <svg class="source-card-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3" y="6" width="18" height="4"></rect>
+                    <rect x="3" y="12" width="18" height="4"></rect>
+                    <rect x="3" y="18" width="18" height="2"></rect>
+                  </svg>
+                  <div class="source-card-title" x-text="setTitleRu(setMetaById('set1_manual_research'))"></div>
+                </div>
+                <p class="source-card-desc">Базовый набор доменов ландшафта доступности — ручное исследование AI-видимости источников.</p>
+                <div class="source-card-meta">
+                  <span x-text="(setMetaById('set1_manual_research')?.domain_count || 0) + ' доменов'"></span>
+                  <span class="source-card-cta" x-text="form.sourceMode === 'set1' ? 'выбрано →' : 'выбрать →'"></span>
+                </div>
+              </button>
+            </template>
+
+            <!-- Set 2 -->
+            <template x-if="setMetaById('set2_corpus_sources')">
+              <button type="button" class="source-card" :class="form.sourceMode === 'set2' ? 'is-active' : ''"
+                      @click="pickSource('set2')">
+                <div class="source-card-ordinal">02 / 04 · Набор</div>
+                <div class="flex items-start gap-3">
+                  <svg class="source-card-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="7" cy="7" r="2"></circle>
+                    <circle cx="17" cy="7" r="2"></circle>
+                    <circle cx="12" cy="17" r="2"></circle>
+                    <path d="M8.5 8.5L11 15.5M15.5 8.5L13 15.5M9 7H15"></path>
+                  </svg>
+                  <div class="source-card-title" x-text="setTitleRu(setMetaById('set2_corpus_sources'))"></div>
+                </div>
+                <p class="source-card-desc">Корпус: домены, которые ChatGPT, Claude и Perplexity реально цитировали в пользовательских сессиях.</p>
+                <div class="source-card-meta">
+                  <span x-text="(setMetaById('set2_corpus_sources')?.domain_count || 0) + ' доменов'"></span>
+                  <span class="source-card-cta" x-text="form.sourceMode === 'set2' ? 'выбрано →' : 'выбрать →'"></span>
+                </div>
+              </button>
+            </template>
+
+            <!-- Set 3 -->
+            <template x-if="setMetaById('set3_ru_fmcg_consumer')">
+              <button type="button" class="source-card" :class="form.sourceMode === 'set3' ? 'is-active' : ''"
+                      @click="pickSource('set3')">
+                <div class="source-card-ordinal">03 / 04 · Набор</div>
+                <div class="flex items-start gap-3">
+                  <svg class="source-card-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 7l9-4 9 4-9 4-9-4z"></path>
+                    <path d="M3 12l9 4 9-4"></path>
+                    <path d="M3 17l9 4 9-4"></path>
+                  </svg>
+                  <div class="source-card-title" x-text="setTitleRu(setMetaById('set3_ru_fmcg_consumer'))"></div>
+                </div>
+                <p class="source-card-desc">Российский FMCG / consumer-сегмент: бренды и категории потребительских товаров.</p>
+                <div class="source-card-meta">
+                  <span x-text="(setMetaById('set3_ru_fmcg_consumer')?.domain_count || 0) + ' доменов'"></span>
+                  <span class="source-card-cta" x-text="form.sourceMode === 'set3' ? 'выбрано →' : 'выбрать →'"></span>
+                </div>
+              </button>
+            </template>
+
+            <!-- Мой список -->
+            <button type="button" class="source-card" :class="form.sourceMode === 'custom' ? 'is-active' : ''"
+                    @click="pickSource('custom')">
+              <div class="source-card-ordinal">04 / 04 · Свой источник</div>
+              <div class="flex items-start gap-3">
+                <svg class="source-card-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 6h16M4 12h10M4 18h13"></path>
+                  <circle cx="19" cy="18" r="2"></circle>
+                </svg>
+                <div class="source-card-title">Мой список</div>
+              </div>
+              <p class="source-card-desc">Произвольный список доменов: построчно, через запятую, нумерация, маркеры, URL — парсер нормализует.</p>
+              <div class="source-card-meta">
+                <span x-text="'до ' + (customDomains.length || '∞') + ' доменов'"></span>
+                <span class="source-card-cta" x-text="form.sourceMode === 'custom' ? 'выбрано →' : 'выбрать →'"></span>
+              </div>
+            </button>
+          </div>
+
+          <!-- inline detail: subset picker for selected set -->
+          <template x-for="meta in setsMeta" :key="meta.id">
+            <div class="editorial-detail" x-show="form.sourceMode === setKeyOfMeta(meta)">
+              <div class="flex items-center gap-3 text-xs mb-3 flex-wrap">
+                <span class="text-[color:var(--brand-text-soft)] uppercase tracking-wider font-semibold" x-text="setTitleRu(meta)"></span>
+                <span class="text-[color:var(--brand-text-muted)]" x-text="setSelectedCount(meta.id) + ' / ' + meta.domain_count + ' выбрано'"></span>
+                <button @click="selectAllInSet(meta.id)" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-primary)] border-b border-dotted border-[color:var(--brand-text-soft)]">выбрать всё</button>
+                <button @click="deselectAllInSet(meta.id)" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-primary)] border-b border-dotted border-[color:var(--brand-text-soft)]">снять всё</button>
+                <button @click="toggleSetExpanded(meta.id)" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)] ml-auto">
+                  <span x-show="!setsState[meta.id]?.expanded">показать детали ▾</span>
+                  <span x-show="setsState[meta.id]?.expanded">скрыть детали ▴</span>
+                </button>
+              </div>
+
+              <div x-show="setsState[meta.id]?.expanded" class="space-y-3">
+                <template x-if="meta.kind === 'categorical' && setsState[meta.id]?.data">
+                  <div class="space-y-3">
+                    <template x-for="cat in setsState[meta.id].data.categories" :key="cat.name">
+                      <div class="rounded border border-[color:var(--brand-border)]">
+                        <div class="flex items-center gap-2 px-2 py-1 bg-[color:var(--brand-bg-panel)]">
+                          <input type="checkbox"
+                                 class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                                 :checked="categoryAllSelected(meta.id, cat)"
+                                 @change="toggleCategory(meta.id, cat, $event.target.checked)">
+                          <span class="text-sm font-medium" x-text="cat.name"></span>
+                          <span class="text-xs text-[color:var(--brand-text-soft)] ml-auto" x-text="cat.domains.length + ' доменов'"></span>
+                        </div>
+                        <div class="px-3 py-2 space-y-0.5 bg-[color:var(--brand-bg-soft)]">
+                          <template x-for="dom in cat.domains" :key="dom">
+                            <label class="flex items-start gap-2 text-xs cursor-pointer">
+                              <input type="checkbox"
+                                     class="mt-0.5 rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                                     :checked="setsState[meta.id].selected.has(dom)"
+                                     @change="toggleSetDomain(meta.id, dom, $event.target.checked)">
+                              <span class="font-mono w-32 shrink-0" x-text="dom"></span>
+                              <span class="text-[color:var(--brand-text-muted)] break-words" x-text="setsState[meta.id].data.annotations?.[dom] || ''"></span>
+                            </label>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+
+                <template x-if="meta.kind === 'flat' && setsState[meta.id]?.data">
+                  <div class="space-y-2">
+                    <div class="flex items-center gap-2 flex-wrap text-xs">
+                      <input type="text" placeholder="Фильтр по домену..."
+                             class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-[color:var(--brand-text)]"
+                             :value="setsState[meta.id].filter"
+                             @input="setsState[meta.id].filter = $event.target.value">
+                      <select class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-[color:var(--brand-text)]"
+                              :value="setsState[meta.id].catFilter"
+                              @change="setsState[meta.id].catFilter = $event.target.value">
+                        <option value="all">Все категории</option>
+                        <template x-for="c in flatCategoryOptions(meta.id)" :key="c">
+                          <option :value="c" x-text="c"></option>
+                        </template>
+                      </select>
+                      <span class="text-[color:var(--brand-text-muted)]" x-text="flatVisibleDomains(meta.id).length + ' видно'"></span>
+                    </div>
+                    <div class="rounded border border-[color:var(--brand-border)] max-h-[55vh] overflow-y-auto bg-[color:var(--brand-bg-soft)]">
+                      <template x-for="dom in flatRenderedDomains(meta.id)" :key="dom.domain">
+                        <label class="flex items-center gap-2 px-3 py-1 hover:bg-[color:var(--brand-bg-soft)] cursor-pointer text-xs border-b border-[color:var(--brand-border)] last:border-b-0">
+                          <input type="checkbox"
+                                 class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
+                                 :checked="setsState[meta.id].selected.has(dom.domain)"
+                                 @change="toggleSetDomain(meta.id, dom.domain, $event.target.checked)">
+                          <span class="font-mono flex-1 truncate" x-text="dom.domain"></span>
+                          <span class="text-[color:var(--brand-text-soft)] w-20 truncate" x-text="dom.category_guess || ''"></span>
+                          <span class="text-[color:var(--brand-text-soft)] w-12 text-right" x-text="'×' + dom.frequency"></span>
+                        </label>
+                      </template>
+                      <div x-show="flatVisibleDomains(meta.id).length === 0" class="px-3 py-2 text-[color:var(--brand-text-soft)] text-xs">Ничего не найдено.</div>
+                    </div>
+                    <div x-show="flatHasMore(meta.id)" class="text-xs">
+                      <button @click="setsState[meta.id].showAll = true"
+                              class="text-[color:var(--brand-primary)] hover:underline"
+                              x-text="'Показать все (ещё ' + (flatVisibleDomains(meta.id).length - 100) + ')'"></button>
+                    </div>
+                  </div>
+                </template>
+
+                <div x-show="setsState[meta.id]?.loading" class="text-xs text-[color:var(--brand-text-muted)]">Загрузка...</div>
+                <div x-show="setsState[meta.id]?.error" x-text="setsState[meta.id]?.error" class="text-xs text-[color:var(--brand-error)]"></div>
+              </div>
+            </div>
+          </template>
+
+          <!-- inline detail: custom textarea -->
+          <div class="editorial-detail" x-show="form.sourceMode === 'custom'">
+            <div class="config-label mb-2">Мой список доменов</div>
+            <p class="config-hint mb-2">Любой формат: построчно, через запятую, нумерованный или маркированный список. Парсер уберёт префиксы, www, пути и порты.</p>
+            <textarea x-model="form.domainsText"
+                      spellcheck="false"
+                      rows="9"
+                      placeholder="example.com, mysite.org, brand.ru&#10;1. https://www.test.com/path&#10;- foo.bar"
+                      class="editorial-textarea"></textarea>
+            <div class="text-xs flex items-center gap-2 flex-wrap mt-2">
+              <span class="text-[color:var(--brand-text-muted)]"
+                    x-text="'Распознано доменов: ' + customDomains.length"></span>
+              <span x-show="form.domainsText.trim() && customDomains.length === 0"
+                    class="text-[color:var(--brand-warn)]">
+                ничего не распознано — проверь формат
+              </span>
+            </div>
+          </div>
+
+          <div x-show="setsMeta.length === 0 && !setsLoadError" class="text-xs text-[color:var(--brand-text-soft)] mt-3">Наборы не настроены.</div>
+        </div>
+      </div>
+
+      <!-- ====== Section 02 — Краулеры ====== -->
+      <div class="editorial-section">
+        <span class="editorial-number">02</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Шаг 02 / 04</div>
+        <div class="editorial-header">
+          <svg class="editorial-svg svg-anim-network" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="32" y1="32" x2="14" y2="14"></line>
+            <line x1="32" y1="32" x2="50" y2="14"></line>
+            <line x1="32" y1="32" x2="10" y2="38"></line>
+            <line x1="32" y1="32" x2="54" y2="38"></line>
+            <line x1="32" y1="32" x2="32" y2="56"></line>
+            <circle class="satellite" cx="14" cy="14" r="3" fill="currentColor"></circle>
+            <circle class="satellite" cx="50" cy="14" r="3" fill="currentColor"></circle>
+            <circle class="satellite" cx="10" cy="38" r="3" fill="currentColor"></circle>
+            <circle class="satellite" cx="54" cy="38" r="3" fill="currentColor"></circle>
+            <circle class="satellite" cx="32" cy="56" r="3" fill="currentColor"></circle>
+            <circle cx="32" cy="32" r="6" fill="none"></circle>
+          </svg>
+          <div>
+            <h2 class="editorial-title">Идентификаторы AI-краулеров</h2>
+            <p class="editorial-lede">AI-сервисы ходят по сайтам через специальных программных агентов с уникальными User-Agent. Мы поочерёдно подставляем каждый идентификатор и фиксируем, как реагирует сайт.</p>
+          </div>
+        </div>
+
+        <div class="editorial-body">
+          <div class="crawler-grid">
+            <template x-for="group in uaGroups" :key="group.provider">
+              <div class="crawler-col">
+                <div class="crawler-col-head">
+                  <span class="relative inline-block"
+                        :class="group.providerTip ? 'cursor-help' : ''"
+                        x-data="{ show: false }"
+                        @mouseenter="show = !!group.providerTip" @mouseleave="show = false">
+                    <span x-text="group.providerRu"></span>
+                    <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="group.providerTip || ''"></span>
+                  </span>
+                  <span class="crawler-col-toggle" @click="toggleProviderUas(group)" x-text="providerAllSelected(group) ? 'снять' : 'выбрать'"></span>
+                </div>
+                <!-- flat group -->
+                <template x-if="!group.subgroups">
+                  <div class="crawler-col-list">
+                    <template x-for="label in group.labels" :key="label">
+                      <label class="crawler-check">
+                        <input type="checkbox" x-model="form.uaSelected[label]"
+                               class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                        <span class="relative inline-block cursor-help"
+                              x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                          <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
+                          <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                        </span>
+                      </label>
+                    </template>
+                  </div>
+                </template>
+                <!-- subgroups (Google) -->
+                <template x-if="group.subgroups">
+                  <div class="crawler-col-list">
+                    <template x-for="sub in group.subgroups" :key="sub.name">
+                      <div>
+                        <div class="crawler-subhead">
+                          <span x-text="sub.name"></span>
+                          <span x-show="sub.experimental"
+                                class="px-1 py-0 rounded text-[9px] bg-amber-950/60 text-amber-300 border border-amber-900 normal-case tracking-normal">exp</span>
+                        </div>
+                        <template x-for="label in sub.labels" :key="label">
+                          <label class="crawler-check">
+                            <input type="checkbox" x-model="form.uaSelected[label]"
+                                   class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                            <span class="relative inline-block cursor-help"
+                                  x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
+                              <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                            </span>
+                          </label>
+                        </template>
+                      </div>
+                    </template>
+                    <div x-show="group.robotsOnlyNote"
+                         class="mt-2 text-[10.5px] leading-snug text-[color:var(--brand-text-muted)] border-l-2 border-[color:var(--brand-border-strong)] pl-2"
+                         x-text="group.robotsOnlyNote"></div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Section 03 — Настройка ====== -->
+      <div class="editorial-section">
+        <span class="editorial-number">03</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Шаг 03 / 04</div>
+        <div class="editorial-header">
+          <svg class="editorial-svg svg-anim-dial" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="32" cy="32" r="20"></circle>
+            <circle cx="32" cy="32" r="3" fill="currentColor"></circle>
+            <line class="tick" x1="32" y1="32" x2="32" y2="16" stroke-width="2"></line>
+            <line x1="32" y1="10" x2="32" y2="13" stroke="currentColor"></line>
+            <line x1="32" y1="51" x2="32" y2="54" stroke="currentColor"></line>
+            <line x1="10" y1="32" x2="13" y2="32" stroke="currentColor"></line>
+            <line x1="51" y1="32" x2="54" y2="32" stroke="currentColor"></line>
+          </svg>
+          <div>
+            <h2 class="editorial-title">Параметры запроса</h2>
+            <p class="editorial-lede">Параллельность определяет, сколько проверок выполняется одновременно. Таймаут — сколько ждать ответа от каждого сайта прежде чем считать запрос неуспешным.</p>
+          </div>
+        </div>
+
+        <div class="editorial-body">
+          <div class="config-row">
+            <div class="config-field">
+              <label class="config-label">Параллельность</label>
+              <input type="number" x-model.number="form.concurrency" min="1" max="32" class="config-input">
+              <p class="config-hint">Запросов одновременно. Выше — быстрее, но риск блокировки со стороны сайтов.</p>
+            </div>
+            <div class="config-field">
+              <label class="config-label">Таймаут, сек</label>
+              <input type="number" x-model.number="form.timeoutSeconds" min="5" max="60" class="config-input">
+              <p class="config-hint">Сколько ждать ответ. 15 секунд — стандарт, для медленных сайтов до 30.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Section 04 — Запуск ====== -->
+      <div class="editorial-section">
+        <span class="editorial-number">04</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Шаг 04 / 04</div>
+        <div class="editorial-header">
+          <svg class="editorial-svg svg-anim-arrow" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="52" x2="50" y2="14"></line>
+            <polyline points="34,14 50,14 50,30"></polyline>
+            <circle class="dot" cx="32" cy="32" r="3" fill="currentColor"></circle>
+          </svg>
+          <div>
+            <h2 class="editorial-title">Запуск проверки</h2>
+            <p class="editorial-lede">Итоговая выборка пересчитывается автоматически. Каждый домен умножается на число выбранных AI-краулеров плюс один robots-запрос.</p>
+          </div>
+        </div>
+
+        <div class="launch-band">
+          <div>
+            <div class="launch-summary-eq">
+              <strong x-text="finalDomains.length"></strong> доменов
+              <span class="text-[color:var(--brand-text-soft)]">×</span>
+              <strong x-text="selectedUaCount"></strong> краулеров
+              <span class="text-[color:var(--brand-text-soft)]">=</span>
+              <strong x-text="totalProbeEstimate"></strong> проб
+            </div>
+            <div class="launch-meta">
+              <span x-text="'Источник: ' + sourceLabelRu"></span>
+              <span class="text-[color:var(--brand-text-soft)] mx-1">·</span>
+              <span x-text="'Примерное время: ' + timeEstimateText"></span>
+              <span x-show="sourceBreakdown.deduplicated_removed > 0" class="text-[color:var(--brand-text-soft)] ml-1"
+                    x-text="'· удалено дублей: ' + sourceBreakdown.deduplicated_removed"></span>
+            </div>
+            <div x-show="formError" x-text="formError" class="text-sm text-[color:var(--brand-error)] mt-2"></div>
+          </div>
+          <button @click="startRun()"
+                  :disabled="setsLoading || submitting || finalDomains.length === 0 || selectedUaCount === 0"
+                  class="launch-cta">
+            <span x-show="!submitting">Запустить проверку</span>
+            <span x-show="submitting">Запускаю...</span>
+            <svg class="launch-cta-arrow" viewBox="0 0 18 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="0" y1="6" x2="16" y2="6"></line>
+              <polyline points="11,1 16,6 11,11"></polyline>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- ====== Methodology (collapsed) ====== -->
+      <details class="methodology-panel rounded-lg border p-4" style="margin-top: 80px;">
         <summary class="methodology-summary cursor-pointer select-none">
           <div class="flex items-center justify-between gap-4">
             <div class="min-w-0">
               <div class="flex items-center gap-2 flex-wrap">
                 <span class="methodology-caret text-sm">▶</span>
-                <h2 class="text-sm font-semibold text-[color:var(--brand-info)]">Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</h2>
+                <h2 class="text-sm font-semibold text-[color:var(--brand-info)]">Как работает методика — Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</h2>
               </div>
               <p class="text-xs text-[color:var(--brand-text-muted)] mt-1 leading-relaxed">
                 Мы эмулируем <strong>реальные отпечатки AI-ботов</strong> и crawler/retrieval-агентов LLM-систем, чтобы проверить, может ли сайт стать источником знаний для AI-ответов.
@@ -237,349 +1041,6 @@
           </div>
         </div>
       </details>
-
-      <!-- Phase 1: mode picker — shown only when domainMode is null -->
-      <div x-show="form.domainMode === null" class="space-y-3">
-        <div class="text-sm font-medium text-[color:var(--brand-text)]">Откуда взять домены для проверки?</div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <button @click="form.domainMode = 'sets'" type="button"
-                  class="text-left rounded-xl border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-6 transition hover:border-[color:var(--brand-primary)] hover:bg-[color:var(--brand-bg-panel)] focus:outline-none focus:border-[color:var(--brand-primary)] group">
-            <div class="flex items-center gap-3 mb-3">
-              <span class="text-3xl">📦</span>
-              <span class="text-lg font-semibold text-[color:var(--brand-text)] group-hover:text-[color:var(--brand-primary)]">Готовые наборы</span>
-            </div>
-            <p class="text-sm text-[color:var(--brand-text-muted)] leading-relaxed mb-3">
-              Использовать предустановленные подборки доменов с аннотациями и категориями.
-            </p>
-            <div class="text-xs text-[color:var(--brand-text-soft)]">
-              <span x-text="setsMeta.length + ' набора: ' + setsMeta.map(m => m.title || m.id).join(', ')"></span>
-            </div>
-          </button>
-          <button @click="form.domainMode = 'custom'" type="button"
-                  class="text-left rounded-xl border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] p-6 transition hover:border-[color:var(--brand-primary)] hover:bg-[color:var(--brand-bg-panel)] focus:outline-none focus:border-[color:var(--brand-primary)] group">
-            <div class="flex items-center gap-3 mb-3">
-              <span class="text-3xl">✍️</span>
-              <span class="text-lg font-semibold text-[color:var(--brand-text)] group-hover:text-[color:var(--brand-primary)]">Мои домены</span>
-            </div>
-            <p class="text-sm text-[color:var(--brand-text-muted)] leading-relaxed mb-3">
-              Ввести произвольный список доменов вручную.
-            </p>
-            <div class="text-xs text-[color:var(--brand-text-soft)]">
-              Любой формат — нумерация, маркеры, CSV, URL'ы
-            </div>
-          </button>
-        </div>
-      </div>
-
-      <!-- Phase 2: breadcrumb + content -->
-      <div x-show="form.domainMode !== null" class="space-y-4">
-        <!-- Breadcrumb mode indicator -->
-        <div class="flex items-center justify-between gap-3 rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)] px-3 py-2 text-xs">
-          <div class="flex items-center gap-2">
-            <span class="text-[color:var(--brand-text-muted)]">Режим:</span>
-            <span class="font-medium text-[color:var(--brand-text)]"
-                  x-text="form.domainMode === 'sets' ? '📦 Готовые наборы' : '✍️ Мои домены'"></span>
-          </div>
-          <button @click="form.domainMode = null" type="button"
-                  class="text-[color:var(--brand-primary)] hover:underline">← изменить режим</button>
-        </div>
-
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-
-        <!-- Left column: sets OR custom -->
-        <div class="lg:col-span-2 space-y-5">
-
-          <!-- Domain sets (sets mode only) -->
-          <div class="space-y-3"
-               x-show="form.domainMode === 'sets'">
-            <div>
-              <h2 class="text-sm font-semibold relative inline-block cursor-help"
-                  x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Наборы доменов</span>
-                <span x-show="show" x-transition class="rw-tip rw-tip-below">
-                  Готовые подборки доменов для проверки. Можно включить один или оба набора, плюс добавить свои домены ниже. Перед стартом список объединяется и дедуплицируется.
-                </span>
-              </h2>
-              <p class="text-xs text-[color:var(--brand-text-muted)] mt-0.5">
-                Выбери один или оба набора, по желанию добавь свои домены ниже. Итоговый список перед запуском дедуплицируется.
-              </p>
-            </div>
-
-            <div x-show="setsLoadError" x-text="setsLoadError" class="text-xs text-[color:var(--brand-warn)]"></div>
-
-            <template x-for="meta in setsMeta" :key="meta.id">
-              <div class="rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-soft)]">
-                <div class="flex items-start gap-3 p-3">
-                  <input type="checkbox"
-                         class="mt-1 rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
-                         :checked="setsState[meta.id]?.enabled"
-                         @change="toggleSetEnabled(meta.id, $event.target.checked)">
-                  <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 flex-wrap">
-                      <span class="font-medium relative inline-block cursor-help"
-                            x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                        <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="setTitleRu(meta)"></span>
-                        <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="setHelpRu(meta)"></span>
-                      </span>
-                      <span class="text-xs text-[color:var(--brand-text-soft)]" x-text="meta.kind === 'categorical' ? 'категориальный' : 'плоский'"></span>
-                    </div>
-                    <p class="text-xs text-[color:var(--brand-text-muted)] mt-1" x-text="meta.description"></p>
-                    <div class="text-xs text-[color:var(--brand-text-muted)] mt-2 flex items-center gap-4 flex-wrap">
-                      <span x-text="meta.domain_count + ' доменов'"></span>
-                      <span x-text="setSelectedCount(meta.id) + ' выбрано'"
-                            :class="setsState[meta.id]?.enabled ? 'text-[color:var(--brand-primary)] font-medium' : 'text-[color:var(--brand-text-soft)]'"></span>
-                      <button @click="toggleSetExpanded(meta.id)"
-                              class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]">
-                        <span x-show="!setsState[meta.id]?.expanded">Показать детали ▾</span>
-                        <span x-show="setsState[meta.id]?.expanded">Скрыть детали ▴</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div x-show="setsState[meta.id]?.expanded" class="border-t border-[color:var(--brand-border)] p-3 space-y-3">
-                  <div class="flex items-center gap-3 text-xs">
-                    <button @click="selectAllInSet(meta.id)" class="px-2 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Выбрать всё в наборе</button>
-                    <button @click="deselectAllInSet(meta.id)" class="px-2 py-1 rounded bg-[color:var(--brand-bg-panel)] hover:bg-[color:var(--brand-border)]">Снять всё в наборе</button>
-                    <span class="text-[color:var(--brand-text-muted)]" x-text="setSelectedCount(meta.id) + ' из ' + meta.domain_count + ' выбрано'"></span>
-                  </div>
-
-                  <template x-if="meta.kind === 'categorical' && setsState[meta.id]?.data">
-                    <div class="space-y-3">
-                      <template x-for="cat in setsState[meta.id].data.categories" :key="cat.name">
-                        <div class="rounded border border-[color:var(--brand-border)]">
-                          <div class="flex items-center gap-2 px-2 py-1 bg-[color:var(--brand-bg-panel)]">
-                            <input type="checkbox"
-                                   class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
-                                   :checked="categoryAllSelected(meta.id, cat)"
-                                   @change="toggleCategory(meta.id, cat, $event.target.checked)">
-                            <span class="text-sm font-medium" x-text="cat.name"></span>
-                            <span class="text-xs text-[color:var(--brand-text-soft)] ml-auto" x-text="cat.domains.length + ' доменов'"></span>
-                          </div>
-                          <div class="px-3 py-2 space-y-0.5 bg-[color:var(--brand-bg-soft)]">
-                            <template x-for="dom in cat.domains" :key="dom">
-                              <label class="flex items-start gap-2 text-xs cursor-pointer">
-                                <input type="checkbox"
-                                       class="mt-0.5 rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
-                                       :checked="setsState[meta.id].selected.has(dom)"
-                                       @change="toggleSetDomain(meta.id, dom, $event.target.checked)">
-                                <span class="font-mono w-32 shrink-0" x-text="dom"></span>
-                                <span class="text-[color:var(--brand-text-muted)] break-words" x-text="setsState[meta.id].data.annotations?.[dom] || ''"></span>
-                              </label>
-                            </template>
-                          </div>
-                        </div>
-                      </template>
-                    </div>
-                  </template>
-
-                  <template x-if="meta.kind === 'flat' && setsState[meta.id]?.data">
-                    <div class="space-y-2">
-                      <div class="flex items-center gap-2 flex-wrap text-xs">
-                        <input type="text" placeholder="Фильтр по домену..."
-                               class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-[color:var(--brand-text)]"
-                               :value="setsState[meta.id].filter"
-                               @input="setsState[meta.id].filter = $event.target.value">
-                        <select class="bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-[color:var(--brand-text)]"
-                                :value="setsState[meta.id].catFilter"
-                                @change="setsState[meta.id].catFilter = $event.target.value">
-                          <option value="all">Все категории</option>
-                          <template x-for="c in flatCategoryOptions(meta.id)" :key="c">
-                            <option :value="c" x-text="c"></option>
-                          </template>
-                        </select>
-                        <span class="text-[color:var(--brand-text-muted)]" x-text="flatVisibleDomains(meta.id).length + ' видно'"></span>
-                      </div>
-                      <div class="rounded border border-[color:var(--brand-border)] max-h-[55vh] overflow-y-auto bg-[color:var(--brand-bg-soft)]">
-                        <template x-for="dom in flatRenderedDomains(meta.id)" :key="dom.domain">
-                          <label class="flex items-center gap-2 px-3 py-1 hover:bg-[color:var(--brand-bg-soft)] cursor-pointer text-xs border-b border-[color:var(--brand-border)] last:border-b-0">
-                            <input type="checkbox"
-                                   class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]"
-                                   :checked="setsState[meta.id].selected.has(dom.domain)"
-                                   @change="toggleSetDomain(meta.id, dom.domain, $event.target.checked)">
-                            <span class="font-mono flex-1 truncate" x-text="dom.domain"></span>
-                            <span class="text-[color:var(--brand-text-soft)] w-20 truncate" x-text="dom.category_guess || ''"></span>
-                            <span class="text-[color:var(--brand-text-soft)] w-12 text-right" x-text="'×' + dom.frequency"></span>
-                          </label>
-                        </template>
-                        <div x-show="flatVisibleDomains(meta.id).length === 0" class="px-3 py-2 text-[color:var(--brand-text-soft)] text-xs">Ничего не найдено.</div>
-                      </div>
-                      <div x-show="flatHasMore(meta.id)" class="text-xs">
-                        <button @click="setsState[meta.id].showAll = true"
-                                class="text-[color:var(--brand-primary)] hover:underline"
-                                x-text="'Показать все (ещё ' + (flatVisibleDomains(meta.id).length - 100) + ')'"></button>
-                      </div>
-                    </div>
-                  </template>
-
-                  <div x-show="setsState[meta.id]?.loading" class="text-xs text-[color:var(--brand-text-muted)]">Загрузка...</div>
-                  <div x-show="setsState[meta.id]?.error" x-text="setsState[meta.id]?.error" class="text-xs text-[color:var(--brand-error)]"></div>
-                </div>
-              </div>
-            </template>
-
-            <div x-show="setsMeta.length === 0 && !setsLoadError" class="text-xs text-[color:var(--brand-text-soft)]">Наборы не настроены.</div>
-          </div>
-
-          <!-- Custom domains (custom mode only, full-width) -->
-          <div class="space-y-2" x-show="form.domainMode === 'custom'">
-            <label class="text-sm font-medium relative inline-block cursor-help"
-                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Мои домены</span>
-              <span x-show="show" x-transition class="rw-tip rw-tip-below">
-                Парсер сам уберёт нумерацию, маркеры списков, https://, www., пути и порты. Можно вставлять списки из Word, Excel, Markdown — построчно, через запятую или через пробел.
-              </span>
-            </label>
-            <p class="text-xs text-[color:var(--brand-text-muted)]">
-              Любой формат: построчно, через запятую, нумерованный или маркированный список.
-            </p>
-            <textarea x-model="form.domainsText"
-                      spellcheck="false"
-                      rows="10"
-                      placeholder="example.com, mysite.org, brand.ru&#10;1. https://www.test.com/path&#10;- foo.bar"
-                      class="w-full bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded p-3 font-mono text-sm text-[color:var(--brand-text)] placeholder:text-[color:var(--brand-text-soft)] focus:outline-none focus:border-[color:var(--brand-primary)]"></textarea>
-            <div class="text-xs flex items-center gap-2 flex-wrap">
-              <span class="text-[color:var(--brand-text-muted)]"
-                    x-text="'Распознано доменов: ' + customDomains.length"></span>
-              <span x-show="form.domainsText.trim() && customDomains.length === 0"
-                    class="text-[color:var(--brand-warn)]">
-                ничего не распознано — проверь формат
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Right column: UAs + numbers -->
-        <div class="space-y-4">
-          <div>
-            <div class="mb-2">
-              <label class="text-sm font-medium relative inline-block cursor-help"
-                     x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Идентификаторы AI-краулеров</span>
-                <span x-show="show" x-transition class="rw-tip rw-tip-left">
-                  AI-сервисы (ChatGPT, Claude, Perplexity и другие) ходят по сайтам через специальных программных агентов, которых можно отличить по уникальной строке-визитке - User-Agent. Мы притворяемся каждым из этих агентов по очереди и смотрим, как сайт отвечает.
-                </span>
-              </label>
-            </div>
-            <div class="space-y-3">
-              <template x-for="group in uaGroups" :key="group.provider">
-                <div>
-                  <div class="text-xs text-[color:var(--brand-text-soft)] uppercase tracking-wide mb-1 relative inline-block"
-                       :class="group.providerTip ? 'cursor-help' : ''"
-                       x-data="{ show: false }"
-                       @mouseenter="show = !!group.providerTip" @mouseleave="show = false">
-                    <span :class="group.providerTip ? 'border-b border-dotted border-[color:var(--brand-text-soft)]' : ''" x-text="group.providerRu"></span>
-                    <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="group.providerTip || ''"></span>
-                  </div>
-                  <!-- flat group (no subgroups) -->
-                  <template x-if="!group.subgroups">
-                    <div class="space-y-1 ml-1">
-                      <template x-for="label in group.labels" :key="label">
-                        <label class="flex items-center gap-2 text-sm cursor-pointer">
-                          <input type="checkbox" x-model="form.uaSelected[label]"
-                                 class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                          <span class="relative inline-block cursor-help"
-                                x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                            <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
-                            <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="UA_TOOLTIPS[label] || ''"></span>
-                          </span>
-                        </label>
-                      </template>
-                    </div>
-                  </template>
-                  <!-- group with subgroups (e.g. Google) -->
-                  <template x-if="group.subgroups">
-                    <div class="space-y-2 ml-1">
-                      <template x-for="sub in group.subgroups" :key="sub.name">
-                        <div class="space-y-0.5">
-                          <div class="text-[10px] uppercase tracking-wider text-[color:var(--brand-text-soft)] flex items-center gap-1.5">
-                            <span x-text="sub.name"></span>
-                            <span x-show="sub.experimental"
-                                  class="px-1.5 py-0.5 rounded text-[9px] bg-amber-950/60 text-amber-300 border border-amber-900 normal-case tracking-normal">experimental</span>
-                          </div>
-                          <template x-for="label in sub.labels" :key="label">
-                            <label class="flex items-center gap-2 text-sm cursor-pointer ml-1">
-                              <input type="checkbox" x-model="form.uaSelected[label]"
-                                     class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                              <span class="relative inline-block cursor-help"
-                                    x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                                <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
-                                <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="UA_TOOLTIPS[label] || ''"></span>
-                              </span>
-                            </label>
-                          </template>
-                        </div>
-                      </template>
-                      <div x-show="group.robotsOnlyNote"
-                           class="ml-1 mt-1 text-[11px] leading-snug text-[color:var(--brand-text-muted)] border-l-2 border-[color:var(--brand-border-strong)] pl-2"
-                           x-text="group.robotsOnlyNote"></div>
-                    </div>
-                  </template>
-                </div>
-              </template>
-            </div>
-          </div>
-
-          <div>
-            <label class="text-sm font-medium relative inline-block cursor-help mb-1"
-                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Параллельность запросов</span>
-              <span x-show="show" x-transition class="rw-tip rw-tip-left">
-                Сколько проверок выполняется одновременно. Выше - быстрее общее время, но больше нагрузка на сеть и риск быть заблокированным сайтом за слишком частые запросы.
-              </span>
-            </label>
-            <input type="number" x-model.number="form.concurrency" min="1" max="32"
-                   class="w-24 bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)]">
-          </div>
-
-          <div>
-            <label class="text-sm font-medium relative inline-block cursor-help mb-1"
-                   x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-              <span class="border-b border-dotted border-[color:var(--brand-text-soft)]">Таймаут (секунды)</span>
-              <span x-show="show" x-transition class="rw-tip rw-tip-left">
-                Сколько ждать ответа от каждого сайта прежде чем считать запрос неуспешным. 15 секунд достаточно для большинства сайтов; для медленных можно увеличить до 30.
-              </span>
-            </label>
-            <input type="number" x-model.number="form.timeoutSeconds" min="5" max="60"
-                   class="w-24 bg-[color:var(--brand-bg-panel)] border border-[color:var(--brand-border-strong)] rounded px-2 py-1 text-sm text-[color:var(--brand-text)]">
-          </div>
-        </div>
-      </div>
-      </div>
-
-      <!-- Final summary + start (full-width, sticky bottom while Phase 2 active) -->
-      <div x-show="form.domainMode !== null"
-           class="sticky bottom-0 z-30 rounded-lg border border-[color:var(--brand-border)] bg-[color:var(--brand-bg-panel)] p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 shadow-[0_-8px_24px_-12px_rgba(0,0,0,0.6)]">
-        <div class="space-y-1">
-          <div class="text-sm">
-            <span class="text-[color:var(--brand-text-muted)]">Итоговый список: </span>
-            <span class="font-semibold" x-text="finalDomains.length + ' уникальных доменов'"></span>
-          </div>
-          <div class="text-xs text-[color:var(--brand-text-muted)]" x-text="
-            'Набор 1: ' + sourceBreakdown.set1_selected
-            + ' · Набор 2: ' + sourceBreakdown.set2_selected
-            + (sourceBreakdown.set3_selected ? ' · Набор 3: ' + sourceBreakdown.set3_selected : '')
-            + ' · своих: ' + sourceBreakdown.custom
-            + (sourceBreakdown.deduplicated_removed > 0
-                ? ' · удалено дублей: ' + sourceBreakdown.deduplicated_removed
-                : '')
-          "></div>
-          <div class="text-xs text-[color:var(--brand-text-muted)]">
-            <span x-text="'Будет выполнено ' + totalProbeEstimate + ' проб (' + finalDomains.length + ' × (' + selectedUaCount + ' идентификаторов + 1 robots.txt))'"></span>
-            <span class="text-[color:var(--brand-text-soft)] mx-1">·</span>
-            <span x-text="'Примерное время: ' + timeEstimateText"></span>
-          </div>
-        </div>
-        <div class="flex items-center gap-3 shrink-0">
-          <span x-show="formError" x-text="formError" class="text-sm text-[color:var(--brand-error)]"></span>
-          <button @click="startRun()"
-                  :disabled="setsLoading || submitting || finalDomains.length === 0 || selectedUaCount === 0"
-                  class="px-5 py-2.5 rounded bg-[color:var(--brand-primary)] hover:bg-[color:var(--brand-primary-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium">
-            <span x-show="!submitting">Запустить проверку</span>
-            <span x-show="submitting">Запускаю...</span>
-          </button>
-        </div>
-      </div>
     </section>
 
     <!-- ============ ACTIVE RUN ============ -->
@@ -1078,7 +1539,7 @@
         ROBOTS_RULE_TIPS,
         form: {
           domainsText: '',
-          domainMode: null,
+          sourceMode: null,
           uaSelected: {},
           concurrency: 8,
           timeoutSeconds: 15,
@@ -1255,44 +1716,49 @@
         },
         get parsedDomains() { return this.finalDomains; },
         get finalDomains() {
-          if (this.form.domainMode === 'custom') {
+          const mode = this.form.sourceMode;
+          if (mode === 'custom') {
             return this.customDomains;
           }
-          if (this.form.domainMode === 'sets') {
+          if (mode === 'set1' || mode === 'set2' || mode === 'set3') {
+            const setId = this.setIdForMode(mode);
+            const st = this.setsState[setId];
+            if (!st) return [];
             const seen = new Set(); const out = [];
-            for (const meta of this.setsMeta) {
-              const st = this.setsState[meta.id];
-              if (!st || !st.enabled) continue;
-              for (const d of st.selected) {
-                const norm = (d || '').toLowerCase().replace(/^www\./, '');
-                if (norm && !seen.has(norm)) { seen.add(norm); out.push(norm); }
-              }
+            for (const d of st.selected) {
+              const norm = (d || '').toLowerCase().replace(/^www\./, '');
+              if (norm && !seen.has(norm)) { seen.add(norm); out.push(norm); }
             }
             return out;
           }
-          // picker phase (domainMode === null) — submit disabled
+          // picker phase (sourceMode === null) — submit disabled
           return [];
         },
         get sourceBreakdown() {
-          const custom = this.customDomains.length;
-          if (this.form.domainMode === 'custom') {
-            return { set1_selected: 0, set2_selected: 0, set3_selected: 0, custom, deduplicated_removed: 0 };
+          const mode = this.form.sourceMode;
+          if (mode === 'custom') {
+            return { set1_selected: 0, set2_selected: 0, set3_selected: 0, custom: this.customDomains.length, deduplicated_removed: 0 };
           }
-          if (this.form.domainMode === 'sets') {
-            let s1 = 0, s2 = 0, s3 = 0;
-            for (const meta of this.setsMeta) {
-              const st = this.setsState[meta.id];
-              if (!st || !st.enabled) continue;
-              const n = st.selected.size;
-              if (meta.id === 'set1_manual_research') s1 = n;
-              else if (meta.id === 'set2_corpus_sources') s2 = n;
-              else if (meta.id === 'set3_ru_fmcg_consumer') s3 = n;
-            }
-            const raw = s1 + s2 + s3;
-            const final = this.finalDomains.length;
-            return { set1_selected: s1, set2_selected: s2, set3_selected: s3, custom: 0, deduplicated_removed: Math.max(0, raw - final) };
+          if (mode === 'set1' || mode === 'set2' || mode === 'set3') {
+            const setId = this.setIdForMode(mode);
+            const st = this.setsState[setId];
+            const n = st ? st.selected.size : 0;
+            const out = { set1_selected: 0, set2_selected: 0, set3_selected: 0, custom: 0, deduplicated_removed: 0 };
+            if (mode === 'set1') out.set1_selected = n;
+            else if (mode === 'set2') out.set2_selected = n;
+            else if (mode === 'set3') out.set3_selected = n;
+            return out;
           }
           return { set1_selected: 0, set2_selected: 0, set3_selected: 0, custom: 0, deduplicated_removed: 0 };
+        },
+        get sourceLabelRu() {
+          const mode = this.form.sourceMode;
+          if (mode === 'custom') return 'Мой список';
+          if (mode === 'set1' || mode === 'set2' || mode === 'set3') {
+            const meta = this.setMetaById(this.setIdForMode(mode));
+            return meta ? this.setTitleRu(meta) : 'Набор';
+          }
+          return 'не выбран';
         },
         get setsLoading() {
           return Object.values(this.setsState).some(st => st && st.enabled && st.loading);
@@ -1514,8 +1980,51 @@
         },
 
         // ----- sets -----
-        setTitleRu(meta) { return SET_TITLES_RU[meta.id] || meta.title; },
-        setHelpRu(meta)  { return SET_HELP_RU[meta.id] || meta.description || ''; },
+        setTitleRu(meta) { return meta ? (SET_TITLES_RU[meta.id] || meta.title) : ''; },
+        setHelpRu(meta)  { return meta ? (SET_HELP_RU[meta.id] || meta.description || '') : ''; },
+        setMetaById(id)  { return this.setsMeta.find(m => m.id === id) || null; },
+        setIdForMode(mode) {
+          if (mode === 'set1') return 'set1_manual_research';
+          if (mode === 'set2') return 'set2_corpus_sources';
+          if (mode === 'set3') return 'set3_ru_fmcg_consumer';
+          return null;
+        },
+        setKeyOfMeta(meta) {
+          if (!meta) return null;
+          if (meta.id === 'set1_manual_research') return 'set1';
+          if (meta.id === 'set2_corpus_sources') return 'set2';
+          if (meta.id === 'set3_ru_fmcg_consumer') return 'set3';
+          return null;
+        },
+        async pickSource(mode) {
+          this.form.sourceMode = mode;
+          if (mode === 'set1' || mode === 'set2' || mode === 'set3') {
+            const setId = this.setIdForMode(mode);
+            const st = this.setsState[setId];
+            if (st) {
+              st.enabled = true;
+              await this.ensureSetData(setId);
+            }
+          }
+        },
+        providerAllSelected(group) {
+          const labels = this._allLabelsForGroup(group);
+          if (labels.length === 0) return false;
+          return labels.every(l => this.form.uaSelected[l]);
+        },
+        toggleProviderUas(group) {
+          const labels = this._allLabelsForGroup(group);
+          const allOn = this.providerAllSelected(group);
+          for (const l of labels) this.form.uaSelected[l] = !allOn;
+        },
+        _allLabelsForGroup(group) {
+          if (group.subgroups) {
+            const out = [];
+            for (const sub of group.subgroups) for (const l of sub.labels) out.push(l);
+            return out;
+          }
+          return group.labels || [];
+        },
         async loadSetsMeta() {
           this.setsLoadError = '';
           try {
