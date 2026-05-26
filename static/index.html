@@ -818,6 +818,59 @@
     }
 
     /* accented details toggle inside Step 01 subset picker */
+    /* Accent button for the "Методика" header nav entry. Reads as a primary
+       call-to-action even when other nav buttons are plain text — the
+       methodology page is the long-form explanation, and the rest are
+       run-flow tabs, so this is intentionally louder. */
+    .nav-methodology-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 14px;
+      border-radius: 4px;
+      border: 1px solid var(--brand-primary);
+      background: rgba(255, 50, 75, 0.08);
+      color: var(--brand-primary);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+      cursor: pointer;
+    }
+    .nav-methodology-btn:hover {
+      background: var(--brand-primary);
+      color: #fff;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 18px rgba(255, 50, 75, 0.28);
+    }
+    .nav-methodology-btn:focus { outline: none; }
+    .nav-methodology-btn:focus-visible {
+      box-shadow: 0 0 0 2px rgba(255, 50, 75, 0.45);
+    }
+    .nav-methodology-btn.is-active {
+      background: var(--brand-primary);
+      color: #fff;
+    }
+    .nav-methodology-btn.is-active:hover { transform: none; }
+    .nav-methodology-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      flex: 0 0 auto;
+      opacity: 0.9;
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .nav-methodology-btn:not(.is-active) .nav-methodology-dot {
+        animation: nav-meth-pulse 2.2s ease-in-out infinite;
+      }
+      @keyframes nav-meth-pulse {
+        0%, 100% { opacity: 0.35; transform: scale(0.85); }
+        50%      { opacity: 1;    transform: scale(1.15); }
+      }
+    }
+
     .subset-toggle-btn {
       display: inline-flex;
       align-items: center;
@@ -1182,14 +1235,16 @@
 
     <!-- Header -->
     <header class="flex items-center justify-between border-b border-[color:var(--brand-border)] pb-4 mb-6">
-      <div class="flex items-center gap-3">
+      <button type="button" @click="setTab('new_run')"
+              class="flex items-center gap-3 text-left transition-opacity hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--brand-primary)] rounded"
+              aria-label="На главную">
         <img src="/static/brand/logo-mark.svg" alt="RW+" class="h-9 w-9" />
         <div class="h-9 w-px bg-[color:var(--brand-border)]"></div>
         <div>
           <h1 class="text-xl font-semibold tracking-tight">AI Visibility Checker</h1>
           <p class="text-xs text-[color:var(--brand-text-muted)] mt-0.5">Утилита RW+ для исследования доступности российских web-ресурсов для AI-поиска</p>
         </div>
-      </div>
+      </button>
       <div class="flex items-center gap-4">
         <!-- proxy pool indicator: polls /api/healthz on load and every 60s -->
         <div class="relative inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded border cursor-help"
@@ -1214,8 +1269,10 @@
                   :class="tab === 'history' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
                   class="px-3 py-1.5 rounded">История</button>
           <button @click="setTab('methodology')"
-                  :class="tab === 'methodology' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
-                  class="px-3 py-1.5 rounded">Методика</button>
+                  :class="tab === 'methodology' ? 'nav-methodology-btn is-active' : 'nav-methodology-btn'">
+            <span class="nav-methodology-dot" aria-hidden="true"></span>
+            <span>Методика</span>
+          </button>
         </nav>
       </div>
     </header>
