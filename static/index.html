@@ -156,21 +156,31 @@
           <p class="text-xs text-[color:var(--brand-text-muted)] mt-0.5">Утилита RW+ для исследования доступности российских web-ресурсов для AI-поиска</p>
         </div>
       </div>
-      <nav class="flex gap-1 text-sm">
-        <button @click="setTab('new_run')"
-                :class="tab === 'new_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
-                class="px-3 py-1.5 rounded">Новая проверка</button>
-        <button @click="setTab('active_run')"
-                :class="tab === 'active_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
-                :disabled="!currentRunId"
-                class="px-3 py-1.5 rounded disabled:opacity-40 disabled:hover:text-[color:var(--brand-text-muted)]">
-          Текущая проверка
-          <span x-show="currentRunId" x-text="'· ' + (currentRunId || '').slice(0,8)" class="text-xs text-[color:var(--brand-text-soft)]"></span>
-        </button>
-        <button @click="setTab('history')"
-                :class="tab === 'history' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
-                class="px-3 py-1.5 rounded">История</button>
-      </nav>
+      <div class="flex items-center gap-4">
+        <!-- proxy pool indicator: polls /api/healthz on load and every 60s -->
+        <div class="relative inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded border cursor-help"
+             :class="proxyHealthClasses()"
+             x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+          <span class="inline-block w-2 h-2 rounded-full" :class="proxyDotClass()"></span>
+          <span x-text="proxyLabel()"></span>
+          <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="proxyTooltip()"></span>
+        </div>
+        <nav class="flex gap-1 text-sm">
+          <button @click="setTab('new_run')"
+                  :class="tab === 'new_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                  class="px-3 py-1.5 rounded">Новая проверка</button>
+          <button @click="setTab('active_run')"
+                  :class="tab === 'active_run' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                  :disabled="!currentRunId"
+                  class="px-3 py-1.5 rounded disabled:opacity-40 disabled:hover:text-[color:var(--brand-text-muted)]">
+            Текущая проверка
+            <span x-show="currentRunId" x-text="'· ' + (currentRunId || '').slice(0,8)" class="text-xs text-[color:var(--brand-text-soft)]"></span>
+          </button>
+          <button @click="setTab('history')"
+                  :class="tab === 'history' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                  class="px-3 py-1.5 rounded">История</button>
+        </nav>
+      </div>
     </header>
 
     <!-- ============ NEW RUN ============ -->
@@ -407,19 +417,50 @@
                     <span :class="group.providerTip ? 'border-b border-dotted border-[color:var(--brand-text-soft)]' : ''" x-text="group.providerRu"></span>
                     <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="group.providerTip || ''"></span>
                   </div>
-                  <div class="space-y-1 ml-1">
-                    <template x-for="label in group.labels" :key="label">
-                      <label class="flex items-center gap-2 text-sm cursor-pointer">
-                        <input type="checkbox" x-model="form.uaSelected[label]"
-                               class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
-                        <span class="relative inline-block cursor-help"
-                              x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
-                          <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
-                          <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="UA_TOOLTIPS[label] || ''"></span>
-                        </span>
-                      </label>
-                    </template>
-                  </div>
+                  <!-- flat group (no subgroups) -->
+                  <template x-if="!group.subgroups">
+                    <div class="space-y-1 ml-1">
+                      <template x-for="label in group.labels" :key="label">
+                        <label class="flex items-center gap-2 text-sm cursor-pointer">
+                          <input type="checkbox" x-model="form.uaSelected[label]"
+                                 class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                          <span class="relative inline-block cursor-help"
+                                x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                            <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
+                            <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="UA_TOOLTIPS[label] || ''"></span>
+                          </span>
+                        </label>
+                      </template>
+                    </div>
+                  </template>
+                  <!-- group with subgroups (e.g. Google) -->
+                  <template x-if="group.subgroups">
+                    <div class="space-y-2 ml-1">
+                      <template x-for="sub in group.subgroups" :key="sub.name">
+                        <div class="space-y-0.5">
+                          <div class="text-[10px] uppercase tracking-wider text-[color:var(--brand-text-soft)] flex items-center gap-1.5">
+                            <span x-text="sub.name"></span>
+                            <span x-show="sub.experimental"
+                                  class="px-1.5 py-0.5 rounded text-[9px] bg-amber-950/60 text-amber-300 border border-amber-900 normal-case tracking-normal">experimental</span>
+                          </div>
+                          <template x-for="label in sub.labels" :key="label">
+                            <label class="flex items-center gap-2 text-sm cursor-pointer ml-1">
+                              <input type="checkbox" x-model="form.uaSelected[label]"
+                                     class="rounded border-[color:var(--brand-border-strong)] text-[color:var(--brand-primary)] focus:ring-[color:var(--brand-primary)]">
+                              <span class="relative inline-block cursor-help"
+                                    x-data="{ show: false }" @mouseenter="show = true" @mouseleave="show = false">
+                                <span class="border-b border-dotted border-[color:var(--brand-text-soft)]" x-text="label"></span>
+                                <span x-show="show" x-transition class="rw-tip rw-tip-left" x-text="UA_TOOLTIPS[label] || ''"></span>
+                              </span>
+                            </label>
+                          </template>
+                        </div>
+                      </template>
+                      <div x-show="group.robotsOnlyNote"
+                           class="ml-1 mt-1 text-[11px] leading-snug text-[color:var(--brand-text-muted)] border-l-2 border-[color:var(--brand-border-strong)] pl-2"
+                           x-text="group.robotsOnlyNote"></div>
+                    </div>
+                  </template>
                 </div>
               </template>
             </div>
@@ -832,6 +873,17 @@
       { provider: 'DeepSeek',   providerRu: 'DeepSeek (без официальной документации)',
                                 providerTip: 'Китайский AI-сервис, чей краулер не имеет официальной документации (в отличие от OpenAI, Anthropic, Perplexity, которые публично описывают свои боты). Имена DeepSeekBot и DeepSeek-User идентифицированы по наблюдениям сообщества - они массово встречаются в block-листах сайтов. Имитация менее достоверна чем для других провайдеров, но многие сайты явно блокируют именно эти имена, поэтому проверка имеет смысл. По умолчанию выключены - включайте если хотите учесть DeepSeek в анализе.',
                                 labels: ['DeepSeekBot', 'DeepSeek-User'] },
+      { provider: 'Google',     providerRu: 'Google (поиск, AI Overviews, Gemini, Vertex AI)',
+                                providerTip: 'Экосистема Google-краулеров. Googlebot индексирует сайты для классического поиска и AI Overviews. GoogleOther — для внутренних исследований и продуктов. Google-Agent, NotebookLM, CloudVertexBot — user-triggered и enterprise AI-агенты. По умолчанию выключены — включайте, если интересует видимость в Google AI Overviews, Gemini и Vertex AI.',
+                                labels: ['Googlebot-smartphone', 'Googlebot-desktop', 'GoogleOther-mobile', 'GoogleOther-desktop', 'Google-Agent-mobile', 'Google-Agent-desktop', 'Google-NotebookLM', 'Google-CloudVertexBot', 'GoogleAgent-URLContext', 'Gemini-Deep-Research'],
+                                subgroups: [
+                                  { name: 'Поиск и AI Overviews',     labels: ['Googlebot-smartphone', 'Googlebot-desktop'] },
+                                  { name: 'Generic Google crawler',   labels: ['GoogleOther-mobile', 'GoogleOther-desktop'] },
+                                  { name: 'User-triggered AI-агенты', labels: ['Google-Agent-mobile', 'Google-Agent-desktop', 'Google-NotebookLM'] },
+                                  { name: 'Enterprise / RAG',         labels: ['Google-CloudVertexBot'] },
+                                  { name: 'Observed (experimental)',  labels: ['GoogleAgent-URLContext', 'Gemini-Deep-Research'], experimental: true },
+                                ],
+                                robotsOnlyNote: 'Google-Extended — policy-токен для robots.txt (контроль обучения Gemini/Vertex AI). HTTP-запросов от него не бывает: проверка отображается в секции robots.txt отчёта, отдельного чекбокса не нужно.' },
       { provider: 'Controls',   providerRu: 'Контрольные запросы',             labels: ['Chrome-control', 'empty-ua'] },
     ];
     const UA_DEFAULTS = ['GPTBot', 'OAI-SearchBot', 'ClaudeBot', 'PerplexityBot', 'Chrome-control'];
@@ -847,6 +899,16 @@
       'Perplexity-User': 'Бот Perplexity, активирующийся в момент запроса пользователя.',
       'DeepSeekBot': 'Бот, предположительно используемый DeepSeek для тренировочного краулинга (аналог GPTBot и ClaudeBot). Имя идентифицировано по block-листам, не подтверждено официально.',
       'DeepSeek-User': 'Предположительный бот для веб-поиска в момент ответа DeepSeek пользователю (аналог ChatGPT-User и Perplexity-User). Имя сконструировано по аналогии с другими провайдерами и логикой DeepSeek R1, который выполняет двухэтапный поиск (индекс плюс real-time crawling). Существование не подтверждено официально.',
+      'Googlebot-smartphone': 'Мобильный Googlebot для поискового индекса Google и AI Overviews. Основной краулер, от которого зависит видимость сайта в Google Search и в ответах Gemini c grounding на Google.',
+      'Googlebot-desktop': 'Десктопный Googlebot. Реже встречается, чем mobile (Google использует mobile-first индексацию), но всё ещё активен на части сайтов.',
+      'GoogleOther-mobile': 'Generic Google crawler (mobile) для внутренних исследовательских и продуктовых задач Google, не относящихся к поисковому индексу. Документирован официально.',
+      'GoogleOther-desktop': 'Generic Google crawler (desktop) для внутренних задач Google. Поведенчески похож на Googlebot, но обслуживает другие пайплайны Google.',
+      'Google-Agent-mobile': 'Google-Agent (mobile) — официальный user-triggered AI-агент Gemini, выполняющий действия по запросу пользователя (заполнение форм, навигация и т.п.).',
+      'Google-Agent-desktop': 'Google-Agent (desktop) — официальный user-triggered AI-агент Gemini, аналог mobile-версии для десктопных flow.',
+      'Google-NotebookLM': 'Google-NotebookLM — фетчер NotebookLM, забирающий конкретный URL по явному запросу пользователя в NotebookLM (RAG-источники для notebooks).',
+      'Google-CloudVertexBot': 'Google-CloudVertexBot — индексатор Vertex AI Search (enterprise grounding для корпоративных RAG-приложений на платформе Google Cloud).',
+      'GoogleAgent-URLContext': 'GoogleAgent-URLContext — наблюдаемый бот для Gemini API URL Context tool. Документации нет; имя зафиксировано по логам сайтов. Помечено как experimental.',
+      'Gemini-Deep-Research': 'Gemini-Deep-Research — наблюдаемый бот, активирующийся при использовании режима Deep Research в Gemini. Документации нет; имя зафиксировано по логам сайтов. Помечено как experimental.',
       'Chrome-control': 'Контрольный запрос обычным браузером (Chrome). Нужен чтобы сравнить - блокирует ли сайт именно AI-ботов или вообще любой нерезидентный трафик. Если Chrome тоже не пускают - значит проблема не в anti-AI политике, а в общей блокировке (часто гео-блокировка).',
       'empty-ua': 'Запрос с пустой строкой User-Agent. Помогает выявить блокировки которые не зависят от конкретного бота.',
     };
@@ -1002,6 +1064,10 @@
         // tick
         _tick: 0,
 
+        // proxy pool status (from /api/healthz)
+        proxy: { enabled: false, total: 0, healthy: 0, loaded: false, error: false },
+        _proxyTimer: null,
+
         init() {
           for (const g of UA_GROUPS) {
             for (const lbl of g.labels) {
@@ -1020,6 +1086,51 @@
             }
           });
           this.loadSetsMeta();
+          this.refreshProxyStatus();
+          this._proxyTimer = setInterval(() => this.refreshProxyStatus(), 60000);
+        },
+
+        async refreshProxyStatus() {
+          try {
+            const r = await fetch('/api/healthz');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const j = await r.json();
+            const p = j && j.proxy ? j.proxy : {};
+            this.proxy = {
+              enabled: !!p.enabled,
+              total: Number(p.total || 0),
+              healthy: Number(p.healthy || 0),
+              loaded: true,
+              error: false,
+            };
+          } catch (_e) {
+            this.proxy = { enabled: false, total: 0, healthy: 0, loaded: true, error: true };
+          }
+        },
+        proxyDotClass() {
+          if (!this.proxy.loaded || this.proxy.error) return 'bg-[color:var(--brand-text-soft)]';
+          if (!this.proxy.enabled) return 'bg-[color:var(--brand-text-soft)]';
+          if (this.proxy.healthy > 0) return 'bg-[color:var(--brand-success)]';
+          return 'bg-[color:var(--brand-warn)]';
+        },
+        proxyHealthClasses() {
+          if (!this.proxy.loaded || this.proxy.error) return 'border-[color:var(--brand-border)] text-[color:var(--brand-text-soft)]';
+          if (!this.proxy.enabled) return 'border-[color:var(--brand-border)] text-[color:var(--brand-text-muted)]';
+          if (this.proxy.healthy > 0) return 'border-emerald-900 text-emerald-300 bg-emerald-950/40';
+          return 'border-amber-900 text-amber-300 bg-amber-950/40';
+        },
+        proxyLabel() {
+          if (!this.proxy.loaded) return 'Proxy: ...';
+          if (this.proxy.error) return 'Proxy: error';
+          if (!this.proxy.enabled) return 'Direct mode';
+          if (this.proxy.healthy > 0) return 'Proxy: ' + this.proxy.healthy + '/' + this.proxy.total + ' healthy';
+          return 'Proxy: pool empty';
+        },
+        proxyTooltip() {
+          if (this.proxy.error) return 'Не удалось получить /api/healthz. Проверьте, что бэкенд жив.';
+          if (!this.proxy.enabled) return 'Прокси-пул отключён. Все запросы к доменам идут напрямую с IP сервера.';
+          if (this.proxy.healthy > 0) return 'Прокси-пул активен: ' + this.proxy.healthy + ' здоровых из ' + this.proxy.total + '. Запросы к доменам пойдут через Webshare-прокси (ротация случайная). Обновляется каждые 60 секунд.';
+          return 'Прокси-пул включён, но ни одной здоровой прокси нет (' + this.proxy.total + ' всего). Запросы могут не пойти. Проверьте Webshare API и cooldown-список.';
         },
 
         // ----- form-side getters -----
