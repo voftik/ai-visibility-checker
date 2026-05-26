@@ -577,12 +577,19 @@ async def run_crawl(run_id: str) -> None:
                     proxy_url = None
                     proxy_info = {"used": False}
 
+                if proxy is not None:
+                    get_msg = (
+                        f"GET {job.target_url} as {job.user_agent_label} "
+                        f"via {proxy.address}:{proxy.port} [{proxy.country or '??'}]"
+                    )
+                else:
+                    get_msg = f"GET {job.target_url} as {job.user_agent_label} (direct)"
                 bus.publish(
                     run_id,
                     {
                         "type": "log",
                         "level": "info",
-                        "message": f"GET {job.target_url} as {job.user_agent_label}",
+                        "message": get_msg,
                     },
                 )
                 probe = await _do_probe(
@@ -603,12 +610,21 @@ async def run_crawl(run_id: str) -> None:
                 ):
                     if pool is not None:
                         pool.mark_bad(proxy_url)
+                    if proxy is not None:
+                        proxy_failed_label = (
+                            f"{proxy.address}:{proxy.port} [{proxy.country or '??'}]"
+                        )
+                    else:
+                        proxy_failed_label = "?"
                     bus.publish(
                         run_id,
                         {
                             "type": "log",
                             "level": "warn",
-                            "message": f"Proxy {proxy.address if proxy else '?'} failed for {job.domain}; retrying directly",
+                            "message": (
+                                f"Proxy {proxy_failed_label} failed for {job.domain}; "
+                                f"retrying directly"
+                            ),
                         },
                     )
                     probe = await _do_probe(
@@ -773,6 +789,14 @@ async def run_crawl(run_id: str) -> None:
                         pass
 
                 summary = _summarize_probe(job.user_agent_label, markers, probe)
+                proxy_used = bool(proxy_info.get("used"))
+                proxy_address_field: str | None = None
+                if proxy_used and proxy is not None:
+                    proxy_address_field = f"{proxy.address}:{proxy.port}"
+                proxy_country_field = (
+                    proxy.country if (proxy_used and proxy is not None and proxy.country) else None
+                )
+                proxy_fallback_field = bool(proxy_info.get("fallback_direct"))
                 bus.publish(
                     run_id,
                     {
@@ -781,6 +805,10 @@ async def run_crawl(run_id: str) -> None:
                         "user_agent_label": job.user_agent_label,
                         "http_status": probe.http_status,
                         "summary": summary,
+                        "proxy_used": proxy_used,
+                        "proxy_address": proxy_address_field,
+                        "proxy_country": proxy_country_field,
+                        "proxy_fallback": proxy_fallback_field,
                     },
                 )
                 bus.publish(

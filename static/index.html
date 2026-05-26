@@ -707,11 +707,12 @@
                             :class="p.tls_ok === false ? 'text-[color:var(--brand-error)]' : 'text-[color:var(--brand-text-soft)]'"
                             x-text="p.tls_ok === null ? '-' : (p.tls_ok ? '✓' : '✗')"></td>
                         <td class="px-2 py-1 text-[color:var(--brand-text-muted)]" x-html="renderMarkers(p.detected_protections)"></td>
+                        <td class="px-2 py-1 whitespace-nowrap" x-html="renderProxyCell(p)" :title="proxyCellTitle(p)"></td>
                         <td class="px-2 py-1 font-mono text-[color:var(--brand-text-soft)] truncate max-w-[260px]" x-text="p.final_url || '-'" :title="p.final_url"></td>
                       </tr>
                     </template>
                     <tr x-show="filteredProbes.length === 0">
-                      <td colspan="11" class="px-2 py-4 text-center text-[color:var(--brand-text-soft)]">Нет проб, удовлетворяющих фильтру.</td>
+                      <td colspan="12" class="px-2 py-4 text-center text-[color:var(--brand-text-soft)]">Нет проб, удовлетворяющих фильтру.</td>
                     </tr>
                   </tbody>
                 </table>
@@ -930,6 +931,7 @@
       'ttfb_ms':                         'Time to first byte - сколько миллисекунд прошло от отправки запроса до получения первого байта ответа. Косвенный показатель скорости и здоровья сайта.',
       'detected_protections':            'Какие технические системы защиты сработали при запросе - WAF (Cloudflare, Qrator, DDoS-Guard, Variti), captcha (Yandex SmartCaptcha), редиректы, и так далее.',
       'tls_ok':                          'Удалось ли установить безопасное TLS-соединение с сайтом. ✗ означает что сертификат не прошёл проверку - типично для российских сайтов с сертификатами Минцифры из-за рубежа.',
+      'proxy':                           'Через какой исходящий IP/прокси ушёл запрос. Зелёный — запрос прошёл через резидентный прокси указанной страны; жёлтый — прокси упал и запрос ушёл напрямую с сервера; серый — прокси не использовался (direct).',
     };
 
     const ROBOTS_RULE_TIPS = {
@@ -1309,6 +1311,57 @@
             const cls = bad ? 'text-[color:var(--brand-error)]' : 'text-[color:var(--brand-text-muted)]';
             return '<span class="' + cls + '">' + htmlEscape(m) + '</span>';
           }).join('<span class="text-[color:var(--brand-text-soft)]">, </span>');
+        },
+        // Normalize proxy info from either persisted shape (p.content_signals._proxy
+        // = {used, address, country, fallback_direct}) or SSE event shape
+        // ({proxy_used, proxy_address, proxy_country, proxy_fallback}).
+        _proxyInfoFromProbe(p) {
+          if (!p) return { used: false, address: null, country: null, fallback: false };
+          if (p.proxy_used !== undefined || p.proxy_address !== undefined) {
+            return {
+              used: !!p.proxy_used,
+              address: p.proxy_address || null,
+              country: p.proxy_country || null,
+              fallback: !!p.proxy_fallback,
+            };
+          }
+          const px = (p.content_signals && p.content_signals._proxy) || null;
+          if (!px) return { used: false, address: null, country: null, fallback: false };
+          return {
+            used: !!px.used,
+            address: px.address || null,
+            country: px.country || null,
+            fallback: !!px.fallback_direct,
+          };
+        },
+        renderProxyCell(p) {
+          const px = this._proxyInfoFromProbe(p);
+          const country = px.country ? htmlEscape(px.country.toUpperCase()) : '??';
+          const addr = px.address ? htmlEscape(px.address) : '';
+          if (px.used && !px.fallback) {
+            return '<span class="inline-flex items-center gap-1 text-[color:var(--brand-success)]">'
+              + '<span class="font-medium">' + country + '</span>'
+              + '<span class="font-mono text-[color:var(--brand-text-muted)] hidden md:inline">' + addr + '</span>'
+              + '</span>';
+          }
+          if (px.used && px.fallback) {
+            return '<span class="inline-flex items-center gap-1 text-[color:var(--brand-warn)]" title="прокси упал, запрос ушёл напрямую">'
+              + '<span>↩</span>'
+              + '<span>direct</span>'
+              + '<span class="text-[color:var(--brand-text-muted)] hidden md:inline">(прокси ' + country + ' failed)</span>'
+              + '</span>';
+          }
+          return '<span class="text-[color:var(--brand-text-soft)]">— direct</span>';
+        },
+        proxyCellTitle(p) {
+          const px = this._proxyInfoFromProbe(p);
+          if (px.used && !px.fallback) {
+            return 'Запрос ушёл через прокси ' + (px.address || '?') + ' [' + (px.country || '??') + ']';
+          }
+          if (px.used && px.fallback) {
+            return 'Прокси ' + (px.address || '?') + ' [' + (px.country || '??') + '] упал; запрос повторён напрямую с сервера';
+          }
+          return 'Запрос ушёл напрямую (без прокси)';
         },
         formatBytes(n) {
           if (n == null) return '-';
@@ -1773,6 +1826,7 @@
             { key: 'ttfb_ms',                           label: 'TTFB',       tip: PROBE_COL_TIPS.ttfb_ms },
             { key: 'tls_ok',                            label: 'TLS',        tip: PROBE_COL_TIPS.tls_ok },
             { key: 'detected_protections',              label: 'Защиты',     tip: PROBE_COL_TIPS.detected_protections },
+            { key: 'proxy',                             label: 'Прокси',     tip: PROBE_COL_TIPS.proxy },
             { key: 'final_url',                         label: 'Финальный URL', tip: null },
           ];
         },
@@ -1785,8 +1839,17 @@
               (p.user_agent_label || '').toLowerCase().includes(q));
           }
           const { col, dir } = this.probesSort;
+          const sortKey = (p) => {
+            if (col === 'proxy') {
+              const px = this._proxyInfoFromProbe(p);
+              if (!px.used) return 'z-direct';
+              if (px.fallback) return 'y-fallback-' + (px.country || '');
+              return 'a-' + (px.country || '') + '-' + (px.address || '');
+            }
+            return p[col];
+          };
           arr.sort((a, b) => {
-            let av = a[col], bv = b[col];
+            let av = sortKey(a), bv = sortKey(b);
             if (av == null) av = '';
             if (bv == null) bv = '';
             if (typeof av === 'number' && typeof bv === 'number') return dir === 'asc' ? av - bv : bv - av;
@@ -1869,10 +1932,19 @@
           const ts = this.logTimestamp(e);
           if (e.type === 'phase_change') return ts + '  PHASE  --- ' + e.phase + ' ---';
           if (e.type === 'probe_done') {
+            let proxyStr = '';
+            if (e.proxy_used && !e.proxy_fallback) {
+              proxyStr = '  via ' + (e.proxy_address || '?') + ' [' + (e.proxy_country || '??') + ']';
+            } else if (e.proxy_used && e.proxy_fallback) {
+              proxyStr = '  ↩ direct (proxy ' + (e.proxy_country || '??') + ' failed)';
+            } else if (e.proxy_used === false) {
+              proxyStr = '  direct';
+            }
             return ts + '  PROBE  ' + (e.domain || '').padEnd(22, ' ')
               + ' ' + (e.user_agent_label || '').padEnd(15, ' ')
               + ' ' + (e.http_status ?? '-')
-              + '  ' + (e.summary || '');
+              + '  ' + (e.summary || '')
+              + proxyStr;
           }
           return ts + '  ' + (e.level || 'info').toUpperCase().padEnd(6, ' ') + ' ' + (e.message || '');
         },
@@ -1887,11 +1959,23 @@
             const statusCls = this.statusColor(status, null);
             const dom = htmlEscape((e.domain || '').padEnd(22, ' ').slice(0, 28));
             const ua = htmlEscape((e.user_agent_label || '').padEnd(15, ' ').slice(0, 18));
+            let proxyBadge = '';
+            if (e.proxy_used && !e.proxy_fallback) {
+              proxyBadge = ' <span class="text-[color:var(--brand-success)]">via '
+                + htmlEscape(e.proxy_address || '?')
+                + ' [' + htmlEscape((e.proxy_country || '??').toUpperCase()) + ']</span>';
+            } else if (e.proxy_used && e.proxy_fallback) {
+              proxyBadge = ' <span class="text-[color:var(--brand-warn)]">↩ direct (прокси '
+                + htmlEscape((e.proxy_country || '??').toUpperCase()) + ' failed)</span>';
+            } else if (e.proxy_used === false) {
+              proxyBadge = ' <span class="text-[color:var(--brand-text-soft)]">direct</span>';
+            }
             return ts + '  <span class="text-[color:var(--brand-text-soft)]">PROBE</span>  '
               + '<span>' + dom + '</span> '
               + '<span class="text-[color:var(--brand-text-muted)]">' + ua + '</span> '
               + '<span class="' + statusCls + ' font-semibold">' + htmlEscape(status ?? '-') + '</span>  '
-              + '<span class="text-[color:var(--brand-text-muted)]">' + htmlEscape(e.summary || '') + '</span>';
+              + '<span class="text-[color:var(--brand-text-muted)]">' + htmlEscape(e.summary || '') + '</span>'
+              + proxyBadge;
           }
           const lvl = (e.level || 'info').toLowerCase();
           const lvlMap = { info: 'text-[color:var(--brand-text-muted)]', warn: 'text-[color:var(--brand-warn)]', error: 'text-[color:var(--brand-error)]' };
