@@ -621,6 +621,7 @@
       gap: 8px;
     }
     .crawler-chip {
+      position: relative;
       display: inline-flex;
       align-items: center;
       gap: 8px;
@@ -634,6 +635,10 @@
       transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
       user-select: none;
       font-family: inherit;
+    }
+    .crawler-chip .rw-tip {
+      z-index: 70;
+      max-width: 320px;
     }
     .crawler-chip:hover {
       border-color: var(--brand-border-strong);
@@ -812,6 +817,41 @@
       padding-left: 18px;
     }
 
+    /* accented details toggle inside Step 01 subset picker */
+    .subset-toggle-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 14px;
+      border: 1px solid var(--brand-primary);
+      border-radius: 3px;
+      background: rgba(255, 50, 75, 0.08);
+      color: var(--brand-primary);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+      font-family: inherit;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .subset-toggle-btn:hover {
+      background: var(--brand-primary);
+      color: #fff;
+      transform: translateY(-1px);
+    }
+    .subset-toggle-btn:focus { outline: none; }
+    .subset-toggle-btn:focus-visible {
+      box-shadow: 0 0 0 2px rgba(255, 50, 75, 0.45);
+    }
+    .subset-toggle-caret {
+      font-size: 13px;
+      line-height: 1;
+      font-weight: 700;
+    }
+
     /* editorial textarea */
     .editorial-textarea {
       width: 100%;
@@ -884,6 +924,248 @@
         80% { opacity: 1; }
         100% { opacity: 0; transform: translate(12px, -12px); }
       }
+
+      /* methodology: diagram-1 retrieval chain — dot travels left to right */
+      .svg-anim-chain .chain-dot {
+        animation: chain-travel 3.2s ease-in-out infinite;
+      }
+      @keyframes chain-travel {
+        0%   { transform: translateX(0); opacity: 0; }
+        8%   { opacity: 1; }
+        92%  { opacity: 1; }
+        100% { transform: translateX(560px); opacity: 0; }
+      }
+      .svg-anim-chain .chain-node {
+        animation: chain-node-pulse 3.2s ease-in-out infinite;
+      }
+      .svg-anim-chain .chain-node:nth-child(1) { animation-delay: 0s; }
+      .svg-anim-chain .chain-node:nth-child(2) { animation-delay: 0.45s; }
+      .svg-anim-chain .chain-node:nth-child(3) { animation-delay: 0.9s; }
+      .svg-anim-chain .chain-node:nth-child(4) { animation-delay: 1.35s; }
+      .svg-anim-chain .chain-node:nth-child(5) { animation-delay: 1.8s; }
+      @keyframes chain-node-pulse {
+        0%, 80%, 100% { opacity: 0.45; }
+        15% { opacity: 1; }
+      }
+
+      /* methodology: diagram-2 bot-network — satellites pulse and lines fade in */
+      .svg-anim-botnet .botnet-link {
+        animation: botnet-link-pulse 3s ease-in-out infinite;
+      }
+      .svg-anim-botnet .botnet-link:nth-of-type(1) { animation-delay: 0s; }
+      .svg-anim-botnet .botnet-link:nth-of-type(2) { animation-delay: 0.6s; }
+      .svg-anim-botnet .botnet-link:nth-of-type(3) { animation-delay: 1.2s; }
+      .svg-anim-botnet .botnet-link:nth-of-type(4) { animation-delay: 1.8s; }
+      .svg-anim-botnet .botnet-link:nth-of-type(5) { animation-delay: 2.4s; }
+      @keyframes botnet-link-pulse {
+        0%, 100% { stroke-opacity: 0.25; }
+        50% { stroke-opacity: 1; }
+      }
+      .svg-anim-botnet .botnet-sat {
+        animation: botnet-sat-glow 3s ease-in-out infinite;
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+      .svg-anim-botnet .botnet-sat:nth-of-type(1) { animation-delay: 0s; }
+      .svg-anim-botnet .botnet-sat:nth-of-type(2) { animation-delay: 0.6s; }
+      .svg-anim-botnet .botnet-sat:nth-of-type(3) { animation-delay: 1.2s; }
+      .svg-anim-botnet .botnet-sat:nth-of-type(4) { animation-delay: 1.8s; }
+      .svg-anim-botnet .botnet-sat:nth-of-type(5) { animation-delay: 2.4s; }
+      @keyframes botnet-sat-glow {
+        0%, 100% { opacity: 0.55; }
+        50% { opacity: 1; }
+      }
+
+      /* methodology: diagram-3 probe-anatomy — sequential highlights */
+      .svg-anim-probe .probe-highlight {
+        animation: probe-flash 4s ease-in-out infinite;
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+      .svg-anim-probe .probe-highlight:nth-of-type(1) { animation-delay: 0s; }
+      .svg-anim-probe .probe-highlight:nth-of-type(2) { animation-delay: 1s; }
+      .svg-anim-probe .probe-highlight:nth-of-type(3) { animation-delay: 2s; }
+      .svg-anim-probe .probe-highlight:nth-of-type(4) { animation-delay: 3s; }
+      @keyframes probe-flash {
+        0%, 65%, 100% { stroke-opacity: 0.35; fill-opacity: 0; }
+        12% { stroke-opacity: 1; fill-opacity: 0.18; }
+        40% { stroke-opacity: 1; fill-opacity: 0.05; }
+      }
+      .svg-anim-probe .probe-flow {
+        stroke-dasharray: 6 6;
+        animation: probe-flow-march 2s linear infinite;
+      }
+      @keyframes probe-flow-march {
+        from { stroke-dashoffset: 0; }
+        to   { stroke-dashoffset: -24; }
+      }
+
+      /* methodology: diagram-4 control vs bot — soft opacity pulse */
+      .svg-anim-doors .door-allow { animation: door-pulse-allow 3.2s ease-in-out infinite; }
+      .svg-anim-doors .door-deny  { animation: door-pulse-deny  3.2s ease-in-out infinite; }
+      @keyframes door-pulse-allow {
+        0%, 100% { opacity: 0.7; }
+        50% { opacity: 1; }
+      }
+      @keyframes door-pulse-deny {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.55; }
+      }
+    }
+
+    /* ============ methodology page ============ */
+    .meth-wrap {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 8px 0 120px;
+    }
+    .meth-section {
+      position: relative;
+      padding: 56px 0 0;
+    }
+    .meth-section + .meth-section {
+      padding-top: 80px;
+    }
+    @media (max-width: 720px) {
+      .meth-section + .meth-section { padding-top: 56px; }
+    }
+    .meth-eyebrow-strong {
+      font-size: 11px;
+      letter-spacing: 0.28em;
+      text-transform: uppercase;
+      color: var(--brand-primary);
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+    .meth-h1 {
+      font-size: 2.4rem;
+      line-height: 1.12;
+      font-weight: 700;
+      color: var(--brand-text);
+      letter-spacing: -0.02em;
+      margin: 4px 0 18px;
+      max-width: 760px;
+    }
+    @media (max-width: 720px) {
+      .meth-h1 { font-size: 1.8rem; }
+    }
+    .meth-lede {
+      font-size: 16.5px;
+      line-height: 1.6;
+      color: var(--brand-text-muted);
+      max-width: 720px;
+      margin-bottom: 18px;
+    }
+    .meth-body p {
+      font-size: 14.5px;
+      line-height: 1.7;
+      color: var(--brand-text-muted);
+      margin: 0.9em 0;
+    }
+    .meth-body p strong {
+      color: var(--brand-text);
+      font-weight: 600;
+    }
+    .meth-list {
+      list-style: none;
+      padding: 0;
+      margin: 14px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .meth-list li {
+      font-size: 13.5px;
+      line-height: 1.55;
+      color: var(--brand-text-muted);
+      border-left: 2px solid var(--brand-border-strong);
+      padding: 4px 0 4px 14px;
+    }
+    .meth-list li strong {
+      color: var(--brand-text);
+      font-weight: 600;
+    }
+    .meth-figure {
+      margin: 22px 0 26px;
+      padding: 20px 22px;
+      border: 1px solid var(--brand-border);
+      background: var(--brand-bg-soft);
+      border-left: 2px solid var(--brand-primary);
+    }
+    .meth-figure-caption {
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--brand-text-soft);
+      font-weight: 600;
+      margin-top: 14px;
+    }
+    .meth-svg-chain {
+      width: 100%;
+      max-width: 640px;
+      height: 96px;
+      display: block;
+      color: var(--brand-primary);
+    }
+    .meth-svg-botnet {
+      width: 256px;
+      height: 256px;
+      display: block;
+      margin: 0 auto;
+      color: var(--brand-primary);
+    }
+    .meth-svg-probe {
+      width: 100%;
+      max-width: 420px;
+      height: 200px;
+      display: block;
+      color: var(--brand-primary);
+    }
+    .meth-svg-doors {
+      width: 100%;
+      max-width: 320px;
+      height: 144px;
+      display: block;
+      color: var(--brand-primary);
+    }
+    .meth-uainline {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.92em;
+      color: var(--brand-text);
+      background: var(--brand-bg-panel);
+      padding: 1px 6px;
+      border-radius: 3px;
+    }
+    .meth-details {
+      margin-top: 18px;
+      border-left: 2px solid var(--brand-border-strong);
+      padding: 10px 0 10px 16px;
+    }
+    .meth-details summary {
+      cursor: pointer;
+      font-size: 12.5px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--brand-primary);
+      font-weight: 600;
+      list-style: none;
+      user-select: none;
+    }
+    .meth-details summary::-webkit-details-marker { display: none; }
+    .meth-details[open] summary { margin-bottom: 12px; }
+    .meth-callout-info {
+      border: 1px solid var(--brand-border);
+      border-left: 3px solid var(--brand-info);
+      background: rgba(96, 165, 250, 0.06);
+      padding: 14px 18px;
+      margin: 16px 0;
+      font-size: 13.5px;
+      color: var(--brand-text-muted);
+      line-height: 1.6;
+    }
+    .meth-callout-info strong {
+      color: var(--brand-text);
+      font-weight: 600;
     }
 
     .source-card-svg {
@@ -931,66 +1213,15 @@
           <button @click="setTab('history')"
                   :class="tab === 'history' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
                   class="px-3 py-1.5 rounded">История</button>
+          <button @click="setTab('methodology')"
+                  :class="tab === 'methodology' ? 'bg-[color:var(--brand-bg-panel)] text-[color:var(--brand-primary)]' : 'text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)]'"
+                  class="px-3 py-1.5 rounded">Методика</button>
         </nav>
       </div>
     </header>
 
     <!-- ============ NEW RUN ============ -->
     <section x-show="tab === 'new_run'" class="editorial-wrap">
-
-      <!-- ====== Methodology (top, above stepper) ====== -->
-      <details class="methodology-panel rounded-lg border p-4 methodology-top-slot">
-        <summary class="methodology-summary cursor-pointer select-none">
-          <div class="flex items-center justify-between gap-4">
-            <div class="min-w-0">
-              <div class="flex items-center gap-2 flex-wrap">
-                <span class="methodology-caret text-sm">▶</span>
-                <h2 class="text-sm font-semibold text-[color:var(--brand-info)]">Как работает методика — Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</h2>
-              </div>
-              <p class="text-xs text-[color:var(--brand-text-muted)] mt-1 leading-relaxed">
-                Мы эмулируем <strong>реальные отпечатки AI-ботов</strong> и crawler/retrieval-агентов LLM-систем, чтобы проверить, может ли сайт стать источником знаний для AI-ответов.
-              </p>
-            </div>
-            <span class="methodology-toggle text-xs text-[color:var(--brand-info)] shrink-0"></span>
-          </div>
-        </summary>
-
-        <div class="mt-4 border-t border-[color:var(--brand-border)] pt-4 space-y-4">
-          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
-            Это нужно для проверки <strong>доступности веб-ресурсов как источников знаний LLM-систем</strong>: <strong>AI-видимость продуктов и брендов</strong> зависит от того, может ли crawler/retrieval-слой получить официальный контент. Если сайт закрыт для этого слоя, LLM может не увидеть описание продукта, актуальные цены, документацию, новости, условия, адреса и другие факты, даже если обычный пользователь открывает сайт в браузере.
-          </p>
-          <p class="text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
-            Кратко о механике: когда пользователь задаёт вопрос, LLM-система может вызвать <strong>web search tool</strong> или внутренний поиск по индексу. Дальше <strong>retrieval</strong> (ретривел) собирает кандидатов: URL, сниппеты и фрагменты страниц. Затем <strong>rerank</strong> (реранк) пересортировывает кандидаты по релевантности, качеству и доступности. Лучшие фрагменты попадают в контекст модели как <strong>RAG</strong> - retrieval augmented generation, и уже на их основе формируется ответ. Если crawler видит captcha, гео-заглушку, пустой SPA-shell или запрет robots.txt, ресурс выпадает из этой цепочки или попадает в неё как некачественный источник.
-          </p>
-
-          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs text-[color:var(--brand-text-muted)] leading-relaxed">
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Реальные bot fingerprints</div>
-              <p>Для каждого домена отправляются запросы с конкретными <strong>User-Agent строками</strong>: GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, anthropic-ai, Claude-Web, PerplexityBot и Perplexity-User. DeepSeekBot и DeepSeek-User вынесены отдельно, потому что у DeepSeek нет официальной спецификации краулеров.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что именно эмулируется</div>
-              <p>Мы меняем идентификатор бота, но держим одинаковый HTTP-контекст: Accept для HTML/XML, Accept-Language: en-US,en;q=0.9, Accept-Encoding: gzip, deflate и Connection: keep-alive. Так видна разница между реакцией сайта на конкретного AI-краулера и на обычный запрос.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Контрольные отпечатки</div>
-              <p>Chrome-control имитирует обычный браузерный User-Agent, а empty-ua отправляет запрос без User-Agent. Если AI-бот получает отказ, а Chrome-control получает контент, это похоже на anti-AI фильтр. Если отказ получают все, это чаще WAF, TLS, гео- или инфраструктурное ограничение.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Что фиксируется в ответе</div>
-              <p>Для каждой пробы сохраняются HTTP-статус, цепочка редиректов, TLS-результат, response headers, размер тела, sample HTML, признаки WAF/captcha/interstitial и объём текста, который можно извлечь без выполнения JavaScript.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Сетевые ограничения в России</div>
-              <p>Проверка идёт с серверной точки вне российской пользовательской сети. Российские WAF, блокировки зарубежных IP, гео-заглушки и сертификатные проблемы попадают в результат, потому что глобальные LLM чаще ходят за источниками не с IP конечного пользователя в РФ.</p>
-            </div>
-            <div>
-              <div class="font-medium text-[color:var(--brand-text)] mb-1">Почему результату можно доверять</div>
-              <p>Оценка строится на <strong>воспроизводимой матрице запросов</strong>: один домен, одинаковые сетевые условия, разные bot fingerprints и контрольные отпечатки. LLM-отчёт только интерпретирует эти измерения; первичные технические сигналы остаются в таблицах пробы.</p>
-            </div>
-          </div>
-        </div>
-      </details>
 
       <!-- ====== Stepper progress indicator ====== -->
       <div class="stepper-indicator" role="navigation" aria-label="Прогресс проверки">
@@ -1161,9 +1392,11 @@
                 <span class="text-[color:var(--brand-text-muted)]" x-text="setSelectedCount(meta.id) + ' / ' + meta.domain_count + ' выбрано'"></span>
                 <button @click="selectAllInSet(meta.id)" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-primary)] border-b border-dotted border-[color:var(--brand-text-soft)]">выбрать всё</button>
                 <button @click="deselectAllInSet(meta.id)" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-primary)] border-b border-dotted border-[color:var(--brand-text-soft)]">снять всё</button>
-                <button @click="toggleSetExpanded(meta.id)" class="text-[color:var(--brand-text-muted)] hover:text-[color:var(--brand-text)] ml-auto">
-                  <span x-show="!setsState[meta.id]?.expanded">показать детали ▾</span>
-                  <span x-show="setsState[meta.id]?.expanded">скрыть детали ▴</span>
+                <button @click="toggleSetExpanded(meta.id)" class="subset-toggle-btn ml-auto"
+                        :aria-expanded="setsState[meta.id]?.expanded ? 'true' : 'false'">
+                  <span x-show="!setsState[meta.id]?.expanded">показать детали</span>
+                  <span x-show="setsState[meta.id]?.expanded">скрыть детали</span>
+                  <span class="subset-toggle-caret" x-text="setsState[meta.id]?.expanded ? '▴' : '▾'"></span>
                 </button>
               </div>
 
@@ -1345,7 +1578,7 @@
                         <span class="crawler-chip-mark" x-text="form.uaSelected[label] ? '✓' : ''"></span>
                         <span class="crawler-chip-label" x-text="label"></span>
                         <span x-show="isUaExperimental(label)" class="crawler-chip-exp">exp</span>
-                        <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                        <span x-show="show" x-transition class="rw-tip rw-tip-above" x-text="UA_TOOLTIPS[label] || ''"></span>
                       </button>
                     </template>
                   </div>
@@ -1364,7 +1597,7 @@
                           <span class="crawler-chip-mark" x-text="form.uaSelected[label] ? '✓' : ''"></span>
                           <span class="crawler-chip-label" x-text="label"></span>
                           <span x-show="isUaExperimental(label) || sub.experimental" class="crawler-chip-exp">exp</span>
-                          <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                          <span x-show="show" x-transition class="rw-tip rw-tip-above" x-text="UA_TOOLTIPS[label] || ''"></span>
                         </button>
                       </template>
                     </template>
@@ -1400,7 +1633,7 @@
                             @mouseenter="show = true" @mouseleave="show = false">
                       <span class="crawler-chip-mark" x-text="form.uaSelected[label] ? '✓' : ''"></span>
                       <span class="crawler-chip-label" x-text="label"></span>
-                      <span x-show="show" x-transition class="rw-tip rw-tip-below" x-text="UA_TOOLTIPS[label] || ''"></span>
+                      <span x-show="show" x-transition class="rw-tip rw-tip-above" x-text="UA_TOOLTIPS[label] || ''"></span>
                     </button>
                   </template>
                 </div>
@@ -1534,6 +1767,252 @@
               <polyline points="11,1 16,6 11,11"></polyline>
             </svg>
           </button>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ============ METHODOLOGY ============ -->
+    <section x-show="tab === 'methodology'" class="meth-wrap">
+
+      <!-- ====== Hero ====== -->
+      <div class="meth-section">
+        <div class="editorial-hairline"></div>
+        <div class="meth-eyebrow-strong">Методика</div>
+        <h1 class="meth-h1">Методика оценки AI visibility</h1>
+        <p class="meth-lede">
+          Мы эмулируем <strong>реальные отпечатки AI-ботов</strong> и retrieval-агентов LLM-систем, чтобы проверить, может ли веб-ресурс стать источником знаний для ответов ChatGPT, Claude, Perplexity и Gemini. Ниже — что мы измеряем, как устроена цепочка, и почему результату можно доверять.
+        </p>
+        <div class="meth-callout-info">
+          <strong>Оценка AI visibility паблишеров и web-ресурсов с учетом технической доступности для LLM</strong> — основанная на воспроизводимой матрице сетевых проб против реальных идентификаторов AI-краулеров с зафиксированным контролем браузерного трафика.
+        </div>
+      </div>
+
+      <!-- ====== Section A — Что мы измеряем ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">A</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел A</div>
+        <h2 class="editorial-title">Что мы измеряем</h2>
+        <div class="meth-body">
+          <details class="meth-details" open>
+            <summary>Развернуть раздел A</summary>
+            <p>
+              Это нужно для проверки <strong>доступности веб-ресурсов как источников знаний LLM-систем</strong>: <strong>AI-видимость продуктов и брендов</strong> зависит от того, может ли crawler/retrieval-слой получить официальный контент. Если сайт закрыт для этого слоя, LLM может не увидеть описание продукта, актуальные цены, документацию, новости, условия, адреса и другие факты, даже если обычный пользователь открывает сайт в браузере.
+            </p>
+            <p>
+              Замер строится на трёх осях одновременно: какой именно AI-краулер заходит (идентификатор), как сайт реагирует (HTTP-сигналы) и как это сопоставляется с обычным браузером (контрольная проба). Каждая точка такой матрицы — это один HTTP-запрос с фиксированным User-Agent и одинаковыми остальными параметрами.
+            </p>
+          </details>
+        </div>
+      </div>
+
+      <!-- ====== Section B — Retrieval chain ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">B</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел B</div>
+        <h2 class="editorial-title">Как работает retrieval-цепочка</h2>
+        <div class="meth-body">
+          <p>
+            Кратко о механике: когда пользователь задаёт вопрос, LLM-система может вызвать <strong>web search tool</strong> или внутренний поиск по индексу. Дальше <strong>retrieval</strong> (ретривел) собирает кандидатов: URL, сниппеты и фрагменты страниц. Затем <strong>rerank</strong> (реранк) пересортировывает кандидатов по релевантности, качеству и доступности. Лучшие фрагменты попадают в контекст модели как <strong>RAG</strong> — retrieval augmented generation, и уже на их основе формируется ответ. Если crawler видит captcha, гео-заглушку, пустой SPA-shell или запрет robots.txt, ресурс выпадает из этой цепочки или попадает в неё как некачественный источник.
+          </p>
+          <div class="meth-figure">
+            <svg class="meth-svg-chain svg-anim-chain" viewBox="0 0 640 96" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <!-- 5 nodes evenly distributed -->
+              <g class="chain-node">
+                <circle cx="40" cy="48" r="20"></circle>
+                <text x="40" y="86" text-anchor="middle" font-size="10" fill="currentColor" stroke="none">User</text>
+              </g>
+              <g class="chain-node">
+                <circle cx="180" cy="48" r="20"></circle>
+                <text x="180" y="86" text-anchor="middle" font-size="9" fill="currentColor" stroke="none">Web search</text>
+              </g>
+              <g class="chain-node">
+                <circle cx="320" cy="48" r="20"></circle>
+                <text x="320" y="86" text-anchor="middle" font-size="9" fill="currentColor" stroke="none">Retrieval</text>
+              </g>
+              <g class="chain-node">
+                <circle cx="460" cy="48" r="20"></circle>
+                <text x="460" y="86" text-anchor="middle" font-size="9" fill="currentColor" stroke="none">Rerank → RAG</text>
+              </g>
+              <g class="chain-node">
+                <circle cx="600" cy="48" r="20"></circle>
+                <text x="600" y="86" text-anchor="middle" font-size="10" fill="currentColor" stroke="none">Answer</text>
+              </g>
+              <!-- connecting segments -->
+              <line x1="60" y1="48" x2="160" y2="48" stroke-opacity="0.4"></line>
+              <line x1="200" y1="48" x2="300" y2="48" stroke-opacity="0.4"></line>
+              <line x1="340" y1="48" x2="440" y2="48" stroke-opacity="0.4"></line>
+              <line x1="480" y1="48" x2="580" y2="48" stroke-opacity="0.4"></line>
+              <!-- traveling dot -->
+              <circle class="chain-dot" cx="40" cy="48" r="4" fill="currentColor" stroke="none"></circle>
+            </svg>
+            <div class="meth-figure-caption">Диаграмма B-1 · путь запроса через retrieval-цепочку</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Section C — Real AI-bot fingerprints ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">C</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел C</div>
+        <h2 class="editorial-title">Реальные отпечатки AI-ботов</h2>
+        <div class="meth-body">
+          <p>
+            Для каждого домена отправляются запросы с конкретными <strong>User-Agent строками</strong>, документированными или массово наблюдаемыми у каждого провайдера. Мы меняем идентификатор бота, но держим одинаковый HTTP-контекст: Accept для HTML/XML, <strong>Accept-Language</strong>: en-US,en;q=0.9, Accept-Encoding: gzip, deflate и Connection: keep-alive. Так видна разница между реакцией сайта на конкретного AI-краулера и на обычный запрос.
+          </p>
+          <ul class="meth-list">
+            <li><strong>OpenAI</strong> — <span class="meth-uainline">GPTBot</span>, <span class="meth-uainline">OAI-SearchBot</span>, <span class="meth-uainline">ChatGPT-User</span>. GPTBot собирает контент для обучения; OAI-SearchBot ходит в момент пользовательского вопроса с поиском; ChatGPT-User — действия пользователя ChatGPT при открытии конкретного URL.</li>
+            <li><strong>Anthropic</strong> — <span class="meth-uainline">ClaudeBot</span>, <span class="meth-uainline">anthropic-ai</span>, <span class="meth-uainline">Claude-Web</span>. ClaudeBot — обучающий аналог GPTBot; anthropic-ai — историческое имя, до сих пор активно в block-листах; Claude-Web — веб-поиск во время ответа.</li>
+            <li><strong>Perplexity</strong> — <span class="meth-uainline">PerplexityBot</span>, <span class="meth-uainline">Perplexity-User</span>. Первый индексирует, второй активируется в момент запроса.</li>
+            <li><strong>DeepSeek</strong> — <span class="meth-uainline">DeepSeekBot</span>, <span class="meth-uainline">DeepSeek-User</span>. Идентифицированы по наблюдениям сообщества и block-листам сайтов: официальной спецификации краулеров у DeepSeek нет, но имена массово встречаются в WAF-конфигах.</li>
+            <li><strong>Google</strong> — экосистема: Googlebot (поиск и AI Overviews), GoogleOther (внутренние задачи), Google-Agent и Google-NotebookLM (user-triggered AI), Google-CloudVertexBot (enterprise RAG).</li>
+          </ul>
+          <div class="meth-figure">
+            <svg class="meth-svg-botnet svg-anim-botnet" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <!-- central hub: website -->
+              <circle cx="128" cy="128" r="22" fill="none" stroke-width="2"></circle>
+              <text x="128" y="132" text-anchor="middle" font-size="9" fill="currentColor" stroke="none">site</text>
+              <!-- 5 connecting lines -->
+              <line class="botnet-link" x1="128" y1="128" x2="40" y2="40"></line>
+              <line class="botnet-link" x1="128" y1="128" x2="216" y2="40"></line>
+              <line class="botnet-link" x1="128" y1="128" x2="24" y2="160"></line>
+              <line class="botnet-link" x1="128" y1="128" x2="232" y2="160"></line>
+              <line class="botnet-link" x1="128" y1="128" x2="128" y2="232"></line>
+              <!-- 5 satellite labels -->
+              <g class="botnet-sat">
+                <circle cx="40" cy="40" r="16" fill="currentColor" fill-opacity="0.18" stroke="currentColor"></circle>
+                <text x="40" y="44" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">OpenAI</text>
+              </g>
+              <g class="botnet-sat">
+                <circle cx="216" cy="40" r="16" fill="currentColor" fill-opacity="0.18" stroke="currentColor"></circle>
+                <text x="216" y="44" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">Anthropic</text>
+              </g>
+              <g class="botnet-sat">
+                <circle cx="24" cy="160" r="16" fill="currentColor" fill-opacity="0.18" stroke="currentColor"></circle>
+                <text x="24" y="164" text-anchor="middle" font-size="7" fill="currentColor" stroke="none">Perplexity</text>
+              </g>
+              <g class="botnet-sat">
+                <circle cx="232" cy="160" r="16" fill="currentColor" fill-opacity="0.18" stroke="currentColor"></circle>
+                <text x="232" y="164" text-anchor="middle" font-size="7" fill="currentColor" stroke="none">DeepSeek</text>
+              </g>
+              <g class="botnet-sat">
+                <circle cx="128" cy="232" r="16" fill="currentColor" fill-opacity="0.18" stroke="currentColor"></circle>
+                <text x="128" y="236" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">Google</text>
+              </g>
+            </svg>
+            <div class="meth-figure-caption">Диаграмма C-1 · пять провайдеров идут на один сайт с разными User-Agent</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Section D — Probe anatomy ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">D</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел D</div>
+        <h2 class="editorial-title">Что фиксируется в каждой пробе</h2>
+        <div class="meth-body">
+          <p>
+            Для каждой пробы сохраняются HTTP-статус, цепочка редиректов, TLS-результат, response headers, размер тела, sample HTML, признаки WAF/captcha/interstitial и объём текста, который можно извлечь без выполнения JavaScript. Это позволяет отличить формально-открытый ответ (200) от функционально-пустого (SPA-shell без контента) и опубликовать первичные сигналы рядом с интерпретацией LLM-отчёта.
+          </p>
+          <ul class="meth-list">
+            <li><strong>HTTP-статус и redirects</strong> — 200, 4xx, 5xx, цепочка переходов вплоть до финального URL.</li>
+            <li><strong>Response headers</strong> — server, content-type, cache, security-сигналы, маркеры WAF-вендоров.</li>
+            <li><strong>Body sample и extractable text</strong> — первые килобайты, объём текста после очистки без JS.</li>
+            <li><strong>Timings</strong> — TTFB и total time, чтобы понять, не отдаётся ли пустая страница быстро.</li>
+            <li><strong>TLS и proxy</strong> — успешность handshake и через какой выходной IP ушёл запрос.</li>
+          </ul>
+          <div class="meth-figure">
+            <svg class="meth-svg-probe svg-anim-probe" viewBox="0 0 420 200" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <!-- request box (left) -->
+              <rect x="14" y="36" width="120" height="128" rx="2"></rect>
+              <text x="74" y="28" text-anchor="middle" font-size="10" fill="currentColor" stroke="none" letter-spacing="0.1em">REQUEST</text>
+              <rect class="probe-highlight" x="22" y="48" width="104" height="22" rx="1"></rect>
+              <text x="74" y="62" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">URL</text>
+              <rect class="probe-highlight" x="22" y="76" width="104" height="22" rx="1"></rect>
+              <text x="74" y="90" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">UA + headers</text>
+              <!-- arrow -->
+              <line class="probe-flow" x1="142" y1="100" x2="278" y2="100" stroke-width="1.5"></line>
+              <polyline points="270,93 280,100 270,107" fill="none"></polyline>
+              <!-- response box (right) -->
+              <rect x="286" y="36" width="120" height="128" rx="2"></rect>
+              <text x="346" y="28" text-anchor="middle" font-size="10" fill="currentColor" stroke="none" letter-spacing="0.1em">RESPONSE</text>
+              <rect class="probe-highlight" x="294" y="48" width="104" height="22" rx="1"></rect>
+              <text x="346" y="62" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">status / TLS</text>
+              <rect class="probe-highlight" x="294" y="76" width="104" height="22" rx="1"></rect>
+              <text x="346" y="90" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">headers</text>
+              <rect class="probe-highlight" x="294" y="104" width="104" height="22" rx="1"></rect>
+              <text x="346" y="118" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">body / text</text>
+              <rect class="probe-highlight" x="294" y="132" width="104" height="22" rx="1"></rect>
+              <text x="346" y="146" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">timings</text>
+            </svg>
+            <div class="meth-figure-caption">Диаграмма D-1 · анатомия пробы — поля запроса и ответа, которые фиксируются</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Section E — Control fingerprints ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">E</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел E</div>
+        <h2 class="editorial-title">Контрольные отпечатки</h2>
+        <div class="meth-body">
+          <p>
+            <strong>Chrome-control</strong> имитирует обычный браузерный User-Agent, а empty-ua отправляет запрос без User-Agent. Если AI-бот получает отказ, а Chrome-control получает контент — это похоже на anti-AI фильтр. Если отказ получают все — это чаще WAF, TLS, гео- или инфраструктурное ограничение. Контрольные пробы — это ось, относительно которой интерпретируются результаты AI-краулеров.
+          </p>
+          <div class="meth-figure">
+            <svg class="meth-svg-doors svg-anim-doors" viewBox="0 0 320 144" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <!-- left: Chrome-control — open door, green check -->
+              <g class="door-allow" stroke="#22C55E">
+                <rect x="32" y="20" width="60" height="104" rx="2"></rect>
+                <!-- door is opened, hinge on right -->
+                <path d="M32 20 L20 30 L20 134 L32 124 Z" fill="#22C55E" fill-opacity="0.18"></path>
+                <line x1="40" y1="72" x2="46" y2="78" stroke-width="2"></line>
+                <line x1="46" y1="78" x2="58" y2="66" stroke-width="2"></line>
+              </g>
+              <text x="60" y="138" text-anchor="middle" font-size="9" fill="#22C55E" stroke="none">Chrome-control</text>
+              <!-- right: AI-bot — closed door, red x -->
+              <g class="door-deny" stroke="#F87171">
+                <rect x="228" y="20" width="60" height="104" rx="2"></rect>
+                <line x1="240" y1="68" x2="276" y2="68" stroke-width="2" stroke-opacity="0.4"></line>
+                <line x1="244" y1="60" x2="260" y2="76" stroke-width="2"></line>
+                <line x1="260" y1="60" x2="244" y2="76" stroke-width="2"></line>
+                <circle cx="278" cy="74" r="2" fill="#F87171"></circle>
+              </g>
+              <text x="258" y="138" text-anchor="middle" font-size="9" fill="#F87171" stroke="none">AI-бот</text>
+            </svg>
+            <div class="meth-figure-caption">Диаграмма E-1 · контроль (Chrome-control) пускают, AI-бота не пускают — типичный anti-AI фильтр</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== Section F — Russia network constraints ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">F</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел F</div>
+        <h2 class="editorial-title">Сетевые ограничения в России</h2>
+        <div class="meth-body">
+          <p>
+            Проверка идёт с серверной точки вне российской пользовательской сети. Российские WAF, блокировки зарубежных IP, гео-заглушки и сертификатные проблемы попадают в результат, потому что глобальные LLM чаще ходят за источниками не с IP конечного пользователя в РФ. Поэтому для AI visibility важна именно эта vantage-точка, а не дефолтный домашний IP в России.
+          </p>
+        </div>
+      </div>
+
+      <!-- ====== Section G — Why trust the result ====== -->
+      <div class="meth-section">
+        <span class="editorial-number">G</span>
+        <div class="editorial-hairline"></div>
+        <div class="editorial-eyebrow">Раздел G</div>
+        <h2 class="editorial-title">Почему результату можно доверять</h2>
+        <div class="meth-body">
+          <p>
+            Оценка строится на <strong>воспроизводимой матрице запросов</strong>: один домен, одинаковые сетевые условия, разные bot fingerprints и контрольные отпечатки. LLM-отчёт только интерпретирует эти измерения; первичные технические сигналы остаются в таблицах пробы, и их можно перепроверить вручную. Каждая проба содержит сырое тело ответа, заголовки и тайминги — это позволяет третьей стороне реконструировать вывод без обращения к нашей версии.
+          </p>
         </div>
       </div>
 
