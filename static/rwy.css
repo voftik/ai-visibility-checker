@@ -1,0 +1,298 @@
+/* ============================================================================
+   RWY «Полоса» theme for the AI Visibility Checker  (task 38.4)
+   ----------------------------------------------------------------------------
+   Re-themes the Checker into the runwai.ru design system WITHOUT touching markup
+   logic. Strategy: this file is loaded AFTER the vendored Tailwind + the inline
+   <style> block, so it wins on cascade. It works by:
+     1. re-pointing every --brand-* CSS variable to an RWY token;
+     2. loading the three RWY fonts (Geologica / Raleway / IBM Plex Mono);
+     3. overriding the handful of hardcoded colours the app didn't route through
+        a --brand-* var (primary alpha tints, #fff button text, the dark
+        Tailwind status-pill utility classes).
+   RWY tokens copied verbatim from runwai.ru/site/src/app/globals.css.
+   ============================================================================ */
+
+:root {
+  /* ---- RWY «Полоса» source-of-truth tokens ---- */
+  --rwy-paper: #faf8f4;
+  --rwy-concrete: #efebe2;
+  --rwy-sky: #eaf0f3;
+  --rwy-white: #ffffff;
+  --rwy-ink: #17181c;
+  --rwy-graphite: #5b5b5b;
+  --rwy-line: #dad4c8;
+  --rwy-amber: #ffb000;
+  --rwy-amber-ink: #8a5a00;
+  --rwy-green: #178a4c;
+  --rwy-red: #d64533;
+  --rwy-ease-taxi: cubic-bezier(0.3, 0.7, 0.2, 1);
+
+  /* ---- Re-map the Checker's --brand-* contract onto RWY ----
+     Light "airfield at dawn": paper background, ink text, amber the only accent.
+     The accent for TEXT / thin strokes is amber-ink (#8a5a00) so it keeps AA
+     contrast on paper; pure --amber is reserved for fills, dots, focus rings. */
+  --brand-primary: var(--rwy-amber-ink);     /* links, active states, accent text */
+  --brand-primary-hover: var(--rwy-amber);   /* hover lift = brighter amber */
+  --brand-mark: var(--rwy-graphite);
+  --brand-text: var(--rwy-ink);
+  --brand-text-muted: #3c3d42;               /* darkened from RWY graphite for body legibility on paper */
+  --brand-text-soft: var(--rwy-graphite);
+  --brand-bg: var(--rwy-paper);
+  --brand-bg-soft: #f4f0e8;                  /* one notch off paper for panels */
+  --brand-bg-panel: var(--rwy-concrete);
+  --brand-bg-elevated: var(--rwy-white);
+  --brand-border: var(--rwy-line);
+  --brand-border-strong: #c7c0b2;            /* a touch darker than --line */
+  --brand-tooltip-bg: var(--rwy-ink);        /* dark pill tooltip reads well on paper */
+  --brand-tooltip-text: var(--rwy-paper);
+  --brand-success: var(--rwy-green);
+  --brand-warn: var(--rwy-amber-ink);
+  --brand-error: var(--rwy-red);
+  --brand-info: #2563a8;                     /* calm steel-blue, AA on paper */
+}
+
+/* ===== Fonts: Geologica (display) / Raleway (body) / IBM Plex Mono (mono) =====
+   Loaded via <link> in <head>; here we wire them into the type system. The app
+   uses system-ui by default + ui-monospace in many spots — we override both. */
+body {
+  font-family: "Raleway", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+  background: var(--rwy-paper);
+  color: var(--rwy-ink);
+}
+
+/* Headings / display text → Geologica.  The app's titles use Tailwind font-weight
+   utilities on plain <h1>/<h2>/.editorial-title/.meth-h1 — give them Geologica. */
+h1, h2, h3,
+.editorial-title, .meth-h1, .launch-summary-eq,
+.source-card-title, .prose-rwplus h1, .prose-rwplus h2, .prose-rwplus h3,
+.shared-empty h2 {
+  font-family: "Geologica", "Raleway", system-ui, sans-serif !important;
+  letter-spacing: -0.01em;
+}
+
+/* Monospace everywhere the app asked for ui-monospace → IBM Plex Mono (stencil) */
+.font-mono,
+code, pre, kbd, samp,
+.stepper-breadcrumb-ord, .source-card-ordinal, .crawler-row-count,
+.config-input, .editorial-textarea, .share-url-input,
+.meth-uainline, .prose-rwplus code, .prose-rwplus pre {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+}
+
+/* Uppercase tracked labels → mono stencil look in amber-ink (RWY .stencil) */
+.editorial-eyebrow, .config-label, .crawler-col-head, .crawler-row-name,
+.crawler-subgroup-label, .stepper-label, .meth-eyebrow-strong,
+.meth-figure-caption, .source-card-meta, .crawler-row-actions,
+.subset-toggle-btn, .share-btn, .share-panel-header, .meth-details summary {
+  font-family: "IBM Plex Mono", ui-monospace, monospace !important;
+}
+
+::selection {
+  background: rgb(255 176 0 / 0.35);
+}
+
+/* ============================================================================
+   Spots the app hardcoded a colour instead of routing through a --brand-* var.
+   ============================================================================ */
+
+/* --- amber buttons need INK text (white on amber fails contrast) --- */
+.stepper-next-btn,
+.launch-cta {
+  background: var(--rwy-amber) !important;
+  color: var(--rwy-ink) !important;
+  box-shadow: 0 10px 24px -12px rgb(255 176 0 / 0.7);
+  border-radius: 10px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace !important;
+}
+.stepper-next-btn:hover:not(:disabled),
+.launch-cta:hover:not(:disabled) {
+  background: #ffbf2e !important;
+  color: var(--rwy-ink) !important;
+  box-shadow: 0 16px 30px -12px rgb(255 176 0 / 0.85);
+}
+
+/* nav "Методика" CTA + the small accent buttons used rgba(255,50,75,...) tints
+   and turned white-on-primary on hover — re-skin to amber-on-ink. */
+.nav-methodology-btn {
+  border-color: var(--rwy-amber);
+  background: rgb(255 176 0 / 0.12);
+  color: var(--rwy-amber-ink);
+}
+.nav-methodology-btn:hover {
+  background: var(--rwy-amber);
+  color: var(--rwy-ink);
+  box-shadow: 0 6px 18px rgb(255 176 0 / 0.32);
+}
+.nav-methodology-btn:focus-visible { box-shadow: 0 0 0 2px rgb(255 176 0 / 0.55); }
+.nav-methodology-btn.is-active {
+  background: var(--rwy-amber);
+  color: var(--rwy-ink);
+}
+
+.subset-toggle-btn,
+.share-btn {
+  border-color: var(--rwy-amber);
+  background: rgb(255 176 0 / 0.1);
+  color: var(--rwy-amber-ink);
+}
+.subset-toggle-btn:hover,
+.share-btn:hover {
+  background: var(--rwy-amber);
+  color: var(--rwy-ink);
+}
+.subset-toggle-btn:focus-visible,
+.share-btn:focus-visible { box-shadow: 0 0 0 2px rgb(255 176 0 / 0.55); }
+.share-btn:disabled,
+.share-btn:disabled:hover {
+  background: rgb(255 176 0 / 0.05);
+  color: var(--rwy-amber-ink);
+}
+.share-dot { background: var(--rwy-amber); box-shadow: 0 0 0 2px rgb(255 176 0 / 0.25); }
+
+/* editorial hairline + launch band accent rule were brand-primary (now amber-ink);
+   make these decorative lines the brighter amber so they read as RWY centerlines. */
+.editorial-hairline { background: var(--rwy-amber); }
+.launch-band { border-top-color: var(--rwy-amber); }
+
+/* stepper dots: current = amber ring, done = green. (was red primary) */
+.stepper-dot.is-current {
+  background: var(--rwy-amber);
+  border-color: var(--rwy-amber);
+  box-shadow: 0 0 0 4px rgb(255 176 0 / 0.22);
+}
+
+/* run-status stepper circles: active = amber, done/failed got #0B0B0C text → ink/paper */
+.step-circle.active  { color: var(--rwy-amber-ink); border-color: var(--rwy-amber); }
+.step-circle.active::after { border-top-color: var(--rwy-amber); }
+.step-circle.done    { background: var(--rwy-green); color: var(--rwy-paper); border-color: var(--rwy-green); }
+.step-circle.failed  { background: var(--rwy-red);   color: var(--rwy-paper); border-color: var(--rwy-red); }
+.pulse-dot { background: var(--rwy-amber); }
+
+/* config underline-input focus + textarea accent: amber */
+.config-input:focus { border-bottom-color: var(--rwy-amber); }
+.editorial-textarea:focus { border-left-color: var(--rwy-amber); }
+
+/* source card active marker: amber centerline + amber-ink title */
+.source-card.is-active {
+  border-left-color: var(--rwy-amber);
+  background: var(--brand-bg-panel);
+}
+.source-card.is-active .source-card-title,
+.source-card.is-active .source-card-cta,
+.source-card.is-active .source-card-svg { color: var(--rwy-amber-ink); }
+.source-card:focus-visible { border-color: var(--rwy-amber); }
+
+/* crawler chips: selected = amber-marked */
+.crawler-chip.is-selected {
+  background: rgb(255 176 0 / 0.1);
+  border-color: var(--rwy-amber);
+  color: var(--rwy-ink);
+}
+.crawler-chip.is-selected .crawler-chip-mark {
+  background: var(--rwy-amber);
+  border-color: var(--rwy-amber);
+  color: var(--rwy-ink);
+}
+.crawler-chip:focus-visible {
+  border-color: var(--rwy-amber);
+  box-shadow: 0 0 0 2px rgb(255 176 0 / 0.5);
+}
+.crawler-chip-exp,
+.crawler-subgroup-tag {
+  color: var(--rwy-amber-ink);
+}
+.crawler-subgroup-tag {
+  background: rgb(255 176 0 / 0.12);
+  border-color: rgb(255 176 0 / 0.35);
+}
+
+/* methodology panels: the inline <style> used hardcoded blue/green washes.
+   Re-skin to a calm amber-tinted "blueprint" panel. */
+.methodology-panel {
+  border-color: var(--rwy-line);
+  background: linear-gradient(180deg, rgb(255 176 0 / 0.06), rgb(255 176 0 / 0.02));
+  box-shadow: inset 4px 0 0 var(--rwy-amber);
+}
+.methodology-caret { color: var(--rwy-amber-ink); }
+.meth-figure { border-left-color: var(--rwy-amber); }
+.meth-callout-info {
+  border-left-color: var(--brand-info);
+  background: rgb(37 99 168 / 0.06);
+}
+
+/* report markdown: blockquote accent + link underline were brand-primary tints */
+.prose-rwplus a { color: var(--brand-info); border-bottom-color: var(--brand-info); }
+.prose-rwplus blockquote {
+  border-left-color: var(--rwy-amber);
+  background: linear-gradient(90deg, rgb(255 176 0 / 0.08), rgb(255 176 0 / 0));
+}
+
+/* shared-report ribbon + toast used brand-primary rgba tints */
+.shared-ribbon {
+  background: rgb(255 176 0 / 0.1);
+  border-color: rgb(255 176 0 / 0.35);
+}
+.shared-toast.kind-success {
+  background: rgb(23 138 76 / 0.12);
+  border-color: rgb(23 138 76 / 0.55);
+  color: var(--rwy-green);
+}
+.shared-toast.kind-error {
+  background: rgb(214 69 51 / 0.12);
+  border-color: rgb(214 69 51 / 0.55);
+  color: var(--rwy-red);
+}
+
+/* ============================================================================
+   Dark Tailwind status-pill utility classes (emitted from app() JS:
+   statusBadgeClass / ruleBadge / proxyHealthClasses). The vendored Tailwind
+   ships these as *-950/*-900/*-300 dark tints; on paper they'd be black boxes.
+   Override the exact utility selectors to light, RWY-toned status chips.
+   Specificity note: single-class selectors here match Tailwind's own; this
+   file loads later, so it wins. !important guards against Tailwind layer order.
+   ============================================================================ */
+
+/* fills */
+.bg-emerald-950\/40, .bg-emerald-950\/60 { background-color: rgb(23 138 76 / 0.12) !important; }
+.bg-red-950\/40,     .bg-red-950\/60     { background-color: rgb(214 69 51 / 0.1) !important; }
+.bg-amber-950\/40,   .bg-amber-950\/60   { background-color: rgb(255 176 0 / 0.14) !important; }
+.bg-blue-950\/60                          { background-color: rgb(37 99 168 / 0.1) !important; }
+.bg-purple-950\/60                        { background-color: rgb(91 91 91 / 0.1) !important; }
+
+/* text */
+.text-emerald-300 { color: var(--rwy-green) !important; }
+.text-red-300     { color: var(--rwy-red) !important; }
+.text-amber-300   { color: var(--rwy-amber-ink) !important; }
+.text-blue-300    { color: var(--brand-info) !important; }
+.text-purple-300, .text-purple-700 { color: var(--rwy-graphite) !important; }
+
+/* borders */
+.border-emerald-900 { border-color: rgb(23 138 76 / 0.4) !important; }
+.border-red-900     { border-color: rgb(214 69 51 / 0.4) !important; }
+.border-amber-900   { border-color: rgb(255 176 0 / 0.5) !important; }
+.border-blue-900    { border-color: rgb(37 99 168 / 0.4) !important; }
+.border-purple-900  { border-color: rgb(91 91 91 / 0.35) !important; }
+
+/* ============================================================================
+   RWY runway-marking flourishes (decorative, cosmetic only)
+   ============================================================================ */
+
+/* amber focus ring fallback for keyboard nav across interactive controls */
+:focus-visible {
+  outline-color: var(--rwy-amber);
+}
+
+/* checkboxes/radios accent → amber (replaces Tailwind text-[--brand-primary] hint) */
+input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--rwy-amber);
+}
+
+/* header app name in Geologica; the favicon/logo swap is in the markup */
+.app-logo-name {
+  font-family: "Geologica", "Raleway", sans-serif !important;
+  letter-spacing: -0.01em;
+}
+.app-logo-sub {
+  font-family: "IBM Plex Mono", ui-monospace, monospace !important;
+  letter-spacing: 0.04em;
+}

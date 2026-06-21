@@ -3,8 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RW+ AI Visibility Checker</title>
-  <link rel="icon" type="image/svg+xml" href="/static/brand/favicon.svg">
+  <title>Runway AI · Visibility Checker</title>
+  <link rel="icon" type="image/svg+xml" href="/static/brand/runwai-favicon.svg">
+  <!-- RWY «Полоса» fonts: Geologica (display) / Raleway (body) / IBM Plex Mono (mono) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geologica:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Raleway:wght@300;400;500;600;700&display=swap&subset=cyrillic,latin">
   <link rel="stylesheet" href="/static/vendor/tailwind.css">
   <style>
     :root {
@@ -1385,6 +1389,9 @@
     }
     .source-card.is-active .source-card-svg { color: var(--brand-primary); }
   </style>
+  <!-- RWY «Полоса» re-theme (task 38.4): loaded LAST so it overrides the
+       --brand-* contract above + the vendored Tailwind. Cosmetic only. -->
+  <link rel="stylesheet" href="/static/rwy.css">
 </head>
 <body class="bg-[color:var(--brand-bg)] text-[color:var(--brand-text)] min-h-screen">
   <div x-data="app()" x-init="init()" x-cloak class="max-w-6xl mx-auto px-6 py-6">
@@ -1394,11 +1401,27 @@
       <button type="button" @click="onLogoClick()"
               class="flex items-center gap-3 text-left transition-opacity hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--brand-primary)] rounded"
               aria-label="На главную">
-        <img src="/static/brand/logo-mark.svg" alt="RW+" class="h-9 w-9" />
+        <!-- Runway AI logo (RWY): wordmark + amber "AI" chip, inline SVG.
+             Paths from runwai.ru/site/src/components/Logo.tsx (logo v2). -->
+        <span class="inline-flex items-center gap-2" aria-label="Runway AI">
+          <svg viewBox="0 0 700 100" height="26" fill="currentColor"
+               xmlns="http://www.w3.org/2000/svg" aria-hidden="true"
+               style="color: var(--rwy-ink);">
+            <path d="M83.5928 18.3389L15.7188 83.3887H0V0H83.5928V18.3389Z" />
+            <rect x="56.1885" y="55.7412" width="27.6096" height="27.6096" />
+            <path d="M136.991 7.21896H159.971V32.5463V77.6414H136.991V30.5695L136.991 7.21896ZM193.576 6.23058V25.9983C191.352 25.5041 189.128 25.1334 186.904 24.8863C184.763 24.6392 182.786 24.5157 180.974 24.5157C177.02 24.5157 173.437 25.3393 170.225 26.9867C167.095 28.5516 164.583 31.0637 162.689 34.5231C160.877 37.9824 159.971 42.4713 159.971 47.9898L155.399 42.3066C155.976 37.2823 156.923 32.5463 158.241 28.0986C159.559 23.6509 161.371 19.7385 163.677 16.3615C165.983 12.9022 168.825 10.1841 172.202 8.20734C175.661 6.23057 179.821 5.24219 184.68 5.24219C186.08 5.24219 187.563 5.32456 189.128 5.48929C190.693 5.65402 192.176 5.90112 193.576 6.23058Z" />
+            <path d="M234.552 79.4937C228.045 79.4937 222.444 78.1758 217.749 75.5401C213.137 72.822 209.595 68.9921 207.124 64.0501C204.735 59.1082 203.541 53.2603 203.541 46.5063V7.21802H226.521V43.1705C226.521 48.8537 227.88 53.2191 230.598 56.2666C233.316 59.3141 237.228 60.8379 242.335 60.8379C246.124 60.8379 249.336 60.0554 251.972 58.4905C254.608 56.9255 256.626 54.6605 258.026 51.6953C259.508 48.7302 260.25 45.2296 260.25 41.1937L267.415 45.0237C266.592 52.4366 264.615 58.7376 261.485 63.9266C258.438 69.0332 254.566 72.9044 249.872 75.5401C245.259 78.1758 240.152 79.4937 234.552 79.4937ZM260.25 77.6404V50.2128V7.21802H283.106V53.6721V77.6404H260.25Z" />
+            <path d="M295.292 7.21896H318.272V34.6466V77.6414H295.292V31.1873L295.292 7.21896ZM344.587 5.24219C351.341 5.24219 357.066 6.60122 361.761 9.31927C366.538 12.0373 370.162 15.8673 372.633 20.8092C375.186 25.6688 376.463 31.5168 376.463 38.3531V77.6414H353.483V41.8124C353.483 35.9645 352.041 31.5579 349.159 28.5928C346.276 25.5453 342.158 24.0215 336.804 24.0215C333.015 24.0215 329.72 24.8452 326.92 26.4925C324.12 28.0574 321.978 30.3225 320.496 33.2876C319.013 36.1704 318.272 39.6297 318.272 43.6656L310.982 39.8357C311.888 32.3404 313.906 26.0395 317.036 20.9328C320.248 15.8261 324.202 11.955 328.897 9.31927C333.674 6.60122 338.904 5.24219 344.587 5.24219Z" />
+            <path d="M478.234 64.915H470.945L491.824 7.21802H514.804L487.994 77.6404H464.52L441.787 18.0902H449.694L426.591 77.6404H403.117L376.43 7.21802H399.534L420.537 64.915H413.001L434.745 7.21802H456.86L478.234 64.915Z" />
+            <path d="M579.223 77.6414L579.47 42.4302L579.223 7.21896H603.068V77.6414H579.223ZM584.906 42.4302C583.671 49.9254 581.323 56.4735 577.864 62.0743C574.404 67.5928 570.039 71.917 564.768 75.0469C559.496 78.0944 553.566 79.6181 546.977 79.6181C540.058 79.6181 533.963 78.0532 528.692 74.9233C523.503 71.7934 519.426 67.4692 516.46 61.9508C513.495 56.3499 512.013 49.843 512.013 42.4302C512.013 35.0173 513.495 28.5516 516.46 23.0331C519.426 17.4323 523.503 13.0669 528.692 9.93702C533.963 6.80713 540.058 5.24219 546.977 5.24219C553.566 5.24219 559.496 6.80713 564.768 9.93702C570.039 12.9845 574.404 17.2675 577.864 22.786C581.406 28.3045 583.753 34.8525 584.906 42.4302ZM535.24 42.4302C535.24 46.219 536.022 49.596 537.587 52.5611C539.152 55.4439 541.294 57.7501 544.012 59.4798C546.812 61.1271 550.024 61.9508 553.648 61.9508C557.272 61.9508 560.691 61.1271 563.903 59.4798C567.198 57.7501 570.08 55.4439 572.551 52.5611C575.022 49.596 576.875 46.219 578.111 42.4302C576.875 38.6414 575.022 35.3056 572.551 32.4228C570.08 29.4576 567.198 27.1514 563.903 25.5041C560.691 23.7744 557.272 22.9096 553.648 22.9096C550.024 22.9096 546.812 23.7744 544.012 25.5041C541.294 27.1514 539.152 29.4576 537.587 32.4228C536.022 35.3056 535.24 38.6414 535.24 42.4302Z" />
+            <path d="M634.392 100.003C629.45 100.003 625.043 99.3849 621.172 98.1494C617.383 96.9139 613.677 95.0607 610.053 92.5897V76.4049C613.759 78.7935 617.218 80.482 620.431 81.4704C623.725 82.5412 627.308 83.0765 631.179 83.0765C634.639 83.0765 637.645 82.3353 640.198 80.8527C642.834 79.3701 645.017 76.652 646.746 72.6985L674.915 7.21802H699.254L664.784 79.8643C662.478 84.8062 659.719 88.7598 656.507 91.7249C653.294 94.6901 649.794 96.7904 646.005 98.0259C642.299 99.3437 638.427 100.003 634.392 100.003ZM637.11 72.0808L606.593 7.21802H631.797L659.225 72.0808H637.11Z" />
+          </svg>
+          <span style="background: var(--rwy-amber); color: var(--rwy-ink); border-radius: 5px; padding: 1px 7px 2px; font-size: 13px; font-weight: 600; letter-spacing: 0.05em; font-family: 'Geologica', sans-serif;">AI</span>
+        </span>
         <div class="h-9 w-px bg-[color:var(--brand-border)]"></div>
         <div>
-          <h1 class="text-xl font-semibold tracking-tight">AI Visibility Checker</h1>
-          <p class="text-xs text-[color:var(--brand-text-muted)] mt-0.5">Утилита RW+ для исследования доступности российских web-ресурсов для AI-поиска</p>
+          <h1 class="app-logo-name text-xl font-semibold tracking-tight">Visibility Checker</h1>
+          <p class="app-logo-sub text-xs text-[color:var(--brand-text-muted)] mt-0.5">Утилита Runway AI для исследования доступности российских web-ресурсов для AI-поиска</p>
         </div>
       </button>
       <div class="flex items-center gap-4">
@@ -1432,7 +1455,7 @@
           </button>
         </nav>
         <a x-show="tab === 'shared_report'" href="/" class="shared-home-link" rel="noopener">
-          <span>&larr; На главную aiv.rw.plus</span>
+          <span>&larr; На главную Runway AI Checker</span>
         </a>
       </div>
     </header>
@@ -2625,7 +2648,7 @@
           <h2>Ссылка недействительна</h2>
           <p x-text="sharedError"></p>
           <p class="mt-4">
-            <a href="/" class="text-[color:var(--brand-primary)] hover:underline">Открыть aiv.rw.plus</a>
+            <a href="/" class="text-[color:var(--brand-primary)] hover:underline">Открыть Runway AI Checker</a>
           </p>
         </div>
       </template>
@@ -2782,8 +2805,8 @@
 
     <!-- Footer -->
     <footer class="mt-10 pt-4 border-t border-[color:var(--brand-border)] text-xs text-[color:var(--brand-text-soft)] flex items-center justify-between flex-wrap gap-2">
-      <div>© 2026 RW+. AI Visibility research toolkit</div>
-      <a href="https://rw.plus" target="_blank" rel="noopener" class="hover:text-[color:var(--brand-primary)]">rw.plus</a>
+      <div>© 2026 Runway AI. Инструмент исследования AI-видимости</div>
+      <a href="https://runwai.ru" target="_blank" rel="noopener" class="hover:text-[color:var(--brand-primary)]">runwai.ru</a>
     </footer>
 
   </div>
