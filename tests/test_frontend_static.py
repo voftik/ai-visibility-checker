@@ -58,6 +58,16 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("AI-видимости источников", data["description"])
         self.assertNotIn("web_search/web_fetch", data["description"])
 
+    def test_runwai_mobile_header_can_wrap_navigation(self) -> None:
+        css = Path("static/rwy.css").read_text(encoding="utf-8")
+
+        self.assertIn("@media (max-width: 720px)", css)
+        self.assertIn("header > div.flex.items-center.gap-4", css)
+        self.assertIn("flex-direction: column !important", css)
+        self.assertIn("header nav.flex.gap-1.text-sm", css)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", css)
+        self.assertIn("white-space: normal", css)
+
 
 if __name__ == "__main__":
     unittest.main()
