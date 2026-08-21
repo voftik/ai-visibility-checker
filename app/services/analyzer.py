@@ -86,7 +86,7 @@ GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
 MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v2"
 PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v3"
-PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v3"
+PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v4"
 PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
 LEGACY_PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v1"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
@@ -3062,7 +3062,11 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
         system=system,
         user_payload=payload,
         max_tokens=6000,
-        model=CRITIC_MODEL,
+        # Не CRITIC_MODEL: gemini-flash игнорирует minItems строгой схемы и
+        # явное требование «ровно шесть проверок» — возвращал 1-2 проверки с
+        # verdict=pass (прогон 5ae13350, 2026-08-21). Processing-модель уже
+        # доверена для каталога и аннотаций и соблюдает строгие схемы.
+        model=PROCESSING_MODEL,
         reasoning_effort="high",
         prompt_version=PROMPT_SET_REVIEW_VERSION,
     )
