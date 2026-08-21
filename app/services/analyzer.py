@@ -3150,7 +3150,10 @@ choice_request поставь true только если текст действ
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    for attempt in range(2):
+    # Четыре, а не две: строгий семантический критик (все шесть проверок,
+    # processing-модель) обычно требует 2-3 итерации на сходимость — с двумя
+    # попытками прогон profi.travel умирал на одном несведённом TR-сценарии.
+    for attempt in range(4):
         user_content = dict(payload)
         if last_errors:
             user_content["validation_errors_to_fix"] = last_errors
