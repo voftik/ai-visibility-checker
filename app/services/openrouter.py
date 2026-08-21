@@ -236,8 +236,13 @@ def web_request_policy(
                         },
                     }
                 ],
-                # There is exactly one tool, so "required" forces web search.
-                "tool_choice": "required",
+                # "auto", а не "required": принудительный tool_choice держится
+                # на каждом витке серверного цикла инструментов, поэтому модель
+                # не получает хода на текст — Anthropic закрывает обмен с
+                # native_finish_reason="pause_turn" и пустым content. Факт
+                # поиска гарантирует пост-проверка attest_web_response(),
+                # а не принуждение на входе.
+                "tool_choice": "auto",
                 "max_tool_calls": 4,
             }
         )
@@ -448,6 +453,45 @@ def _parse_json(text: str) -> dict[str, Any] | list[Any]:
     return parsed
 
 
+def _empty_response_error(
+    choice: dict[str, Any],
+    message: dict[str, Any],
+) -> str:
+    """Name the stop reason: bare "empty response" hides why it happened."""
+
+    return (
+        "Model returned an empty response "
+        f"(finish_reason={choice.get('finish_reason') or '?'}, "
+        f"native_finish_reason={choice.get('native_finish_reason') or '?'}, "
+        f"tool_calls={len(message.get('tool_calls') or [])})"
+    )
+
+
+def _policy_retry_reminder(
+    policy: WebSearchPolicy,
+    violations: list[str],
+) -> dict[str, str]:
+    """Explain the rejected contract so the retry is not a blind repeat."""
+
+    if policy is WebSearchPolicy.FORBIDDEN:
+        instruction = (
+            "Предыдущий ответ отклонён: в нём остались следы веб-поиска, который "
+            "в этом запросе запрещён. Ответь только по собственным знаниям — без "
+            "инструментов, URL и ссылок на источники."
+        )
+    else:
+        instruction = (
+            "Предыдущий ответ отклонён: обязательный веб-поиск не подтверждён. "
+            "Обязательно выполни поиск в вебе и обопри каждый внешний вывод на "
+            "конкретный URL из результатов поиска."
+        )
+    detail = ", ".join(violations) or "unknown"
+    return {
+        "role": "user",
+        "content": f"{instruction}\n(нарушения контракта: {detail})",
+    }
+
+
 def _response_error(response: httpx.Response) -> str:
     try:
         payload = response.json()
@@ -482,6 +526,8 @@ async def chat(
         model=model,
         policy=web_policy,
     )
+    # web_request_policy() уже отвергла неизвестные значения понятной ошибкой.
+    request_policy_enum = WebSearchPolicy(web_policy)
     payload.update(policy_fields)
     if reasoning_effort:
         payload["reasoning"] = {
@@ -508,6 +554,17 @@ async def chat(
     for attempt, delay in enumerate((0.0, 2.0, 7.0), start=1):
         if delay:
             await asyncio.sleep(delay)
+        if isinstance(last_error, OpenRouterPolicyError):
+            # Идентичный повтор воспроизведёт то же нарушение контракта,
+            # поэтому причину отказа сообщаем модели явно. Список строится
+            # от исходных messages, чтобы напоминания не накапливались.
+            payload["messages"] = [
+                *messages,
+                _policy_retry_reminder(
+                    request_policy_enum,
+                    last_error.result.web_attestation.get("violations") or [],
+                ),
+            ]
         try:
             async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
                 headers = _headers()
@@ -528,7 +585,9 @@ async def chat(
             message = choices[0].get("message") or {}
             text = _message_text(message)
             if not text:
-                raise OpenRouterError("Model returned an empty response")
+                raise OpenRouterError(
+                    _empty_response_error(choices[0], message)
+                )
             parsed = _parse_json(text) if response_schema is not None else None
             citations = _citations(message)
             annotations = _annotations(message)

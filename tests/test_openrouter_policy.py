@@ -1,8 +1,10 @@
 import unittest
+from copy import deepcopy
 from typing import Any
 from unittest.mock import patch
 
 from app.services.openrouter import (
+    OpenRouterError,
     OpenRouterPolicyError,
     WebSearchPolicy,
     chat,
@@ -37,8 +39,33 @@ class _FakeClient:
         headers: dict[str, str],
         json: dict[str, Any],
     ) -> _FakeResponse:
-        self.requests.append({"headers": headers, "json": json})
+        # Копия: chat() переиспользует один payload между попытками, и без
+        # снимка запись первой попытки меняется задним числом.
+        self.requests.append(
+            {"headers": dict(headers), "json": deepcopy(json)}
+        )
         return _FakeResponse(self.body)
+
+
+class _SequenceClient(_FakeClient):
+    """Отдаёт заранее заданные ответы по одному на попытку."""
+
+    def __init__(self, bodies: list[dict[str, Any]]):
+        super().__init__(bodies[0])
+        self._bodies = bodies
+
+    async def post(
+        self,
+        _url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+    ) -> _FakeResponse:
+        self.requests.append(
+            {"headers": dict(headers), "json": deepcopy(json)}
+        )
+        index = min(len(self.requests) - 1, len(self._bodies) - 1)
+        return _FakeResponse(self._bodies[index])
 
 
 def _body(
@@ -114,7 +141,7 @@ class OpenRouterPolicyRequestTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.web_attestation["metric_eligible"])
 
-    async def test_required_policy_forces_the_only_server_tool(self) -> None:
+    async def test_required_policy_offers_the_only_server_tool(self) -> None:
         client = _FakeClient(
             _body(web_search_requests=1, with_citation=True)
         )
@@ -135,7 +162,7 @@ class OpenRouterPolicyRequestTests(unittest.IsolatedAsyncioTestCase):
             )
 
         payload = client.requests[0]["json"]
-        self.assertEqual(payload["tool_choice"], "required")
+        self.assertEqual(payload["tool_choice"], "auto")
         self.assertEqual(len(payload["tools"]), 1)
         self.assertEqual(
             payload["tools"][0]["type"],
@@ -223,3 +250,111 @@ class OpenRouterPolicyRequestTests(unittest.IsolatedAsyncioTestCase):
             "router_retrieval_stage_while_forbidden",
             raised.exception.result.web_attestation["violations"],
         )
+
+    async def test_empty_pause_turn_response_names_the_stop_reason(
+        self,
+    ) -> None:
+        # Пустой content при native_finish_reason="pause_turn" три недели
+        # выглядел как безымянная «Model returned an empty response».
+        body = _body(web_search_requests=1, with_citation=True)
+        body["choices"] = [
+            {
+                "finish_reason": "stop",
+                "native_finish_reason": "pause_turn",
+                "message": {"role": "assistant", "content": ""},
+            }
+        ]
+        client = _FakeClient(body)
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.asyncio.sleep",
+                return_value=None,
+            ),
+            self.assertRaises(OpenRouterError) as raised,
+        ):
+            await chat(
+                model="anthropic/claude-opus-5",
+                messages=[{"role": "user", "content": "Что нового?"}],
+                web_policy=WebSearchPolicy.REQUIRED,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("pause_turn", message)
+        self.assertIn("finish_reason=stop", message)
+
+    async def test_policy_retry_tells_the_model_why_it_was_rejected(
+        self,
+    ) -> None:
+        client = _SequenceClient(
+            [
+                _body(web_search_requests=0, with_citation=False),
+                _body(web_search_requests=1, with_citation=True),
+            ]
+        )
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.asyncio.sleep",
+                return_value=None,
+            ),
+        ):
+            result = await chat(
+                model="openai/gpt-5.4",
+                messages=[{"role": "user", "content": "Что нового?"}],
+                web_policy=WebSearchPolicy.REQUIRED,
+            )
+
+        self.assertEqual(len(client.requests), 2)
+        first = client.requests[0]["json"]["messages"]
+        second = client.requests[1]["json"]["messages"]
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 2)
+        self.assertIn("веб-поиск", second[-1]["content"])
+        self.assertIn(
+            "web_search_requests_not_confirmed",
+            second[-1]["content"],
+        )
+        self.assertTrue(result.web_attestation["metric_eligible"])
+
+    async def test_policy_retry_reminder_does_not_accumulate(self) -> None:
+        client = _SequenceClient(
+            [_body(web_search_requests=0, with_citation=False)]
+        )
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.asyncio.sleep",
+                return_value=None,
+            ),
+            self.assertRaises(OpenRouterPolicyError),
+        ):
+            await chat(
+                model="openai/gpt-5.4",
+                messages=[{"role": "user", "content": "Что нового?"}],
+                web_policy=WebSearchPolicy.REQUIRED,
+            )
+
+        self.assertEqual(len(client.requests), 3)
+        self.assertEqual(len(client.requests[2]["json"]["messages"]), 2)

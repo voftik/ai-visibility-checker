@@ -881,13 +881,16 @@ class PanelRoutingTests(unittest.TestCase):
             unconfirmed["violations"],
         )
 
-    def test_required_request_has_one_forced_server_web_tool(self) -> None:
+    def test_required_request_offers_one_server_web_tool(self) -> None:
         fields, _policy = web_request_policy(
             model="openai/gpt-5.4",
             policy=WebSearchPolicy.REQUIRED,
         )
 
-        self.assertEqual(fields["tool_choice"], "required")
+        # Не "required": принуждение держится на каждом витке серверного
+        # цикла инструментов и не даёт модели хода на текст. Факт поиска
+        # проверяет attest_web_response() уже по ответу.
+        self.assertEqual(fields["tool_choice"], "auto")
         self.assertEqual(len(fields["tools"]), 1)
         self.assertEqual(
             fields["tools"][0]["type"],
