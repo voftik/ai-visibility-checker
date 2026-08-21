@@ -86,7 +86,7 @@ GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
 MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v2"
 PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v3"
-PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v2"
+PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v3"
 PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
 LEGACY_PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v1"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
@@ -537,6 +537,10 @@ PROMPT_SET_REVIEW_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "checks": {
             "type": "array",
+            # Ровно шесть: flash-критик без этого ограничения возвращал одну
+            # проверку с verdict=pass (прогон 5ae13350, 2026-08-21).
+            "minItems": 6,
+            "maxItems": 6,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -3011,6 +3015,9 @@ async def _review_prompt_set_semantics(
         "market_research_digest": research_digest,
         "canonical_intent_definitions": INTENT_DEFINITIONS,
         "prompts": prompts,
+        "prompt_keys_to_check": [
+            str(item.get("prompt_key") or "") for item in prompts
+        ],
     }
     system = f"""
 Ты независимый методолог-критик экспресс-исследования AI visibility.
@@ -3028,6 +3035,9 @@ TR — Trend-Driven: тренды, новизна, популярность ил
 за навигацию, NAV — за общий поиск типа решения, TR — за доверие или проверку
 риска. Просьба назвать конкретные варианты есть во всех сценариях как
 измерительная рамка; сама по себе она не превращает каждый запрос в E.
+
+В checks верни ровно шесть объектов — по одному на каждый prompt_key из
+prompt_keys_to_check, без пропусков и добавлений.
 
 Поставь pass, только если все шесть запросов естественны для обычного
 пользователя, различаются по доминирующему намерению, соответствуют заявленным
@@ -3051,7 +3061,7 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
         schema_name="aiv_prompt_set_semantic_review",
         system=system,
         user_payload=payload,
-        max_tokens=3500,
+        max_tokens=6000,
         model=CRITIC_MODEL,
         reasoning_effort="high",
         prompt_version=PROMPT_SET_REVIEW_VERSION,
