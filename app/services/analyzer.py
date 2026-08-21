@@ -2939,6 +2939,20 @@ def _prompt_review_errors(
         if isinstance(item, dict)
         and (normalized := _normalized_research_url(item.get("url")))
     }
+    # Сценарий может законно опираться на сам сайт (календарь событий,
+    # вебинары): требовать внешнюю поисковую цитату для такого граундинга —
+    # строже, чем гейт исследования, который эти site-URL уже сверил с реально
+    # скачанными страницами. Прогон 5ae13350 (2026-08-21) падал ровно здесь:
+    # критик одобрял transactional/nav сценарии с «Не требуется», а
+    # пересечение только с веб-цитатами оставалось пустым.
+    if isinstance(market_research, dict):
+        site_confirmed = market_research.get("site_confirmed")
+        if isinstance(site_confirmed, dict):
+            for item in _nonempty_research_items(site_confirmed.get("evidence")):
+                if isinstance(item, dict) and (
+                    normalized := _normalized_research_url(item.get("url"))
+                ):
+                    research_citation_urls.add(normalized)
     expected = {
         str(item.get("prompt_key") or ""): str(item.get("intent_class") or "")
         for item in prompt_set.get("prompts") or []
