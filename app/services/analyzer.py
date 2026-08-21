@@ -2481,9 +2481,18 @@ def _market_research_with_gate(
     return output
 
 
-def _require_market_research_ready(
+def _require_market_research_usable(
     research: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """Fail on blocked or unattested research; let limited proceed.
+
+    limited — штатный честный итог: схема и промпт сами предписывают модели
+    ставить его при неопределённостях, а весь дальнейший пайплайн (метрики,
+    coverage, отчёт) умеет деградировать с data_state="limited". Требовать
+    здесь идеального ready — значит отвергать состояние, которое мы же
+    запросили; фатальны только blocked и провал веб-аттестации.
+    """
+
     if not isinstance(research, dict):
         raise MarketResearchGateError(
             "Нельзя строить сценарии без исследования рынка."
@@ -2496,9 +2505,10 @@ def _require_market_research_ready(
         else None
     )
     if (
-        research.get("status") != "ready"
+        research.get("status") not in {"ready", "limited"}
         or not isinstance(sufficiency, dict)
-        or sufficiency.get("status") != "ready"
+        or sufficiency.get("status") not in {"ready", "limited"}
+        or sufficiency.get("blocking_issues")
         or not isinstance(attestation, dict)
         or attestation.get("version") != WEB_ATTESTATION_VERSION
         or attestation.get("policy") != WebSearchPolicy.REQUIRED.value
@@ -2604,7 +2614,7 @@ async def _market_research(
         payload=payload,
     )
     if isinstance(cached, dict):
-        return _require_market_research_ready(cached)
+        return _require_market_research_usable(cached)
 
     await _save_artifact(
         run_id,
@@ -2804,7 +2814,7 @@ uncertainties, а не в source_urls.
         usage_json=combined_usage,
         prompt_version=MARKET_RESEARCH_VERSION,
     )
-    return _require_market_research_ready(output)
+    return _require_market_research_usable(output)
 
 
 def _prompt_contains_alias(text: str, alias: str) -> bool:
@@ -2976,7 +2986,7 @@ async def _review_prompt_set_semantics(
 ) -> list[str]:
     """Check that each label describes the prompt's actual dominant intent."""
 
-    research = _require_market_research_ready(market_research)
+    research = _require_market_research_usable(market_research)
     research_digest = _stable_json_sha256(research)
     prompts = [
         item
@@ -3056,7 +3066,7 @@ async def _generate_prompt_set(
     *,
     market_research: dict[str, Any],
 ) -> dict[str, Any]:
-    research = _require_market_research_ready(market_research)
+    research = _require_market_research_usable(market_research)
     payload: dict[str, Any] = {
         "requested_site": requested_site or {},
         "site_profile": profile,

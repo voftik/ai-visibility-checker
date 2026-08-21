@@ -45,6 +45,7 @@ from app.services.report_semantic_gate import (
     CANONICAL_OBSERVATIONAL_MEMORY_LIMITATION,
 )
 from app.services.analyzer import (
+    _require_market_research_usable,
     ANALYSIS_MODEL,
     ANNOTATION_VERSION,
     ENTITY_CATALOG_CHUNK_VERSION,
@@ -1537,6 +1538,32 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("критерии выбора" in issue for issue in gate["blocking_issues"])
         )
+
+    def test_limited_research_with_verified_attestation_is_usable(self) -> None:
+        # limited — штатный честный итог (реальный прогон profi.travel,
+        # 2026-08-21): аттестация verified, все измерения покрыты, но часть
+        # источников с низкой уверенностью. Фатален только blocked.
+        research = _ready_market_research()
+        research["status"] = "limited"
+        research["sufficiency"]["status"] = "limited"
+        research["sufficiency"]["limited_issues"] = [
+            "Источник https://example.org/a помечен низкой уверенностью."
+        ]
+
+        result = _require_market_research_usable(research)
+
+        self.assertEqual(result["status"], "limited")
+
+    def test_blocked_research_is_never_usable(self) -> None:
+        research = _ready_market_research()
+        research["status"] = "blocked"
+        research["sufficiency"]["status"] = "blocked"
+        research["sufficiency"]["blocking_issues"] = [
+            "Веб-поиск не прошёл обязательную аттестацию."
+        ]
+
+        with self.assertRaises(MarketResearchGateError):
+            _require_market_research_usable(research)
 
     async def test_unattested_market_research_never_reaches_prompt_model(
         self,
