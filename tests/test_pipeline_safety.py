@@ -1515,6 +1515,23 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             profile["brand_name"],
         )
 
+    def test_prose_evidence_with_embedded_url_counts_as_confirmed(self) -> None:
+        # Критик пишет supporting_evidence прозой с URL внутри текста; парсинг
+        # строки целиком как URL отвергал даже прошедший ревью набор
+        # (прогон 5ae13350, 2026-08-21).
+        from app.services.analyzer import _urls_in_evidence_text
+
+        urls = _urls_in_evidence_text(
+            "Сайт подтверждает аудиторию, см. https://example.com/news/1. "
+            "Второй источник: (https://www.example.org/report)."
+        )
+
+        self.assertEqual(
+            urls,
+            {"https://example.com/news/1", "https://example.org/report"},
+        )
+        self.assertEqual(_urls_in_evidence_text("просто текст без ссылок"), set())
+
     def test_market_research_blocks_empty_jobs_and_criteria(self) -> None:
         research = _ready_market_research()
         external = research["external_market_research"]

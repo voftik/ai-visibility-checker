@@ -2219,6 +2219,28 @@ def _normalized_research_url(value: Any) -> str:
     return f"{scheme}://{host}{port}{path}{query}"
 
 
+_EVIDENCE_URL_RX = re.compile(r"https?://[^\s\"'<>\)\]]+")
+
+
+def _urls_in_evidence_text(value: Any) -> set[str]:
+    """Extract confirmed-citation candidates from a prose evidence line.
+
+    Критик пишет supporting_evidence прозой с URL внутри текста — именно так,
+    как просит промпт («подтверждения и URL»). Парсить строку целиком как URL
+    нельзя: предложение не URL, множество получается пустым, и прошедший
+    ревью набор детерминированно отвергается с бессмысленным «Исправление не
+    требуется» (прогон 5ae13350, 2026-08-21).
+    """
+
+    text = str(value or "")
+    found: set[str] = set()
+    for match in _EVIDENCE_URL_RX.findall(text):
+        normalized = _normalized_research_url(match.rstrip(".,;:!?"))
+        if normalized:
+            found.add(normalized)
+    return found
+
+
 def _research_url_host(value: Any) -> str:
     normalized = _normalized_research_url(value)
     if not normalized:
@@ -2964,11 +2986,9 @@ def _prompt_review_errors(
             for item in check.get("supporting_evidence") or []
             if str(item).strip()
         ]
-        supporting_urls = {
-            normalized
-            for item in supporting_evidence
-            if (normalized := _normalized_research_url(item))
-        }
+        supporting_urls: set[str] = set()
+        for item in supporting_evidence:
+            supporting_urls |= _urls_in_evidence_text(item)
         if (
             check.get("grounded_in_research") is not True
             or unsupported
