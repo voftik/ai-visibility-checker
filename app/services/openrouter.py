@@ -453,6 +453,32 @@ def _parse_json(text: str) -> dict[str, Any] | list[Any]:
     return parsed
 
 
+# Часть upstream-эндпоинтов выполняет веб-поиск, но не отдаёт наружу
+# url_citation-аннотации OpenRouter. Замер 2026-08-21 на anthropic/claude-opus-5:
+# Anthropic и Claude Platform on AWS — 0 аннотаций при web_search_requests=3,
+# Amazon Bedrock и Azure — 11-12 аннотаций. Аттестация такой ответ принять не
+# может, поэтому эндпоинт запоминается на время жизни процесса, и следующие
+# запросы к этой модели маршрутизируются мимо него, а не сжигают на нём попытки.
+_NON_CITING_PROVIDERS: dict[str, set[str]] = {}
+
+
+def _non_citing_providers(model: str) -> list[str]:
+    return sorted(_NON_CITING_PROVIDERS.get(model) or ())
+
+
+def _remember_non_citing_provider(model: str, provider: str) -> None:
+    if provider:
+        _NON_CITING_PROVIDERS.setdefault(model, set()).add(provider)
+
+
+def _citation_routing_failure(attestation: dict[str, Any]) -> bool:
+    """Поиск состоялся, но этот эндпоинт не отдал ни одной URL-цитаты."""
+
+    return set(attestation.get("violations") or []) == {
+        "url_citation_not_confirmed"
+    } and int(attestation.get("web_search_requests") or 0) > 0
+
+
 def _empty_response_error(
     choice: dict[str, Any],
     message: dict[str, Any],
@@ -529,6 +555,14 @@ async def chat(
     # web_request_policy() уже отвергла неизвестные значения понятной ошибкой.
     request_policy_enum = WebSearchPolicy(web_policy)
     payload.update(policy_fields)
+    # Маршрутизация не входит в аудируемый контракт доступа к вебу и потому
+    # не попадает в request_policy: контракт описывает, что требуется, а не
+    # через какой эндпоинт это удалось подтвердить. Иначе смена провайдера
+    # меняла бы policy hash и обесценивала бы уже собранные ячейки панели.
+    if request_policy_enum is not WebSearchPolicy.FORBIDDEN:
+        avoid = _non_citing_providers(model)
+        if avoid:
+            payload["provider"] = {"ignore": avoid}
     if reasoning_effort:
         payload["reasoning"] = {
             "effort": reasoning_effort,
@@ -555,16 +589,20 @@ async def chat(
         if delay:
             await asyncio.sleep(delay)
         if isinstance(last_error, OpenRouterPolicyError):
-            # Идентичный повтор воспроизведёт то же нарушение контракта,
+            attestation = last_error.result.web_attestation
+            # Когда цитат не отдал сам эндпоинт, модель ни при чём:
+            # исправление — смена маршрута, уже применённая к payload.
+            # Иначе идентичный повтор воспроизвёл бы то же нарушение,
             # поэтому причину отказа сообщаем модели явно. Список строится
             # от исходных messages, чтобы напоминания не накапливались.
-            payload["messages"] = [
-                *messages,
-                _policy_retry_reminder(
-                    request_policy_enum,
-                    last_error.result.web_attestation.get("violations") or [],
-                ),
-            ]
+            if not _citation_routing_failure(attestation):
+                payload["messages"] = [
+                    *messages,
+                    _policy_retry_reminder(
+                        request_policy_enum,
+                        attestation.get("violations") or [],
+                    ),
+                ]
         try:
             async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
                 headers = _headers()
@@ -619,6 +657,14 @@ async def chat(
                 router_metadata=router_metadata,
             )
             if not attestation["metric_eligible"]:
+                if _citation_routing_failure(attestation):
+                    _remember_non_citing_provider(
+                        model,
+                        str(body.get("provider") or "").strip(),
+                    )
+                    avoid = _non_citing_providers(model)
+                    if avoid:
+                        payload["provider"] = {"ignore": avoid}
                 violations = ", ".join(attestation["violations"])
                 raise OpenRouterPolicyError(
                     f"OpenRouter web policy attestation failed: {violations}",
