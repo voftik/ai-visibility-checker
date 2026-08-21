@@ -112,6 +112,29 @@ the constraint on every turn of the tool loop, so the model never gets a turn to
 answer — Anthropic ends it with `native_finish_reason="pause_turn"` and empty content.
 That silently broke every run between 2026-08-01 and 2026-08-21.
 
+**Citations are endpoint-dependent, and OpenRouter routes by default.** The same model can
+run the search and still return zero `url_citation` annotations, depending on which
+upstream endpoint answered. Measured 2026-08-21 on `anthropic/claude-opus-5`, identical
+request, provider pinned:
+
+| endpoint | annotations | web_search_requests |
+|---|---:|---:|
+| Anthropic | 0 | 3 |
+| Claude Platform on AWS | 0 | 3 |
+| Amazon Bedrock | 11–12 | 4 |
+| Azure | 11 | 4 |
+
+Reasoning settings make no difference. Since default routing picks Claude Platform on AWS,
+`market_research` could never satisfy its gate. `chat()` therefore remembers, per model,
+endpoints that searched but returned no citations, and routes around them with
+`provider.ignore` — in-process memory, reset on restart, no hardcoded provider table. That
+routing stays **out of** `request_policy`: the contract records what was required, not
+which endpoint proved it, and folding it in would change the policy hash and invalidate
+already-collected panel cells.
+
+Consequence when debugging: a first attempt landing on a non-citing endpoint is normal and
+costs one call; the retry is where it succeeds.
+
 ### Other subsystems
 
 - `app/services/protections.py` — WAF / interstitial / SPA-empty-shell / TLS-block
