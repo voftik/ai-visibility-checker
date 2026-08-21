@@ -1,80 +1,65 @@
-"""Cheap content-shape detector.
+"""Content extraction and render-strategy signals for crawler responses.
 
-`extract_text_signals` runs over the decoded HTML body and returns:
-  - extractable_text_length: how many characters survive after stripping
-    <script>/<style> blocks, all tags, and whitespace collapse. This is the
-    primary "what would an AI fetcher actually see" signal.
-  - tag_paragraph_count / tag_link_count: rough structural markers.
-  - looks_like_*: five orthogonal heuristic flags for content shape.
-  - primary_language_guess: "ru" / "en" / "mixed" / None on cyrillic ratio.
-
-Pure regex + str.count, no HTML parser dependency. Designed to be tolerant of
-broken markup; returns conservative defaults rather than raising.
+The important distinction is between an authentication *form* and an
+authentication *wall*. A newsletter/login widget on an otherwise readable
+page must never erase the page's real content.
 """
 from __future__ import annotations
 
+import json
 import re
+from html import unescape
+from typing import Any
 
-_RE_SCRIPT = re.compile(r"<script\b[^>]*>.*?</script>", re.I | re.S)
-_RE_STYLE = re.compile(r"<style\b[^>]*>.*?</style>", re.I | re.S)
-_RE_TAG = re.compile(r"<[^>]+>")
-_RE_WS = re.compile(r"\s+")
+from bs4 import BeautifulSoup
 
-_RE_P = re.compile(r"<p\b", re.I)
-_RE_ARTICLE = re.compile(r"<article\b", re.I)
-_RE_HEADING = re.compile(r"<h[1-3]\b", re.I)
-_RE_LINK = re.compile(r"<a\s[^>]*href=", re.I)
-_RE_SCRIPT_OPEN = re.compile(r"<script[\s>]", re.I)
-
-_LOGIN_TOKENS = (
-    'name="password"',
-    "name='password'",
-    'type="password"',
-    "type='password'",
-    "login-form",
-    "sign-in",
-    "войти",
-    "логин",
+_WS = re.compile(r"\s+")
+_FRAMEWORK_MARKERS = (
+    "__next_data__",
+    "__nuxt__",
+    "__remixcontext",
+    "data-reactroot",
+    "ng-version",
+    'id="__next"',
+    'id="app"',
+    'id="root"',
 )
-
 _REDIRECT_TOKENS = (
-    'meta http-equiv="refresh"',
-    "meta http-equiv='refresh'",
+    'http-equiv="refresh"',
     "window.location",
     "document.location",
 )
-
 _CAPTCHA_TOKENS = (
     "captcha",
     "smartcaptcha",
     "recaptcha",
-    "проверка",
     "are you human",
     "checking your browser",
     "just a moment",
 )
-
 _ERROR_TOKENS = (
     "404",
     "403",
     "401",
-    "498",
-    "500",
     "forbidden",
     "not found",
     "access denied",
+    "страница не найдена",
+    "доступ запрещён",
 )
-
-# Phrases that indicate the page is a geo-restriction notice rather than the
-# real content. RU phrases first (gosuslugi/banks/regulators), then EN. These
-# are intentionally distinct from captcha/error tokens — a geo-block page
-# usually serves HTTP 200 with a friendly banner.
+_AUTH_TOKENS = (
+    "sign in",
+    "log in",
+    "login",
+    "авторизация",
+    "войдите в аккаунт",
+    "войдите, чтобы продолжить",
+    "требуется вход",
+)
 _GEO_BLOCK_TOKENS = (
-    # Russian
     "отключите vpn",
     "отключите впн",
     "доступ ограничен",
-    "доступ запрещ",
     "доступ к сайту ограничен",
     "по соображениям безопасности",
     "из соображений безопасности",
@@ -82,155 +67,316 @@ _GEO_BLOCK_TOKENS = (
     "недоступно в вашей стране",
     "недоступен в вашем регионе",
     "недоступно в вашем регионе",
-    "недоступен из-за рубежа",
-    "из вашей страны",
-    "из вашего региона",
-    "географическим ограничен",
-    "вы находитесь за пределами",
-    "сервис доступен только",
     "только из россии",
-    "только на территории",
-    # English
     "this content is not available in your country",
     "not available in your region",
     "geo-restricted",
-    "geo restricted",
-    "access denied for your region",
-    "service is only available",
     "blocked in your country",
-    "outside your country",
     "vpn detected",
     "please disable your vpn",
-    "disable vpn",
+)
+_SCHEMA_ORG_TYPE_URL = re.compile(
+    r"^https?://(?:www\.)?schema\.org/([^/?#]+)/?$",
+    re.I,
 )
 
 
-def _strip_to_text(body: str) -> str:
-    if not body:
-        return ""
-    s = _RE_SCRIPT.sub(" ", body)
-    s = _RE_STYLE.sub(" ", s)
-    s = _RE_TAG.sub(" ", s)
-    s = _RE_WS.sub(" ", s).strip()
-    return s
+def _clean_text(value: str | None) -> str:
+    return _WS.sub(" ", unescape(value or "")).strip()
 
 
 def _language_guess(text: str) -> str | None:
-    head = text[:2000]
+    head = text[:4000]
     if len(head) < 100:
         return None
-    cyr = sum(1 for ch in head if "Ѐ" <= ch <= "ӿ")
-    letters = sum(1 for ch in head if ch.isalpha())
-    if letters == 0:
+    letters = sum(1 for char in head if char.isalpha())
+    if not letters:
         return None
-    cyr_ratio = cyr / letters
-    if cyr_ratio > 0.7:
+    cyrillic = sum(1 for char in head if "Ѐ" <= char <= "ӿ")
+    ratio = cyrillic / letters
+    if ratio > 0.70:
         return "ru"
-    if cyr_ratio < 0.10:
+    if ratio < 0.10:
         return "en"
     return "mixed"
 
 
-def extract_text_signals(body_text: str, content_type: str | None) -> dict:
+def _schema_type_name(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _SCHEMA_ORG_TYPE_URL.fullmatch(text)
+    return match.group(1) if match else text
+
+
+def _deduplicate_types(values: list[str], *, limit: int = 30) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _schema_type_name(value)
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _jsonld_types(soup: BeautifulSoup) -> list[str]:
+    found: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            item_type = value.get("@type")
+            if isinstance(item_type, str):
+                found.append(item_type)
+            elif isinstance(item_type, list):
+                found.extend(str(item) for item in item_type if item)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            visit(json.loads(tag.get_text(" ", strip=True)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return _deduplicate_types(found)
+
+
+def _microdata_types(soup: BeautifulSoup) -> list[str]:
+    found: list[str] = []
+    for tag in soup.find_all(attrs={"itemtype": True}):
+        raw_value = tag.get("itemtype")
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        for value in values:
+            for token in str(value or "").split():
+                match = _SCHEMA_ORG_TYPE_URL.fullmatch(token.strip())
+                if match:
+                    found.append(match.group(1))
+    return _deduplicate_types(found)
+
+
+def _structured_data_types(soup: BeautifulSoup) -> list[str]:
+    return _deduplicate_types(
+        [
+            *_jsonld_types(soup),
+            *_microdata_types(soup),
+        ]
+    )
+
+
+def _extract_main_text(soup: BeautifulSoup) -> tuple[str, bool]:
+    candidates = soup.select("main, article, [role='main']")
+    has_semantic_main = bool(candidates)
+    container = max(
+        candidates,
+        key=lambda node: len(_clean_text(node.get_text(" ", strip=True))),
+        default=soup.body or soup,
+    )
+    clone = BeautifulSoup(str(container), "html.parser")
+    for node in clone.select(
+        "script, style, noscript, template, svg, nav, header, footer, aside, "
+        "dialog, form, [aria-hidden='true']"
+    ):
+        node.decompose()
+    return _clean_text(clone.get_text(" ", strip=True)), has_semantic_main
+
+
+def _empty_result() -> dict[str, Any]:
+    return {
+        "extractable_text_length": 0,
+        "main_content_length": 0,
+        "body_size_bytes": 0,
+        "body_to_text_ratio": None,
+        "tag_paragraph_count": 0,
+        "tag_link_count": 0,
+        "script_count": 0,
+        "title": None,
+        "meta_description": None,
+        "canonical_url": None,
+        "structured_data_types": [],
+        "render_strategy": "unknown",
+        "render_strategy_confidence": "low",
+        "render_strategy_reasons": [],
+        "auth_form_present": False,
+        "looks_like_login_wall": False,
+        "looks_like_spa_shell": False,
+        "looks_like_redirect_shell": False,
+        "looks_like_captcha_page": False,
+        "looks_like_error_page": False,
+        "looks_like_geo_block": False,
+        "looks_disproportionate_wrapper": False,
+        "primary_language_guess": None,
+        "main_text_excerpt": "",
+        "visible_text_excerpt": "",
+    }
+
+
+def extract_text_signals(body_text: str, content_type: str | None) -> dict[str, Any]:
     if content_type:
-        ct = content_type.lower()
-        if ct.startswith(("image/", "audio/", "video/", "application/octet-stream", "application/pdf")):
-            return {
-                "extractable_text_length": 0,
-                "body_size_bytes": 0,
-                "body_to_text_ratio": None,
-                "tag_paragraph_count": 0,
-                "tag_link_count": 0,
-                "looks_like_spa_shell": False,
-                "looks_like_login_wall": False,
-                "looks_like_redirect_shell": False,
-                "looks_like_captcha_page": False,
-                "looks_like_error_page": False,
-                "looks_like_geo_block": False,
-                "looks_disproportionate_wrapper": False,
-                "primary_language_guess": None,
-            }
+        media_type = content_type.lower()
+        if media_type.startswith(
+            ("image/", "audio/", "video/", "application/octet-stream", "application/pdf")
+        ):
+            return _empty_result()
 
-    body_text = body_text or ""
-    body_lower = body_text.lower()
-    body_len = len(body_text)
+    html = body_text or ""
+    if not html:
+        return _empty_result()
 
-    extractable = _strip_to_text(body_text)
-    extractable_len = len(extractable)
+    lower = html.lower()
+    soup = BeautifulSoup(html, "html.parser")
+    title = _clean_text(soup.title.get_text(" ", strip=True) if soup.title else "") or None
+    description_node = soup.find(
+        "meta",
+        attrs={"name": re.compile(r"^description$", re.I)},
+    )
+    meta_description = (
+        _clean_text(description_node.get("content"))
+        if description_node and description_node.get("content")
+        else None
+    )
+    canonical_node = soup.find("link", attrs={"rel": lambda value: value and "canonical" in value})
+    canonical_url = (
+        str(canonical_node.get("href")).strip()
+        if canonical_node and canonical_node.get("href")
+        else None
+    )
+    structured_types = _structured_data_types(soup)
 
-    p_count = len(_RE_P.findall(body_text))
-    art_count = len(_RE_ARTICLE.findall(body_text))
-    h_count = len(_RE_HEADING.findall(body_text))
-    paragraph_total = p_count + art_count + h_count
-    link_count = len(_RE_LINK.findall(body_text))
+    script_count = len(soup.find_all("script"))
+    link_count = len(soup.find_all("a", href=True))
+    paragraph_count = len(soup.select("p, article, h1, h2, h3"))
 
-    script_count = len(_RE_SCRIPT_OPEN.findall(body_text))
+    visible_clone = BeautifulSoup(html, "html.parser")
+    for node in visible_clone.select(
+        "script, style, noscript, template, svg, [aria-hidden='true']"
+    ):
+        node.decompose()
+    visible_text = _clean_text(visible_clone.get_text(" ", strip=True))
+    main_text, has_semantic_main = _extract_main_text(soup)
+    visible_length = len(visible_text)
+    main_length = len(main_text)
+    body_length = len(html)
+    body_to_text = body_length / visible_length if visible_length else None
 
-    # "Heavy wrapper around a tiny body" - the page is large in raw bytes but
-    # produces almost no readable text. This is the structural fingerprint of
-    # an interstitial/banner/SPA stub regardless of which language or wording
-    # the page uses. We use it as a soft signal that strengthens other
-    # detectors.
-    body_to_text_ratio = (body_len / extractable_len) if extractable_len else float("inf")
-    looks_disproportionate = (
-        body_len >= 1500               # at least 1.5KB on the wire (banners/SPAs are rarely smaller)
-        and extractable_len < 300      # very little real text
-        and body_to_text_ratio > 15    # at least 15 bytes per visible char
+    password_nodes = list(soup.select("input[type='password']"))
+    login_forms = [
+        form
+        for form in soup.find_all("form")
+        if any(
+            token in str(form).lower()
+            for token in ("login", "sign-in", "signin", "авториза")
+        )
+        or form.select_one("input[type='password']") is not None
+    ]
+    auth_form_present = bool(password_nodes or login_forms)
+    auth_controls = [*login_forms, *password_nodes]
+    auth_form_in_main = any(
+        node.find_parent(["main", "article"]) is not None
+        or node.find_parent(attrs={"role": "main"}) is not None
+        for node in auth_controls
+    )
+    auth_language = any(token in visible_text.lower() for token in _AUTH_TOKENS)
+    meaningful_content = main_length >= 800 or (
+        has_semantic_main and main_length >= 500 and paragraph_count >= 3
+    ) or (
+        has_semantic_main
+        and main_length >= 180
+        and not auth_form_in_main
+    )
+    looks_like_login_wall = bool(
+        auth_form_present
+        and auth_language
+        and not meaningful_content
+        and main_length < 500
+        and visible_length < 1600
     )
 
-    looks_like_spa_shell = (
-        extractable_len < 500
-        and paragraph_total == 0
-        and script_count >= 3
-    )
+    framework_marker = any(marker in lower for marker in _FRAMEWORK_MARKERS)
+    app_root = bool(soup.select_one("#__next, #app, #root, [data-reactroot], [ng-version]"))
+    if visible_length < 450 and script_count >= 3 and (framework_marker or app_root):
+        render_strategy = "client_rendered_shell"
+        render_confidence = "high"
+        render_reasons = [
+            "В исходном HTML почти нет текста.",
+            "Страница содержит корневой контейнер приложения и несколько скриптов.",
+        ]
+    elif framework_marker and main_length >= 500:
+        render_strategy = "hybrid_ssr_hydration"
+        render_confidence = "high"
+        render_reasons = [
+            "Содержательный текст уже есть в исходном HTML.",
+            "Найдены признаки последующей гидратации интерфейса.",
+        ]
+    elif main_length >= 500 and script_count <= 2:
+        render_strategy = "static_html"
+        render_confidence = "medium"
+        render_reasons = ["Основной текст доступен без выполнения JavaScript."]
+    elif main_length >= 500:
+        render_strategy = "server_rendered"
+        render_confidence = "medium"
+        render_reasons = ["Основной текст присутствует в серверном HTML."]
+    else:
+        render_strategy = "unknown"
+        render_confidence = "low"
+        render_reasons = ["По исходному HTML нельзя надёжно определить способ рендеринга."]
 
-    looks_like_login_wall = (
-        any(t in body_lower for t in _LOGIN_TOKENS) and extractable_len < 2000
+    disproportionate = bool(
+        body_length >= 1500
+        and visible_length < 300
+        and body_to_text is not None
+        and body_to_text > 15
     )
-
-    looks_like_redirect_shell = (
-        any(t in body_lower for t in _REDIRECT_TOKENS) and extractable_len < 1000
+    looks_like_spa_shell = render_strategy == "client_rendered_shell"
+    looks_like_redirect = any(token in lower for token in _REDIRECT_TOKENS) and visible_length < 1000
+    looks_like_captcha = any(token in lower for token in _CAPTCHA_TOKENS) and visible_length < 4000
+    looks_like_error = (
+        visible_length < 1000
+        and any(token in f"{title or ''} {visible_text[:800]}".lower() for token in _ERROR_TOKENS)
     )
-
-    looks_like_captcha_page = any(t in body_lower for t in _CAPTCHA_TOKENS)
-
-    looks_like_error_page = (
-        extractable_len < 800 and any(t in body_lower for t in _ERROR_TOKENS)
+    geo_token_match = (
+        any(token in visible_text.lower() for token in _GEO_BLOCK_TOKENS)
+        and visible_length < 4000
     )
-
-    # Geo-block: page that the server serves with HTTP 200 telling the visitor
-    # they are coming from the wrong country/IP. Distinct from captcha/error —
-    # the visitor is not asked to prove they are human, they are told to leave.
-    #
-    # Two ways to fire:
-    #   1. Token match: any RU/EN geo-block phrase is present AND body is
-    #      shortish (extractable_len < 4000) so a stray "vpn" mention in a
-    #      real article doesn't mis-fire.
-    #   2. Structural match: a large body (>= 3KB) returned almost no readable
-    #      text (< 300 chars). This catches localised banners whose wording we
-    #      have not enumerated. To stay specific we require either a typical
-    #      banner-page link count (<= 5 anchors — interstitials are minimal)
-    #      OR an extreme byte-per-char ratio plus paragraph_total <= 1.
-    matched_token = any(t in body_lower for t in _GEO_BLOCK_TOKENS) and extractable_len < 4000
-    matched_structural = looks_disproportionate and (
-        link_count <= 5 or paragraph_total <= 1
-    )
-    looks_like_geo_block = matched_token or matched_structural
+    # A short confirmation, checkout or application page can legitimately have
+    # a heavy HTML wrapper and only one paragraph. Structure alone is not
+    # evidence of a geographic block; a geo-specific marker must be present.
+    # Keep the structural signal separately so the comparative probe layer can
+    # still notice a suspiciously thin response without inventing its cause.
+    geo_structural_match = bool(geo_token_match and disproportionate)
 
     return {
-        "extractable_text_length": extractable_len,
-        "body_size_bytes": body_len,
-        "body_to_text_ratio": (
-            None if not extractable_len else round(body_to_text_ratio, 1)
-        ),
-        "tag_paragraph_count": paragraph_total,
+        "extractable_text_length": visible_length,
+        "main_content_length": main_length,
+        "body_size_bytes": body_length,
+        "body_to_text_ratio": round(body_to_text, 1) if body_to_text else None,
+        "tag_paragraph_count": paragraph_count,
         "tag_link_count": link_count,
-        "looks_like_spa_shell": bool(looks_like_spa_shell),
-        "looks_like_login_wall": bool(looks_like_login_wall),
-        "looks_like_redirect_shell": bool(looks_like_redirect_shell),
-        "looks_like_captcha_page": bool(looks_like_captcha_page),
-        "looks_like_error_page": bool(looks_like_error_page),
-        "looks_like_geo_block": bool(looks_like_geo_block),
-        "looks_disproportionate_wrapper": bool(looks_disproportionate),
-        "primary_language_guess": _language_guess(extractable),
+        "script_count": script_count,
+        "title": title,
+        "meta_description": meta_description,
+        "canonical_url": canonical_url,
+        "structured_data_types": structured_types,
+        "render_strategy": render_strategy,
+        "render_strategy_confidence": render_confidence,
+        "render_strategy_reasons": render_reasons,
+        "auth_form_present": bool(auth_form_present),
+        "looks_like_login_wall": looks_like_login_wall,
+        "looks_like_spa_shell": looks_like_spa_shell,
+        "looks_like_redirect_shell": bool(looks_like_redirect),
+        "looks_like_captcha_page": bool(looks_like_captcha),
+        "looks_like_error_page": bool(looks_like_error),
+        "looks_like_geo_block": bool(geo_token_match or geo_structural_match),
+        "looks_disproportionate_wrapper": disproportionate,
+        "primary_language_guess": _language_guess(main_text or visible_text),
+        "main_text_excerpt": main_text[:24_000],
+        "visible_text_excerpt": visible_text[:6_000],
     }

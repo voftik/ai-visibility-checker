@@ -8,11 +8,12 @@ __pycache__/
 # Secrets
 .env
 
-# SQLite runtime
-sqlite.db
-sqlite.db-journal
-sqlite.db-wal
-sqlite.db-shm
+# SQLite runtime (включая конфликтные копии Yandex.Disk вида «sqlite (2).db»)
+sqlite*.db
+sqlite*.db-journal
+sqlite*.db-wal
+sqlite*.db-shm
+static/generated/
 
 # Proxy cache (runtime artifact)
 .proxy_cache.json
@@ -21,6 +22,10 @@ sqlite.db-shm
 .DS_Store
 .idea/
 .vscode/
+.playwright-cli/
+
+# Рабочие артефакты прогонов: скриншоты Playwright, генерации картинок
+output/
 
 # Claude Code / OMC local state
 .claude/

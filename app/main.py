@@ -9,13 +9,12 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import init_db
-from app.routes.defaults import router as defaults_router
 from app.routes.pages import router as pages_router
 from app.routes.runs import router as runs_router
-from app.routes.sets import router as sets_router
 from app.routes.shared import router as shared_router
 from app.services.event_bus import bus
 from app.services import proxy_pool
+from app.services.run_coordinator import coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -46,29 +45,31 @@ async def lifespan(app: FastAPI):
         logger.info("ProxyPool: disabled (WEBSHARE_API_KEY empty or PROXY_ENABLED=false)")
         proxy_pool.set_pool(None)
 
+    await coordinator.start()
     try:
         yield
     finally:
+        await coordinator.stop()
         pool = proxy_pool.get_pool()
         if pool is not None:
             pool.stop_background_refresh()
 
 
-app = FastAPI(title="AI Visibility Checker", lifespan=lifespan)
+app = FastAPI(
+    title="AIV",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 app.include_router(pages_router)
 app.include_router(runs_router)
-app.include_router(defaults_router)
-app.include_router(sets_router)
 app.include_router(shared_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/api/healthz", include_in_schema=False)
 async def healthz() -> dict:
-    """Lightweight liveness + proxy-pool diagnostics for the UI indicator."""
-    pool = proxy_pool.get_pool()
-    return {
-        "ok": True,
-        "proxy": pool.status() if pool is not None else {"enabled": False, "total": 0, "healthy": 0},
-    }
+    """Public liveness check without infrastructure details."""
+    return {"ok": True}

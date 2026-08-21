@@ -1,0 +1,35 @@
+# Штатный способ запустить переанализ сохранённых ответов одного прогона:
+#     systemctl start aiv-reprocess@<run_id>
+#     journalctl -fu aiv-reprocess@<run_id>
+#
+# Существует, чтобы никто больше не запускал переанализ однострочником через
+# systemd-run: прямой вызов analyzer.reprocess_saved_answers обходит claim,
+# lease и откат состояния, и правит боевой прогон, не владея им.
+#
+# Type=simple, а НЕ oneshot: к oneshot применяется TimeoutStartSec (по умолчанию
+# 90 с), и долгий переанализ был бы убит на старте.
+[Unit]
+Description=AIV: переанализ сохранённых ответов прогона %i
+Documentation=file:///root/projects/ai-visibility-checker/CLAUDE.md
+After=network-online.target ai-visibility.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/projects/ai-visibility-checker
+ExecStart=/root/.local/bin/uv run python scripts/reprocess_saved_run.py %i
+Environment=PYTHONUNBUFFERED=1
+SyslogIdentifier=aiv-reprocess
+
+# Остановка по сигналу не авария: скрипт откатывает состояние и выходит с 143.
+SuccessExitStatus=143
+# Время на _release_reprocess_claim до SIGKILL.
+TimeoutStopSec=120
+# Переанализ не должен висеть вечно.
+RuntimeMaxSec=3600
+# Машина 1.9 GiB, основной сервис занимает около 195 МБ.
+MemoryHigh=550M
+MemoryMax=700M
+# Операция с данными: автоматический повтор недопустим.
+Restart=no

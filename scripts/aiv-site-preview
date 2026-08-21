@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec /usr/bin/systemd-run \
+  --quiet \
+  --wait \
+  --pipe \
+  --collect \
+  --uid=aiv-preview \
+  --gid=aiv-preview \
+  --setenv=PLAYWRIGHT_BROWSERS_PATH=/var/lib/aiv-preview/browsers \
+  --property=NoNewPrivileges=yes \
+  --property=PrivateTmp=yes \
+  --property=PrivateDevices=yes \
+  --property=ProtectSystem=strict \
+  --property=ProtectHome=yes \
+  --property=ReadOnlyPaths=/opt/aiv-preview \
+  --property=ReadWritePaths=/var/lib/aiv-preview \
+  --property=RestrictAddressFamilies="AF_UNIX AF_INET AF_INET6" \
+  --property=MemoryMax=1G \
+  --property=TasksMax=256 \
+  --property=RuntimeMaxSec=55 \
+  --property=IPAddressAllow=127.0.0.53/32 \
+  --property=IPAddressDeny=0.0.0.0/8 \
+  --property=IPAddressDeny=10.0.0.0/8 \
+  --property=IPAddressDeny=100.64.0.0/10 \
+  --property=IPAddressDeny=127.0.0.0/8 \
+  --property=IPAddressDeny=169.254.0.0/16 \
+  --property=IPAddressDeny=172.16.0.0/12 \
+  --property=IPAddressDeny=192.0.0.0/24 \
+  --property=IPAddressDeny=192.168.0.0/16 \
+  --property=IPAddressDeny=198.18.0.0/15 \
+  --property=IPAddressDeny=224.0.0.0/4 \
+  --property=IPAddressDeny=240.0.0.0/4 \
+  --property=IPAddressDeny=::1/128 \
+  --property=IPAddressDeny=fc00::/7 \
+  --property=IPAddressDeny=fe80::/10 \
+  --property=IPAddressDeny=ff00::/8 \
+  /opt/aiv-preview/venv/bin/python \
+  /opt/aiv-preview/site_preview_worker.py \
+  "$@"

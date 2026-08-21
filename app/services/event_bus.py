@@ -59,6 +59,15 @@ class EventBus:
             return []
         return list(ch.history)
 
+    def reset(self, run_id: str) -> None:
+        """Start a fresh event stream for a new execution attempt."""
+
+        channel = self._channels.pop(run_id, None)
+        if channel is None:
+            return
+        for queue in list(channel.queues):
+            queue.put_nowait(None)
+
     def publish(self, run_id: str, event: dict[str, Any]) -> None:
         if "ts" not in event:
             event = {**event, "ts": datetime.now(timezone.utc).isoformat()}

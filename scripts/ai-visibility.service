@@ -1,0 +1,39 @@
+[Unit]
+Description=AI Visibility Checker
+Documentation=file:///root/projects/ai-visibility-checker/CLAUDE.md
+# network-online, а не network: приложению нужен работающий исходящий доступ
+# к OpenRouter и целевым сайтам сразу на старте.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/projects/ai-visibility-checker
+# Один воркер обязателен: фоновые задачи обхода, шина событий SSE и пул прокси
+# держат состояние в памяти процесса. Никогда не добавлять --workers N.
+ExecStart=/root/.local/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+Environment=PYTHONUNBUFFERED=1
+SyslogIdentifier=ai-visibility
+
+# Штатное завершение по SIGTERM: uv run возвращает 128+15=143, и без этой
+# строки systemd помечает юнит failed после каждого обычного stop/restart.
+SuccessExitStatus=143
+
+# always, а не on-failure: сервис должен подниматься и после чистого выхода.
+Restart=always
+RestartSec=5
+
+# Координатору нужно время на coordinator.stop() и сохранение контрольной точки
+# незавершённого прогона, иначе он получит SIGKILL посреди записи.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Машина 1.9 GiB. Потолок не даёт тяжёлому анализу утянуть систему целиком;
+# при превышении процесс перезапустится по Restart=always.
+MemoryHigh=900M
+MemoryMax=1200M
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

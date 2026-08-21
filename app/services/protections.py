@@ -157,17 +157,11 @@ def _is_geo_interstitial(facts: ProbeFacts) -> bool:
     return any(p in facts.body_text_lower for p in _GEO_PHRASES)
 
 
-_LOGIN_FORM = re.compile(r"<input[^>]+(type=['\"]?password|name=['\"]?(login|password|email))", re.I)
-_BODY_HAS_CONTENT = re.compile(r"<(article|main|section|p|h1|h2)[\s>]", re.I)
-
-
 def _is_auth_required(facts: ProbeFacts) -> bool:
     if facts.status == 401:
         return True
-    if facts.status == 200 and _LOGIN_FORM.search(facts.body_text):
-        if not _BODY_HAS_CONTENT.search(facts.body_text):
-            return True
-    return False
+    signals = facts.content_signals or {}
+    return bool(facts.status == 200 and signals.get("looks_like_login_wall"))
 
 
 # Composite (rely on prior simple detectors)

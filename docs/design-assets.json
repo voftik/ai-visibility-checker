@@ -1,0 +1,18 @@
+{
+  "model": "google/gemini-3-pro-image",
+  "resolution": "2K",
+  "assets": [
+    {
+      "id": "aiv-progress-map",
+      "aspect_ratio": "4:3",
+      "role": "Static explanatory visual for the live progress screen.",
+      "prompt": "Create a precise editorial process infographic for a premium AI visibility audit interface, landscape 4:3, on a clean uniform cool light-grey background close to #CDD5DE. Arrange exactly six unlabelled stations on one continuous dark connector path, readable from upper left to lower right. Station one: one blank browser-page frame. Station two: one transparent scanner grid passing across that same page. Station three: exactly six small blank intent cards, each distinguished only by one different solid geometric shape. Station four: exactly five tall blank AI-answer panels, with no placeholder lines inside. Station five: one split comparison plane with a simple web-source grid on one half and a plain memory plane on the other half. Station six: one finished report sheet containing only a clean five-bar chart made of solid rectangles. Use thin near-black lines, white functional planes, restrained translucent glass or polished chrome only for depth, and a single small #FF324B active dot on the connector path. Crisp orthographic/isometric schematic, premium European digital-agency art direction, controlled negative space. ABSOLUTE TYPOGRAPHY BAN: render no labels and no glyphs anywhere — no words, letters, digits, parenthetical numerals, punctuation, question marks, percent signs, code marks, arrow glyphs, logos, watermarks, or horizontal strokes that resemble written placeholder text. Do not add brains, robots, faces, globes, neural networks, decorative blobs, extra instruments, or extra stations."
+    },
+    {
+      "id": "aiv-report-cover",
+      "aspect_ratio": "4:3",
+      "role": "Static explanatory cover for the report summary.",
+      "prompt": "Create one literal diagnostic cutaway infographic for an AI visibility report, landscape 4:3, on a clean uniform cool light-grey background close to #CDD5DE. Place one large blank website panel on the left. From it, three and only three clearly separated horizontal measurement lanes travel to the right. Top lane, crawler access: a transparent scanning grid passes through three blank web-page tiles, with one tile visibly blocked by a simple solid barrier shape. Middle lane, brand visibility: exactly five tall blank AI-answer cards sit in a row; one target card is selected only by a single small #FF324B dot. Bottom lane, knowledge gap: two parallel paths — the upper path passes through a small grid of web-source tiles, the lower path bypasses the grid as model memory — then both converge into one side-by-side comparison chart made only of solid rectangular bars. Use thin near-black connector lines, white planes, crisp orthographic/isometric geometry, restrained glass/chrome depth, and one dominant asymmetrical composition. Every object must belong to these three measurements; no instruments or metaphorical machinery. ABSOLUTE TYPOGRAPHY BAN: render no labels and no glyphs anywhere — no words, letters, digits, punctuation, question marks, percent signs, code marks, arrow glyphs, logos, watermarks, or horizontal strokes that resemble written placeholder text. Do not include brains, robots, faces, globes, neural networks, thermometers, gauges, random cubes, glowing orbs, decorative sculpture, or any fourth lane."
+    }
+  ]
+}
