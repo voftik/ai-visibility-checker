@@ -2161,6 +2161,15 @@ async def _classify_site(run_id: str, site_context: dict[str, Any]) -> dict[str,
     )
 
 
+# Структурный дефект самого ревью (не сценариев): не тот состав checks.
+# Такой вердикт не должен тратить попытку генерации набора — перегенерировать
+# нужно ревью, а не сценарии.
+_REVIEW_STRUCTURALLY_INVALID = (
+    "Критик должен вернуть ровно по одной проверке на каждый из шести "
+    "безбрендовых сценариев."
+)
+
+
 class MarketResearchGateError(OpenRouterError):
     """Market context is not sufficiently evidenced to design scenarios."""
 
@@ -2915,7 +2924,7 @@ def _prompt_review_errors(
     }
     checks = review.get("checks")
     if not isinstance(checks, list):
-        return ["Критик не вернул проверки шести безбрендовых сценариев."]
+        return [_REVIEW_STRUCTURALLY_INVALID]
 
     by_key: dict[str, dict[str, Any]] = {}
     for check in checks:
@@ -2923,10 +2932,10 @@ def _prompt_review_errors(
             continue
         key = str(check.get("prompt_key") or "")
         if key in by_key:
-            return [f"Критик дважды проверил сценарий {key or 'без ключа'}."]
+            return [_REVIEW_STRUCTURALLY_INVALID]
         by_key[key] = check
     if set(by_key) != set(expected):
-        return ["Критик должен проверить каждый из шести безбрендовых сценариев."]
+        return [_REVIEW_STRUCTURALLY_INVALID]
 
     errors: list[str] = []
     for key, declared_intent in expected.items():
@@ -3053,24 +3062,38 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    review = await _structured_artifact(
-        run_id,
-        stage_key="scenario_design",
-        artifact_key="prompt_set_semantic_review",
-        schema=PROMPT_SET_REVIEW_SCHEMA,
-        schema_name="aiv_prompt_set_semantic_review",
-        system=system,
-        user_payload=payload,
-        max_tokens=6000,
-        # Не CRITIC_MODEL: gemini-flash игнорирует minItems строгой схемы и
-        # явное требование «ровно шесть проверок» — возвращал 1-2 проверки с
-        # verdict=pass (прогон 5ae13350, 2026-08-21). Processing-модель уже
-        # доверена для каталога и аннотаций и соблюдает строгие схемы.
-        model=PROCESSING_MODEL,
-        reasoning_effort="high",
-        prompt_version=PROMPT_SET_REVIEW_VERSION,
-    )
-    return _prompt_review_errors(review, prompt_set, research)
+    errors: list[str] = []
+    for review_attempt in range(3):
+        attempt_payload = dict(payload)
+        if review_attempt:
+            # Кэш-бастер: _structured_artifact кэширует по input_json, и без
+            # изменения входа повтор вернул бы тот же дефектный вердикт.
+            attempt_payload["review_attempt"] = review_attempt
+            attempt_payload["previous_review_error"] = (
+                _REVIEW_STRUCTURALLY_INVALID
+            )
+        review = await _structured_artifact(
+            run_id,
+            stage_key="scenario_design",
+            artifact_key="prompt_set_semantic_review",
+            schema=PROMPT_SET_REVIEW_SCHEMA,
+            schema_name="aiv_prompt_set_semantic_review",
+            system=system,
+            user_payload=attempt_payload,
+            max_tokens=6000,
+            # Не CRITIC_MODEL: gemini-flash игнорирует minItems строгой схемы
+            # и явное требование «ровно шесть проверок» — возвращал 1-2
+            # проверки с verdict=pass (прогон 5ae13350, 2026-08-21).
+            # Processing-модель надёжнее, но и она изредка теряет элемент,
+            # поэтому структурно дефектное ревью повторяется здесь же.
+            model=PROCESSING_MODEL,
+            reasoning_effort="high",
+            prompt_version=PROMPT_SET_REVIEW_VERSION,
+        )
+        errors = _prompt_review_errors(review, prompt_set, research)
+        if errors != [_REVIEW_STRUCTURALLY_INVALID]:
+            break
+    return errors
 
 
 async def _generate_prompt_set(
@@ -3153,10 +3176,22 @@ choice_request поставь true только если текст действ
     # Четыре, а не две: строгий семантический критик (все шесть проверок,
     # processing-модель) обычно требует 2-3 итерации на сходимость — с двумя
     # попытками прогон profi.travel умирал на одном несведённом TR-сценарии.
+    previous_set: dict[str, Any] | None = None
     for attempt in range(4):
         user_content = dict(payload)
         if last_errors:
             user_content["validation_errors_to_fix"] = last_errors
+        if last_errors and previous_set is not None:
+            # Точечный ремонт: полная регенерация с нуля не сходится — каждая
+            # новая редакция набора рождает новые формулировки и новые
+            # замечания критика. Сценарии без замечаний фиксируются дословно.
+            user_content["previous_prompt_set"] = previous_set
+            user_content["repair_instruction"] = (
+                "Исправь только сценарии, упомянутые в "
+                "validation_errors_to_fix. Остальные сценарии из "
+                "previous_prompt_set перенеси в ответ дословно, не меняя ни "
+                "текст, ни prompt_key."
+            )
         result = await chat(
             model=ANALYSIS_MODEL,
             messages=[
@@ -3172,6 +3207,7 @@ choice_request поставь true только если текст действ
         if not isinstance(result.parsed, dict):
             last_errors = ["Ответ не является объектом."]
             continue
+        previous_set = result.parsed
         last_errors = _validate_prompt_set(result.parsed, profile)
         if not last_errors:
             last_errors = await _review_prompt_set_semantics(
