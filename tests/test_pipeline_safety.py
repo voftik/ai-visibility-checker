@@ -1476,13 +1476,35 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        request = chat_mock.await_args.kwargs
-        self.assertEqual(request["model"], ANALYSIS_MODEL)
-        self.assertEqual(request["web_policy"], WebSearchPolicy.REQUIRED)
-        request_payload = json.loads(request["messages"][1]["content"])
+        # Два вызова: исследование с обязательным вебом (без схемы) и
+        # структурирование по схеме без доступа к вебу.
+        self.assertEqual(chat_mock.await_count, 2)
+        research_request = chat_mock.await_args_list[0].kwargs
+        self.assertEqual(research_request["model"], ANALYSIS_MODEL)
+        self.assertEqual(
+            research_request["web_policy"], WebSearchPolicy.REQUIRED
+        )
+        self.assertNotIn("response_schema", research_request)
+        request_payload = json.loads(research_request["messages"][1]["content"])
         self.assertEqual(request_payload["requested_site"], site_context["requested_site"])
         self.assertEqual(request_payload["site_profile"], profile)
         self.assertEqual(request_payload["site_evidence"], site_context["pages"])
+        structuring_request = chat_mock.await_args_list[1].kwargs
+        self.assertEqual(
+            structuring_request["web_policy"], WebSearchPolicy.FORBIDDEN
+        )
+        self.assertIsNotNone(structuring_request.get("response_schema"))
+        structuring_payload = json.loads(
+            structuring_request["messages"][1]["content"]
+        )
+        self.assertIn("research_notes", structuring_payload)
+        self.assertEqual(
+            structuring_payload["confirmed_source_urls"],
+            sorted(
+                item["url"]
+                for item in _ready_market_research()["web_evidence"]["citations"]
+            ),
+        )
         final_write = save_artifact.await_args.kwargs
         self.assertEqual(final_write["artifact_key"], "market_research")
         self.assertEqual(final_write["prompt_version"], MARKET_RESEARCH_VERSION)

@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
-MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v1"
+MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v2"
 PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v3"
 PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v2"
 PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
@@ -2615,7 +2615,16 @@ async def _market_research(
         input_json=payload,
         prompt_version=MARKET_RESEARCH_VERSION,
     )
-    system = f"""
+    # Шаг разделён на два вызова, потому что строгая JSON-схема и
+    # URL-цитаты в агентском цикле веб-поиска взаимоисключаются (замер
+    # 2026-08-21 на anthropic/claude-opus-5): эндпоинты, соблюдающие
+    # response_format, не отдают url_citation-аннотаций, а эндпоинты и
+    # engine=exa, отдающие цитаты, игнорируют схему и пишут повествование.
+    # Поэтому retrieval и структурирование аттестуются раздельно:
+    # 1) исследование со свободным текстом и обязательным веб-поиском —
+    #    отсюда берутся аттестация и подтверждённые цитаты;
+    # 2) структурирование в MARKET_RESEARCH_SCHEMA без доступа к вебу.
+    research_system = f"""
 Ты старший исследователь рынка. Перед проектированием поисковых сценариев
 изучи сайт, который указал пользователь, и внешний рыночный контекст.
 Обязательно используй предоставленный веб-поиск и опирай каждый внешний
@@ -2624,44 +2633,38 @@ async def _market_research(
 Разделяй два слоя:
 1. site_confirmed — только факты, которые уже подтверждены site_profile и
 страницами в site_evidence;
-2. external_market_research — сведения из внешних источников о рынке,
-тематике, географии, аудиториях, реальных customer jobs, критериях выбора и
-профессиональной терминологии.
+2. внешние рыночные сведения — рынок, тематика, география, аудитории,
+реальные customer jobs, критерии выбора и профессиональная терминология
+(семь измерений, каждое с точной мыслью, выдержкой и URL источника).
 
 Основной бренд определяет только сайт. Никогда не заменяй primary_brand
-названием группы, конкурента, отрасли или бренда из внешнего поиска. Внешний
-рынок может дополнить контекст, но не переопределить идентичность цели,
-продукты или связи между сущностями, подтверждённые сайтом.
+названием группы, конкурента, отрасли или бренда из внешнего поиска.
 
-Для каждого из семи измерений external_market_research добавь отдельное
-evidence с точной мыслью, выдержкой и source_urls. Используй не менее двух
-независимых внешних источников. Не заполняй пробелы догадками: неизвестность
-запиши в uncertainties и поставь limited или blocked. ready допустим только
-при полном покрытии измерений подтверждёнными источниками.
+Пиши структурированные исследовательские заметки: для каждого измерения —
+отдельный раздел с выводами, дословными выдержками и полными URL. Используй
+не менее двух независимых внешних источников. Не заполняй пробелы догадками:
+неизвестное перечисли отдельным разделом «Неопределённости».
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
     try:
-        result = await chat(
+        research = await chat(
             model=ANALYSIS_MODEL,
             messages=[
-                {"role": "system", "content": system},
+                {"role": "system", "content": research_system},
                 {
                     "role": "user",
                     "content": json.dumps(payload, ensure_ascii=False),
                 },
             ],
-            response_schema=MARKET_RESEARCH_SCHEMA,
-            schema_name="aiv_market_research",
             web_policy=WebSearchPolicy.REQUIRED,
             reasoning_effort="high",
             max_tokens=12_000,
             temperature=0.1,
         )
     except OpenRouterPolicyError as exc:
-        parsed = exc.result.parsed
         output = _market_research_with_gate(
-            parsed if isinstance(parsed, dict) else {},
+            {},
             profile,
             payload=payload,
             web_attestation=exc.result.web_attestation,
@@ -2696,7 +2699,77 @@ evidence с точной мыслью, выдержкой и source_urls. Исп
         )
         raise
 
-    if not isinstance(result.parsed, dict):
+    confirmed_urls = sorted(
+        {
+            str(item.get("url") or "").strip()
+            for item in research.citations or []
+            if isinstance(item, dict) and str(item.get("url") or "").strip()
+        }
+    )
+    structuring_system = f"""
+Ты редактор данных. Преобразуй исследовательские заметки в JSON строго по
+схеме, ничего не добавляя от себя.
+
+Правила:
+1. site_confirmed заполняй только фактами, подтверждёнными site_profile и
+страницами site_evidence из входных данных; в evidence указывай URL страницы
+сайта, точный claim и дословный excerpt.
+2. external_market_research заполняй только сведениями из заметок. В
+source_urls каждого доказательства используй только URL из списка
+confirmed_source_urls; источник, которого нет в списке, перечисли в
+uncertainties, а не в source_urls.
+3. Никогда не меняй primary_brand: его определяет сайт.
+4. Не заполняй пробелы догадками: неизвестность запиши в uncertainties и
+поставь limited или blocked. ready допустим только при полном покрытии
+измерений подтверждёнными источниками.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    try:
+        structured = await chat(
+            model=ANALYSIS_MODEL,
+            messages=[
+                {"role": "system", "content": structuring_system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "site_input": payload,
+                            "research_notes": research.text,
+                            "confirmed_source_urls": confirmed_urls,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            response_schema=MARKET_RESEARCH_SCHEMA,
+            schema_name="aiv_market_research",
+            web_policy=WebSearchPolicy.FORBIDDEN,
+            reasoning_effort="high",
+            max_tokens=12_000,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        await _save_artifact(
+            run_id,
+            stage_key="scenario_design",
+            artifact_key="market_research",
+            status="failed",
+            model=ANALYSIS_MODEL,
+            input_json=payload,
+            raw_text=research.text,
+            usage_json=research.usage,
+            error_message=str(exc),
+            prompt_version=MARKET_RESEARCH_VERSION,
+        )
+        raise
+
+    combined_usage = dict(research.usage)
+    combined_usage["_aiv_structuring_usage"] = structured.usage
+    combined_raw = (
+        f"{research.text}\n\n=== STRUCTURED JSON ===\n\n{structured.text}"
+    )
+    if not isinstance(structured.parsed, dict):
         error = "Market research response is not an object"
         await _save_artifact(
             run_id,
@@ -2705,18 +2778,19 @@ evidence с точной мыслью, выдержкой и source_urls. Исп
             status="failed",
             model=ANALYSIS_MODEL,
             input_json=payload,
-            raw_text=result.text,
-            usage_json=result.usage,
+            raw_text=combined_raw,
+            usage_json=combined_usage,
             error_message=error,
             prompt_version=MARKET_RESEARCH_VERSION,
         )
         raise OpenRouterError(error)
+    # Гейт и аттестация — от исследовательского вызова: именно он ходил в веб.
     output = _market_research_with_gate(
-        result.parsed,
+        structured.parsed,
         profile,
         payload=payload,
-        web_attestation=result.web_attestation,
-        citations=result.citations,
+        web_attestation=research.web_attestation,
+        citations=research.citations,
     )
     await _save_artifact(
         run_id,
@@ -2726,8 +2800,8 @@ evidence с точной мыслью, выдержкой и source_urls. Исп
         model=ANALYSIS_MODEL,
         input_json=payload,
         output_json=output,
-        raw_text=result.text,
-        usage_json=result.usage,
+        raw_text=combined_raw,
+        usage_json=combined_usage,
         prompt_version=MARKET_RESEARCH_VERSION,
     )
     return _require_market_research_ready(output)
