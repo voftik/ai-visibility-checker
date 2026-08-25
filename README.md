@@ -725,7 +725,7 @@ Proxy pool необязателен. Без `WEBSHARE_API_KEY` crawler рабо�
 uv run python -m unittest discover -s tests -v
 ```
 
-На момент обновления этого README в suite 456 тестов.
+На момент обновления этого README в suite 457 тестов.
 
 Основные группы:
 

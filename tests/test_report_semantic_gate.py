@@ -12,10 +12,14 @@ from app.services.openrouter import OpenRouterError
 from app.services.report_semantic_gate import (
     CANONICAL_OBSERVATIONAL_MEMORY_LIMITATION,
     CANONICAL_UNAVAILABLE_PORTFOLIO_LIMITATION,
+    REPORT_SEMANTIC_MAX_TOKENS,
+    REPORT_SEMANTIC_REASONING_EFFORT,
+    REPORT_SEMANTIC_REVIEW_SCHEMA,
     deterministic_report_semantic_errors,
     metric_availability_contract,
     normalize_report_semantic_review,
     report_semantic_blockers,
+    review_final_report_semantics,
     validate_report_semantic_review,
 )
 
@@ -1607,6 +1611,46 @@ class ReportSemanticGateUnitTests(unittest.TestCase):
 
 
 class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_semantic_reviewer_has_bounded_nontruncating_contract(
+        self,
+    ) -> None:
+        response = SimpleNamespace(
+            parsed={
+                "verdict": "pass",
+                "summary": "Смысловых противоречий не найдено.",
+                "violations": [],
+            },
+            text="{}",
+            usage={},
+        )
+        with patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(return_value=response),
+        ) as chat_mock:
+            review, _text, _usage = await review_final_report_semantics(
+                {
+                    "evidence_document": {"report_data": {}},
+                    "metric_availability_contract": [],
+                    "candidate_report": {},
+                    "deterministic_precheck_errors": [],
+                },
+                attempt=1,
+            )
+
+        self.assertEqual(review["verdict"], "pass")
+        kwargs = chat_mock.await_args.kwargs
+        self.assertEqual(
+            kwargs["reasoning_effort"],
+            REPORT_SEMANTIC_REASONING_EFFORT,
+        )
+        self.assertEqual(kwargs["max_tokens"], REPORT_SEMANTIC_MAX_TOKENS)
+        self.assertEqual(
+            REPORT_SEMANTIC_REVIEW_SCHEMA["properties"]["violations"][
+                "maxItems"
+            ],
+            16,
+        )
+
     async def test_one_repair_is_reviewed_before_publication(self) -> None:
         rejected = _candidate("Память моделей не знает бренд.")
         repaired = _candidate("В отчёте используются подтверждённые данные.")

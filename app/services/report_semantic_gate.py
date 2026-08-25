@@ -10,9 +10,11 @@ from app.config import settings
 from app.services.openrouter import OpenRouterError, chat
 
 
-REPORT_SEMANTIC_GATE_VERSION = "aiv-final-report-semantic-gate-v21"
+REPORT_SEMANTIC_GATE_VERSION = "aiv-final-report-semantic-gate-v22"
 REPORT_SEMANTIC_MODEL = settings.OPENROUTER_CRITIC_MODEL
 MAX_FINAL_REPORT_REPAIRS = 2
+REPORT_SEMANTIC_REASONING_EFFORT = "medium"
+REPORT_SEMANTIC_MAX_TOKENS = 20_000
 
 
 REPORT_SEMANTIC_REVIEW_SCHEMA: dict[str, Any] = {
@@ -23,9 +25,10 @@ REPORT_SEMANTIC_REVIEW_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": ["pass", "revise", "block"],
         },
-        "summary": {"type": "string"},
+        "summary": {"type": "string", "maxLength": 2_000},
         "violations": {
             "type": "array",
+            "maxItems": 16,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -47,14 +50,18 @@ REPORT_SEMANTIC_REVIEW_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "enum": ["critical", "important", "observation"],
                     },
-                    "report_path": {"type": "string"},
-                    "claim": {"type": "string"},
+                    "report_path": {"type": "string", "maxLength": 500},
+                    "claim": {"type": "string", "maxLength": 1_000},
                     "evidence_paths": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 500},
                     },
-                    "finding": {"type": "string"},
-                    "repair_instruction": {"type": "string"},
+                    "finding": {"type": "string", "maxLength": 1_000},
+                    "repair_instruction": {
+                        "type": "string",
+                        "maxLength": 1_000,
+                    },
                 },
                 "required": [
                     "code",
@@ -148,6 +155,12 @@ verdict=pass допустим только без critical/important наруш�
 используй, когда текст можно исправить без изменения рассчитанных данных.
 verdict=block — когда исправление потребовало бы придумать данные или
 пересчитать метрику. Пиши кратко и предметно по-русски.
+
+Верни только замечания, которые требуют изменения публикации. Не перечисляй
+очевидные корректные места и не дублируй один корневой дефект для каждой
+повторяющейся фразы: объедини доказательства в один violation. Всего может быть
+не больше 16 нарушений; если их больше, оставь наиболее существенные
+critical/important, достаточные для безопасного ремонта.
 """.strip()
 
 
@@ -1569,8 +1582,8 @@ async def review_final_report_semantics(
         ],
         response_schema=REPORT_SEMANTIC_REVIEW_SCHEMA,
         schema_name=f"aiv_final_report_semantic_gate_{attempt}",
-        reasoning_effort="high",
-        max_tokens=8_000,
+        reasoning_effort=REPORT_SEMANTIC_REASONING_EFFORT,
+        max_tokens=REPORT_SEMANTIC_MAX_TOKENS,
         temperature=0.0,
     )
     if not isinstance(response.parsed, dict):
