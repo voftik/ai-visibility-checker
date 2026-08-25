@@ -15,11 +15,13 @@ import logging
 import math
 import re
 import unicodedata
+import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm.attributes import flag_modified
@@ -117,6 +119,8 @@ PANEL_MAX_TOKENS_ALLOWLIST = frozenset(
     {PANEL_DEFAULT_MAX_TOKENS, PANEL_RETRY_MAX_TOKENS}
 )
 PANEL_RETRY_PROVENANCE_VERSION = "aiv-panel-retry-v1"
+PANEL_ATTEMPT_AUDIT_VERSION = "aiv-panel-attempt-v1"
+PANEL_ATTEMPT_ARTIFACT_PREFIX = "panel_attempt_"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v8"
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v15"
@@ -2227,6 +2231,10 @@ class MarketResearchGateError(OpenRouterError):
     """Market context is not sufficiently evidenced to design scenarios."""
 
 
+class PanelCheckpointMismatchError(RuntimeError):
+    """Persisted prompts no longer match the panel evidence checkpoint."""
+
+
 _MARKET_RESEARCH_DIMENSIONS = (
     "market",
     "topics",
@@ -3662,12 +3670,14 @@ async def _recover_prompt_set(
         }
     )
     missing_checks = sorted(required_checks - requested_checks)
-    if missing_checks:
+    unsupported_checks = sorted(requested_checks - required_checks)
+    if missing_checks or unsupported_checks:
         failed_digest = stable_digest(
             {
                 "candidate": previous_set,
                 "errors": last_errors,
                 "missing_acceptance_checks": missing_checks,
+                "unsupported_acceptance_checks": unsupported_checks,
             }
         )
         await finish_recovery(
@@ -3675,11 +3685,20 @@ async def _recover_prompt_set(
             succeeded=False,
             before_digest=before_digest,
             after_digest=failed_digest,
-            details={"missing_acceptance_checks": missing_checks},
+            details={
+                "missing_acceptance_checks": missing_checks,
+                "unsupported_acceptance_checks": unsupported_checks,
+            },
         )
+        problems: list[str] = []
+        if missing_checks:
+            problems.append("missing: " + ", ".join(missing_checks))
+        if unsupported_checks:
+            problems.append("unsupported: " + ", ".join(unsupported_checks))
         raise OrchestratorContractError(
-            "Recovery plan omitted executable acceptance checks: "
-            + ", ".join(missing_checks)
+            "Recovery plan acceptance checks do not match the stage executor ("
+            + "; ".join(problems)
+            + ")"
         )
     if action == ACTION_STOP:
         await finish_recovery(
@@ -3737,6 +3756,8 @@ async def _recover_prompt_set(
             reasoning_effort="high",
             max_tokens=7_000,
             temperature=0.1,
+            retry_response_contract_errors=False,
+            retry_transport_errors=False,
         )
         recovered = result.parsed if isinstance(result.parsed, dict) else {}
         raw_text = result.text
@@ -3983,21 +4004,44 @@ choice_request поставь true только если текст действ
             base_payload_digest=base_payload_digest,
             budget_attempt=budget_attempt,
         )
-        result = await chat(
-            model=ANALYSIS_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": json.dumps(user_content, ensure_ascii=False),
-                },
-            ],
-            response_schema=PROMPT_SET_SCHEMA,
-            schema_name="aiv_prompt_set",
-            reasoning_effort="high",
-            max_tokens=7000,
-            temperature=0.2,
-        )
+        try:
+            result = await chat(
+                model=ANALYSIS_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_content, ensure_ascii=False),
+                    },
+                ],
+                response_schema=PROMPT_SET_SCHEMA,
+                schema_name="aiv_prompt_set",
+                reasoning_effort="high",
+                max_tokens=7000,
+                temperature=0.2,
+                retry_response_contract_errors=False,
+                retry_transport_errors=False,
+            )
+        except (OpenRouterError, httpx.HTTPError, ValueError) as exc:
+            failed_result = getattr(exc, "result", None)
+            last_errors = [
+                "Генератор не вернул пригодный ответ в зарезервированной "
+                f"попытке {budget_attempt}: {type(exc).__name__}."
+            ]
+            await _fail_prompt_candidate_attempt(
+                run_id,
+                artifact_key=artifact_key,
+                base_payload_digest=base_payload_digest,
+                budget_attempt=budget_attempt,
+                raw_text=str(getattr(failed_result, "text", "") or ""),
+                usage=(
+                    dict(getattr(failed_result, "usage", {}) or {})
+                    if failed_result is not None
+                    else {}
+                ),
+                error_message=last_errors[0],
+            )
+            continue
         if not isinstance(result.parsed, dict):
             last_errors = ["Ответ не является объектом."]
             await _fail_prompt_candidate_attempt(
@@ -4076,11 +4120,216 @@ choice_request поставь true только если текст действ
     )
 
 
+def _panel_prompt_identity(value: VisibilityPrompt | dict[str, Any]) -> dict[str, str]:
+    if isinstance(value, VisibilityPrompt):
+        return {
+            "prompt_key": str(value.prompt_key or ""),
+            "intent_class": str(value.intent_class or ""),
+            "role": str(value.role or ""),
+            "text": str(value.text or "").strip(),
+            "rationale": str(value.rationale or "").strip(),
+        }
+    return {
+        "prompt_key": str(value.get("prompt_key") or ""),
+        "intent_class": str(value.get("intent_class") or ""),
+        "role": str(value.get("role") or ""),
+        "text": str(value.get("text") or "").strip(),
+        "rationale": str(value.get("rationale") or "").strip(),
+    }
+
+
+_PANEL_RUNNING_STATUS_RE = re.compile(
+    r"^running:(?P<generation>[0-9a-f]{8}):[0-9a-f]{12}$"
+)
+
+
+def _panel_running_generation(status: object) -> int | None:
+    match = _PANEL_RUNNING_STATUS_RE.fullmatch(str(status or ""))
+    if match is None:
+        return None
+    return int(match.group("generation"), 16)
+
+
+def _new_panel_claim_status(generation: int) -> str:
+    bounded_generation = max(0, int(generation)) & 0xFFFFFFFF
+    return f"running:{bounded_generation:08x}:{uuid.uuid4().hex[:12]}"
+
+
+async def _panel_resume_checkpoint_from_session(
+    session: Any,
+    run_id: str,
+) -> list[VisibilityPrompt] | None:
+    answer_rows = list(
+        (
+            await session.execute(
+                select(
+                    ModelAnswer.id,
+                    ModelAnswer.prompt_id,
+                    ModelAnswer.provider_key,
+                    ModelAnswer.model,
+                    ModelAnswer.mode,
+                    ModelAnswer.status,
+                    func.length(
+                        func.trim(
+                            func.coalesce(ModelAnswer.response_text, ""),
+                            " \t\r\n",
+                        )
+                    ).label("response_length"),
+                )
+                .where(ModelAnswer.run_id == run_id)
+                .order_by(ModelAnswer.id)
+            )
+        ).all()
+    )
+    if not answer_rows:
+        return None
+
+    prompt_artifact = (
+        await session.execute(
+            select(RunArtifact).where(
+                RunArtifact.run_id == run_id,
+                RunArtifact.artifact_key == "prompt_set",
+            )
+        )
+    ).scalar_one_or_none()
+    prompts = list(
+        (
+            await session.execute(
+                select(VisibilityPrompt)
+                .where(VisibilityPrompt.run_id == run_id)
+                .order_by(VisibilityPrompt.sequence, VisibilityPrompt.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    reasons: list[str] = []
+    supported_versions = (
+        LEGACY_PROMPT_SET_VERSIONS | CANONICAL_INTENT_PROMPT_SET_VERSIONS
+    )
+    if prompt_artifact is None:
+        reasons.append("prompt_set_artifact_missing")
+    else:
+        if prompt_artifact.status != "completed":
+            reasons.append("prompt_set_artifact_not_completed")
+        if prompt_artifact.prompt_version not in supported_versions:
+            reasons.append("prompt_set_version_not_supported")
+
+    artifact_output = (
+        prompt_artifact.output_json
+        if prompt_artifact is not None
+        and isinstance(prompt_artifact.output_json, dict)
+        else {}
+    )
+    artifact_items = artifact_output.get("prompts")
+    if not isinstance(artifact_items, list):
+        reasons.append("prompt_set_output_missing")
+        artifact_items = []
+    artifact_identity = [
+        _panel_prompt_identity(item)
+        for item in artifact_items
+        if isinstance(item, dict)
+    ]
+    persisted_identity = [_panel_prompt_identity(prompt) for prompt in prompts]
+
+    if len(prompts) != 9 or len(artifact_identity) != 9:
+        reasons.append("prompt_count_mismatch")
+    if len(artifact_identity) != len(artifact_items):
+        reasons.append("prompt_set_output_invalid")
+    if [prompt.sequence for prompt in prompts] != list(range(1, 10)):
+        reasons.append("prompt_sequence_mismatch")
+    persisted_keys = [item["prompt_key"] for item in persisted_identity]
+    if any(not key for key in persisted_keys) or len(set(persisted_keys)) != len(
+        persisted_keys
+    ):
+        reasons.append("persisted_prompt_key_invalid")
+    if persisted_identity != artifact_identity:
+        reasons.append("persisted_prompt_set_mismatch")
+
+    prompt_ids = {prompt.id for prompt in prompts}
+    answer_cells: set[tuple[int, str, str]] = set()
+    for answer_row in answer_rows:
+        (
+            _answer_id,
+            prompt_id,
+            provider_key,
+            model,
+            mode,
+            status,
+            response_length,
+        ) = answer_row
+        provider_value = str(provider_key or "").strip()
+        model_value = str(model or "").strip()
+        mode_value = str(mode or "").strip()
+        status_value = str(status or "").strip()
+        if prompt_id not in prompt_ids:
+            reasons.append("answer_prompt_outside_checkpoint")
+        if not provider_value or not model_value:
+            reasons.append("answer_provider_or_model_missing")
+        if mode_value not in {"web", "memory"}:
+            reasons.append("answer_mode_invalid")
+        if status_value not in {"pending", "failed", "completed"} and (
+            _panel_running_generation(status_value) is None
+        ):
+            reasons.append("answer_status_invalid")
+        if status_value == "completed" and int(response_length or 0) <= 0:
+            reasons.append("completed_answer_raw_missing")
+        cell = (int(prompt_id), provider_value, mode_value)
+        if cell in answer_cells:
+            reasons.append("answer_grid_duplicate_cell")
+        answer_cells.add(cell)
+
+    if reasons:
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: " + ", ".join(dict.fromkeys(reasons))
+        )
+    return prompts
+
+
+async def _load_panel_resume_checkpoint(
+    run_id: str,
+) -> list[VisibilityPrompt] | None:
+    """Return the immutable prompt checkpoint once panel evidence exists."""
+
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        checkpoint = await _panel_resume_checkpoint_from_session(session, run_id)
+    await assert_run_lease(run_id)
+    return checkpoint
+
+
 async def _persist_prompts(
     run_id: str,
     prompt_set: dict[str, Any],
 ) -> list[VisibilityPrompt]:
+    await assert_run_lease(run_id)
     async with SessionLocal() as session:
+        checkpoint = await _panel_resume_checkpoint_from_session(session, run_id)
+        if checkpoint is not None:
+            incoming_items = prompt_set.get("prompts")
+            if not isinstance(incoming_items, list):
+                raise PanelCheckpointMismatchError(
+                    "Panel checkpoint mismatch: incoming_prompt_set_missing"
+                )
+            incoming_identity = [
+                _panel_prompt_identity(item)
+                for item in incoming_items
+                if isinstance(item, dict)
+            ]
+            checkpoint_identity = [
+                _panel_prompt_identity(prompt) for prompt in checkpoint
+            ]
+            if (
+                len(incoming_identity) != len(incoming_items)
+                or incoming_identity != checkpoint_identity
+            ):
+                raise PanelCheckpointMismatchError(
+                    "Panel checkpoint mismatch: incoming_prompt_set_changed"
+                )
+            await assert_run_lease(run_id)
+            return checkpoint
+
         items = list(prompt_set["prompts"])
         existing = {
             prompt.prompt_key: prompt
@@ -4117,6 +4366,7 @@ async def _persist_prompts(
             prompt.text = text_value
             prompt.rationale = str(item["rationale"]).strip()
             prompt.sequence = sequence
+        await assert_run_lease(run_id)
         await session.commit()
         result = await session.execute(
             select(VisibilityPrompt)
@@ -4241,6 +4491,141 @@ def _panel_retry_no_result_attempt_record(
         "citation_count": 0,
         "token_usage": {},
     }
+
+
+def _panel_attempt_audit_record(
+    *,
+    answer_id: int,
+    claim_status: str,
+    max_tokens: int,
+    request_sha256: str,
+    result: Any | None,
+    error: Exception | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if result is None:
+        summary = _panel_retry_no_result_attempt_record(max_tokens=max_tokens)
+        transport: dict[str, Any] = {}
+        citations: list[Any] = []
+        usage: dict[str, Any] = {}
+    else:
+        summary = _panel_retry_attempt_record(result, max_tokens=max_tokens)
+        usage = dict(result.usage) if isinstance(result.usage, dict) else {}
+        raw_transport = usage.get("_aiv_transport")
+        if not isinstance(raw_transport, dict):
+            raw_transport = getattr(result, "transport", None)
+        transport = (
+            copy.deepcopy(raw_transport)
+            if isinstance(raw_transport, dict)
+            else {}
+        )
+        citations = copy.deepcopy(list(result.citations or []))
+    output = {
+        "version": PANEL_ATTEMPT_AUDIT_VERSION,
+        "answer_id": answer_id,
+        "claim_status": claim_status,
+        "max_tokens": max_tokens,
+        "request_sha256": request_sha256,
+        "transport": transport,
+        "response_text_sha256": summary["response_text_sha256"],
+        "response_char_count": summary["response_char_count"],
+        "citation_count": summary["citation_count"],
+        "citations": citations,
+        "token_usage": summary["token_usage"],
+        "error_type": type(error).__name__ if error is not None else None,
+        "error_message": str(error)[:1000] if error is not None else None,
+    }
+    return output, usage
+
+
+async def _reserve_panel_attempt(
+    run_id: str,
+    *,
+    answer_id: int,
+    claim_status: str,
+    mode: str,
+    provider_key: str,
+    model: str,
+    max_tokens: int,
+    request_sha256: str,
+) -> str:
+    """Append a durable reservation before exactly one provider POST."""
+
+    await assert_run_lease(run_id)
+    artifact_key = (
+        f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}{answer_id}_{uuid.uuid4().hex}"
+    )
+    async with SessionLocal() as session:
+        session.add(
+            RunArtifact(
+                run_id=run_id,
+                stage_key=(
+                    "web_visibility" if mode == "web" else "knowledge_gap"
+                ),
+                artifact_key=artifact_key,
+                status="running",
+                model=model,
+                prompt_version=PANEL_ATTEMPT_AUDIT_VERSION,
+                input_json={
+                    "version": PANEL_ATTEMPT_AUDIT_VERSION,
+                    "answer_id": answer_id,
+                    "claim_status": claim_status,
+                    "mode": mode,
+                    "provider_key": provider_key,
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "request_sha256": request_sha256,
+                },
+            )
+        )
+        await assert_run_lease(run_id)
+        await session.commit()
+    return artifact_key
+
+
+async def _finalize_panel_attempt(
+    run_id: str,
+    *,
+    artifact_key: str,
+    answer_id: int,
+    claim_status: str,
+    max_tokens: int,
+    request_sha256: str,
+    result: Any | None,
+    error: Exception | None,
+) -> None:
+    """Finalize a reservation once; historical attempts are never rewritten."""
+
+    output, usage = _panel_attempt_audit_record(
+        answer_id=answer_id,
+        claim_status=claim_status,
+        max_tokens=max_tokens,
+        request_sha256=request_sha256,
+        result=result,
+        error=error,
+    )
+    async with SessionLocal() as session:
+        changed = await session.execute(
+            update(RunArtifact)
+            .where(
+                RunArtifact.run_id == run_id,
+                RunArtifact.artifact_key == artifact_key,
+                RunArtifact.status == "running",
+            )
+            .values(
+                status="completed" if error is None else "failed",
+                output_json=output,
+                raw_text=(
+                    str(getattr(result, "text", "") or "")
+                    if result is not None
+                    else None
+                ),
+                usage_json=usage or None,
+                error_message=(str(error)[:1000] if error is not None else None),
+            )
+        )
+        await session.commit()
+    if changed.rowcount != 1:
+        raise RuntimeError("Panel attempt audit reservation changed unexpectedly")
 
 
 def _legacy_panel_request_sha256(
@@ -4898,9 +5283,36 @@ async def _ensure_answer_rows(
     run_id: str,
     prompts: list[VisibilityPrompt],
     mode: str,
-) -> list[tuple[int, str, str, str, str, str]]:
-    jobs: list[tuple[int, str, str, str, str, str]] = []
+) -> list[tuple[int, str, str, str, str, str, str]]:
+    jobs: list[tuple[int, str, str, str, str, str, str]] = []
+    await assert_run_lease(run_id)
+    owner = lease_owner_for(run_id)
     async with SessionLocal() as session:
+        run_conditions: list[Any] = [Run.id == run_id]
+        if owner is not None:
+            run_conditions.extend(
+                (
+                    Run.execution_slot == 1,
+                    Run.lease_owner == owner,
+                    Run.status.in_(
+                        (
+                            RunStatus.pending,
+                            RunStatus.crawling,
+                            RunStatus.analyzing,
+                        )
+                    ),
+                )
+            )
+        generation = (
+            await session.execute(
+                select(Run.attempt_count).where(*run_conditions)
+            )
+        ).scalar_one_or_none()
+        if generation is None:
+            if owner is not None:
+                raise RunLeaseLostError(f"Run lease lost for {run_id}")
+            raise LookupError(f"Run not found: {run_id}")
+        claim_generation = max(0, int(generation or 0)) & 0xFFFFFFFF
         existing_rows = list(
             (
                 await session.execute(
@@ -4916,6 +5328,24 @@ async def _ensure_answer_rows(
         existing = {
             (row.prompt_id, row.provider_key): row for row in existing_rows
         }
+        annotation_by_answer_id: dict[int, dict[str, Any]] = {}
+        if existing_rows:
+            annotation_by_answer_id = {
+                int(answer_id): dict(annotation_json)
+                for answer_id, annotation_json in (
+                    await session.execute(
+                        select(
+                            AnswerAnnotation.answer_id,
+                            AnswerAnnotation.annotation_json,
+                        ).where(
+                            AnswerAnnotation.answer_id.in_(
+                                [row.id for row in existing_rows]
+                            )
+                        )
+                    )
+                ).all()
+                if isinstance(annotation_json, dict)
+            }
         for prompt in prompts:
             for panel in panel_models():
                 selected_model = panel.model if mode == "web" else panel.memory_model
@@ -4968,12 +5398,127 @@ async def _ensure_answer_rows(
                     # but _metric_rows will fail it closed unless its exact
                     # request and web policy are attested.
                     continue
-                reset = await session.execute(
-                    update(ModelAnswer)
-                    .where(
-                        ModelAnswer.id == row.id,
+                previous_status = str(row.status or "")
+                running_generation = _panel_running_generation(previous_status)
+                if running_generation == claim_generation:
+                    # Another worker in this exact run attempt owns the paid
+                    # call.  Only a later coordinator attempt may reclaim it.
+                    continue
+                if previous_status not in {"pending", "failed", "completed"} and (
+                    running_generation is None
+                ):
+                    raise PanelCheckpointMismatchError(
+                        "Panel answer has an invalid scheduling state: "
+                        + previous_status
+                    )
+                existing_usage = (
+                    dict(row.usage_json)
+                    if isinstance(row.usage_json, dict)
+                    else {}
+                )
+                existing_citations = copy.deepcopy(row.citations_json or [])
+                existing_annotation = annotation_by_answer_id.get(row.id)
+                if (
+                    running_generation is None
+                    and (
+                        row.response_text is not None
+                        or row.citations_json is not None
+                        or row.usage_json is not None
+                        or row.error_message is not None
+                        or existing_annotation is not None
+                    )
+                ):
+                    historical_evidence = {
+                        "canonical_status": previous_status,
+                        "response_text": row.response_text,
+                        "citations": existing_citations,
+                        "usage": existing_usage,
+                        "error_message": row.error_message,
+                        "annotation": existing_annotation,
+                    }
+                    evidence_digest = _stable_json_sha256(historical_evidence)
+                    contract = existing_usage.get("_aiv_panel_contract")
+                    if not isinstance(contract, dict):
+                        contract = {}
+                    transport = existing_usage.get("_aiv_transport")
+                    if not isinstance(transport, dict):
+                        transport = {}
+                    token_usage = {
+                        key: int(value)
+                        for key, value in sorted(existing_usage.items())
+                        if isinstance(key, str)
+                        and key.endswith("_tokens")
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and value >= 0
+                        and float(value).is_integer()
+                    }
+                    historical_text = str(row.response_text or "")
+                    await session.execute(
+                        sqlite_insert(RunArtifact)
+                        .values(
+                            run_id=run_id,
+                            stage_key=(
+                                "web_visibility"
+                                if mode == "web"
+                                else "knowledge_gap"
+                            ),
+                            artifact_key=(
+                                f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}import_"
+                                f"{row.id}_{evidence_digest[:24]}"
+                            ),
+                            status="completed",
+                            model=row.model,
+                            prompt_version=PANEL_ATTEMPT_AUDIT_VERSION,
+                            input_json={
+                                "version": PANEL_ATTEMPT_AUDIT_VERSION,
+                                "answer_id": row.id,
+                                "imported_existing_evidence": True,
+                                "mode": row.mode,
+                                "provider_key": row.provider_key,
+                                "model": row.model,
+                                "max_tokens": contract.get("max_tokens"),
+                                "request_sha256": contract.get(
+                                    "request_sha256"
+                                ),
+                                "evidence_digest": evidence_digest,
+                            },
+                            output_json={
+                                "version": PANEL_ATTEMPT_AUDIT_VERSION,
+                                "answer_id": row.id,
+                                "imported_existing_evidence": True,
+                                "canonical_status": previous_status,
+                                "response_text_sha256": hashlib.sha256(
+                                    historical_text.encode("utf-8")
+                                ).hexdigest(),
+                                "response_char_count": len(historical_text),
+                                "citation_count": len(existing_citations),
+                                "citations": existing_citations,
+                                "token_usage": token_usage,
+                                "transport": copy.deepcopy(transport),
+                                "error_message": row.error_message,
+                                "annotation": copy.deepcopy(existing_annotation),
+                            },
+                            raw_text=row.response_text,
+                            usage_json=existing_usage or None,
+                            error_message=(
+                                str(row.error_message)[:1000]
+                                if row.error_message
+                                else None
+                            ),
+                        )
+                        .on_conflict_do_nothing(
+                            index_elements=("run_id", "artifact_key")
+                        )
+                    )
+                claim_status = _new_panel_claim_status(claim_generation)
+                claim_conditions: list[Any] = [
+                    ModelAnswer.id == row.id,
+                    ModelAnswer.status == previous_status,
+                ]
+                if previous_status == "completed":
+                    claim_conditions.append(
                         or_(
-                            ModelAnswer.status != "completed",
                             ModelAnswer.response_text.is_(None),
                             func.length(
                                 func.trim(
@@ -4982,21 +5527,19 @@ async def _ensure_answer_rows(
                                 )
                             )
                             == 0,
-                        ),
+                        )
                     )
+                claimed = await session.execute(
+                    update(ModelAnswer)
+                    .where(*claim_conditions)
                     .values(
                         model=selected_model,
-                        status="pending",
-                        response_text=None,
-                        citations_json=None,
-                        usage_json=None,
-                        error_message=None,
+                        status=claim_status,
                     )
                     .execution_options(synchronize_session=False)
                 )
-                if reset.rowcount != 1:
-                    # Another resume completed this cell after our read.
-                    # Its raw evidence is immutable and must stay intact.
+                if claimed.rowcount != 1:
+                    # Another worker claimed or completed this exact cell.
                     continue
                 await session.execute(
                     delete(AnswerAnnotation).where(
@@ -5011,10 +5554,48 @@ async def _ensure_answer_rows(
                         panel.label,
                         selected_model,
                         request_sha256,
+                        claim_status,
                     )
                 )
+        await assert_run_lease(run_id)
         await session.commit()
     return jobs
+
+
+async def _wait_for_panel_claims(
+    run_id: str,
+    *,
+    mode: str,
+) -> list[str]:
+    """Do not let a concurrent analyzer pass cells owned by another worker."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(
+        30.0,
+        float(settings.OPENROUTER_TIMEOUT_SECONDS) * 2 + 30.0,
+    )
+    while True:
+        async with SessionLocal() as session:
+            statuses = list(
+                (
+                    await session.execute(
+                        select(ModelAnswer.status).where(
+                            ModelAnswer.run_id == run_id,
+                            ModelAnswer.mode == mode,
+                        )
+                    )
+                ).scalars()
+            )
+        if not any(
+            _panel_running_generation(status) is not None for status in statuses
+        ):
+            return statuses
+        await assert_run_lease(run_id)
+        if loop.time() >= deadline:
+            raise OpenRouterError(
+                f"Timed out waiting for claimed {mode} panel cells"
+            )
+        await asyncio.sleep(0.1)
 
 
 async def _run_panel(
@@ -5049,6 +5630,9 @@ async def _run_panel(
             ).all()
         )
     if not jobs:
+        statuses = await _wait_for_panel_claims(run_id, mode=mode)
+        if not statuses or statuses.count("completed") / len(statuses) < 0.60:
+            raise OpenRouterError(f"Too few successful {mode} panel responses")
         return
 
     semaphore = asyncio.Semaphore(
@@ -5057,7 +5641,7 @@ async def _run_panel(
     progress_lock = asyncio.Lock()
     completed_now = existing_completed
 
-    async def worker(job: tuple[int, str, str, str, str, str]) -> None:
+    async def worker(job: tuple[int, str, str, str, str, str, str]) -> None:
         nonlocal completed_now
         (
             answer_id,
@@ -5066,7 +5650,33 @@ async def _run_panel(
             _provider_label,
             model,
             _request_sha256,
+            claim_status,
         ) = job
+
+        def claim_write_conditions() -> list[Any]:
+            conditions: list[Any] = [
+                ModelAnswer.id == answer_id,
+                ModelAnswer.status == claim_status,
+            ]
+            owner = lease_owner_for(run_id)
+            if owner is not None:
+                conditions.append(
+                    select(Run.id)
+                    .where(
+                        Run.id == run_id,
+                        Run.execution_slot == 1,
+                        Run.lease_owner == owner,
+                        Run.status.in_(
+                            (
+                                RunStatus.pending,
+                                RunStatus.crawling,
+                                RunStatus.analyzing,
+                            )
+                        ),
+                    )
+                    .exists()
+                )
+            return conditions
 
         def usage_with_provenance(
             result: Any,
@@ -5115,13 +5725,11 @@ async def _run_panel(
             max_tokens: int,
             retry_attempts: list[dict[str, Any]] | None,
         ) -> bool:
+            await assert_run_lease(run_id)
             async with SessionLocal() as session:
                 claimed = await session.execute(
                     update(ModelAnswer)
-                    .where(
-                        ModelAnswer.id == answer_id,
-                        ModelAnswer.status.in_(("pending", "failed")),
-                    )
+                    .where(*claim_write_conditions())
                     .values(
                         status="completed",
                         response_text=result.text,
@@ -5135,6 +5743,7 @@ async def _run_panel(
                     )
                 )
                 await session.commit()
+            await assert_run_lease(run_id)
             return claimed.rowcount == 1
 
         async def persist_failure(
@@ -5144,6 +5753,7 @@ async def _run_panel(
             evidence_max_tokens: int | None = None,
             retry_attempts: list[dict[str, Any]] | None = None,
         ) -> bool:
+            await assert_run_lease(run_id)
             values: dict[str, Any] = {
                 "status": "failed",
                 "error_message": str(exc)[:1000],
@@ -5167,14 +5777,77 @@ async def _run_panel(
             async with SessionLocal() as session:
                 claimed = await session.execute(
                     update(ModelAnswer)
-                    .where(
-                        ModelAnswer.id == answer_id,
-                        ModelAnswer.status == "pending",
-                    )
+                    .where(*claim_write_conditions())
                     .values(**values)
                 )
                 await session.commit()
+            await assert_run_lease(run_id)
             return claimed.rowcount == 1
+
+        async def request_once(max_tokens: int) -> Any:
+            """Execute one provider POST backed by one append-only artifact."""
+
+            request_sha256 = _panel_request_sha256(
+                prompt_text=prompt_text,
+                mode=mode,
+                provider_key=provider_key,
+                model=model,
+                max_tokens=max_tokens,
+            )
+            artifact_key = await _reserve_panel_attempt(
+                run_id,
+                answer_id=answer_id,
+                claim_status=claim_status,
+                mode=mode,
+                provider_key=provider_key,
+                model=model,
+                max_tokens=max_tokens,
+                request_sha256=request_sha256,
+            )
+            await assert_run_lease(run_id)
+            try:
+                result = await chat(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": _panel_system(mode),
+                        },
+                        {"role": "user", "content": prompt_text},
+                    ],
+                    web_policy=_panel_web_policy(mode, provider_key),
+                    max_tokens=max_tokens,
+                    temperature=0.35,
+                    retry_response_contract_errors=False,
+                    retry_transport_errors=False,
+                )
+            except asyncio.CancelledError:
+                # The durable reservation remains ``running``.  A later run
+                # attempt may reclaim the cell without inventing a result.
+                raise
+            except Exception as exc:
+                await _finalize_panel_attempt(
+                    run_id,
+                    artifact_key=artifact_key,
+                    answer_id=answer_id,
+                    claim_status=claim_status,
+                    max_tokens=max_tokens,
+                    request_sha256=request_sha256,
+                    result=getattr(exc, "result", None),
+                    error=exc,
+                )
+                raise
+            await _finalize_panel_attempt(
+                run_id,
+                artifact_key=artifact_key,
+                answer_id=answer_id,
+                claim_status=claim_status,
+                max_tokens=max_tokens,
+                request_sha256=request_sha256,
+                result=result,
+                error=None,
+            )
+            return result
 
         request_max_tokens = PANEL_DEFAULT_MAX_TOKENS
         retry_attempts: list[dict[str, Any]] | None = None
@@ -5182,19 +5855,7 @@ async def _run_panel(
         try:
             async with semaphore:
                 try:
-                    result = await chat(
-                        model=model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": _panel_system(mode),
-                            },
-                            {"role": "user", "content": prompt_text},
-                        ],
-                        web_policy=_panel_web_policy(mode, provider_key),
-                        max_tokens=request_max_tokens,
-                        temperature=0.35,
-                    )
+                    result = await request_once(request_max_tokens)
                 except OpenRouterOutputLimitError as first_limit:
                     first_limit_result = first_limit.result
                     retry_attempts = [
@@ -5205,19 +5866,7 @@ async def _run_panel(
                     ]
                     request_max_tokens = PANEL_RETRY_MAX_TOKENS
                     try:
-                        result = await chat(
-                            model=model,
-                            messages=[
-                                {
-                                    "role": "system",
-                                    "content": _panel_system(mode),
-                                },
-                                {"role": "user", "content": prompt_text},
-                            ],
-                            web_policy=_panel_web_policy(mode, provider_key),
-                            max_tokens=request_max_tokens,
-                            temperature=0.35,
-                        )
+                        result = await request_once(request_max_tokens)
                     except OpenRouterOutputLimitError as second_limit:
                         retry_attempts.append(
                             _panel_retry_attempt_record(
@@ -5329,17 +5978,7 @@ async def _run_panel(
                 )
 
     await asyncio.gather(*(worker(job) for job in jobs))
-    async with SessionLocal() as session:
-        statuses = list(
-            (
-                await session.execute(
-                    select(ModelAnswer.status).where(
-                        ModelAnswer.run_id == run_id,
-                        ModelAnswer.mode == mode,
-                    )
-                )
-            ).scalars()
-        )
+    statuses = await _wait_for_panel_claims(run_id, mode=mode)
     if not statuses or statuses.count("completed") / len(statuses) < 0.60:
         raise OpenRouterError(f"Too few successful {mode} panel responses")
 
@@ -16219,35 +16858,46 @@ async def analyze_run(run_id: str) -> None:
             status=RunStatus.analyzing,
         )
         await apply_ua_conditional_block(run_id)
+        panel_checkpoint = await _load_panel_resume_checkpoint(run_id)
         technical, technical_review, profile, site_context = (
             await _prepare_analysis_foundation(run_id)
         )
-        await update_progress(
-            run_id,
-            stage="scenario_design",
-            percent=31,
-            detail="Проверяем рынок, аудитории и критерии выбора по источникам.",
-            eta_seconds=960,
-        )
-        market_research = await _market_research(
-            run_id,
-            profile,
-            site_context,
-        )
-        await update_progress(
-            run_id,
-            stage="scenario_design",
-            percent=34,
-            detail="Строим сценарии из подтверждённых задач выбора.",
-            eta_seconds=840,
-        )
-        prompt_set = await _generate_prompt_set(
-            run_id,
-            profile,
-            site_context.get("requested_site"),
-            market_research=market_research,
-        )
-        prompts = await _persist_prompts(run_id, prompt_set)
+        if panel_checkpoint is None:
+            await update_progress(
+                run_id,
+                stage="scenario_design",
+                percent=31,
+                detail="Проверяем рынок, аудитории и критерии выбора по источникам.",
+                eta_seconds=960,
+            )
+            market_research = await _market_research(
+                run_id,
+                profile,
+                site_context,
+            )
+            await update_progress(
+                run_id,
+                stage="scenario_design",
+                percent=34,
+                detail="Строим сценарии из подтверждённых задач выбора.",
+                eta_seconds=840,
+            )
+            prompt_set = await _generate_prompt_set(
+                run_id,
+                profile,
+                site_context.get("requested_site"),
+                market_research=market_research,
+            )
+            prompts = await _persist_prompts(run_id, prompt_set)
+        else:
+            prompts = panel_checkpoint
+            await update_progress(
+                run_id,
+                stage="scenario_design",
+                percent=34,
+                detail="Продолжаем с сохранёнными сценариями и ответами.",
+                eta_seconds=840,
+            )
         await update_progress(
             run_id,
             stage="web_visibility",
@@ -16284,6 +16934,14 @@ async def analyze_run(run_id: str) -> None:
         )
     except asyncio.CancelledError:
         raise
+    except PanelCheckpointMismatchError as exc:
+        logger.error("Panel checkpoint rejected for run %s: %s", run_id, exc)
+        await fail_run(
+            run_id,
+            "Продолжение остановлено: сохранённые сценарии и ответы не прошли "
+            "проверку целостности. Исходные ответы не изменены; нужна "
+            "операторская проверка.",
+        )
     except Exception:
         logger.exception("AIV analysis failed for run %s", run_id)
         await fail_run(

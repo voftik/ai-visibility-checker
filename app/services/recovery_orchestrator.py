@@ -369,6 +369,10 @@ guidance — короткий дополнительный контекст дл
         # an invalid/partial schema response is reconciled as a failed epoch
         # instead of silently buying two more Fable completions.
         retry_response_contract_errors=False,
+        # The durable call budget counts provider requests, not retry loops.
+        # An uncertain transport result may already have consumed the expensive
+        # completion, so Fable must never be retried inside one epoch.
+        retry_transport_errors=False,
     )
     if not isinstance(result.parsed, dict):
         raise OrchestratorContractError(

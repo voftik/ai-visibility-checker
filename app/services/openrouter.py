@@ -630,6 +630,7 @@ async def chat(
     max_tokens: int = 12_000,
     temperature: float = 0.2,
     retry_response_contract_errors: bool = True,
+    retry_transport_errors: bool = True,
 ) -> ChatResult:
     payload: dict[str, Any] = {
         "model": model,
@@ -805,6 +806,8 @@ async def chat(
                 isinstance(exc, OpenRouterResponseContractError)
                 and not retry_response_contract_errors
             ):
+                raise
+            if not retry_transport_errors:
                 raise
             last_error = exc
             if attempt >= 3:

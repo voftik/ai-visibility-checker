@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, func, select, text
+from httpx import ASGITransport, AsyncClient, ReadTimeout
+from sqlalchemy import delete, func, select, text, update
 
 from app.config import settings
 from app.db import SessionLocal, init_db
@@ -66,8 +66,10 @@ from app.services.analyzer import (
     LEGACY_PANEL_EVIDENCE_VERSION,
     LEGACY_MEMORY_OBSERVATION_REASON,
     LEGACY_MEMORY_MODELS,
+    LEGACY_PROMPT_SET_VERSIONS,
     PROCESSING_BATCH_CONCURRENCY,
     PROCESSING_MODEL,
+    PANEL_ATTEMPT_AUDIT_VERSION,
     PANEL_CONTRACT_VERSION,
     MARKET_RESEARCH_SCHEMA,
     MARKET_RESEARCH_VERSION,
@@ -108,6 +110,7 @@ from app.services.analyzer import (
     _illustration_review_errors,
     _legacy_panel_request_sha256,
     _legacy_panel_run_contract,
+    _load_panel_resume_checkpoint,
     _panel_metric_access,
     _market_research,
     _market_research_sufficiency,
@@ -142,7 +145,9 @@ from app.services.analyzer import (
     _validate_final_report,
     _validate_illustration_concepts,
     _validate_prompt_set,
+    analyze_run,
     MarketResearchGateError,
+    PanelCheckpointMismatchError,
 )
 from app.services.content_extractor import extract_text_signals
 from app.services.robots_parser import parse_robots, robots_path_allowed
@@ -1879,6 +1884,8 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         request = chat_mock.await_args.kwargs
         self.assertEqual(request["model"], ANALYSIS_MODEL)
         self.assertEqual(request["reasoning_effort"], "high")
+        self.assertFalse(request["retry_response_contract_errors"])
+        self.assertFalse(request["retry_transport_errors"])
         system = request["messages"][0]["content"]
         self.assertIn("NB — Need Based", system)
         self.assertIn("NAV — Navigation", system)
@@ -2096,6 +2103,177 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             if event == ("generator", "called"):
                 self.assertEqual(events[index - 1], ("artifact", "running"))
         recovery.assert_awaited_once()
+        semantic_review.assert_not_awaited()
+
+    async def test_prompt_generator_continues_after_one_shot_contract_failure(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "category": "Аналитика",
+            "customer_jobs": ["Сравнить поставщиков"],
+            "decision_criteria": ["Точность"],
+            "geography": ["Россия"],
+        }
+        research = _ready_market_research()
+        candidate = _deterministic_prompt_fallback(profile, research)
+        contract_failure = OpenRouterResponseContractError(
+            "Structured response is unusable",
+            result=SimpleNamespace(
+                text="{unfinished",
+                usage={
+                    "total_tokens": 17,
+                    "_aiv_transport": {"response_id": "response-first"},
+                },
+            ),
+        )
+        success = SimpleNamespace(
+            parsed=candidate,
+            text=json.dumps(candidate, ensure_ascii=False),
+            usage={"total_tokens": 23},
+        )
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._prompt_candidate_state",
+                new=AsyncMock(return_value=(0, None, "", {}, None, 0)),
+            ),
+            patch(
+                "app.services.analyzer._reserve_prompt_candidate_attempt",
+                new=AsyncMock(side_effect=("candidate-1", "candidate-2")),
+            ) as reserve,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._save_prompt_candidate",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._save_accepted_prompt_set",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "app.services.analyzer.chat",
+                new=AsyncMock(side_effect=(contract_failure, success)),
+            ) as generator,
+        ):
+            result = await _generate_prompt_set(
+                "run-id",
+                profile,
+                market_research=research,
+            )
+
+        self.assertEqual(result, candidate)
+        self.assertEqual(generator.await_count, 2)
+        self.assertEqual(reserve.await_count, 2)
+        save_artifact.assert_awaited_once()
+        failed = save_artifact.await_args.kwargs
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["artifact_key"], "candidate-1")
+        self.assertEqual(failed["input_json"]["budget_attempt"], 1)
+        self.assertEqual(failed["raw_text"], "{unfinished")
+        self.assertEqual(failed["usage_json"]["total_tokens"], 17)
+        self.assertEqual(
+            failed["usage_json"]["_aiv_transport"]["response_id"],
+            "response-first",
+        )
+        self.assertIn("не вернул пригодный ответ", failed["error_message"])
+        for request in generator.await_args_list:
+            self.assertFalse(
+                request.kwargs["retry_response_contract_errors"]
+            )
+            self.assertFalse(request.kwargs["retry_transport_errors"])
+
+    async def test_prompt_generator_exhausts_four_one_shot_failures_before_recovery(
+        self,
+    ) -> None:
+        profile = {"brand_name": "Example", "brand_aliases": []}
+        research = _ready_market_research()
+        recovered = {"recovery": "planned"}
+        failures = [
+            OpenRouterError("temporary transport failure 1"),
+            OpenRouterResponseContractError(
+                "incomplete structured response",
+                result=SimpleNamespace(text="{", usage={"total_tokens": 3}),
+            ),
+            ReadTimeout("provider timed out"),
+            OpenRouterError("temporary transport failure 4"),
+        ]
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._prompt_candidate_state",
+                new=AsyncMock(return_value=(0, None, "", {}, None, 0)),
+            ),
+            patch(
+                "app.services.analyzer._reserve_prompt_candidate_attempt",
+                new=AsyncMock(
+                    side_effect=tuple(
+                        f"candidate-{attempt}" for attempt in range(1, 5)
+                    )
+                ),
+            ) as reserve,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._recover_prompt_set",
+                new=AsyncMock(return_value=recovered),
+            ) as recovery,
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer.chat",
+                new=AsyncMock(side_effect=failures),
+            ) as generator,
+        ):
+            result = await _generate_prompt_set(
+                "run-id",
+                profile,
+                market_research=research,
+            )
+
+        self.assertEqual(result, recovered)
+        self.assertEqual(generator.await_count, 4)
+        self.assertEqual(reserve.await_count, 4)
+        self.assertEqual(save_artifact.await_count, 4)
+        self.assertTrue(
+            all(
+                call.kwargs["status"] == "failed"
+                for call in save_artifact.await_args_list
+            )
+        )
+        self.assertEqual(
+            [
+                call.kwargs["input_json"]["budget_attempt"]
+                for call in save_artifact.await_args_list
+            ],
+            [1, 2, 3, 4],
+        )
+        recovery.assert_awaited_once()
+        self.assertIn(
+            "попытке 4: OpenRouterError",
+            recovery.await_args.kwargs["last_errors"][0],
+        )
         semantic_review.assert_not_awaited()
 
     async def test_recovered_prompt_candidate_reexecutes_semantic_gate(
@@ -2447,6 +2625,85 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         chat_mock.assert_not_awaited()
         self.assertEqual(_validate_prompt_set(recovered, profile), [])
 
+    async def test_guided_prompt_recovery_disables_internal_chat_retries(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "category": "Аналитика",
+            "customer_jobs": ["Сравнить поставщиков"],
+            "decision_criteria": ["Точность"],
+            "geography": ["Россия"],
+        }
+        research = _ready_market_research()
+        payload = {
+            "requested_site": {},
+            "site_profile": profile,
+            "market_research": research,
+            "market_research_digest": "a" * 64,
+        }
+        recovered = _deterministic_prompt_fallback(profile, research)
+        result = SimpleNamespace(
+            parsed=recovered,
+            text=json.dumps(recovered, ensure_ascii=False),
+            usage={"total_tokens": 1},
+        )
+        plan = SimpleNamespace(
+            epoch=1,
+            decision={
+                "action": ACTION_RETRY_WITH_GUIDANCE,
+                "rationale": "Нужна последняя точечная правка.",
+                "guidance": "Сохранить валидные сценарии дословно.",
+                "acceptance_checks": [
+                    "prompt_contract_valid",
+                    "semantic_review_passed",
+                ],
+            },
+        )
+        with (
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ),
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.finish_recovery",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._save_accepted_prompt_set",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "app.services.analyzer.chat",
+                new=AsyncMock(return_value=result),
+            ) as chat_mock,
+        ):
+            actual = await _recover_prompt_set(
+                "run-id",
+                profile=profile,
+                research=research,
+                payload=payload,
+                system="Системный контракт",
+                previous_set=None,
+                last_errors=["Критик отклонил набор."],
+            )
+
+        self.assertEqual(actual, recovered)
+        chat_mock.assert_awaited_once()
+        request = chat_mock.await_args.kwargs
+        self.assertFalse(request["retry_response_contract_errors"])
+        self.assertFalse(request["retry_transport_errors"])
+
     async def test_prompt_recovery_rejects_unexecuted_acceptance_checks(
         self,
     ) -> None:
@@ -2502,6 +2759,71 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("semantic_review_passed", str(raised.exception))
         self.assertFalse(finish.await_args.kwargs["succeeded"])
+        save.assert_not_awaited()
+
+    async def test_prompt_recovery_rejects_extra_acceptance_checks(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "category": "Аналитика",
+        }
+        research = _ready_market_research()
+        payload = {
+            "requested_site": {},
+            "site_profile": profile,
+            "market_research": research,
+            "market_research_digest": "a" * 64,
+        }
+        plan = SimpleNamespace(
+            epoch=1,
+            decision={
+                "action": ACTION_DETERMINISTIC_FALLBACK,
+                "rationale": "Локальный цикл не сошёлся.",
+                "guidance": "",
+                "acceptance_checks": [
+                    "prompt_contract_valid",
+                    "semantic_review_passed",
+                    "critic_gate_passed",
+                ],
+            },
+        )
+        with (
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ),
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.finish_recovery",
+                new_callable=AsyncMock,
+            ) as finish,
+            patch(
+                "app.services.analyzer._save_accepted_prompt_set",
+                new_callable=AsyncMock,
+            ) as save,
+            self.assertRaises(OpenRouterError) as raised,
+        ):
+            await _recover_prompt_set(
+                "run-id",
+                profile=profile,
+                research=research,
+                payload=payload,
+                system="Системный контракт",
+                previous_set=None,
+                last_errors=["Критик отклонил набор."],
+            )
+
+        self.assertIn("unsupported: critic_gate_passed", str(raised.exception))
+        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        self.assertEqual(
+            finish.await_args.kwargs["details"]["unsupported_acceptance_checks"],
+            ["critic_gate_passed"],
+        )
         save.assert_not_awaited()
 
     async def test_market_research_digest_invalidates_cached_prompt_set(
@@ -8283,6 +8605,102 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         await init_db()
 
+    @staticmethod
+    def _checkpoint_prompt_items() -> list[dict[str, object]]:
+        intents = ("I", "E", "T", "NB", "NAV", "TR", "I", "E", "TR")
+        return [
+            {
+                "prompt_key": f"checkpoint-{sequence}",
+                "intent_class": intent,
+                "role": (
+                    "unbranded_discovery"
+                    if sequence <= 6
+                    else "brand_diagnostic"
+                ),
+                "text": f"Сохранённый сценарий {sequence}",
+                "rationale": f"Проверяет сигнал {sequence}",
+                "choice_request": sequence <= 6,
+            }
+            for sequence, intent in enumerate(intents, start=1)
+        ]
+
+    async def _create_panel_checkpoint(
+        self,
+        *,
+        prompt_version: str = PROMPT_SET_VERSION,
+        artifact_mismatch: bool = False,
+        answer_status: str = "completed",
+        with_annotation: bool = False,
+    ) -> tuple[str, list[dict[str, object]], list[int], int]:
+        run_id = f"test-panel-checkpoint-{uuid.uuid4()}"
+        items = self._checkpoint_prompt_items()
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="example.com",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            prompts: list[VisibilityPrompt] = []
+            for sequence, item in enumerate(items, start=1):
+                prompt = VisibilityPrompt(
+                    run_id=run_id,
+                    prompt_key=str(item["prompt_key"]),
+                    intent_class=str(item["intent_class"]),
+                    role=str(item["role"]),
+                    text=str(item["text"]),
+                    rationale=str(item["rationale"]),
+                    sequence=sequence,
+                )
+                session.add(prompt)
+                prompts.append(prompt)
+            await session.flush()
+            artifact_items = copy.deepcopy(items)
+            if artifact_mismatch:
+                artifact_items[0]["text"] = "Сценарий не совпадает с БД"
+            session.add(
+                RunArtifact(
+                    run_id=run_id,
+                    stage_key="scenario_design",
+                    artifact_key="prompt_set",
+                    status="completed",
+                    prompt_version=prompt_version,
+                    output_json={"prompts": artifact_items},
+                )
+            )
+            answer = ModelAnswer(
+                run_id=run_id,
+                prompt_id=prompts[0].id,
+                provider_key="openai",
+                model="test/model",
+                mode="web",
+                status=answer_status,
+                response_text=(
+                    "Сохранённый raw-ответ"
+                    if answer_status == "completed"
+                    else None
+                ),
+            )
+            session.add(answer)
+            await session.flush()
+            if with_annotation:
+                session.add(
+                    AnswerAnnotation(
+                        answer_id=answer.id,
+                        annotation_json={"valid": True},
+                    )
+                )
+            await session.commit()
+            return run_id, items, [prompt.id for prompt in prompts], answer.id
+
+    @staticmethod
+    async def _delete_run(run_id: str) -> None:
+        async with SessionLocal() as session:
+            await session.execute(delete(Run).where(Run.id == run_id))
+            await session.commit()
+
     async def _single_panel_fixture(
         self,
     ) -> tuple[str, VisibilityPrompt, PanelModel]:
@@ -8893,6 +9311,13 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 [3_200, 6_400],
             )
+            self.assertTrue(
+                all(
+                    call.kwargs["retry_response_contract_errors"] is False
+                    and call.kwargs["retry_transport_errors"] is False
+                    for call in panel_chat.await_args_list
+                )
+            )
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -8901,8 +9326,41 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                         )
                     )
                 ).scalar_one()
+                audit_rows = list(
+                    (
+                        await session.execute(
+                            select(RunArtifact)
+                            .where(
+                                RunArtifact.run_id == run_id,
+                                RunArtifact.prompt_version
+                                == PANEL_ATTEMPT_AUDIT_VERSION,
+                            )
+                            .order_by(RunArtifact.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
             self.assertEqual(answer.status, "completed")
             self.assertEqual(answer.response_text, complete.text)
+            self.assertEqual(len(audit_rows), 2)
+            self.assertEqual(
+                [row.input_json["max_tokens"] for row in audit_rows],
+                [3_200, 6_400],
+            )
+            self.assertEqual(
+                [row.status for row in audit_rows],
+                ["failed", "completed"],
+            )
+            self.assertEqual(
+                [row.raw_text for row in audit_rows],
+                [partial.text, complete.text],
+            )
+            self.assertEqual(len({row.artifact_key for row in audit_rows}), 2)
+            self.assertEqual(
+                audit_rows[0].output_json["error_type"],
+                "OpenRouterOutputLimitError",
+            )
             provenance = answer.usage_json["_aiv_panel_contract"]
             self.assertEqual(provenance["max_tokens"], 6_400)
             self.assertEqual(
@@ -9109,6 +9567,223 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps(retry, ensure_ascii=False),
             )
         finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_cancelled_retry_keeps_attempts_and_imported_failed_raw(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        historical_raw = "Исторический failed raw до новой системы аудита."
+        historical_citations = [{"url": "https://old.example/source"}]
+        historical_usage = {"prompt_tokens": 11, "completion_tokens": 19}
+        partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Частичный ответ первой попытки 3 200.",
+            limited=True,
+            prompt_tokens=73,
+            completion_tokens=3_200,
+        )
+        resumed = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Новый полный ответ после следующего run attempt.",
+            limited=False,
+            prompt_tokens=79,
+            completion_tokens=311,
+        )
+        async with SessionLocal() as session:
+            answer = ModelAnswer(
+                run_id=run_id,
+                prompt_id=prompt.id,
+                provider_key="openai",
+                model="test/model",
+                mode="web",
+                status="failed",
+                response_text=historical_raw,
+                citations_json=historical_citations,
+                usage_json=historical_usage,
+                error_message="historical failure",
+            )
+            session.add(answer)
+            await session.flush()
+            answer_id = answer.id
+            session.add(
+                AnswerAnnotation(
+                    answer_id=answer_id,
+                    annotation_json={"stale": True},
+                )
+            )
+            await session.commit()
+
+        second_started = asyncio.Event()
+        first_worker_calls = 0
+
+        async def first_limit_then_wait(**_kwargs: object) -> SimpleNamespace:
+            nonlocal first_worker_calls
+            first_worker_calls += 1
+            if first_worker_calls == 1:
+                raise OpenRouterOutputLimitError(
+                    "first output limit",
+                    result=partial,
+                )
+            second_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        task: asyncio.Task[None] | None = None
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=first_limit_then_wait,
+                ) as first_worker_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                task = asyncio.create_task(
+                    _run_panel(
+                        run_id,
+                        [prompt],
+                        mode="web",
+                        start_percent=40,
+                        end_percent=60,
+                    )
+                )
+                await asyncio.wait_for(second_started.wait(), timeout=5)
+                self.assertEqual(first_worker_chat.await_count, 2)
+                task.cancel()
+                outcomes = await asyncio.gather(task, return_exceptions=True)
+                self.assertIsInstance(outcomes[0], asyncio.CancelledError)
+
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(ModelAnswer.id == answer_id)
+                    )
+                ).scalar_one()
+                artifacts_before_resume = list(
+                    (
+                        await session.execute(
+                            select(RunArtifact)
+                            .where(
+                                RunArtifact.run_id == run_id,
+                                RunArtifact.prompt_version
+                                == PANEL_ATTEMPT_AUDIT_VERSION,
+                            )
+                            .order_by(RunArtifact.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                annotation_count = (
+                    await session.execute(
+                        select(func.count(AnswerAnnotation.id)).where(
+                            AnswerAnnotation.answer_id == answer_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertRegex(
+                answer.status,
+                r"^running:[0-9a-f]{8}:[0-9a-f]{12}$",
+            )
+            self.assertEqual(answer.response_text, historical_raw)
+            self.assertEqual(annotation_count, 0)
+            self.assertEqual(len(artifacts_before_resume), 3)
+            imported = [
+                row
+                for row in artifacts_before_resume
+                if row.input_json.get("imported_existing_evidence")
+            ]
+            self.assertEqual(len(imported), 1)
+            self.assertEqual(imported[0].raw_text, historical_raw)
+            self.assertEqual(
+                imported[0].output_json["annotation"],
+                {"stale": True},
+            )
+            attempted = [
+                row
+                for row in artifacts_before_resume
+                if not row.input_json.get("imported_existing_evidence")
+            ]
+            self.assertEqual(
+                [row.status for row in attempted],
+                ["failed", "running"],
+            )
+            self.assertEqual(attempted[0].raw_text, partial.text)
+            self.assertIsNone(attempted[1].raw_text)
+
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(Run)
+                    .where(Run.id == run_id)
+                    .values(attempt_count=Run.attempt_count + 1)
+                )
+                await session.commit()
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    return_value=resumed,
+                ) as resumed_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+            resumed_chat.assert_awaited_once()
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(ModelAnswer.id == answer_id)
+                    )
+                ).scalar_one()
+                all_artifacts = list(
+                    (
+                        await session.execute(
+                            select(RunArtifact)
+                            .where(
+                                RunArtifact.run_id == run_id,
+                                RunArtifact.prompt_version
+                                == PANEL_ATTEMPT_AUDIT_VERSION,
+                            )
+                            .order_by(RunArtifact.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            self.assertEqual(answer.status, "completed")
+            self.assertEqual(answer.response_text, resumed.text)
+            self.assertEqual(len(all_artifacts), 4)
+            self.assertEqual(imported[0].raw_text, historical_raw)
+            self.assertEqual(
+                [row.status for row in all_artifacts],
+                ["completed", "failed", "running", "completed"],
+            )
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
@@ -9397,68 +10072,25 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_concurrent_panel_successes_preserve_first_completed_evidence(
+    async def test_concurrent_panel_workers_issue_one_paid_call_per_cell(
         self,
     ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
-        fast = self._panel_result(
+        result = self._panel_result(
             prompt_text=prompt.text,
-            text_value="Первый завершённый ответ.",
+            text_value="Единственный завершённый ответ.",
             limited=False,
             prompt_tokens=71,
             completion_tokens=113,
         )
-        slow = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Запоздавший ответ не должен перезаписать первый.",
-            limited=False,
-            prompt_tokens=71,
-            completion_tokens=997,
-        )
-        fast.usage["attempt_marker"] = "fast-first"
-        slow.usage["attempt_marker"] = "slow-second"
-        both_started = asyncio.Event()
-        release_slow = asyncio.Event()
-        call_lock = asyncio.Lock()
-        call_count = 0
+        started = asyncio.Event()
+        release = asyncio.Event()
         tasks: list[asyncio.Task[None]] = []
 
-        async def two_successes(**_kwargs: object) -> SimpleNamespace:
-            nonlocal call_count
-            async with call_lock:
-                call_index = call_count
-                call_count += 1
-                if call_count == 2:
-                    both_started.set()
-            await both_started.wait()
-            if call_index == 0:
-                return fast
-            await release_slow.wait()
-            return slow
-
-        async def saved_snapshot() -> str | None:
-            async with SessionLocal() as session:
-                answer = (
-                    await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
-                    )
-                ).scalar_one()
-            if answer.status != "completed":
-                return None
-            return json.dumps(
-                {
-                    "status": answer.status,
-                    "response_text": answer.response_text,
-                    "citations_json": answer.citations_json,
-                    "usage_json": answer.usage_json,
-                    "error_message": answer.error_message,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+        async def one_success(**_kwargs: object) -> SimpleNamespace:
+            started.set()
+            await release.wait()
+            return result
 
         try:
             with (
@@ -9469,7 +10101,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=two_successes,
+                    side_effect=one_success,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -9488,25 +10120,23 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     )
                     for _ in range(2)
                 ]
-                await asyncio.wait_for(both_started.wait(), timeout=5)
-                first_snapshot = None
-                for _ in range(200):
-                    first_snapshot = await saved_snapshot()
-                    if first_snapshot is not None:
-                        break
-                    await asyncio.sleep(0.005)
-                self.assertIsNotNone(first_snapshot)
-                release_slow.set()
+                await asyncio.wait_for(started.wait(), timeout=5)
+                await asyncio.sleep(0.05)
+                self.assertEqual(panel_chat.await_count, 1)
+                release.set()
                 await asyncio.gather(*tasks)
-                final_snapshot = await saved_snapshot()
 
-            self.assertEqual(panel_chat.await_count, 2)
-            self.assertEqual(final_snapshot, first_snapshot)
-            self.assertIn("Первый завершённый ответ.", final_snapshot or "")
-            self.assertNotIn("Запоздавший ответ", final_snapshot or "")
-            self.assertIn('"attempt_marker":"fast-first"', final_snapshot or "")
+            self.assertEqual(panel_chat.await_count, 1)
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "completed")
+            self.assertEqual(answer.response_text, result.text)
         finally:
-            release_slow.set()
+            release.set()
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -9516,36 +10146,38 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_concurrent_panel_failure_then_success_allows_complete_to_win(
+    async def test_later_run_attempt_reclaims_cell_and_rejects_stale_token(
         self,
     ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
-        success = self._panel_result(
+        stale = self._panel_result(
             prompt_text=prompt.text,
-            text_value="Успешный полный ответ.",
+            text_value="Устаревший worker не должен сохранить этот ответ.",
             limited=False,
             prompt_tokens=61,
             completion_tokens=149,
         )
-        success.usage["attempt_marker"] = "success-after-failure"
-        both_started = asyncio.Event()
-        release_success = asyncio.Event()
-        call_lock = asyncio.Lock()
+        resumed = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Ответ нового run attempt.",
+            limited=False,
+            prompt_tokens=67,
+            completion_tokens=151,
+        )
+        stale_started = asyncio.Event()
+        release_stale = asyncio.Event()
         call_count = 0
         tasks: list[asyncio.Task[None]] = []
 
-        async def failure_then_success(**_kwargs: object) -> SimpleNamespace:
+        async def stale_then_resumed(**_kwargs: object) -> SimpleNamespace:
             nonlocal call_count
-            async with call_lock:
-                call_index = call_count
-                call_count += 1
-                if call_count == 2:
-                    both_started.set()
-            await both_started.wait()
+            call_index = call_count
+            call_count += 1
             if call_index == 0:
-                raise OpenRouterError("fast transport failure")
-            await release_success.wait()
-            return success
+                stale_started.set()
+                await release_stale.wait()
+                return stale
+            return resumed
 
         try:
             with (
@@ -9556,14 +10188,14 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=failure_then_success,
+                    side_effect=stale_then_resumed,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
                     new_callable=AsyncMock,
                 ),
             ):
-                tasks = [
+                tasks.append(
                     asyncio.create_task(
                         _run_panel(
                             run_id,
@@ -9573,35 +10205,31 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                             end_percent=60,
                         )
                     )
-                    for _ in range(2)
-                ]
-                try:
-                    await asyncio.wait_for(both_started.wait(), timeout=5)
-                except TimeoutError:
-                    diagnostics = [
-                        repr(task.exception()) if task.done() else "pending"
-                        for task in tasks
-                    ]
-                    self.fail(
-                        "Concurrent panel workers did not both start: "
-                        f"{diagnostics}"
+                )
+                await asyncio.wait_for(stale_started.wait(), timeout=5)
+                async with SessionLocal() as session:
+                    await session.execute(
+                        update(Run)
+                        .where(Run.id == run_id)
+                        .values(attempt_count=Run.attempt_count + 1)
                     )
-                done, _pending = await asyncio.wait(
-                    tasks,
-                    timeout=5,
-                    return_when=asyncio.FIRST_COMPLETED,
+                    await session.commit()
+                tasks.append(
+                    asyncio.create_task(
+                        _run_panel(
+                            run_id,
+                            [prompt],
+                            mode="web",
+                            start_percent=40,
+                            end_percent=60,
+                        )
+                    )
                 )
-                self.assertEqual(len(done), 1)
-                release_success.set()
-                outcomes = await asyncio.gather(
-                    *tasks,
-                    return_exceptions=True,
-                )
+                await asyncio.wait_for(tasks[1], timeout=5)
+                release_stale.set()
+                await asyncio.wait_for(tasks[0], timeout=5)
 
             self.assertEqual(panel_chat.await_count, 2)
-            self.assertTrue(
-                any(isinstance(outcome, OpenRouterError) for outcome in outcomes)
-            )
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -9611,14 +10239,10 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "completed")
-            self.assertEqual(answer.response_text, success.text)
+            self.assertEqual(answer.response_text, resumed.text)
             self.assertIsNone(answer.error_message)
-            self.assertEqual(
-                answer.usage_json["attempt_marker"],
-                "success-after-failure",
-            )
         finally:
-            release_success.set()
+            release_stale.set()
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -9749,8 +10373,72 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_changed_prompt_discards_stale_answers_and_annotations(self) -> None:
-        run_id = f"test-prompts-{uuid.uuid4()}"
+    async def test_panel_resume_checkpoint_accepts_supported_prompt_versions(
+        self,
+    ) -> None:
+        versions = (PROMPT_SET_VERSION, sorted(LEGACY_PROMPT_SET_VERSIONS)[-1])
+        for prompt_version in versions:
+            with self.subTest(prompt_version=prompt_version):
+                run_id, _items, prompt_ids, _answer_id = (
+                    await self._create_panel_checkpoint(
+                        prompt_version=prompt_version,
+                        answer_status="pending",
+                    )
+                )
+                try:
+                    checkpoint = await _load_panel_resume_checkpoint(run_id)
+                    self.assertIsNotNone(checkpoint)
+                    self.assertEqual(
+                        [prompt.id for prompt in checkpoint or []],
+                        prompt_ids,
+                    )
+                finally:
+                    await self._delete_run(run_id)
+
+    async def test_panel_resume_checkpoint_validates_running_claim_token(
+        self,
+    ) -> None:
+        run_id, _items, _prompt_ids, answer_id = (
+            await self._create_panel_checkpoint(
+                answer_status="running:00000001:0123456789ab"
+            )
+        )
+        try:
+            checkpoint = await _load_panel_resume_checkpoint(run_id)
+            self.assertIsNotNone(checkpoint)
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(ModelAnswer)
+                    .where(ModelAnswer.id == answer_id)
+                    .values(status="running:00000001:not-a-valid-token")
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "answer_status_invalid",
+            ):
+                await _load_panel_resume_checkpoint(run_id)
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_panel_checkpoint_resumes_75_completed_and_6_failed_rows(
+        self,
+    ) -> None:
+        run_id = f"test-panel-81-{uuid.uuid4()}"
+        items = self._checkpoint_prompt_items()
+        panels = tuple(
+            PanelModel(
+                key=f"provider-{index}",
+                label=f"Provider {index}",
+                model=f"test/web-{index}",
+                memory_model=(
+                    f"test/memory-{index}" if index < 4 else None
+                ),
+            )
+            for index in range(5)
+        )
+        completed_snapshot: dict[int, str] = {}
+        failed_ids: list[int] = []
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -9760,74 +10448,404 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     config_json={},
                 )
             )
-            prompt = VisibilityPrompt(
-                run_id=run_id,
-                prompt_key="u-1",
-                intent_class="I",
-                role="unbranded_discovery",
-                text="Старый пользовательский запрос",
-                rationale="Старое основание",
-                sequence=1,
-            )
-            session.add(prompt)
+            prompts: list[VisibilityPrompt] = []
+            for sequence, item in enumerate(items, start=1):
+                prompt = VisibilityPrompt(
+                    run_id=run_id,
+                    prompt_key=str(item["prompt_key"]),
+                    intent_class=str(item["intent_class"]),
+                    role=str(item["role"]),
+                    text=str(item["text"]),
+                    rationale=str(item["rationale"]),
+                    sequence=sequence,
+                )
+                session.add(prompt)
+                prompts.append(prompt)
             await session.flush()
-            answer = ModelAnswer(
-                run_id=run_id,
-                prompt_id=prompt.id,
-                provider_key="openai",
-                model="test/model",
-                mode="web",
-                status="completed",
-                response_text="Ответ на старый запрос",
-            )
-            session.add(answer)
-            await session.flush()
-            old_answer_id = answer.id
             session.add(
-                AnswerAnnotation(
-                    answer_id=answer.id,
-                    annotation_json={"valid": True},
+                RunArtifact(
+                    run_id=run_id,
+                    stage_key="scenario_design",
+                    artifact_key="prompt_set",
+                    status="completed",
+                    prompt_version=PROMPT_SET_VERSION,
+                    output_json={"prompts": copy.deepcopy(items)},
                 )
             )
+            cell_index = 0
+            for mode in ("web", "memory"):
+                for prompt in prompts:
+                    for panel in panels:
+                        model = (
+                            panel.model
+                            if mode == "web"
+                            else panel.memory_model
+                        )
+                        if model is None:
+                            continue
+                        cell_index += 1
+                        is_failed = cell_index <= 6
+                        raw = (
+                            f"Старый failed raw {cell_index}"
+                            if is_failed
+                            else f"Неизменяемый completed raw {cell_index}"
+                        )
+                        answer = ModelAnswer(
+                            run_id=run_id,
+                            prompt_id=prompt.id,
+                            provider_key=panel.key,
+                            model=model,
+                            mode=mode,
+                            status="failed" if is_failed else "completed",
+                            response_text=raw,
+                            citations_json=[{"url": f"https://e/{cell_index}"}],
+                            usage_json={"total_tokens": cell_index},
+                            error_message=("old failure" if is_failed else None),
+                        )
+                        session.add(answer)
+                        await session.flush()
+                        if is_failed:
+                            failed_ids.append(answer.id)
+                        else:
+                            completed_snapshot[answer.id] = json.dumps(
+                                {
+                                    "response_text": answer.response_text,
+                                    "citations_json": answer.citations_json,
+                                    "usage_json": answer.usage_json,
+                                    "model": answer.model,
+                                },
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            )
             await session.commit()
+        self.assertEqual(cell_index, 81)
+        self.assertEqual(len(completed_snapshot), 75)
+        self.assertEqual(len(failed_ids), 6)
+
+        recovered_calls = 0
+
+        async def recovered_result(**_kwargs: object) -> SimpleNamespace:
+            nonlocal recovered_calls
+            recovered_calls += 1
+            return SimpleNamespace(
+                text=f"Восстановленный ответ {recovered_calls}",
+                citations=[],
+                usage={"total_tokens": 100 + recovered_calls},
+                request_policy={"sha256": "policy", "policy": "required"},
+                web_attestation={"metric_eligible": True},
+            )
 
         try:
-            persisted = await _persist_prompts(
-                run_id,
-                {
-                    "prompts": [
-                        {
-                            "prompt_key": "u-1",
-                            "intent_class": "I",
-                            "role": "unbranded_discovery",
-                            "text": "Новый пользовательский запрос",
-                            "rationale": "Новое основание",
-                        }
-                    ]
-                },
-            )
-            self.assertEqual(persisted[0].text, "Новый пользовательский запрос")
+            checkpoint = await _load_panel_resume_checkpoint(run_id)
+            self.assertEqual(len(checkpoint or []), 9)
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=panels,
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=recovered_result,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    checkpoint or [],
+                    mode="web",
+                    start_percent=38,
+                    end_percent=64,
+                )
+                await _run_panel(
+                    run_id,
+                    checkpoint or [],
+                    mode="memory",
+                    start_percent=65,
+                    end_percent=72,
+                )
+            self.assertEqual(panel_chat.await_count, 6)
             async with SessionLocal() as session:
-                answer_count = (
+                answers = list(
+                    (
+                        await session.execute(
+                            select(ModelAnswer).where(
+                                ModelAnswer.run_id == run_id
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                imported_count = (
                     await session.execute(
-                        select(func.count())
-                        .select_from(ModelAnswer)
-                        .where(ModelAnswer.run_id == run_id)
+                        select(func.count(RunArtifact.id)).where(
+                            RunArtifact.run_id == run_id,
+                            RunArtifact.prompt_version
+                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                            RunArtifact.artifact_key.contains(
+                                "panel_attempt_import_",
+                                autoescape=True,
+                            ),
+                        )
                     )
                 ).scalar_one()
+            self.assertEqual(len(answers), 81)
+            self.assertTrue(all(row.status == "completed" for row in answers))
+            self.assertEqual(imported_count, 6)
+            for row in answers:
+                if row.id not in completed_snapshot:
+                    continue
+                self.assertEqual(
+                    json.dumps(
+                        {
+                            "response_text": row.response_text,
+                            "citations_json": row.citations_json,
+                            "usage_json": row.usage_json,
+                            "model": row.model,
+                        },
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ),
+                    completed_snapshot[row.id],
+                )
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_analyze_run_reuses_exact_panel_checkpoint(self) -> None:
+        run_id, _items, prompt_ids, _answer_id = (
+            await self._create_panel_checkpoint(answer_status="pending")
+        )
+        market = AsyncMock()
+        generate = AsyncMock()
+        persist = AsyncMock()
+        panel = AsyncMock()
+        finish = AsyncMock()
+        fail = AsyncMock()
+        semantic_review = AsyncMock()
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer.apply_ua_conditional_block",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._prepare_analysis_foundation",
+                    new=AsyncMock(
+                        return_value=(
+                            {"score": 100},
+                            {"summary": "ok"},
+                            {"brand_name": "Example"},
+                            {"requested_site": {"domain": "example.com"}},
+                        )
+                    ),
+                ),
+                patch("app.services.analyzer._market_research", new=market),
+                patch("app.services.analyzer._generate_prompt_set", new=generate),
+                patch("app.services.analyzer._persist_prompts", new=persist),
+                patch("app.services.analyzer._run_panel", new=panel),
+                patch(
+                    "app.services.analyzer._finish_saved_answer_analysis",
+                    new=finish,
+                ),
+                patch("app.services.analyzer.fail_run", new=fail),
+                patch(
+                    "app.services.analyzer._review_prompt_set_semantics",
+                    new=semantic_review,
+                ),
+            ):
+                await analyze_run(run_id)
+
+            market.assert_not_awaited()
+            generate.assert_not_awaited()
+            persist.assert_not_awaited()
+            semantic_review.assert_not_awaited()
+            self.assertEqual(panel.await_count, 2)
+            self.assertEqual(
+                [prompt.id for prompt in panel.await_args_list[0].args[1]],
+                prompt_ids,
+            )
+            self.assertEqual(panel.await_args_list[0].kwargs["mode"], "web")
+            self.assertEqual(panel.await_args_list[1].kwargs["mode"], "memory")
+            finish.assert_awaited_once()
+            fail.assert_not_awaited()
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_analyze_run_checkpoint_mismatch_fails_before_writes(
+        self,
+    ) -> None:
+        run_id, items, _prompt_ids, answer_id = (
+            await self._create_panel_checkpoint(
+                artifact_mismatch=True,
+                with_annotation=True,
+            )
+        )
+        foundation = AsyncMock()
+        market = AsyncMock()
+        generate = AsyncMock()
+        persist = AsyncMock()
+        panel = AsyncMock()
+        finish = AsyncMock()
+        fail = AsyncMock()
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer.apply_ua_conditional_block",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._prepare_analysis_foundation",
+                    new=foundation,
+                ),
+                patch("app.services.analyzer._market_research", new=market),
+                patch("app.services.analyzer._generate_prompt_set", new=generate),
+                patch("app.services.analyzer._persist_prompts", new=persist),
+                patch("app.services.analyzer._run_panel", new=panel),
+                patch(
+                    "app.services.analyzer._finish_saved_answer_analysis",
+                    new=finish,
+                ),
+                patch("app.services.analyzer.fail_run", new=fail),
+            ):
+                await analyze_run(run_id)
+
+            foundation.assert_not_awaited()
+            market.assert_not_awaited()
+            generate.assert_not_awaited()
+            persist.assert_not_awaited()
+            panel.assert_not_awaited()
+            finish.assert_not_awaited()
+            fail.assert_awaited_once()
+            self.assertIn("проверку целостности", fail.await_args.args[1])
+
+            async with SessionLocal() as session:
+                saved_prompt = (
+                    await session.execute(
+                        select(VisibilityPrompt)
+                        .where(VisibilityPrompt.run_id == run_id)
+                        .order_by(VisibilityPrompt.sequence)
+                    )
+                ).scalars().first()
+                saved_answer = await session.get(ModelAnswer, answer_id)
                 annotation_count = (
                     await session.execute(
                         select(func.count())
                         .select_from(AnswerAnnotation)
-                        .where(AnswerAnnotation.answer_id == old_answer_id)
+                        .where(AnswerAnnotation.answer_id == answer_id)
                     )
                 ).scalar_one()
-            self.assertEqual(answer_count, 0)
-            self.assertEqual(annotation_count, 0)
+            self.assertEqual(saved_prompt.text, items[0]["text"])
+            self.assertEqual(saved_answer.response_text, "Сохранённый raw-ответ")
+            self.assertEqual(annotation_count, 1)
         finally:
+            await self._delete_run(run_id)
+
+    async def test_analyze_run_without_answers_uses_generation_path(self) -> None:
+        run_id = f"test-no-panel-checkpoint-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="example.com",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            await session.commit()
+        prompt_set = {"prompts": self._checkpoint_prompt_items()}
+        market = AsyncMock(return_value={"status": "ready"})
+        generate = AsyncMock(return_value=prompt_set)
+        persist = AsyncMock(return_value=[])
+        panel = AsyncMock()
+        finish = AsyncMock()
+        fail = AsyncMock()
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer.apply_ua_conditional_block",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._prepare_analysis_foundation",
+                    new=AsyncMock(
+                        return_value=(
+                            {"score": 100},
+                            {"summary": "ok"},
+                            {"brand_name": "Example"},
+                            {"requested_site": {"domain": "example.com"}},
+                        )
+                    ),
+                ),
+                patch("app.services.analyzer._market_research", new=market),
+                patch("app.services.analyzer._generate_prompt_set", new=generate),
+                patch("app.services.analyzer._persist_prompts", new=persist),
+                patch("app.services.analyzer._run_panel", new=panel),
+                patch(
+                    "app.services.analyzer._finish_saved_answer_analysis",
+                    new=finish,
+                ),
+                patch("app.services.analyzer.fail_run", new=fail),
+            ):
+                await analyze_run(run_id)
+
+            market.assert_awaited_once()
+            generate.assert_awaited_once()
+            persist.assert_awaited_once_with(run_id, prompt_set)
+            self.assertEqual(panel.await_count, 2)
+            finish.assert_awaited_once()
+            fail.assert_not_awaited()
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_changed_prompt_preserves_panel_answers_and_annotations(
+        self,
+    ) -> None:
+        run_id, items, prompt_ids, answer_id = (
+            await self._create_panel_checkpoint(with_annotation=True)
+        )
+        try:
+            persisted = await _persist_prompts(
+                run_id,
+                {"prompts": copy.deepcopy(items)},
+            )
+            self.assertEqual([prompt.id for prompt in persisted], prompt_ids)
+
+            changed_items = copy.deepcopy(items)
+            changed_items[0]["text"] = "Новый пользовательский запрос"
+            with self.assertRaises(PanelCheckpointMismatchError):
+                await _persist_prompts(run_id, {"prompts": changed_items})
+
             async with SessionLocal() as session:
-                await session.execute(delete(Run).where(Run.id == run_id))
-                await session.commit()
+                saved_prompt = await session.get(VisibilityPrompt, prompt_ids[0])
+                saved_answer = await session.get(ModelAnswer, answer_id)
+                annotation_count = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(AnswerAnnotation)
+                        .where(AnswerAnnotation.answer_id == answer_id)
+                    )
+                ).scalar_one()
+            self.assertEqual(saved_prompt.text, items[0]["text"])
+            self.assertEqual(saved_answer.response_text, "Сохранённый raw-ответ")
+            self.assertEqual(annotation_count, 1)
+        finally:
+            await self._delete_run(run_id)
 
     async def test_run_delete_cascades_through_new_pipeline_tables(self) -> None:
         run_id = f"test-{uuid.uuid4()}"

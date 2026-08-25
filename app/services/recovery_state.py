@@ -17,6 +17,7 @@ from app.services.recovery_orchestrator import (
     ORCHESTRATOR_VERSION,
     OrchestratorContractError,
     plan_recovery,
+    validate_recovery_decision,
 )
 from app.services.run_lease import (
     assert_run_lease,
@@ -54,6 +55,7 @@ class DurableRecoveryPlan:
     reused: bool
     facts_digest: str
     failure_fingerprint: str
+    plan_digest: str
 
 
 def _owned_active_run_exists(run_id: str, owner: str | None):
@@ -102,6 +104,49 @@ def stable_digest(value: object) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def recovery_scope_digest(
+    *,
+    facts: dict[str, Any],
+    allowed_actions: set[str],
+    permitted_answer_ids: set[int] | None = None,
+    permitted_artifact_keys: set[str] | None = None,
+) -> str:
+    """Bind durable reuse to both incident facts and executable scope."""
+
+    return stable_digest(
+        {
+            "orchestrator_version": ORCHESTRATOR_VERSION,
+            "facts": facts,
+            "scope": {
+                "allowed_actions": sorted(allowed_actions),
+                "permitted_answer_ids": sorted(permitted_answer_ids or set()),
+                "permitted_artifact_keys": sorted(
+                    permitted_artifact_keys or set()
+                ),
+            },
+        }
+    )
+
+
+def _assert_plan_integrity(
+    plan: DurableRecoveryPlan,
+    *,
+    stored_decision: object,
+    stored_plan_digest: object,
+) -> None:
+    if not isinstance(stored_decision, dict):
+        raise OrchestratorContractError("Stored recovery plan is not an object")
+    digest = str(stored_plan_digest or "")
+    if (
+        not digest
+        or digest != plan.plan_digest
+        or digest != stable_digest(stored_decision)
+        or digest != stable_digest(plan.decision)
+        or stored_decision != plan.decision
+    ):
+        raise OrchestratorContractError("Stored recovery plan digest mismatch")
 
 
 def recovery_failure_fingerprint(
@@ -172,11 +217,14 @@ async def plan_durable_recovery(
         raise OrchestratorContractError("Pipeline orchestrator is disabled")
     owner = lease_owner_for(run_id)
     await assert_run_lease(run_id)
-    facts_digest = stable_digest(
-        {
-            "orchestrator_version": ORCHESTRATOR_VERSION,
-            "facts": facts,
-        }
+    action_scope = set(allowed_actions)
+    answer_scope = set(permitted_answer_ids or set())
+    artifact_scope = set(permitted_artifact_keys or set())
+    facts_digest = recovery_scope_digest(
+        facts=facts,
+        allowed_actions=action_scope,
+        permitted_answer_ids=answer_scope,
+        permitted_artifact_keys=artifact_scope,
     )
     fingerprint = recovery_failure_fingerprint(
         stage_key=stage_key,
@@ -207,15 +255,34 @@ async def plan_durable_recovery(
             )
         ).scalars().first()
         if reusable is not None and isinstance(reusable.plan_json, dict):
+            stored_decision = dict(reusable.plan_json)
+            stored_plan_digest = str(reusable.plan_digest or "")
+            if (
+                not stored_plan_digest
+                or stored_plan_digest != stable_digest(stored_decision)
+            ):
+                raise OrchestratorContractError(
+                    "Stored recovery plan digest mismatch"
+                )
+            validate_recovery_decision(
+                stored_decision,
+                allowed_actions=action_scope,
+                permitted_answer_ids=answer_scope,
+                permitted_artifact_keys=artifact_scope,
+                prior_decisions=[],
+                incident_fingerprint=fingerprint,
+                incident_facts_digest=facts_digest,
+            )
             await assert_run_lease(run_id)
             return DurableRecoveryPlan(
                 run_id=run_id,
                 epoch_id=reusable.id,
                 epoch=reusable.epoch,
-                decision=dict(reusable.plan_json),
+                decision=stored_decision,
                 reused=True,
                 facts_digest=facts_digest,
                 failure_fingerprint=fingerprint,
+                plan_digest=stored_plan_digest,
             )
 
         # ``planning`` means that the expensive request was reserved and may
@@ -310,9 +377,9 @@ async def plan_durable_recovery(
         }
         planner_input = {
             "incident": incident,
-            "allowed_actions": sorted(allowed_actions),
-            "permitted_answer_ids": sorted(permitted_answer_ids or set()),
-            "permitted_artifact_keys": sorted(permitted_artifact_keys or set()),
+            "allowed_actions": sorted(action_scope),
+            "permitted_answer_ids": sorted(answer_scope),
+            "permitted_artifact_keys": sorted(artifact_scope),
             "planner_attempt": {
                 "started": False,
                 "completed": False,
@@ -410,9 +477,9 @@ async def plan_durable_recovery(
     try:
         result = await plan_recovery(
             incident=incident,
-            allowed_actions=allowed_actions,
-            permitted_answer_ids=permitted_answer_ids,
-            permitted_artifact_keys=permitted_artifact_keys,
+            allowed_actions=action_scope,
+            permitted_answer_ids=answer_scope,
+            permitted_artifact_keys=artifact_scope,
             prior_decisions=history,
         )
     except Exception as exc:
@@ -456,6 +523,11 @@ async def plan_durable_recovery(
     # Re-validate first, then repeat the ownership predicate inside the write.
     await assert_run_lease(run_id)
     plan_digest = stable_digest(result.decision)
+    planner_usage = dict(result.usage)
+    planner_usage["_aiv_orchestrator"] = {
+        "input_digest": result.input_digest,
+        "raw_text": result.raw_text,
+    }
     async with SessionLocal() as session:
         changed = await session.execute(
             update(RecoveryEpoch)
@@ -474,7 +546,7 @@ async def plan_durable_recovery(
                 status="planned",
                 plan_json=result.decision,
                 plan_digest=plan_digest,
-                usage_json=result.usage,
+                usage_json=planner_usage,
                 input_json={
                     **started_input,
                     "planner_attempt": {
@@ -501,6 +573,7 @@ async def plan_durable_recovery(
         reused=False,
         facts_digest=facts_digest,
         failure_fingerprint=fingerprint,
+        plan_digest=plan_digest,
     )
 
 
@@ -526,6 +599,8 @@ async def mark_recovery_executing(plan: DurableRecoveryPlan) -> None:
                 select(
                     RecoveryEpoch.status,
                     RecoveryEpoch.outcome_json,
+                    RecoveryEpoch.plan_json,
+                    RecoveryEpoch.plan_digest,
                 ).where(*base_conditions)
             )
         ).one_or_none()
@@ -536,7 +611,12 @@ async def mark_recovery_executing(plan: DurableRecoveryPlan) -> None:
                 "Recovery epoch lost its durable state",
             )
 
-        current_status, stored_outcome = row
+        current_status, stored_outcome, stored_decision, stored_plan_digest = row
+        _assert_plan_integrity(
+            plan,
+            stored_decision=stored_decision,
+            stored_plan_digest=stored_plan_digest,
+        )
         current_outcome = (
             dict(stored_outcome) if isinstance(stored_outcome, dict) else {}
         )
@@ -675,6 +755,8 @@ async def _mark_recovery_status(
                 select(
                     RecoveryEpoch.status,
                     RecoveryEpoch.outcome_json,
+                    RecoveryEpoch.plan_json,
+                    RecoveryEpoch.plan_digest,
                 ).where(*base_conditions)
             )
         ).one_or_none()
@@ -684,7 +766,12 @@ async def _mark_recovery_status(
                 owner,
                 "Recovery epoch lost its durable state",
             )
-        current_status, stored_outcome = row
+        current_status, stored_outcome, stored_decision, stored_plan_digest = row
+        _assert_plan_integrity(
+            plan,
+            stored_decision=stored_decision,
+            stored_plan_digest=stored_plan_digest,
+        )
         merged_outcome = (
             dict(stored_outcome) if isinstance(stored_outcome, dict) else {}
         )

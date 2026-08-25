@@ -344,6 +344,36 @@ class OpenRouterPolicyRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport["response_id"], "generation-123")
         self.assertIn("max_tokens=20000", str(raised.exception))
 
+    async def test_transport_retries_can_be_disabled_for_expensive_calls(
+        self,
+    ) -> None:
+        client = _FakeClient({"error": {"message": "rate limited"}})
+        with (
+            patch.object(_FakeResponse, "status_code", 429),
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.asyncio.sleep",
+                return_value=None,
+            ) as sleep_mock,
+            self.assertRaises(OpenRouterError),
+        ):
+            await chat(
+                model="anthropic/claude-fable-5",
+                messages=[{"role": "user", "content": "Верни план."}],
+                retry_response_contract_errors=False,
+                retry_transport_errors=False,
+            )
+
+        self.assertEqual(len(client.requests), 1)
+        sleep_mock.assert_not_awaited()
+
     async def test_nonfinal_finish_reasons_fail_closed_with_evidence(
         self,
     ) -> None:

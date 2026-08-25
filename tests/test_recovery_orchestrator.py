@@ -33,6 +33,7 @@ from app.services.recovery_state import (
     mark_recovery_executing,
     plan_durable_recovery,
     recovery_failure_fingerprint,
+    recovery_scope_digest,
     stable_digest,
 )
 from app.services.run_lease import RunLeaseLostError, bind_run_lease
@@ -74,6 +75,35 @@ class RecoveryDecisionContractTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
         self.assertEqual(len(stable_digest({"a": 1})), 64)
+
+    def test_durable_scope_digest_binds_every_executable_boundary(self) -> None:
+        base = recovery_scope_digest(
+            facts={"profile": "same"},
+            allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
+            permitted_answer_ids={41},
+            permitted_artifact_keys={"prompt_set"},
+        )
+        variants = (
+            recovery_scope_digest(
+                facts={"profile": "same"},
+                allowed_actions={ACTION_RETRY_WITH_GUIDANCE},
+                permitted_answer_ids={41},
+                permitted_artifact_keys={"prompt_set"},
+            ),
+            recovery_scope_digest(
+                facts={"profile": "same"},
+                allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
+                permitted_answer_ids={42},
+                permitted_artifact_keys={"prompt_set"},
+            ),
+            recovery_scope_digest(
+                facts={"profile": "same"},
+                allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
+                permitted_answer_ids={41},
+                permitted_artifact_keys={"semantic_review"},
+            ),
+        )
+        self.assertTrue(all(value != base for value in variants))
 
     def test_decision_cannot_touch_unlisted_answers_or_artifacts(self) -> None:
         with self.assertRaises(OrchestratorContractError):
@@ -270,6 +300,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["reasoning_effort"], "high")
         self.assertLessEqual(kwargs["max_tokens"], 4_000)
         self.assertFalse(kwargs["retry_response_contract_errors"])
+        self.assertFalse(kwargs["retry_transport_errors"])
 
     async def test_invalid_model_scope_is_rejected_after_the_call(self) -> None:
         parsed = {
@@ -435,11 +466,9 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             failure_code="prompt_set_non_convergent",
             diagnostics=diagnostics,
         )
-        facts_digest = stable_digest(
-            {
-                "orchestrator_version": ORCHESTRATOR_VERSION,
-                "facts": facts,
-            }
+        facts_digest = recovery_scope_digest(
+            facts=facts,
+            allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
         )
         async with self.SessionLocal() as session:
             prepared = RecoveryEpoch(
@@ -519,6 +548,14 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0].model, ORCHESTRATOR_MODEL)
         self.assertTrue(rows[0].input_json["planner_attempt"]["started"])
         self.assertTrue(rows[0].input_json["planner_attempt"]["completed"])
+        self.assertEqual(
+            rows[0].usage_json["_aiv_orchestrator"]["input_digest"],
+            "input-digest",
+        )
+        self.assertEqual(
+            rows[0].usage_json["_aiv_orchestrator"]["raw_text"],
+            "{}",
+        )
 
     async def test_interrupted_planner_attempt_is_accounted_and_reconciled(self) -> None:
         diagnostics = {"validation_errors": ["x"]}
@@ -529,11 +566,9 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             failure_code="prompt_set_non_convergent",
             diagnostics=diagnostics,
         )
-        facts_digest = stable_digest(
-            {
-                "orchestrator_version": ORCHESTRATOR_VERSION,
-                "facts": facts,
-            }
+        facts_digest = recovery_scope_digest(
+            facts=facts,
+            allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
         )
         async with self.SessionLocal() as session:
             session.add(
@@ -692,6 +727,91 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(epochs[0].plan_json, decision)
         self.assertTrue(epochs[0].outcome_json["succeeded"])
         self.assertEqual(epochs[0].outcome_json["execution_attempts"], 1)
+
+    async def test_reused_plan_is_scope_validated_and_digest_checked(self) -> None:
+        decision = {
+            "action": ACTION_DETERMINISTIC_FALLBACK,
+            "rationale": "Локальные попытки исчерпаны без безопасного результата.",
+            "confidence": "high",
+            "guidance": "",
+            "target_answer_ids": [],
+            "invalidate_artifact_keys": [],
+            "acceptance_checks": [
+                "prompt_contract_valid",
+                "semantic_review_passed",
+            ],
+            "incident_fingerprint": "planner-fingerprint",
+            "orchestrator_version": ORCHESTRATOR_VERSION,
+        }
+        planned = OrchestratorResult(
+            decision=decision,
+            raw_text=json.dumps(decision, ensure_ascii=False),
+            usage={"prompt_tokens": 100},
+            input_digest="input-digest",
+        )
+        kwargs = {
+            "stage_key": "scenario_design",
+            "failure_class": "repairable_semantic",
+            "failure_code": "prompt_set_non_convergent",
+            "diagnostics": {"validation_errors": ["x"]},
+            "facts": {"profile_sha256": "a" * 64},
+            "allowed_actions": {ACTION_DETERMINISTIC_FALLBACK},
+        }
+        with patch(
+            "app.services.recovery_state.plan_recovery",
+            new=AsyncMock(return_value=planned),
+        ) as planner:
+            first = await plan_durable_recovery(self.run_id, **kwargs)
+
+            out_of_scope = {
+                **decision,
+                "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+                "target_answer_ids": [999],
+                "acceptance_checks": ["raw_corpus_unchanged"],
+            }
+            async with self.SessionLocal() as session:
+                await session.execute(
+                    update(RecoveryEpoch)
+                    .where(RecoveryEpoch.id == first.epoch_id)
+                    .values(
+                        plan_json=out_of_scope,
+                        plan_digest=stable_digest(out_of_scope),
+                    )
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                OrchestratorContractError,
+                "not allowed|outside the incident",
+            ):
+                await plan_durable_recovery(self.run_id, **kwargs)
+
+            async with self.SessionLocal() as session:
+                await session.execute(
+                    update(RecoveryEpoch)
+                    .where(RecoveryEpoch.id == first.epoch_id)
+                    .values(
+                        plan_json=decision,
+                        plan_digest=stable_digest(decision),
+                    )
+                )
+                await session.commit()
+            reused = await plan_durable_recovery(self.run_id, **kwargs)
+            self.assertTrue(reused.reused)
+
+            async with self.SessionLocal() as session:
+                await session.execute(
+                    update(RecoveryEpoch)
+                    .where(RecoveryEpoch.id == first.epoch_id)
+                    .values(plan_digest="0" * 64)
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                OrchestratorContractError,
+                "digest mismatch",
+            ):
+                await mark_recovery_executing(reused)
+
+        planner.assert_awaited_once()
 
     async def test_lost_lease_after_planner_cannot_publish_plan(self) -> None:
         decision = {
