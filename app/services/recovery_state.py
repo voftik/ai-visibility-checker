@@ -51,6 +51,7 @@ class DurableRecoveryPlan:
     run_id: str
     epoch_id: int
     epoch: int
+    stage_key: str
     decision: dict[str, Any]
     reused: bool
     facts_digest: str
@@ -207,8 +208,19 @@ async def plan_durable_recovery(
     allowed_actions: set[str],
     permitted_answer_ids: set[int] | None = None,
     permitted_artifact_keys: set[str] | None = None,
+    stage_planner_call_limit: int | None = None,
 ) -> DurableRecoveryPlan:
     """Reserve one epoch, call the planner once, and persist its safe plan."""
+
+    if (
+        stage_planner_call_limit is not None
+        and (
+            not isinstance(stage_planner_call_limit, int)
+            or isinstance(stage_planner_call_limit, bool)
+            or stage_planner_call_limit < 1
+        )
+    ):
+        raise ValueError("stage_planner_call_limit must be a positive integer")
 
     # Disabled means no planner attempt exists at all.  Check before lease/DB
     # reservation so toggling the optional layer off cannot consume the
@@ -278,6 +290,7 @@ async def plan_durable_recovery(
                 run_id=run_id,
                 epoch_id=reusable.id,
                 epoch=reusable.epoch,
+                stage_key=reusable.stage_key,
                 decision=stored_decision,
                 reused=True,
                 facts_digest=facts_digest,
@@ -338,6 +351,26 @@ async def plan_durable_recovery(
             raise RecoveryBudgetExceeded(
                 f"Recovery planner call budget exhausted ({planner_calls}/{limit})"
             )
+        if stage_planner_call_limit is not None:
+            stage_planner_calls = int(
+                (
+                    await session.execute(
+                        select(func.count(RecoveryEpoch.id)).where(
+                            RecoveryEpoch.run_id == run_id,
+                            RecoveryEpoch.stage_key == stage_key,
+                            RecoveryEpoch.model.is_not(None),
+                            RecoveryEpoch.status.in_(
+                                _PLANNER_CALL_STARTED_STATUSES
+                            ),
+                        )
+                    )
+                ).scalar_one()
+            )
+            if stage_planner_calls >= stage_planner_call_limit:
+                raise RecoveryBudgetExceeded(
+                    "Recovery stage planner call budget exhausted "
+                    f"({stage_planner_calls}/{stage_planner_call_limit})"
+                )
         next_epoch = int(
             (
                 await session.execute(
@@ -569,6 +602,7 @@ async def plan_durable_recovery(
         run_id=run_id,
         epoch_id=epoch_id,
         epoch=next_epoch,
+        stage_key=stage_key,
         decision=result.decision,
         reused=False,
         facts_digest=facts_digest,
@@ -577,8 +611,29 @@ async def plan_durable_recovery(
     )
 
 
-async def mark_recovery_executing(plan: DurableRecoveryPlan) -> None:
-    """Reserve one of two durable executions for this exact action."""
+async def mark_recovery_executing(
+    plan: DurableRecoveryPlan,
+    *,
+    stage_execution_limit: int | None = None,
+) -> None:
+    """Reserve a durable execution for this exact action.
+
+    The generic per-epoch budget remains two attempts for restart-tolerant
+    stages.  High-risk callers may additionally set a run+stage budget.  The
+    analysis-critic recovery uses a budget of one: after annotations have been
+    touched once, neither a restarted worker nor a second planner epoch may
+    buy another repair/final-critic cycle.
+    """
+
+    if (
+        stage_execution_limit is not None
+        and (
+            not isinstance(stage_execution_limit, int)
+            or isinstance(stage_execution_limit, bool)
+            or stage_execution_limit < 1
+        )
+    ):
+        raise ValueError("stage_execution_limit must be a positive integer")
 
     owner = lease_owner_for(plan.run_id)
     await assert_run_lease(plan.run_id)
@@ -645,6 +700,71 @@ async def mark_recovery_executing(plan: DurableRecoveryPlan) -> None:
             owner=owner,
         )
 
+        stage_attempts = 0
+        if stage_execution_limit is not None:
+            stage_outcomes = list(
+                (
+                    await session.execute(
+                        select(RecoveryEpoch.outcome_json).where(
+                            *_with_lease_guard(
+                                [
+                                    RecoveryEpoch.run_id == plan.run_id,
+                                    RecoveryEpoch.stage_key == plan.stage_key,
+                                ],
+                                run_id=plan.run_id,
+                                owner=owner,
+                            )
+                        )
+                    )
+                ).scalars()
+            )
+            for outcome in stage_outcomes:
+                raw_stage_attempts = (
+                    outcome.get("execution_attempts", 0)
+                    if isinstance(outcome, dict)
+                    else 0
+                )
+                if (
+                    isinstance(raw_stage_attempts, int)
+                    and not isinstance(raw_stage_attempts, bool)
+                    and raw_stage_attempts > 0
+                ):
+                    stage_attempts += raw_stage_attempts
+
+            if stage_attempts >= stage_execution_limit:
+                blocked_outcome = {
+                    **current_outcome,
+                    "execution_attempts": attempts,
+                    "max_execution_attempts": MAX_RECOVERY_EXECUTION_ATTEMPTS,
+                    "stage_execution_attempts": stage_attempts,
+                    "stage_execution_limit": stage_execution_limit,
+                    "succeeded": False,
+                    "reason": "stage_execution_attempt_budget_exhausted",
+                }
+                changed = await session.execute(
+                    update(RecoveryEpoch)
+                    .where(*optimistic_conditions)
+                    .values(
+                        status="blocked",
+                        outcome_json=blocked_outcome,
+                        error_message=(
+                            "Recovery stage execution budget exhausted "
+                            f"({stage_attempts}/{stage_execution_limit})"
+                        ),
+                    )
+                )
+                await session.commit()
+                if changed.rowcount != 1:
+                    await _raise_for_lost_lease_or_state(
+                        plan.run_id,
+                        owner,
+                        "Recovery epoch changed while enforcing stage budget",
+                    )
+                raise RecoveryBudgetExceeded(
+                    "Recovery stage execution budget exhausted "
+                    f"({stage_attempts}/{stage_execution_limit})"
+                )
+
         if attempts >= MAX_RECOVERY_EXECUTION_ATTEMPTS:
             blocked_outcome = {
                 **current_outcome,
@@ -681,6 +801,14 @@ async def mark_recovery_executing(plan: DurableRecoveryPlan) -> None:
             **current_outcome,
             "execution_attempts": attempts + 1,
             "max_execution_attempts": MAX_RECOVERY_EXECUTION_ATTEMPTS,
+            **(
+                {
+                    "stage_execution_attempts": stage_attempts + 1,
+                    "stage_execution_limit": stage_execution_limit,
+                }
+                if stage_execution_limit is not None
+                else {}
+            ),
         }
         changed = await session.execute(
             update(RecoveryEpoch)

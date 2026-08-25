@@ -33,6 +33,7 @@ from app.models import (
     DomainProbe,
     ModelAnswer,
     ProbeType,
+    RecoveryEpoch,
     ReportIllustration,
     RobotsRule,
     Run,
@@ -60,6 +61,7 @@ from app.services.analysis_critic import (
     CRITIC_PRIMARY_MAX_RAW_ANSWERS,
     CRITIC_PRIMARY_RAW_CHAR_BUDGET,
     CRITIC_VERSION,
+    MAX_CRITIC_RECOVERY_FINAL_REVIEWS,
     MAX_CRITIC_ITERATIONS,
     repair_analysis_review,
     review_analysis,
@@ -81,12 +83,17 @@ from app.services.recovery_orchestrator import (
     ACTION_DETERMINISTIC_FALLBACK,
     ACTION_RETRY_WITH_GUIDANCE,
     ACTION_STOP,
+    ACTION_TARGETED_ANNOTATION_REPAIR,
     CHECK_CHECKPOINT_PRESERVED,
+    CHECK_CRITIC_GATE_PASSED,
+    CHECK_DERIVED_METRICS_RECOMPUTED,
     CHECK_PROMPT_CONTRACT_VALID,
+    CHECK_RAW_CORPUS_UNCHANGED,
     CHECK_SEMANTIC_REVIEW_PASSED,
     OrchestratorContractError,
 )
 from app.services.recovery_state import (
+    DurableRecoveryPlan,
     finish_recovery,
     mark_recovery_executing,
     plan_durable_recovery,
@@ -123,7 +130,7 @@ PANEL_ATTEMPT_AUDIT_VERSION = "aiv-panel-attempt-v1"
 PANEL_ATTEMPT_ARTIFACT_PREFIX = "panel_attempt_"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v8"
-ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v15"
+ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v16"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v18"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
@@ -6211,14 +6218,29 @@ def _annotation_matches_answer(
 ) -> bool:
     """Accept an annotation only when every provenance field is current."""
 
+    stored_input_sha256 = str(
+        annotation.get("_annotation_input_sha256") or ""
+    )
+    repair_provenance = annotation.get("_annotation_repair_provenance")
+    repair_resume_match = bool(
+        isinstance(repair_provenance, dict)
+        and repair_provenance.get("version")
+        == "analysis-critic-targeted-repair-v1"
+        and repair_provenance.get("repair_annotation_input_sha256")
+        == stored_input_sha256
+        and repair_provenance.get("resume_annotation_input_sha256")
+        == annotation_input_sha256
+    )
     return bool(
         answer_text.strip()
         and annotation.get("_annotation_version") == ANNOTATION_VERSION
         and annotation.get("_answer_sha256")
         == hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         and annotation.get("_answer_model") == answer_model
-        and annotation.get("_annotation_input_sha256")
-        == annotation_input_sha256
+        and (
+            stored_input_sha256 == annotation_input_sha256
+            or repair_resume_match
+        )
     )
 
 
@@ -6226,7 +6248,18 @@ async def _unannotated_answers(
     run_id: str,
     *,
     annotation_input_sha256: str,
+    target_answer_ids: set[int] | None = None,
+    answer_char_limit: int = ANSWER_ANALYSIS_CHAR_LIMIT,
+    require_complete_raw: bool = False,
 ) -> list[dict[str, Any]]:
+    answer_conditions: list[Any] = [
+        ModelAnswer.run_id == run_id,
+        ModelAnswer.status == "completed",
+    ]
+    if target_answer_ids is not None:
+        answer_conditions.append(
+            ModelAnswer.id.in_(sorted(target_answer_ids))
+        )
     async with SessionLocal() as session:
         rows = (
             await session.execute(
@@ -6236,10 +6269,7 @@ async def _unannotated_answers(
                     AnswerAnnotation,
                     AnswerAnnotation.answer_id == ModelAnswer.id,
                 )
-                .where(
-                    ModelAnswer.run_id == run_id,
-                    ModelAnswer.status == "completed",
-                )
+                .where(*answer_conditions)
                 .order_by(ModelAnswer.id)
             )
         ).all()
@@ -6249,6 +6279,12 @@ async def _unannotated_answers(
         answer_text = answer.response_text or ""
         if not answer_text.strip():
             continue
+        if require_complete_raw and len(answer_text) > answer_char_limit:
+            raise OpenRouterError(
+                "Targeted annotation recovery cannot inspect a truncated "
+                f"raw answer {answer.id} ({len(answer_text)}/"
+                f"{answer_char_limit} chars)"
+            )
         answer_sha256 = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         stored = annotation.annotation_json if annotation is not None else {}
         if _annotation_matches_answer(
@@ -6264,10 +6300,14 @@ async def _unannotated_answers(
             "system": labels.get(answer.provider_key, answer.provider_key),
             "answer_model": answer.model,
             "answer_sha256": answer_sha256,
+            # Kept out of the provider payload; used only by the targeted
+            # executor for an all-or-nothing compare-and-swap after the paid
+            # request returns.
+            "_prior_annotation_sha256": stable_digest(stored or {}),
             "scenario": prompt.text,
             "scenario_role": prompt.role,
             "intent_class": prompt.intent_class,
-            "answer": answer_text[:ANSWER_ANALYSIS_CHAR_LIMIT],
+            "answer": answer_text[:answer_char_limit],
         })
     return output
 
@@ -6303,6 +6343,118 @@ async def _save_annotations(
             saved += 1
         await session.commit()
     return saved
+
+
+async def _save_targeted_recovery_annotations(
+    run_id: str,
+    annotations: list[dict[str, Any]],
+    pending_by_id: dict[int, dict[str, Any]],
+) -> int:
+    """Persist one targeted batch only if its lease and inputs are unchanged.
+
+    The guarded no-op update obtains SQLite's writer lock before snapshots are
+    checked.  This makes the subsequent annotation updates one atomic CAS:
+    a stale worker, changed raw answer/model, or changed prior annotation
+    causes a rollback and writes none of the batch.
+    """
+
+    expected_ids = set(pending_by_id)
+    by_id = {
+        int(item["answer_id"]): item
+        for item in annotations
+        if isinstance(item, dict)
+        and isinstance(item.get("answer_id"), int)
+        and int(item["answer_id"]) in expected_ids
+    }
+    if set(by_id) != expected_ids:
+        raise OrchestratorContractError(
+            "Targeted annotation repair returned an incomplete answer set"
+        )
+
+    await assert_run_lease(run_id)
+    owner = lease_owner_for(run_id)
+    async with SessionLocal() as session:
+        run_conditions: list[Any] = [Run.id == run_id]
+        if owner is not None:
+            run_conditions.extend(
+                (
+                    Run.execution_slot == 1,
+                    Run.lease_owner == owner,
+                    Run.status.in_(
+                        (
+                            RunStatus.pending,
+                            RunStatus.crawling,
+                            RunStatus.analyzing,
+                        )
+                    ),
+                )
+            )
+        locked = await session.execute(
+            update(Run)
+            .where(*run_conditions)
+            .values(execution_slot=Run.execution_slot)
+        )
+        if locked.rowcount != 1:
+            await session.rollback()
+            if owner is not None:
+                await assert_run_lease(run_id)
+            raise OrchestratorContractError(
+                "Targeted annotation repair lost its run lease"
+            )
+
+        current_rows = (
+            await session.execute(
+                select(ModelAnswer, AnswerAnnotation)
+                .outerjoin(
+                    AnswerAnnotation,
+                    AnswerAnnotation.answer_id == ModelAnswer.id,
+                )
+                .where(
+                    ModelAnswer.run_id == run_id,
+                    ModelAnswer.id.in_(sorted(expected_ids)),
+                )
+                .order_by(ModelAnswer.id)
+            )
+        ).all()
+        if {answer.id for answer, _annotation in current_rows} != expected_ids:
+            await session.rollback()
+            raise OrchestratorContractError(
+                "Targeted annotation repair input rows changed"
+            )
+
+        for answer, annotation in current_rows:
+            answer_id = int(answer.id)
+            snapshot = pending_by_id[answer_id]
+            current_raw = str(answer.response_text or "")
+            current_annotation = (
+                annotation.annotation_json
+                if annotation is not None
+                else {}
+            )
+            unchanged = bool(
+                answer.status == "completed"
+                and current_raw.strip()
+                and answer.model == snapshot.get("answer_model")
+                and hashlib.sha256(
+                    current_raw.encode("utf-8")
+                ).hexdigest()
+                == snapshot.get("answer_sha256")
+                and stable_digest(current_annotation or {})
+                == snapshot.get("_prior_annotation_sha256")
+            )
+            if not unchanged or annotation is None:
+                await session.rollback()
+                raise OrchestratorContractError(
+                    "Targeted annotation repair CAS input changed for "
+                    f"answer_id {answer_id}"
+                )
+
+        for answer, annotation in current_rows:
+            assert annotation is not None
+            annotation.annotation_json = by_id[answer.id]
+            flag_modified(annotation, "annotation_json")
+        await session.commit()
+    return len(expected_ids)
 
 
 def _alias_is_present(answer_text: str, alias: str) -> bool:
@@ -7826,6 +7978,7 @@ _MARKDOWN_OWNER_FIELD = re.compile(
 _MARKDOWN_CARD_FIELD_LABEL = re.compile(
     r"(?:"
     r"почему\s+выигрывает|условия|локация|расположение|"
+    r"особенности|профиль|"
     r"цена|стоимость|срок(?:и)?|формат|уникальный\s+формат|"
     r"площадь|отделка|качество\s+отделки|архитектура|"
     r"инфраструктура|транспорт|преимущества|недостатки|"
@@ -8991,7 +9144,7 @@ def _literal_target_attribution_evidence(
     if not entity_spans or not target_spans:
         return ""
 
-    candidates: set[str] = set()
+    candidates: dict[str, tuple[int, int]] = {}
     text_length = len(answer_text)
     hard_boundaries = ".!?;\n"
     direct_aliases = direct_target_aliases or target_aliases
@@ -9058,11 +9211,35 @@ def _literal_target_attribution_evidence(
                         or len(candidate) > 1200
                     ):
                         continue
-                    candidates.add(candidate)
+                    candidate_offset = answer_text.find(
+                        candidate,
+                        start,
+                        end,
+                    )
+                    if candidate_offset < 0:
+                        continue
+                    candidates.setdefault(
+                        candidate,
+                        (
+                            candidate_offset,
+                            candidate_offset + len(candidate),
+                        ),
+                    )
 
     for candidate in sorted(
         candidates,
-        key=lambda value: (len(value.split()), len(value)),
+        key=lambda value: (
+            # A Markdown owner heading is evidence only as a complete raw
+            # line.  Sentence-boundary extraction used to trim ``1. `` from
+            # numbered cards and made a syntactically different fragment win
+            # merely because it was shorter.
+            0
+            if candidates[value][0] == 0
+            or answer_text[candidates[value][0] - 1] == "\n"
+            else 1,
+            len(value.split()),
+            len(value),
+        ),
     ):
         if _has_explicit_target_attribution(
             candidate,
@@ -9206,6 +9383,7 @@ def _reconcile_annotation(
     catalog: dict[str, Any],
     *,
     annotation_input_sha256: str = "",
+    annotation_repair_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Enforce literal entity evidence before deterministic metrics are computed."""
 
@@ -9635,6 +9813,11 @@ def _reconcile_annotation(
     reconciled["_answer_sha256"] = str(pending_answer.get("answer_sha256") or "")
     reconciled["_answer_model"] = str(pending_answer.get("answer_model") or "")
     reconciled["_annotation_input_sha256"] = annotation_input_sha256
+    reconciled.pop("_annotation_repair_provenance", None)
+    if annotation_repair_provenance is not None:
+        reconciled["_annotation_repair_provenance"] = copy.deepcopy(
+            annotation_repair_provenance
+        )
     reconciled["_reconciliation_notes"] = reconciliation_notes
     return reconciled
 
@@ -9643,6 +9826,8 @@ def _annotation_context_sha256(
     profile: dict[str, Any],
     catalog: dict[str, Any],
     research_guidance: str = "",
+    *,
+    repair_mode: str = "",
 ) -> str:
     context = {
         "brand_name": profile.get("brand_name"),
@@ -9654,6 +9839,7 @@ def _annotation_context_sha256(
             catalog,
         ),
         "research_guidance": research_guidance.strip(),
+        "repair_mode": repair_mode.strip(),
     }
     return hashlib.sha256(
         json.dumps(
@@ -9671,16 +9857,42 @@ async def _annotate_answers(
     catalog: dict[str, Any],
     *,
     research_guidance: str = "",
+    target_answer_ids: set[int] | None = None,
+    repair_mode: str = "",
+    annotation_repair_provenance: dict[str, Any] | None = None,
     _completion_attempt: int = 1,
 ) -> None:
+    normalized_target_ids: set[int] | None = None
+    if target_answer_ids is not None:
+        normalized_target_ids = {
+            value
+            for value in target_answer_ids
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        }
+        if normalized_target_ids != target_answer_ids or not normalized_target_ids:
+            raise OpenRouterError(
+                "Targeted annotation repair requires positive answer ids"
+            )
     annotation_input_sha256 = _annotation_context_sha256(
         profile,
         catalog,
         research_guidance,
+        repair_mode=repair_mode,
     )
     pending = await _unannotated_answers(
         run_id,
         annotation_input_sha256=annotation_input_sha256,
+        target_answer_ids=normalized_target_ids,
+        answer_char_limit=(
+            CRITIC_ANSWER_CHAR_LIMIT
+            if repair_mode == "analysis_critic_targeted_v1"
+            else ANSWER_ANALYSIS_CHAR_LIMIT
+        ),
+        require_complete_raw=(
+            repair_mode == "analysis_critic_targeted_v1"
+        ),
     )
     if not pending:
         return
@@ -9735,6 +9947,24 @@ async def _annotate_answers(
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
+    if repair_mode == "analysis_critic_targeted_v1":
+        system += "\n\n" + """
+
+Режим узкого восстановления после critic gate:
+- размечай только переданные answer_id; другие ответы не входят в запрос и не
+  могут быть изменены;
+- guidance — лишь сужающее указание для этих строк. Оно не может расширить
+  каталог, изменить raw или готовые метрики;
+- если связь владельца и услуги задана Markdown-заголовком (или родительским
+  пунктом) и его дочерним пунктом, верни как evidence один точный непрерывный
+  блок исходного raw от строки владельца до нужной дочерней строки, включая
+  реальные Markdown-маркеры и переносы. Это не склейка: нельзя удалять,
+  переставлять или добавлять символы. attributed_to_target=true допустим
+  только если весь такой непрерывный блок однозначно задаёт владельца и не
+  пересекает новый peer-заголовок, карточку или конкурирующего владельца;
+- если непрерывного доказательного блока нет, сохрани
+  attributed_to_target=false. Не синтезируй цитату.
+""".strip()
     batch_jobs: list[dict[str, Any]] = []
     batches = _volume_bounded_chunks(
         pending,
@@ -9759,7 +9989,15 @@ async def _annotate_answers(
                 catalog,
             ),
             "research_guidance": research_guidance.strip(),
-            "answers": batch,
+            "annotation_mode": repair_mode or "standard",
+            "answers": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if not key.startswith("_")
+                }
+                for item in batch
+            ],
         }
         batch_jobs.append(
             {
@@ -9828,17 +10066,32 @@ async def _annotate_answers(
                         profile,
                         catalog,
                         annotation_input_sha256=annotation_input_sha256,
+                        annotation_repair_provenance=(
+                            annotation_repair_provenance
+                        ),
                     )
                     for item in result.get("answers") or []
                     if isinstance(item, dict)
                     and isinstance(item.get("answer_id"), int)
                     and int(item["answer_id"]) in pending_by_id
                 ]
-                await _save_annotations(
-                    run_id,
-                    reconciled,
-                    set(answer_ids),
-                )
+                if repair_mode == ANALYSIS_CRITIC_TARGETED_REPAIR_MODE:
+                    # The provider call may outlive the worker lease.  Check
+                    # once immediately after it, then persist under an atomic
+                    # raw/model/prior-annotation CAS in the same DB write
+                    # transaction.
+                    await assert_run_lease(run_id)
+                    await _save_targeted_recovery_annotations(
+                        run_id,
+                        reconciled,
+                        pending_by_id,
+                    )
+                else:
+                    await _save_annotations(
+                        run_id,
+                        reconciled,
+                        set(answer_ids),
+                    )
             processed += len(batch)
             ratio = processed / total
             await update_progress(
@@ -9858,6 +10111,14 @@ async def _annotate_answers(
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async with SessionLocal() as session:
+        completion_conditions: list[Any] = [
+            ModelAnswer.run_id == run_id,
+            ModelAnswer.status == "completed",
+        ]
+        if normalized_target_ids is not None:
+            completion_conditions.append(
+                ModelAnswer.id.in_(sorted(normalized_target_ids))
+            )
         completed_rows = (
             await session.execute(
                 select(ModelAnswer, AnswerAnnotation)
@@ -9865,10 +10126,7 @@ async def _annotate_answers(
                     AnswerAnnotation,
                     AnswerAnnotation.answer_id == ModelAnswer.id,
                 )
-                .where(
-                    ModelAnswer.run_id == run_id,
-                    ModelAnswer.status == "completed",
-                )
+                .where(*completion_conditions)
             )
         ).all()
     eligible_rows = [
@@ -9896,6 +10154,9 @@ async def _annotate_answers(
             profile,
             catalog,
             research_guidance=research_guidance,
+            target_answer_ids=normalized_target_ids,
+            repair_mode=repair_mode,
+            annotation_repair_provenance=annotation_repair_provenance,
             _completion_attempt=_completion_attempt + 1,
         )
         return
@@ -10212,6 +10473,7 @@ async def _metric_rows(
     run_id: str,
     *,
     annotation_input_sha256: str,
+    annotation_input_sha256_by_answer_id: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     legacy_contract = await _legacy_panel_run_contract(run_id)
     async with SessionLocal() as session:
@@ -10230,6 +10492,14 @@ async def _metric_rows(
     for answer, prompt, annotation in rows:
         answer_text = answer.response_text or ""
         stored = annotation.annotation_json if annotation is not None else {}
+        expected_annotation_sha256 = (
+            annotation_input_sha256_by_answer_id.get(
+                answer.id,
+                annotation_input_sha256,
+            )
+            if annotation_input_sha256_by_answer_id is not None
+            else annotation_input_sha256
+        )
         web_attested, web_attestation_reason = _panel_answer_attestation(
             answer,
             prompt_text=prompt.text,
@@ -10242,7 +10512,7 @@ async def _metric_rows(
                 stored or {},
                 answer_text=answer_text,
                 answer_model=answer.model,
-                annotation_input_sha256=annotation_input_sha256,
+                annotation_input_sha256=expected_annotation_sha256,
             )
         )
         metric_access = _panel_metric_access(
@@ -11610,6 +11880,8 @@ def _critic_raw_sample_class(row: dict[str, Any]) -> str:
 def _critic_selected_raw_answer_ids(
     rows: list[dict[str, Any]],
     warnings: list[dict[str, Any]],
+    *,
+    mandatory_raw_answer_ids: set[int] | None = None,
 ) -> tuple[set[int], dict[str, Any]]:
     """Select diverse raw evidence under one deterministic global budget.
 
@@ -11624,6 +11896,48 @@ def _critic_selected_raw_answer_ids(
         for row in rows
         if isinstance(row.get("answer_id"), int)
     }
+    mandatory_ids = set(mandatory_raw_answer_ids or set())
+    if any(
+        not isinstance(answer_id, int) or isinstance(answer_id, bool)
+        for answer_id in mandatory_ids
+    ):
+        raise OrchestratorContractError(
+            "Mandatory critic raw answer ids must be integers"
+        )
+    missing_mandatory_ids = sorted(mandatory_ids - rows_by_id.keys())
+    oversized_mandatory_ids = sorted(
+        answer_id
+        for answer_id in mandatory_ids & rows_by_id.keys()
+        if len(str(rows_by_id[answer_id].get("answer_text") or ""))
+        > CRITIC_ANSWER_CHAR_LIMIT
+    )
+    empty_mandatory_ids = sorted(
+        answer_id
+        for answer_id in mandatory_ids & rows_by_id.keys()
+        if not str(rows_by_id[answer_id].get("answer_text") or "").strip()
+    )
+    mandatory_chars = sum(
+        len(str(rows_by_id[answer_id].get("answer_text") or ""))
+        for answer_id in mandatory_ids & rows_by_id.keys()
+    )
+    if (
+        missing_mandatory_ids
+        or oversized_mandatory_ids
+        or empty_mandatory_ids
+        or len(mandatory_ids) > CRITIC_PRIMARY_MAX_RAW_ANSWERS
+        or mandatory_chars > CRITIC_PRIMARY_RAW_CHAR_BUDGET
+    ):
+        raise OrchestratorContractError(
+            "Mandatory final-critic raw evidence does not fit the exact "
+            "primary budget: "
+            f"missing={missing_mandatory_ids}, "
+            f"oversized={oversized_mandatory_ids}, "
+            f"empty={empty_mandatory_ids}, "
+            f"count={len(mandatory_ids)}/"
+            f"{CRITIC_PRIMARY_MAX_RAW_ANSWERS}, "
+            f"chars={mandatory_chars}/"
+            f"{CRITIC_PRIMARY_RAW_CHAR_BUDGET}"
+        )
     referenced_warning_ids = {
         int(answer_id)
         for warning in warnings
@@ -11633,7 +11947,10 @@ def _critic_selected_raw_answer_ids(
     }
     warning_ids = referenced_warning_ids & rows_by_id.keys()
     missing_warning_ids = sorted(referenced_warning_ids - rows_by_id.keys())
-    priority_ids: list[int] = sorted(warning_ids)
+    priority_ids: list[int] = [
+        *sorted(mandatory_ids),
+        *sorted(warning_ids - mandatory_ids),
+    ]
     labels_to_keys = {model.label: model.key for model in panel_models()}
     leakage_provider_keys = {
         labels_to_keys.get(str(provider))
@@ -11740,6 +12057,12 @@ def _critic_selected_raw_answer_ids(
         selected_chars += raw_chars
 
     omitted_warning_ids = sorted(warning_ids - selected)
+    omitted_mandatory_ids = sorted(mandatory_ids - selected)
+    if omitted_mandatory_ids:
+        raise OrchestratorContractError(
+            "Mandatory final-critic raw evidence was omitted: "
+            + ", ".join(str(value) for value in omitted_mandatory_ids)
+        )
     selected_classes = Counter(
         _critic_raw_sample_class(rows_by_id[answer_id])
         for answer_id in selected
@@ -11754,6 +12077,8 @@ def _critic_selected_raw_answer_ids(
             for sample_class in class_order
         },
         "warning_answer_ids": sorted(warning_ids),
+        "mandatory_answer_ids": sorted(mandatory_ids),
+        "omitted_mandatory_answer_ids": omitted_mandatory_ids,
         "omitted_warning_answer_ids": omitted_warning_ids,
         "missing_warning_answer_ids": missing_warning_ids,
         "insufficient_warning_evidence_requires_block": bool(
@@ -11769,6 +12094,7 @@ def _critic_payload(
     rows: list[dict[str, Any]],
     metrics: dict[str, Any],
     policy_history: list[dict[str, Any]],
+    mandatory_raw_answer_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     scoped_catalog = _scope_entity_catalog_to_profile(catalog, profile)
     deterministic_warnings = [
@@ -11782,6 +12108,7 @@ def _critic_payload(
     raw_answer_ids, raw_selection = _critic_selected_raw_answer_ids(
         rows,
         deterministic_warnings,
+        mandatory_raw_answer_ids=mandatory_raw_answer_ids,
     )
     omitted_warning_ids = set(
         raw_selection.get("omitted_warning_answer_ids") or []
@@ -12582,6 +12909,7 @@ async def _analysis_critic_repair_artifact(
     payload: dict[str, Any],
     incomplete_review: dict[str, Any],
     validation_errors: list[str],
+    recovery_final: bool = False,
 ) -> dict[str, Any]:
     """Persist one bounded schema/semantics repair of a critic decision."""
 
@@ -12590,6 +12918,7 @@ async def _analysis_critic_repair_artifact(
         "audit_payload": payload,
         "incomplete_review": incomplete_review,
         "validation_errors": validation_errors,
+        "recovery_final": recovery_final,
     }
     cached = await _artifact_output(
         run_id,
@@ -12635,6 +12964,7 @@ async def _analysis_critic_repair_artifact(
             incomplete_review,
             iteration=iteration,
             validation_errors=validation_errors,
+            recovery_final=recovery_final,
         )
         errors = _critic_review_validation_errors(
             repaired,
@@ -12693,6 +13023,7 @@ async def _analysis_critic_artifact(
     *,
     iteration: int,
     payload: dict[str, Any],
+    recovery_final: bool = False,
 ) -> dict[str, Any]:
     artifact_key = f"analysis_critic_r{iteration}"
     cached = await _artifact_output(
@@ -12709,12 +13040,18 @@ async def _analysis_critic_artifact(
             payload=payload,
         )
         if errors:
+            if recovery_final:
+                raise OpenRouterError(
+                    "Cached final recovery critic decision is inconsistent: "
+                    + "; ".join(errors)
+                )
             return await _analysis_critic_repair_artifact(
                 run_id,
                 iteration=iteration,
                 payload=payload,
                 incomplete_review=cached,
                 validation_errors=errors,
+                recovery_final=recovery_final,
             )
         return cached
 
@@ -12734,12 +13071,21 @@ async def _analysis_critic_artifact(
         review, raw_text, usage = await review_analysis(
             payload,
             iteration=iteration,
+            recovery_final=recovery_final,
         )
         errors = _critic_review_validation_errors(
             review,
             payload=payload,
         )
         if errors:
+            if recovery_final:
+                # Round 3 accepts only the complete primary decision.
+                # Transport, schema and semantic repairs are all forbidden:
+                # any rewrite could promote revise/block to pass.
+                raise OpenRouterError(
+                    "Final recovery critic primary decision is inconsistent: "
+                    + "; ".join(errors)
+                )
             prior_attempts = (
                 usage.get("_aiv_critic_attempts")
                 if isinstance(usage, dict)
@@ -12767,6 +13113,7 @@ async def _analysis_critic_artifact(
                     payload=payload,
                     incomplete_review=review,
                     validation_errors=errors,
+                    recovery_final=recovery_final,
                 )
         final_errors = _critic_review_validation_errors(
             review,
@@ -13053,6 +13400,1341 @@ async def _save_critic_gate(
     return output
 
 
+ANALYSIS_CRITIC_RECOVERY_STAGE = "analysis_critic"
+ANALYSIS_CRITIC_TARGETED_REPAIR_MODE = "analysis_critic_targeted_v1"
+ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS = 10
+
+
+class _AnalysisCriticRecoveryBlocked(OpenRouterError):
+    """A terminal targeted recovery failure already persisted its gate."""
+
+
+def _critic_issue_answer_ids(
+    review: dict[str, Any],
+    *,
+    valid_answer_ids: set[int],
+) -> set[int]:
+    """Return only rows that the validated critic tied to repairable work."""
+
+    issue_ids: set[int] = set()
+    for anomaly in review.get("anomalies") or []:
+        if (
+            not isinstance(anomaly, dict)
+            or anomaly.get("severity") not in {"critical", "important"}
+        ):
+            continue
+        issue_ids.update(
+            value
+            for value in anomaly.get("answer_ids") or []
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+        )
+    # A real bounded revise may carry the concrete repair rows primarily in
+    # validated policy_adjustments.  They are part of the critic contract and
+    # therefore safe to use as scope, unlike IDs inferred from prose.
+    for adjustment in review.get("policy_adjustments") or []:
+        if not isinstance(adjustment, dict):
+            continue
+        issue_ids.update(
+            value
+            for value in adjustment.get("answer_ids") or []
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+        )
+    return issue_ids & valid_answer_ids
+
+
+def _raw_corpus_digest(rows: list[dict[str, Any]]) -> str:
+    return stable_digest(
+        [
+            {
+                "answer_id": row.get("answer_id"),
+                "raw_answer_sha256": hashlib.sha256(
+                    str(row.get("answer_text") or "").encode("utf-8")
+                ).hexdigest(),
+            }
+            for row in sorted(
+                rows,
+                key=lambda value: int(value.get("answer_id") or 0),
+            )
+        ]
+    )
+
+
+def _critic_analysis_state_digest(
+    rows: list[dict[str, Any]],
+    metrics: dict[str, Any],
+) -> str:
+    return stable_digest(
+        {
+            "annotations": [
+                {
+                    "answer_id": row.get("answer_id"),
+                    "annotation": row.get("annotation") or {},
+                }
+                for row in sorted(
+                    rows,
+                    key=lambda value: int(value.get("answer_id") or 0),
+                )
+            ],
+            "metrics": metrics,
+        }
+    )
+
+
+def _current_annotation_input_digests(
+    rows: list[dict[str, Any]],
+) -> dict[int, str]:
+    """Return provenance only for eligible completed corpus cells.
+
+    Failed, empty and otherwise ineligible panel cells are part of the final
+    corpus manifest, but by definition have no annotation artifact.  Requiring
+    a digest for them would make any partially failed (yet analysable) panel
+    impossible to repair.
+    """
+
+    digests: dict[int, str] = {}
+    for row in rows:
+        if (
+            row.get("status") != "completed"
+            or not str(row.get("answer_text") or "").strip()
+            or row.get("annotation_state") != "current"
+        ):
+            continue
+        answer_id = row.get("answer_id")
+        annotation = row.get("annotation")
+        annotation_digest = (
+            str(annotation.get("_annotation_input_sha256") or "")
+            if isinstance(annotation, dict)
+            else ""
+        )
+        if not isinstance(answer_id, int) or not annotation_digest:
+            raise OrchestratorContractError(
+                "Targeted recovery requires current annotation provenance"
+            )
+        digests[answer_id] = annotation_digest
+    return digests
+
+
+async def _terminal_analysis_critic_recovery_reason(
+    run_id: str,
+    *,
+    state_digest: str,
+) -> str | None:
+    """Return a prior terminal failure for this exact post-repair state.
+
+    This guard runs before r1.  It prevents a restart from spending two normal
+    critic calls and another recovery attempt on annotations that already
+    failed the one allowed independent final gate.
+    """
+
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.stage_key
+                        == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                        RecoveryEpoch.status.in_(
+                            ("failed", "no_progress", "blocked")
+                        ),
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for row in rows:
+        outcome = row.outcome_json or {}
+        details = (
+            outcome.get("details")
+            if isinstance(outcome, dict)
+            else None
+        )
+        if not isinstance(details, dict):
+            continue
+        if (
+            details.get("terminal_analysis_state_digest") == state_digest
+            and details.get("terminal_analysis_critic_block") is True
+        ):
+            return str(
+                details.get("error")
+                or row.error_message
+                or "Финальная проверка восстановления ранее не пройдена."
+            )[:2000]
+    return None
+
+
+async def _successful_analysis_critic_recovery_gate(
+    run_id: str,
+    *,
+    state_digest: str,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    expected_corpus_cells: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Reuse only an exact durable r3 pass for the current recovered state."""
+
+    async with SessionLocal() as session:
+        epochs = list(
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.stage_key
+                        == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                        RecoveryEpoch.status == "succeeded",
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == "analysis_critic_gate",
+                    RunArtifact.status == "completed",
+                    RunArtifact.model == CRITIC_MODEL,
+                    RunArtifact.prompt_version == ANALYSIS_CRITIC_VERSION,
+                )
+            )
+        ).scalar_one_or_none()
+        primary_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key
+                    == (
+                        "analysis_critic_r"
+                        + str(
+                            MAX_CRITIC_ITERATIONS
+                            + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+                        )
+                    ),
+                )
+            )
+        ).scalar_one_or_none()
+    if (
+        artifact is None
+        or not isinstance(artifact.output_json, dict)
+        or primary_artifact is None
+    ):
+        return None
+    gate = dict(artifact.output_json)
+    if (
+        gate.get("passed") is not True
+        or gate.get("iteration")
+        != MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+        or gate.get("critic_model") != CRITIC_MODEL
+    ):
+        return None
+
+    policy_history = gate.get("policy_history")
+    if not isinstance(policy_history, list):
+        return None
+
+    matching_epoch: RecoveryEpoch | None = None
+    for epoch in epochs:
+        outcome = epoch.outcome_json or {}
+        details = (
+            outcome.get("details")
+            if isinstance(outcome, dict)
+            else None
+        )
+        plan_json = epoch.plan_json
+        if (
+            not isinstance(plan_json, dict)
+            or plan_json.get("action")
+            != ACTION_TARGETED_ANNOTATION_REPAIR
+            or epoch.plan_digest != stable_digest(plan_json)
+        ):
+            continue
+        planned_ids = {
+            value
+            for value in plan_json.get("target_answer_ids") or []
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        recovery_steps = [
+            step
+            for step in policy_history
+            if isinstance(step, dict)
+            and step.get("kind")
+            == "orchestrated_targeted_annotation_repair"
+        ]
+        if not recovery_steps:
+            continue
+        recovery_step = recovery_steps[-1]
+        if (
+            recovery_step.get("orchestrator_epoch") != epoch.epoch
+            or set(recovery_step.get("target_answer_ids") or [])
+            != planned_ids
+        ):
+            continue
+        repaired_rows = {
+            int(row["answer_id"]): row
+            for row in rows
+            if row.get("answer_id") in planned_ids
+        }
+        if set(repaired_rows) != planned_ids:
+            continue
+        if any(
+            not isinstance(row.get("annotation"), dict)
+            or not isinstance(
+                row["annotation"].get("_annotation_repair_provenance"),
+                dict,
+            )
+            or row["annotation"]["_annotation_repair_provenance"].get(
+                "orchestrator_epoch"
+            )
+            != epoch.epoch
+            or row["annotation"]["_annotation_repair_provenance"].get(
+                "orchestrator_plan_digest"
+            )
+            != epoch.plan_digest
+            for row in repaired_rows.values()
+        ):
+            continue
+
+        if (
+            isinstance(details, dict)
+            and outcome.get("succeeded") is True
+            and outcome.get("after_digest") == state_digest
+            and details.get("successful_analysis_state_digest")
+            == state_digest
+            and details.get("successful_gate_sha256")
+            == stable_digest(gate)
+        ):
+            matching_epoch = epoch
+            break
+    if matching_epoch is None:
+        return None
+    provenance = _critic_provenance_digests(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        metrics=metrics,
+        policy_history=policy_history,
+    )
+    corpus_manifest = _final_corpus_manifest(
+        rows,
+        expected_cells=(
+            expected_corpus_cells
+            if expected_corpus_cells is not None
+            else _expected_corpus_cells_from_rows(rows)
+        ),
+    )
+    artifact_input = (
+        artifact.input_json
+        if isinstance(artifact.input_json, dict)
+        else {}
+    )
+    recovery_step = next(
+        (
+            step
+            for step in reversed(policy_history)
+            if isinstance(step, dict)
+            and step.get("kind")
+            == "orchestrated_targeted_annotation_repair"
+        ),
+        None,
+    )
+    if not isinstance(recovery_step, dict):
+        return None
+    final_payload = _critic_payload(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        metrics=metrics,
+        policy_history=policy_history,
+        mandatory_raw_answer_ids=set(
+            matching_epoch.plan_json.get("target_answer_ids") or []
+        ),
+    )
+    final_payload["orchestrated_recovery"] = {
+        "epoch": matching_epoch.epoch,
+        "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+        "target_answer_ids": sorted(
+            matching_epoch.plan_json.get("target_answer_ids") or []
+        ),
+        "raw_corpus_sha256": _raw_corpus_digest(rows),
+        "required_acceptance_checks": sorted(
+            {
+                CHECK_RAW_CORPUS_UNCHANGED,
+                CHECK_DERIVED_METRICS_RECOMPUTED,
+                CHECK_CRITIC_GATE_PASSED,
+            }
+        ),
+    }
+    if not _artifact_cache_matches(
+        primary_artifact,
+        input_json=final_payload,
+        model=CRITIC_MODEL,
+        prompt_version=ANALYSIS_CRITIC_VERSION,
+        require_validated_critic_usage=True,
+    ):
+        return None
+    primary_review = primary_artifact.output_json
+    if not isinstance(primary_review, dict):
+        return None
+    primary_fallback = primary_review.get("fallback")
+    if (
+        primary_review.get("verdict") != "pass"
+        or (isinstance(primary_fallback, dict) and primary_fallback.get("kind"))
+        or _critic_review_validation_errors(
+            primary_review,
+            payload=final_payload,
+        )
+    ):
+        return None
+    if (
+        gate.get("provenance") != provenance
+        or gate.get("metrics_sha256") != provenance["metrics_sha256"]
+        or gate.get("corpus_manifest") != corpus_manifest
+        or artifact_input.get("provenance") != provenance
+        or artifact_input.get("corpus_manifest_digest")
+        != corpus_manifest["digest"]
+        or artifact_input.get("iteration") != gate.get("iteration")
+    ):
+        return None
+    return copy.deepcopy(gate)
+
+
+async def _resume_executing_analysis_critic_recovery(
+    run_id: str,
+    *,
+    state_digest: str,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    expected_corpus_cells: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Resume only the final gate after an exact targeted-repair checkpoint.
+
+    ``mark_recovery_executing`` already consumed the stage's sole execution
+    attempt before annotation.  Therefore a restart must never enter ordinary
+    r1/r2 or write the repaired annotations a second time.  A missing r3
+    artifact means no final critic POST was reserved and permits exactly one;
+    a running/failed/mismatched artifact is ambiguous and fails closed.
+    """
+
+    async with SessionLocal() as session:
+        epoch = (
+            await session.execute(
+                select(RecoveryEpoch)
+                .where(
+                    RecoveryEpoch.run_id == run_id,
+                    RecoveryEpoch.stage_key
+                    == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                    RecoveryEpoch.status == "executing",
+                )
+                .order_by(RecoveryEpoch.epoch.desc())
+            )
+        ).scalars().first()
+        final_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key
+                    == (
+                        "analysis_critic_r"
+                        + str(
+                            MAX_CRITIC_ITERATIONS
+                            + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+                        )
+                    ),
+                )
+            )
+        ).scalar_one_or_none()
+        gate_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == "analysis_critic_gate",
+                )
+            )
+        ).scalar_one_or_none()
+    if epoch is None:
+        return None
+
+    plan_json = epoch.plan_json
+    if (
+        not isinstance(plan_json, dict)
+        or plan_json.get("action")
+        != ACTION_TARGETED_ANNOTATION_REPAIR
+        or epoch.plan_digest != stable_digest(plan_json)
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery has an invalid durable plan"
+        )
+    target_answer_ids = {
+        value
+        for value in plan_json.get("target_answer_ids") or []
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+    if not target_answer_ids:
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery has no targeted answer ids"
+        )
+    outcome = epoch.outcome_json or {}
+    if (
+        not isinstance(outcome, dict)
+        or outcome.get("execution_attempts") != 1
+        or outcome.get("stage_execution_attempts") != 1
+        or outcome.get("stage_execution_limit") != 1
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery has no exact single-attempt reservation"
+        )
+    incident = (
+        epoch.input_json.get("incident")
+        if isinstance(epoch.input_json, dict)
+        else None
+    )
+    facts = (
+        incident.get("facts") if isinstance(incident, dict) else None
+    )
+    if not isinstance(facts, dict):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery is missing immutable facts"
+        )
+    before_digest = str(facts.get("analysis_state_sha256") or "")
+    raw_digest = _raw_corpus_digest(rows)
+    if (
+        not before_digest
+        or before_digest == state_digest
+        or facts.get("raw_corpus_sha256") != raw_digest
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery does not match the current state"
+        )
+
+    repaired_rows = {
+        int(row["answer_id"]): row
+        for row in rows
+        if row.get("answer_id") in target_answer_ids
+    }
+    if set(repaired_rows) != target_answer_ids:
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery target rows are incomplete"
+        )
+    policy_steps: list[dict[str, Any]] = []
+    for row in repaired_rows.values():
+        annotation = row.get("annotation")
+        provenance = (
+            annotation.get("_annotation_repair_provenance")
+            if isinstance(annotation, dict)
+            else None
+        )
+        if (
+            not isinstance(provenance, dict)
+            or provenance.get("orchestrator_epoch") != epoch.epoch
+            or provenance.get("orchestrator_plan_digest")
+            != epoch.plan_digest
+            or set(provenance.get("target_answer_ids") or [])
+            != target_answer_ids
+            or not isinstance(
+                provenance.get("recovery_policy_step"),
+                dict,
+            )
+        ):
+            raise _AnalysisCriticRecoveryBlocked(
+                "Executing recovery annotation provenance is not exact"
+            )
+        policy_steps.append(
+            copy.deepcopy(provenance["recovery_policy_step"])
+        )
+    recovery_policy_step = policy_steps[0]
+    if (
+        any(step != recovery_policy_step for step in policy_steps[1:])
+        or recovery_policy_step.get("kind")
+        != "orchestrated_targeted_annotation_repair"
+        or recovery_policy_step.get("orchestrator_epoch") != epoch.epoch
+        or set(recovery_policy_step.get("target_answer_ids") or [])
+        != target_answer_ids
+        or recovery_policy_step.get("raw_corpus_sha256") != raw_digest
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery checkpoint has inconsistent policy context"
+        )
+    prior_policy_history = facts.get("prior_policy_history")
+    if not isinstance(prior_policy_history, list):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery checkpoint has no prior policy history"
+        )
+    policy_history = [
+        *copy.deepcopy(prior_policy_history),
+        recovery_policy_step,
+    ]
+    final_iteration = (
+        MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+    )
+    final_payload = _critic_payload(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        metrics=metrics,
+        policy_history=policy_history,
+        mandatory_raw_answer_ids=target_answer_ids,
+    )
+    required_checks = {
+        CHECK_RAW_CORPUS_UNCHANGED,
+        CHECK_DERIVED_METRICS_RECOMPUTED,
+        CHECK_CRITIC_GATE_PASSED,
+    }
+    final_payload["orchestrated_recovery"] = {
+        "epoch": epoch.epoch,
+        "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+        "target_answer_ids": sorted(target_answer_ids),
+        "raw_corpus_sha256": raw_digest,
+        "required_acceptance_checks": sorted(required_checks),
+    }
+    if final_artifact is not None:
+        stored_payload = (
+            final_artifact.input_json
+            if isinstance(final_artifact.input_json, dict)
+            else {}
+        )
+        stored_recovery = stored_payload.get("orchestrated_recovery")
+        clearly_prior_epoch = bool(
+            isinstance(stored_recovery, dict)
+            and isinstance(stored_recovery.get("epoch"), int)
+            and stored_recovery.get("epoch") != epoch.epoch
+        )
+        if (
+            final_artifact.model != CRITIC_MODEL
+            or final_artifact.prompt_version != ANALYSIS_CRITIC_VERSION
+            or clearly_prior_epoch
+        ):
+            # A fixed artifact key may contain r3 from an older deployment or
+            # a prior recovery epoch.  It did not reserve the current primary
+            # call and is safely overwriteable.  A current-version artifact
+            # with the same/unknown epoch but mismatched input remains
+            # ambiguous and is handled fail-closed below.
+            final_artifact = None
+    plan = DurableRecoveryPlan(
+        run_id=epoch.run_id,
+        epoch_id=epoch.id,
+        epoch=epoch.epoch,
+        stage_key=epoch.stage_key,
+        decision=copy.deepcopy(plan_json),
+        reused=True,
+        facts_digest=epoch.facts_digest,
+        failure_fingerprint=epoch.failure_fingerprint,
+        plan_digest=str(epoch.plan_digest or ""),
+    )
+
+    try:
+        exact_gate_without_primary = False
+        if gate_artifact is not None and _artifact_cache_matches(
+            gate_artifact,
+            model=CRITIC_MODEL,
+            prompt_version=ANALYSIS_CRITIC_VERSION,
+        ):
+            gate_output = gate_artifact.output_json
+            gate_input = (
+                gate_artifact.input_json
+                if isinstance(gate_artifact.input_json, dict)
+                else {}
+            )
+            expected_provenance = _critic_provenance_digests(
+                profile=profile,
+                catalog=catalog,
+                rows=rows,
+                metrics=metrics,
+                policy_history=policy_history,
+            )
+            expected_manifest = _final_corpus_manifest(
+                rows,
+                expected_cells=(
+                    expected_corpus_cells
+                    if expected_corpus_cells is not None
+                    else _expected_corpus_cells_from_rows(rows)
+                ),
+            )
+            exact_gate_without_primary = bool(
+                isinstance(gate_output, dict)
+                and gate_output.get("passed") is True
+                and gate_output.get("iteration") == final_iteration
+                and gate_output.get("critic_model") == CRITIC_MODEL
+                and gate_output.get("provenance") == expected_provenance
+                and gate_output.get("corpus_manifest") == expected_manifest
+                and gate_input.get("provenance") == expected_provenance
+                and gate_input.get("corpus_manifest_digest")
+                == expected_manifest["digest"]
+                and gate_input.get("iteration") == final_iteration
+            )
+        if final_artifact is None and exact_gate_without_primary:
+            raise OpenRouterError(
+                "Analysis critic gate exists without its exact primary r3 "
+                "artifact"
+            )
+        if final_artifact is None:
+            final_review = await _analysis_critic_artifact(
+                run_id,
+                iteration=final_iteration,
+                payload=final_payload,
+                recovery_final=True,
+            )
+        else:
+            if not _artifact_cache_matches(
+                final_artifact,
+                input_json=final_payload,
+                model=CRITIC_MODEL,
+                prompt_version=ANALYSIS_CRITIC_VERSION,
+                require_validated_critic_usage=True,
+            ):
+                raise OpenRouterError(
+                    "Final recovery critic reservation is failed, running, "
+                    "or does not match the recovered state"
+                )
+            if not isinstance(final_artifact.output_json, dict):
+                raise OpenRouterError(
+                    "Final recovery critic artifact has no decision"
+                )
+            final_review = copy.deepcopy(final_artifact.output_json)
+            validation_errors = _critic_review_validation_errors(
+                final_review,
+                payload=final_payload,
+            )
+            if validation_errors:
+                raise OpenRouterError(
+                    "Final recovery critic artifact is inconsistent: "
+                    + "; ".join(validation_errors)
+                )
+        fallback = final_review.get("fallback")
+        if (
+            final_review.get("verdict") != "pass"
+            or (isinstance(fallback, dict) and fallback.get("kind"))
+        ):
+            raise OpenRouterError(
+                "Independent final critic did not pass resumed recovery: "
+                + str(final_review.get("summary") or "block")
+            )
+        gate = await _save_critic_gate(
+            run_id,
+            passed=True,
+            iteration=final_iteration,
+            profile=profile,
+            catalog=catalog,
+            rows=rows,
+            metrics=metrics,
+            policy_history=policy_history,
+            reason=str(
+                final_review.get("summary")
+                or "Финальная проверка восстановления пройдена."
+            ),
+            expected_corpus_cells=expected_corpus_cells,
+        )
+    except asyncio.CancelledError:
+        raise
+    except RunLeaseLostError:
+        raise
+    except Exception as exc:
+        await _save_critic_gate(
+            run_id,
+            passed=False,
+            iteration=final_iteration,
+            profile=profile,
+            catalog=catalog,
+            rows=rows,
+            metrics=metrics,
+            policy_history=policy_history,
+            reason=(
+                "Возобновлённое восстановление не прошло финальный контроль: "
+                + str(exc)
+            ),
+            expected_corpus_cells=expected_corpus_cells,
+        )
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=state_digest,
+            details={
+                "error": str(exc)[:2000],
+                "target_answer_ids": sorted(target_answer_ids),
+                "raw_corpus_sha256": raw_digest,
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": state_digest,
+                "resumed_after_targeted_annotation_commit": True,
+            },
+        )
+        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+
+    await finish_recovery(
+        plan,
+        succeeded=True,
+        before_digest=before_digest,
+        after_digest=state_digest,
+        details={
+            "target_answer_ids": sorted(target_answer_ids),
+            "raw_corpus_sha256": raw_digest,
+            "executed_acceptance_checks": sorted(required_checks),
+            "final_critic_iteration": final_iteration,
+            "successful_analysis_state_digest": state_digest,
+            "successful_gate_sha256": stable_digest(gate),
+            "resumed_after_targeted_annotation_commit": True,
+        },
+    )
+    return gate
+
+
+async def _recover_analysis_critic_exhaustion(
+    run_id: str,
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    review: dict[str, Any],
+    policy_history: list[dict[str, Any]],
+    accumulated_guidance: list[str],
+    valid_answer_ids: set[int],
+    resume_annotation_input_sha256: str,
+    expected_corpus_cells: list[dict[str, Any]] | None,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Run one planner-scoped annotation repair and one final critic gate."""
+
+    issue_answer_ids = _critic_issue_answer_ids(
+        review,
+        valid_answer_ids=valid_answer_ids,
+    )
+    if not issue_answer_ids:
+        raise OrchestratorContractError(
+            "Analysis critic recovery has no validated issue answer ids"
+        )
+    if len(issue_answer_ids) > ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS:
+        raise OrchestratorContractError(
+            "Analysis critic recovery exceeds the one-batch targeted scope "
+            f"({len(issue_answer_ids)}/"
+            f"{ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS})"
+        )
+
+    # A targeted annotation repair cannot safely apply a catalog-wide policy
+    # change: that would invalidate every other row.  Literal-evidence and
+    # brand-knowledge adjustments leave the scoped catalog unchanged and are
+    # converted to code-owned guidance for the selected rows.
+    proposed_catalog, applied_adjustments, critic_guidance = (
+        _apply_critic_policy(
+            catalog,
+            review,
+            valid_answer_ids=valid_answer_ids,
+        )
+    )
+    if stable_digest(proposed_catalog) != stable_digest(catalog):
+        raise OrchestratorContractError(
+            "Targeted critic recovery cannot apply a catalog-wide adjustment"
+        )
+
+    issue_rows = [
+        {
+            "answer_id": int(row["answer_id"]),
+            "provider_key": row.get("provider_key"),
+            "mode": row.get("mode"),
+            "scenario": row.get("scenario"),
+            "annotation": row.get("annotation") or {},
+            "raw_answer": str(row.get("answer_text") or ""),
+            "raw_answer_sha256": hashlib.sha256(
+                str(row.get("answer_text") or "").encode("utf-8")
+            ).hexdigest(),
+        }
+        for row in rows
+        if row.get("answer_id") in issue_answer_ids
+    ]
+    if {
+        int(item["answer_id"])
+        for item in issue_rows
+    } != issue_answer_ids:
+        raise OrchestratorContractError(
+            "Analysis critic recovery issue rows are incomplete"
+        )
+    oversized_issue_ids = sorted(
+        int(item["answer_id"])
+        for item in issue_rows
+        if len(str(item.get("raw_answer") or ""))
+        > CRITIC_ANSWER_CHAR_LIMIT
+    )
+    if oversized_issue_ids:
+        raise OrchestratorContractError(
+            "Targeted critic recovery would truncate issue raw for answer ids: "
+            + ", ".join(str(value) for value in oversized_issue_ids)
+        )
+    raw_digest_before = _raw_corpus_digest(rows)
+    before_digest = _critic_analysis_state_digest(rows, metrics)
+    facts = {
+        "site_profile": profile,
+        "entity_catalog": catalog,
+        "candidate_metrics": metrics,
+        "critic_review": review,
+        "prior_policy_history": policy_history,
+        "issue_rows": issue_rows,
+        "raw_corpus_sha256": raw_digest_before,
+        "analysis_state_sha256": before_digest,
+        "executor_contract": {
+            ACTION_TARGETED_ANNOTATION_REPAIR: {
+                "acceptance_checks": sorted(
+                    {
+                        CHECK_RAW_CORPUS_UNCHANGED,
+                        CHECK_DERIVED_METRICS_RECOMPUTED,
+                        CHECK_CRITIC_GATE_PASSED,
+                    }
+                ),
+                "max_execution_attempts_for_stage": 1,
+                "max_planner_calls_for_stage": 1,
+                "max_final_critic_rounds": 1,
+                "max_targeted_answer_ids": (
+                    ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS
+                ),
+                "max_targeted_raw_chars": ANNOTATION_BATCH_CHAR_LIMIT,
+            },
+            ACTION_STOP: {
+                "acceptance_checks": [CHECK_CHECKPOINT_PRESERVED],
+            },
+        },
+    }
+    diagnostics = {
+        "critic_iteration": MAX_CRITIC_ITERATIONS,
+        "critic_verdict": str(review.get("verdict") or "block"),
+        "critic_summary": str(review.get("summary") or "")[:2000],
+        "issue_answer_ids": sorted(issue_answer_ids),
+        "anomaly_codes": sorted(
+            {
+                str(item.get("code") or "")
+                for item in review.get("anomalies") or []
+                if isinstance(item, dict) and item.get("code")
+            }
+        ),
+        "executor_contract": {
+            "targeted_acceptance_checks": sorted(
+                {
+                    CHECK_RAW_CORPUS_UNCHANGED,
+                    CHECK_DERIVED_METRICS_RECOMPUTED,
+                    CHECK_CRITIC_GATE_PASSED,
+                }
+            ),
+            "stop_acceptance_checks": [CHECK_CHECKPOINT_PRESERVED],
+        },
+    }
+    plan = await plan_durable_recovery(
+        run_id,
+        stage_key=ANALYSIS_CRITIC_RECOVERY_STAGE,
+        failure_class="repairable_semantic",
+        failure_code="analysis_critic_non_convergent",
+        diagnostics=diagnostics,
+        facts=facts,
+        allowed_actions={
+            ACTION_TARGETED_ANNOTATION_REPAIR,
+            ACTION_STOP,
+        },
+        permitted_answer_ids=issue_answer_ids,
+        stage_planner_call_limit=1,
+    )
+    await mark_recovery_executing(plan, stage_execution_limit=1)
+
+    action = str(plan.decision.get("action") or "")
+    requested_checks = set(plan.decision.get("acceptance_checks") or [])
+    required_checks = (
+        {CHECK_CHECKPOINT_PRESERVED}
+        if action == ACTION_STOP
+        else {
+            CHECK_RAW_CORPUS_UNCHANGED,
+            CHECK_DERIVED_METRICS_RECOMPUTED,
+            CHECK_CRITIC_GATE_PASSED,
+        }
+    )
+    missing_checks = sorted(required_checks - requested_checks)
+    unsupported_checks = sorted(requested_checks - required_checks)
+    if missing_checks or unsupported_checks:
+        after_digest = stable_digest(
+            {
+                "before_digest": before_digest,
+                "missing_acceptance_checks": missing_checks,
+                "unsupported_acceptance_checks": unsupported_checks,
+            }
+        )
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            details={
+                "missing_acceptance_checks": missing_checks,
+                "unsupported_acceptance_checks": unsupported_checks,
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": before_digest,
+            },
+        )
+        raise OrchestratorContractError(
+            "Analysis critic recovery acceptance checks do not match the "
+            "executor"
+        )
+    if action == ACTION_STOP:
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={
+                "reason": "planner_requested_stop",
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": before_digest,
+            },
+        )
+        raise OpenRouterError(
+            str(
+                plan.decision.get("rationale")
+                or "Analysis critic recovery stopped"
+            )
+        )
+    if action != ACTION_TARGETED_ANNOTATION_REPAIR:
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={
+                "error": f"unsupported_action:{action}",
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": before_digest,
+            },
+        )
+        raise OrchestratorContractError(
+            f"Unsupported analysis critic recovery action: {action}"
+        )
+
+    target_answer_ids = set(plan.decision.get("target_answer_ids") or [])
+    if not target_answer_ids or not target_answer_ids.issubset(issue_answer_ids):
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={
+                "error": "target_answer_ids_out_of_scope",
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": before_digest,
+            },
+        )
+        raise OrchestratorContractError(
+            "Analysis critic executor received an out-of-scope target set"
+        )
+    target_raw_chars = sum(
+        len(str(item.get("raw_answer") or ""))
+        for item in issue_rows
+        if item.get("answer_id") in target_answer_ids
+    )
+    if target_raw_chars > ANNOTATION_BATCH_CHAR_LIMIT:
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={
+                "error": "targeted_raw_budget_exceeded",
+                "targeted_raw_chars": target_raw_chars,
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": before_digest,
+            },
+        )
+        raise OrchestratorContractError(
+            "Analysis critic targeted repair exceeds its single-batch raw "
+            f"budget ({target_raw_chars}/{ANNOTATION_BATCH_CHAR_LIMIT})"
+        )
+    planner_guidance = str(plan.decision.get("guidance") or "").strip()
+    if not planner_guidance:
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={
+                "error": "planner_guidance_missing",
+                "terminal_analysis_critic_block": True,
+                "terminal_analysis_state_digest": before_digest,
+            },
+        )
+        raise OrchestratorContractError(
+            "Analysis critic repair requires planner guidance"
+        )
+    targeted_guidance = "\n\n".join(
+        value
+        for value in [
+            *accumulated_guidance,
+            critic_guidance,
+            (
+                "Ограниченный план оркестратора для answer_id "
+                + ", ".join(str(value) for value in sorted(target_answer_ids))
+                + ": "
+                + planner_guidance
+            ),
+        ]
+        if value.strip()
+    )
+
+    recovery_policy_step = {
+        "iteration": MAX_CRITIC_ITERATIONS + 1,
+        "kind": "orchestrated_targeted_annotation_repair",
+        "orchestrator_epoch": plan.epoch,
+        "target_answer_ids": sorted(target_answer_ids),
+        "critic_adjustments": applied_adjustments,
+        "annotation_guidance": targeted_guidance,
+        "raw_corpus_sha256": raw_digest_before,
+    }
+
+    expected_annotation_digests = _current_annotation_input_digests(rows)
+    repair_annotation_digest = _annotation_context_sha256(
+        profile,
+        catalog,
+        targeted_guidance,
+        repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+    )
+    for answer_id in target_answer_ids:
+        expected_annotation_digests[answer_id] = repair_annotation_digest
+    annotation_repair_provenance = {
+        "version": "analysis-critic-targeted-repair-v1",
+        "orchestrator_epoch": plan.epoch,
+        "orchestrator_plan_digest": plan.plan_digest,
+        "target_answer_ids": sorted(target_answer_ids),
+        "repair_annotation_input_sha256": repair_annotation_digest,
+        "resume_annotation_input_sha256": (
+            resume_annotation_input_sha256
+        ),
+        "guidance_sha256": hashlib.sha256(
+            targeted_guidance.encode("utf-8")
+        ).hexdigest(),
+        "critic_review_sha256": stable_digest(review),
+        # This deterministic step is persisted atomically with every targeted
+        # annotation.  It is the restart checkpoint needed to reconstruct the
+        # one allowed r3 payload after a crash between annotation CAS and the
+        # r3 artifact reservation; no second annotation/Fable call is needed.
+        "recovery_policy_step": copy.deepcopy(recovery_policy_step),
+    }
+
+    after_digest = before_digest
+    gate_rows = rows
+    gate_metrics = metrics
+    gate_policy_history = policy_history
+    final_iteration = (
+        MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+    )
+    targeted_annotation_started = False
+    try:
+        targeted_annotation_started = True
+        await _annotate_answers(
+            run_id,
+            profile,
+            catalog,
+            research_guidance=targeted_guidance,
+            target_answer_ids=target_answer_ids,
+            repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+            annotation_repair_provenance=(
+                annotation_repair_provenance
+            ),
+            # One recovery execution gets one annotation pass.  A partial
+            # result fails closed instead of starting the normal completion
+            # retry recursively.
+            _completion_attempt=ANNOTATION_COMPLETION_ATTEMPTS,
+        )
+        recovered_rows = await _metric_rows(
+            run_id,
+            annotation_input_sha256=resume_annotation_input_sha256,
+            annotation_input_sha256_by_answer_id=(
+                expected_annotation_digests
+            ),
+        )
+        recovered_metrics = _compute_metrics(
+            recovered_rows,
+            profile,
+            catalog,
+        )
+        raw_digest_after = _raw_corpus_digest(recovered_rows)
+        after_digest = _critic_analysis_state_digest(
+            recovered_rows,
+            recovered_metrics,
+        )
+        gate_rows = recovered_rows
+        gate_metrics = recovered_metrics
+        if raw_digest_after != raw_digest_before:
+            raise OpenRouterError(
+                "Targeted analysis recovery changed the immutable raw corpus"
+            )
+        if after_digest == before_digest:
+            raise OpenRouterError(
+                "Targeted analysis recovery made no verifiable progress"
+            )
+
+        recovered_policy_history = [
+            *policy_history,
+            recovery_policy_step,
+        ]
+        gate_policy_history = recovered_policy_history
+        final_payload = _critic_payload(
+            profile=profile,
+            catalog=catalog,
+            rows=recovered_rows,
+            metrics=recovered_metrics,
+            policy_history=recovered_policy_history,
+            mandatory_raw_answer_ids=target_answer_ids,
+        )
+        final_payload["orchestrated_recovery"] = {
+            "epoch": plan.epoch,
+            "action": action,
+            "target_answer_ids": sorted(target_answer_ids),
+            "raw_corpus_sha256": raw_digest_after,
+            "required_acceptance_checks": sorted(required_checks),
+        }
+        final_review = await _analysis_critic_artifact(
+            run_id,
+            iteration=final_iteration,
+            payload=final_payload,
+            recovery_final=True,
+        )
+        fallback = final_review.get("fallback")
+        if (
+            final_review.get("verdict") != "pass"
+            or (isinstance(fallback, dict) and fallback.get("kind"))
+        ):
+            raise OpenRouterError(
+                "Independent final critic did not pass the targeted recovery: "
+                + str(final_review.get("summary") or "block")
+            )
+        gate = await _save_critic_gate(
+            run_id,
+            passed=True,
+            iteration=final_iteration,
+            profile=profile,
+            catalog=catalog,
+            rows=recovered_rows,
+            metrics=recovered_metrics,
+            policy_history=recovered_policy_history,
+            reason=str(
+                final_review.get("summary")
+                or "Финальная проверка восстановления пройдена."
+            ),
+            expected_corpus_cells=expected_corpus_cells,
+        )
+    except asyncio.CancelledError:
+        raise
+    except RunLeaseLostError:
+        raise
+    except Exception as exc:
+        if targeted_annotation_started and gate_rows is rows:
+            # The all-or-nothing CAS may have committed before a later local
+            # completion/metric/final-gate step failed.  Reload the actual DB
+            # state so both the failed gate and terminal resume guard bind to
+            # post-repair annotations, never the stale in-memory snapshot.
+            try:
+                persisted_rows = await _metric_rows(
+                    run_id,
+                    annotation_input_sha256=(
+                        resume_annotation_input_sha256
+                    ),
+                    annotation_input_sha256_by_answer_id=(
+                        expected_annotation_digests
+                    ),
+                )
+                persisted_metrics = _compute_metrics(
+                    persisted_rows,
+                    profile,
+                    catalog,
+                )
+                if _raw_corpus_digest(persisted_rows) != raw_digest_before:
+                    raise OpenRouterError(
+                        "Persisted raw corpus changed during targeted repair"
+                    )
+                gate_rows = persisted_rows
+                gate_metrics = persisted_metrics
+                after_digest = _critic_analysis_state_digest(
+                    persisted_rows,
+                    persisted_metrics,
+                )
+            except RunLeaseLostError:
+                raise
+            except Exception:
+                # Preserve the original failure.  The normal path already
+                # captured post-state whenever metric reload was available.
+                logger.exception(
+                    "Could not reload targeted critic recovery state for %s",
+                    run_id,
+                )
+        terminal_details = {
+            "error": str(exc)[:2000],
+            "target_answer_ids": sorted(target_answer_ids),
+            "raw_corpus_sha256": _raw_corpus_digest(gate_rows),
+            "terminal_analysis_critic_block": True,
+            "terminal_analysis_state_digest": after_digest,
+        }
+        # Persist the failed gate against the actual post-repair state.  The
+        # outer loop must not overwrite it with pre-repair rows on unwind.
+        gate_error: Exception | None = None
+        try:
+            await _save_critic_gate(
+                run_id,
+                passed=False,
+                iteration=(
+                    final_iteration
+                    if gate_rows is not rows
+                    else MAX_CRITIC_ITERATIONS
+                ),
+                profile=profile,
+                catalog=catalog,
+                rows=gate_rows,
+                metrics=gate_metrics,
+                policy_history=gate_policy_history,
+                reason=(
+                    "Ограниченное восстановление не прошло независимый "
+                    "финальный контроль: "
+                    + str(exc)
+                ),
+                expected_corpus_cells=expected_corpus_cells,
+            )
+        except RunLeaseLostError:
+            raise
+        except Exception as persistence_error:
+            gate_error = persistence_error
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            details=terminal_details,
+        )
+        if gate_error is not None:
+            raise gate_error from exc
+        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+
+    await finish_recovery(
+        plan,
+        succeeded=True,
+        before_digest=before_digest,
+        after_digest=after_digest,
+        details={
+            "target_answer_ids": sorted(target_answer_ids),
+            "raw_corpus_sha256": raw_digest_before,
+            "executed_acceptance_checks": sorted(required_checks),
+            "final_critic_iteration": final_iteration,
+            "successful_analysis_state_digest": after_digest,
+            "successful_gate_sha256": stable_digest(gate),
+        },
+    )
+    return catalog, recovered_rows, recovered_metrics, gate
+
+
 async def _run_analysis_critic_loop(
     run_id: str,
     *,
@@ -13070,6 +14752,10 @@ async def _run_analysis_critic_loop(
     """Gate metrics with at most one repair and two independent reviews."""
 
     current_catalog = _scope_entity_catalog_to_profile(catalog, profile)
+    resume_annotation_input_sha256 = _annotation_context_sha256(
+        profile,
+        current_catalog,
+    )
     current_rows = rows
     current_metrics = metrics
     policy_history: list[dict[str, Any]] = []
@@ -13082,6 +14768,55 @@ async def _run_analysis_critic_loop(
         and isinstance(row.get("annotation"), dict)
         and row["annotation"].get("valid") is True
     }
+
+    current_state_digest = _critic_analysis_state_digest(
+        current_rows,
+        current_metrics,
+    )
+    successful_gate = await _successful_analysis_critic_recovery_gate(
+        run_id,
+        state_digest=current_state_digest,
+        profile=profile,
+        catalog=current_catalog,
+        rows=current_rows,
+        metrics=current_metrics,
+        expected_corpus_cells=expected_corpus_cells,
+    )
+    if successful_gate is not None:
+        return (
+            current_catalog,
+            current_rows,
+            current_metrics,
+            successful_gate,
+        )
+
+    resumed_gate = await _resume_executing_analysis_critic_recovery(
+        run_id,
+        state_digest=current_state_digest,
+        profile=profile,
+        catalog=current_catalog,
+        rows=current_rows,
+        metrics=current_metrics,
+        expected_corpus_cells=expected_corpus_cells,
+    )
+    if resumed_gate is not None:
+        return (
+            current_catalog,
+            current_rows,
+            current_metrics,
+            resumed_gate,
+        )
+
+    terminal_reason = await _terminal_analysis_critic_recovery_reason(
+        run_id,
+        state_digest=current_state_digest,
+    )
+    if terminal_reason is not None:
+        raise OpenRouterError(
+            "Analysis critic recovery is terminal for the current analysis "
+            "state: "
+            + terminal_reason
+        )
 
     for iteration in range(1, MAX_CRITIC_ITERATIONS + 1):
         await update_progress(
@@ -13127,6 +14862,42 @@ async def _run_analysis_critic_loop(
                 review.get("summary")
                 or "Критик не подтвердил корректность аналитики."
             )
+            if (
+                iteration >= MAX_CRITIC_ITERATIONS
+                and verdict == "revise"
+                and settings.PIPELINE_ORCHESTRATOR_ENABLED
+            ):
+                try:
+                    return await _recover_analysis_critic_exhaustion(
+                        run_id,
+                        profile=profile,
+                        catalog=current_catalog,
+                        rows=current_rows,
+                        metrics=current_metrics,
+                        review=review,
+                        policy_history=policy_history,
+                        accumulated_guidance=accumulated_guidance,
+                        valid_answer_ids=valid_answer_ids,
+                        resume_annotation_input_sha256=(
+                            resume_annotation_input_sha256
+                        ),
+                        expected_corpus_cells=expected_corpus_cells,
+                    )
+                except RunLeaseLostError:
+                    raise
+                except _AnalysisCriticRecoveryBlocked as recovery_error:
+                    raise OpenRouterError(
+                        "Analysis critic blocked report publication: "
+                        + reason
+                        + " Ограниченное восстановление не прошло: "
+                        + str(recovery_error)
+                    ) from recovery_error
+                except Exception as recovery_error:
+                    reason = (
+                        reason
+                        + " Ограниченное восстановление не прошло: "
+                        + str(recovery_error)
+                    )
             await _save_critic_gate(
                 run_id,
                 passed=False,

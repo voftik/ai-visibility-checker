@@ -659,6 +659,79 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             rows[0].usage_json["planner_attempt"]["reconciled_after_restart"]
         )
 
+    async def test_stage_planner_budget_blocks_second_post_after_restart(
+        self,
+    ) -> None:
+        diagnostics = {"critic_iteration": 2, "issue_answer_ids": [569]}
+        facts = {"critic_review_sha256": "a" * 64}
+        fingerprint = recovery_failure_fingerprint(
+            stage_key="analysis_critic",
+            failure_class="repairable_semantic",
+            failure_code="analysis_critic_non_convergent",
+            diagnostics=diagnostics,
+        )
+        facts_digest = recovery_scope_digest(
+            facts=facts,
+            allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
+            permitted_answer_ids={569},
+        )
+        async with self.SessionLocal() as session:
+            session.add(
+                RecoveryEpoch(
+                    run_id=self.run_id,
+                    epoch=1,
+                    stage_key="analysis_critic",
+                    failure_class="repairable_semantic",
+                    failure_code="analysis_critic_non_convergent",
+                    failure_fingerprint=fingerprint,
+                    facts_digest=facts_digest,
+                    status="planning",
+                    model=ORCHESTRATOR_MODEL,
+                    input_json={
+                        "planner_attempt": {
+                            "started": True,
+                            "completed": False,
+                        }
+                    },
+                )
+            )
+            await session.commit()
+
+        with patch(
+            "app.services.recovery_state.plan_recovery",
+            new_callable=AsyncMock,
+        ) as planner:
+            with self.assertRaisesRegex(
+                RecoveryBudgetExceeded,
+                "stage planner call budget exhausted",
+            ):
+                await plan_durable_recovery(
+                    self.run_id,
+                    stage_key="analysis_critic",
+                    failure_class="repairable_semantic",
+                    failure_code="analysis_critic_non_convergent",
+                    diagnostics=diagnostics,
+                    facts=facts,
+                    allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
+                    permitted_answer_ids={569},
+                    stage_planner_call_limit=1,
+                )
+        planner.assert_not_awaited()
+        async with self.SessionLocal() as session:
+            epoch = (
+                await session.execute(
+                    select(RecoveryEpoch).where(
+                        RecoveryEpoch.run_id == self.run_id
+                    )
+                )
+            ).scalar_one()
+        self.assertEqual(epoch.status, "failed")
+        self.assertTrue(
+            epoch.usage_json["planner_attempt"][
+                "reconciled_after_restart"
+            ]
+        )
+
     async def test_plan_survives_restart_and_finishes_once(self) -> None:
         decision = {
             "action": ACTION_DETERMINISTIC_FALLBACK,

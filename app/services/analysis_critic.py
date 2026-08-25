@@ -12,9 +12,10 @@ from app.services.openrouter import (
     chat,
 )
 
-CRITIC_VERSION = "aiv-analysis-critic-v17"
+CRITIC_VERSION = "aiv-analysis-critic-v19"
 CRITIC_TRANSPORT_CONTRACT_VERSION = "aiv-analysis-critic-transport-v1"
 MAX_CRITIC_ITERATIONS = 2
+MAX_CRITIC_RECOVERY_FINAL_REVIEWS = 1
 MAX_CRITIC_REPAIR_ATTEMPTS = 1
 CRITIC_MODEL = settings.OPENROUTER_CRITIC_MODEL
 CRITIC_REASONING_EFFORT = "medium"
@@ -314,6 +315,36 @@ CRITIC_REPAIR_SYSTEM = """
 Это единственная попытка восстановления. Пиши кратко и предметно по-русски.
 """.strip()
 
+CRITIC_RECOVERY_FINAL_SUFFIX = """
+Это отдельная финальная проверка после одного ограниченного ремонта разметки,
+который спланировал сильный оркестратор, но исполнил обычный разметчик. Решение
+оркестратора не является доказательством. Самостоятельно сверь новый corpus,
+аннотации и метрики с raw. Это последний gate: верни pass, только если все
+critical/important проблемы устранены; иначе верни block. Новая revise и ещё
+одна петля ремонта запрещены.
+""".strip()
+
+
+def _critic_iteration_contract(
+    iteration: int,
+    *,
+    recovery_final: bool,
+) -> tuple[int, bool]:
+    """Validate the ordinary two rounds or the one recovery-only final gate."""
+
+    recovery_iteration = (
+        MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+    )
+    if recovery_final:
+        if iteration != recovery_iteration:
+            raise ValueError(
+                "Recovery final critic must use the dedicated final iteration"
+            )
+        return recovery_iteration, True
+    if not 1 <= iteration <= MAX_CRITIC_ITERATIONS:
+        raise ValueError("Critic iteration is outside the bounded loop")
+    return MAX_CRITIC_ITERATIONS, False
+
 
 def _normalize_review(parsed: dict[str, Any]) -> dict[str, Any]:
     # Preserve missing/null required values so the deterministic gate can
@@ -569,22 +600,36 @@ async def review_analysis(
     payload: dict[str, Any],
     *,
     iteration: int,
+    recovery_final: bool = False,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     """Run one bounded independent critique of a candidate metric snapshot."""
 
-    if not 1 <= iteration <= MAX_CRITIC_ITERATIONS:
-        raise ValueError("Critic iteration is outside the bounded loop")
+    max_iterations, recovery_final = _critic_iteration_contract(
+        iteration,
+        recovery_final=recovery_final,
+    )
     try:
         response = await chat(
             model=CRITIC_MODEL,
             messages=[
-                {"role": "system", "content": CRITIC_SYSTEM},
+                {
+                    "role": "system",
+                    "content": (
+                        CRITIC_SYSTEM
+                        + (
+                            "\n\n" + CRITIC_RECOVERY_FINAL_SUFFIX
+                            if recovery_final
+                            else ""
+                        )
+                    ),
+                },
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
                             "iteration": iteration,
-                            "max_iterations": MAX_CRITIC_ITERATIONS,
+                            "max_iterations": max_iterations,
+                            "recovery_final": recovery_final,
                             **payload,
                         },
                         ensure_ascii=False,
@@ -600,6 +645,14 @@ async def review_analysis(
         )
     except OpenRouterResponseContractError as exc:
         incomplete_review, failure = _incomplete_transport_review(exc)
+        if recovery_final:
+            # The final recovery gate has a one-call budget and must be a
+            # fresh, complete primary verdict.  Even a partial JSON prefix
+            # that says ``pass`` is not sufficient to publish.
+            raise OpenRouterError(
+                "Final recovery critic primary response was incomplete or "
+                f"unparseable ({failure}); compact repair is forbidden"
+            ) from exc
         repaired, raw_text, repair_usage = await repair_analysis_review(
             payload,
             incomplete_review,
@@ -608,6 +661,7 @@ async def review_analysis(
                 "Primary critic transport completed but its structured response "
                 f"was unusable ({failure}): {exc}"
             ],
+            recovery_final=recovery_final,
         )
         if (
             repaired.get("verdict") == "pass"
@@ -638,6 +692,7 @@ async def repair_analysis_review(
     *,
     iteration: int,
     validation_errors: list[str],
+    recovery_final: bool = False,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     """Make one bounded attempt to repair an unusable critic decision.
 
@@ -646,18 +701,32 @@ async def repair_analysis_review(
     evidence. The repair model cannot acquire evidence or mutate measurements.
     """
 
-    if not 1 <= iteration <= MAX_CRITIC_ITERATIONS:
-        raise ValueError("Critic iteration is outside the bounded loop")
+    max_iterations, recovery_final = _critic_iteration_contract(
+        iteration,
+        recovery_final=recovery_final,
+    )
     repair_context = _compact_repair_context(payload, incomplete_review)
     response = await chat(
         model=CRITIC_MODEL,
         messages=[
-            {"role": "system", "content": CRITIC_REPAIR_SYSTEM},
+            {
+                "role": "system",
+                "content": (
+                    CRITIC_REPAIR_SYSTEM
+                    + (
+                        "\n\n" + CRITIC_RECOVERY_FINAL_SUFFIX
+                        if recovery_final
+                        else ""
+                    )
+                ),
+            },
             {
                 "role": "user",
                 "content": json.dumps(
                     {
                         "iteration": iteration,
+                        "max_iterations": max_iterations,
+                        "recovery_final": recovery_final,
                         "repair_attempt": 1,
                         "max_repair_attempts": MAX_CRITIC_REPAIR_ATTEMPTS,
                         "validation_errors": validation_errors,
