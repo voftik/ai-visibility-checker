@@ -1234,6 +1234,20 @@ uv run python scripts/backfill_site_preview.py <run-id>
 `systemctl daemon-reload`. Reverse-proxy config и secrets управляются отдельно,
 поэтому один Git checkout всё равно не является полным снимком окружения.
 
+Production unit-файлы запускают Python из
+`/root/projects/aiv-venvs/current`. Это атомарная ссылка на неизменяемое
+окружение конкретного release SHA. Перед переключением кода соберите новое
+окружение отдельно, не меняя checkout `.venv`:
+
+```bash
+release_sha=$(git rev-parse HEAD)
+UV_PROJECT_ENVIRONMENT="/root/projects/aiv-venvs/$release_sha" uv sync --frozen
+```
+
+После проверки импорта и зависимостей переключите `current` атомарно. Для
+rollback сохраните прежнюю цель ссылки вместе с backup кода. Основной сервис и
+`aiv-reprocess@` всегда используют одно и то же release-окружение.
+
 ### Изолированный preview worker
 
 На Linux установите worker один раз:
@@ -1260,6 +1274,10 @@ Wrapper запускает short-lived systemd unit от пользовател�
 - `static/generated/`;
 - установленный production unit;
 - при необходимости `.venv/`, если deploy не пересобирает окружение атомарно.
+
+Checkout `.venv/` может использоваться старым изолированным процессом. Поэтому
+production deploy не запускает в ней `uv sync` и не заменяет её: новый сервис
+получает отдельное окружение через `/root/projects/aiv-venvs/current`.
 
 Деплоить вместе с кодом нужно:
 

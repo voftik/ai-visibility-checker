@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app import db as app_db
 from app.models import (
     AnswerAnnotation,
     Base,
@@ -272,6 +273,108 @@ def _context_receipt() -> dict:
 
 
 class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        db_path = Path(self._temp_dir.name) / "critic-unit.sqlite3"
+        self.engine = create_async_engine(
+            f"sqlite+aiosqlite:///{db_path}",
+            echo=False,
+        )
+        self.SessionLocal = async_sessionmaker(
+            self.engine,
+            expire_on_commit=False,
+            class_=AsyncSession,
+        )
+        self._db_patches = (
+            patch.object(app_db, "engine", self.engine),
+            patch(
+                "app.services.analyzer.SessionLocal",
+                self.SessionLocal,
+            ),
+            patch(
+                "app.services.recovery_state.SessionLocal",
+                self.SessionLocal,
+            ),
+        )
+        for db_patch in self._db_patches:
+            db_patch.start()
+        await app_db.init_db()
+
+    async def asyncTearDown(self) -> None:
+        for db_patch in reversed(self._db_patches):
+            db_patch.stop()
+        await self.engine.dispose()
+        self._temp_dir.cleanup()
+
+    async def test_clean_database_bootstrap_creates_recovery_epochs(
+        self,
+    ) -> None:
+        async with self.engine.connect() as connection:
+            table_names = {
+                str(row[0])
+                for row in (
+                    await connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table'"
+                    )
+                ).all()
+            }
+            recovery_columns = {
+                str(row[1])
+                for row in (
+                    await connection.exec_driver_sql(
+                        "PRAGMA table_info('recovery_epochs')"
+                    )
+                ).all()
+            }
+
+        self.assertIn("recovery_epochs", table_names)
+        self.assertTrue(
+            {
+                "run_id",
+                "epoch",
+                "failure_fingerprint",
+                "facts_digest",
+                "status",
+                "plan_json",
+                "outcome_json",
+            }.issubset(recovery_columns)
+        )
+
+    async def test_bootstrap_adds_recovery_epochs_without_losing_runs(
+        self,
+    ) -> None:
+        legacy_run_id = str(uuid.uuid4())
+        async with self.SessionLocal() as session:
+            session.add(
+                Run(
+                    id=legacy_run_id,
+                    domain="legacy.example",
+                    status=RunStatus.completed,
+                    config_json={"preserve": True},
+                )
+            )
+            await session.commit()
+        async with self.engine.begin() as connection:
+            await connection.exec_driver_sql("DROP TABLE recovery_epochs")
+
+        await app_db.init_db()
+
+        async with self.engine.connect() as connection:
+            recovery_table = (
+                await connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'recovery_epochs'"
+                )
+            ).scalar_one()
+        async with self.SessionLocal() as session:
+            preserved = await session.get(Run, legacy_run_id)
+
+        self.assertEqual(recovery_table, "recovery_epochs")
+        self.assertIsNotNone(preserved)
+        self.assertEqual(preserved.domain, "legacy.example")
+        self.assertEqual(preserved.config_json, {"preserve": True})
+
     async def test_input_budget_reserves_only_model_output_window(
         self,
     ) -> None:

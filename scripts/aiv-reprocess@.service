@@ -18,7 +18,9 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/root/projects/ai-visibility-checker
-ExecStart=/root/.local/bin/uv run python scripts/reprocess_saved_run.py %i
+# Use the same immutable release environment as the web service.  Never mutate
+# the checkout .venv: legacy shadow processes may still reference it.
+ExecStart=/root/projects/aiv-venvs/current/bin/python scripts/reprocess_saved_run.py %i
 Environment=PYTHONUNBUFFERED=1
 SyslogIdentifier=aiv-reprocess
 

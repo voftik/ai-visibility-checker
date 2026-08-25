@@ -12,7 +12,11 @@ User=root
 WorkingDirectory=/root/projects/ai-visibility-checker
 # Один воркер обязателен: фоновые задачи обхода, шина событий SSE и пул прокси
 # держат состояние в памяти процесса. Никогда не добавлять --workers N.
-ExecStart=/root/.local/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+# Production dependencies live outside the mutable code checkout.  ``current``
+# is an atomic symlink to one immutable release-specific environment; this also
+# keeps legacy shadow processes that still point at the old checkout .venv
+# isolated from dependency upgrades.
+ExecStart=/root/projects/aiv-venvs/current/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 Environment=PYTHONUNBUFFERED=1
 SyslogIdentifier=ai-visibility
 

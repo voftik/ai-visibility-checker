@@ -974,3 +974,8 @@ class ReprocessServiceContractTests(unittest.TestCase):
 
         self.assertIn("RuntimeMaxSec=infinity", service)
         self.assertNotRegex(service, r"RuntimeMaxSec=(?:\d|\d+[smhd])")
+        self.assertIn(
+            "ExecStart=/root/projects/aiv-venvs/current/bin/python ",
+            service,
+        )
+        self.assertNotIn("/root/.local/bin/uv run", service)
