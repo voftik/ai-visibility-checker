@@ -16,7 +16,9 @@ class Settings(BaseSettings):
     # after the deterministic canary path is healthy.
     PIPELINE_ORCHESTRATOR_ENABLED: bool = False
     PIPELINE_ORCHESTRATOR_MAX_CALLS_PER_RUN: int = 2
-    PIPELINE_ORCHESTRATOR_MAX_INPUT_CHARS: int = 80_000
+    # Deprecated compatibility knob. The long-response harness no longer
+    # truncates orchestrator evidence by character count.
+    PIPELINE_ORCHESTRATOR_MAX_INPUT_CHARS: int = 0
     OPENROUTER_ILLUSTRATION_CONCEPT_MODEL: str = "anthropic/claude-opus-5"
     OPENROUTER_IMAGE_MODEL: str = "google/gemini-3-pro-image"
     OPENROUTER_OPENAI_MODEL: str = "openai/gpt-chat-latest"
@@ -24,17 +26,24 @@ class Settings(BaseSettings):
     OPENROUTER_PERPLEXITY_MODEL: str = "perplexity/sonar-pro-search"
     OPENROUTER_DEEPSEEK_MODEL: str = "deepseek/deepseek-v4-pro"
     OPENROUTER_CLAUDE_MODEL: str = "anthropic/claude-sonnet-5"
+    # Compatibility value for waiting on a concurrently claimed panel cell.
     OPENROUTER_TIMEOUT_SECONDS: int = 180
+    # A generous inactivity deadline for one non-streaming provider POST.  This
+    # is deliberately independent from output size/max tokens: it only keeps a
+    # dead socket or wedged provider from holding a lease forever.
+    OPENROUTER_READ_TIMEOUT_SECONDS: float = 7200.0
     OPENROUTER_PANEL_CONCURRENCY: int = 5
-    # User-payload budget for the final report call. Claude's system prompt
-    # and the configured 30k output allowance use the remaining part of the
-    # 200k context window.
-    FINAL_INPUT_TOKEN_BUDGET: int = 160_000
+    # Deprecated compatibility knob. Kept so old deployment environments keep
+    # parsing; the value is diagnostics-only and never gates or truncates input.
+    FINAL_INPUT_TOKEN_BUDGET: int = 0
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEFAULT_CONCURRENCY: int = 8
     DEFAULT_TIMEOUT_SECONDS: int = 20
-    AUDIT_PAGE_LIMIT: int = 6
+    # Normal audits use eight representative pages.  The crawler clamps any
+    # per-run override to 6..10 and records the exact selected corpus in a
+    # content-addressed manifest.  This bounds network work, not LLM output.
+    AUDIT_PAGE_LIMIT: int = 8
     RUN_QUEUE_MAX_PENDING: int = 20
     RUN_LEASE_SECONDS: int = 90
     RUN_COORDINATOR_POLL_SECONDS: float = 3.0

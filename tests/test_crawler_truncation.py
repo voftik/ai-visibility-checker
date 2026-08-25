@@ -16,8 +16,8 @@ class _StreamingResponse:
     headers = {"content-type": "text/html; charset=utf-8"}
 
     async def aiter_bytes(self):
-        yield b"a" * crawler.BODY_LIMIT_BYTES
-        yield b"b"
+        yield b"a" * (crawler.BODY_STREAM_SPOOL_BYTES + 1)
+        yield b"TAIL_MARKER"
 
     async def aclose(self) -> None:
         return None
@@ -42,7 +42,7 @@ class _StreamingClient:
 
 
 class ProbeBodyTruncationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_probe_result_marks_an_oversized_stream_as_truncated(
+    async def test_probe_reads_past_spool_threshold_until_eof_without_loss(
         self,
     ) -> None:
         self.assertFalse(crawler.ProbeResult().body_truncated)
@@ -60,9 +60,13 @@ class ProbeBodyTruncationTests(unittest.IsolatedAsyncioTestCase):
                 concurrency=1,
             )
 
-        self.assertTrue(result.body_truncated)
-        self.assertEqual(result.response_size_bytes, crawler.BODY_LIMIT_BYTES)
-        self.assertEqual(len(result.body_bytes or b""), crawler.BODY_LIMIT_BYTES)
+        self.assertFalse(result.body_truncated)
+        self.assertEqual(
+            result.response_size_bytes,
+            crawler.BODY_STREAM_SPOOL_BYTES + 1 + len(b"TAIL_MARKER"),
+        )
+        self.assertTrue((result.body_bytes or b"").endswith(b"TAIL_MARKER"))
+        self.assertTrue(result.full_text.endswith("TAIL_MARKER"))
 
 
 class PersistedTruncationContractTests(unittest.IsolatedAsyncioTestCase):
@@ -126,9 +130,45 @@ class PersistedTruncationContractTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     self._stored_probe(
                         self.run_id,
+                        "current-policy-incomplete",
+                        response_size_bytes=4_194_304,
+                        content_signals={
+                            "_body_truncated": True,
+                            "_body_read_policy": crawler._body_read_policy(
+                                crawler.ProbeResult(body_truncated=True)
+                            ),
+                        },
+                    ),
+                    self._stored_probe(
+                        self.run_id,
+                        "stale-policy-prefix",
+                        response_size_bytes=4_194_304,
+                        content_signals={
+                            "_body_truncated": True,
+                            "_body_read_policy": {
+                                "version": "old-policy",
+                                "response_size_limit_bytes": 4_194_304,
+                                "result": "transport_incomplete",
+                                "terminal": True,
+                            },
+                        },
+                    ),
+                    self._stored_probe(
+                        self.run_id,
                         "complete",
                         response_size_bytes=crawler.LEGACY_BODY_LIMIT_BYTES - 1,
                         content_signals={"_body_truncated": False},
+                    ),
+                    self._stored_probe(
+                        self.run_id,
+                        "current-policy-complete-at-legacy-size",
+                        response_size_bytes=crawler.LEGACY_BODY_LIMIT_BYTES,
+                        content_signals={
+                            "_body_truncated": False,
+                            "_body_read_policy": crawler._body_read_policy(
+                                crawler.ProbeResult(body_truncated=False)
+                            ),
+                        },
                     ),
                 ]
             )
@@ -141,11 +181,24 @@ class PersistedTruncationContractTests(unittest.IsolatedAsyncioTestCase):
             {
                 (
                     "https://example.com/",
-                    "complete",
+                    "current-policy-complete-at-legacy-size",
                     ProbeType.main_page.value,
-                )
+                ),
             },
         )
+
+    def test_incomplete_stream_is_never_reusable(self) -> None:
+        current = crawler._body_read_policy(crawler.ProbeResult(body_truncated=True))
+        self.assertFalse(
+            crawler._probe_result_is_reusable(
+                None,
+                200,
+                body_truncated=True,
+                body_read_policy=current,
+            )
+        )
+        complete = crawler._body_read_policy(crawler.ProbeResult())
+        self.assertTrue(crawler._current_complete_eof_policy(complete))
 
     async def test_truncation_signal_is_persisted_and_rendering_stays_unknown(
         self,
@@ -169,7 +222,7 @@ class PersistedTruncationContractTests(unittest.IsolatedAsyncioTestCase):
             final_url="https://example.com/",
             full_text=html,
             content_type="text/html; charset=utf-8",
-            response_size_bytes=crawler.BODY_LIMIT_BYTES,
+            response_size_bytes=4_194_304,
             body_truncated=True,
             body_looks_empty=False,
         )
@@ -217,6 +270,18 @@ class PersistedTruncationContractTests(unittest.IsolatedAsyncioTestCase):
         page_signals = page.content_signals or {}
         self.assertIs(probe_signals["_body_truncated"], True)
         self.assertIs(page_signals["_body_truncated"], True)
+        self.assertEqual(
+            probe_signals["_body_read_policy"],
+            page_signals["_body_read_policy"],
+        )
+        self.assertEqual(
+            probe_signals["_body_read_policy"]["result"],
+            "transport_incomplete",
+        )
+        self.assertEqual(
+            probe_signals["_body_read_policy"]["version"],
+            crawler.BODY_READ_POLICY_VERSION,
+        )
         self.assertGreater(page.text_length, 1_000)
         self.assertEqual(page_signals["render_strategy"], "unknown")
         self.assertEqual(page_signals["render_strategy_confidence"], "low")

@@ -26,8 +26,11 @@ SyslogIdentifier=aiv-reprocess
 SuccessExitStatus=143
 # Время на _release_reprocess_claim до SIGKILL.
 TimeoutStopSec=120
-# Переанализ не должен висеть вечно.
-RuntimeMaxSec=3600
+# Общего wall-clock потолка нет: каждый физический сетевой вызов имеет свой
+# inactivity timeout, а прогресс и lease контролируются приложением. Поэтому
+# длинный, но продолжающийся lossless-reprocess не будет оборван systemd по
+# истечении произвольного числа часов.
+RuntimeMaxSec=infinity
 # Машина 1.9 GiB, основной сервис занимает около 195 МБ.
 MemoryHigh=550M
 MemoryMax=700M

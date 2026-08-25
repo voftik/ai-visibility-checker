@@ -86,13 +86,12 @@ def _clean_text(value: str | None) -> str:
 
 
 def _language_guess(text: str) -> str | None:
-    head = text[:4000]
-    if len(head) < 100:
+    if len(text) < 100:
         return None
-    letters = sum(1 for char in head if char.isalpha())
+    letters = sum(1 for char in text if char.isalpha())
     if not letters:
         return None
-    cyrillic = sum(1 for char in head if "Ѐ" <= char <= "ӿ")
+    cyrillic = sum(1 for char in text if "Ѐ" <= char <= "ӿ")
     ratio = cyrillic / letters
     if ratio > 0.70:
         return "ru"
@@ -109,7 +108,14 @@ def _schema_type_name(value: Any) -> str | None:
     return match.group(1) if match else text
 
 
-def _deduplicate_types(values: list[str], *, limit: int = 30) -> list[str]:
+def _deduplicate_types(values: list[str]) -> list[str]:
+    """Return the complete, stable type set found in the stored document.
+
+    The crawler reads the physical HTML through EOF.  A silent type-count cap
+    would still turn a complete positive observation into an incomplete one
+    without leaving any provenance that this happened.
+    """
+
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -121,33 +127,84 @@ def _deduplicate_types(values: list[str], *, limit: int = 30) -> list[str]:
             continue
         seen.add(key)
         result.append(normalized)
-        if len(result) >= limit:
-            break
     return result
 
 
-def _jsonld_types(soup: BeautifulSoup) -> list[str]:
+def _jsonld_observation(soup: BeautifulSoup) -> dict[str, Any]:
+    """Parse every JSON-LD script and retain both evidence and failures."""
+
     found: list[str] = []
+    errors: list[dict[str, Any]] = []
+    tags = [
+        tag
+        for tag in soup.find_all("script")
+        if str(tag.get("type") or "")
+        .split(";", 1)[0]
+        .strip()
+        .casefold()
+        == "application/ld+json"
+    ]
 
     def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            item_type = value.get("@type")
-            if isinstance(item_type, str):
-                found.append(item_type)
-            elif isinstance(item_type, list):
-                found.extend(str(item) for item in item_type if item)
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
+        # Iterative traversal avoids treating deeply nested but valid JSON-LD
+        # as a parser failure merely because it exceeds Python's call stack.
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                item_type = current.get("@type")
+                if isinstance(item_type, str):
+                    found.append(item_type)
+                elif isinstance(item_type, list):
+                    found.extend(str(item) for item in item_type if item)
+                pending.extend(reversed(list(current.values())))
+            elif isinstance(current, list):
+                pending.extend(reversed(current))
 
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+    parsed_count = 0
+    for script_index, tag in enumerate(tags):
+        raw = tag.string if isinstance(tag.string, str) else tag.get_text()
         try:
-            visit(json.loads(tag.get_text(" ", strip=True)))
-        except (TypeError, ValueError, json.JSONDecodeError):
+            document = json.loads(raw or "")
+        except json.JSONDecodeError as exc:
+            errors.append(
+                {
+                    "script_index": script_index,
+                    "error_type": "json_decode_error",
+                    "message": exc.msg,
+                    "line": exc.lineno,
+                    "column": exc.colno,
+                    "char_offset": exc.pos,
+                }
+            )
             continue
-    return _deduplicate_types(found)
+        except (TypeError, ValueError) as exc:
+            errors.append(
+                {
+                    "script_index": script_index,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+            continue
+        parsed_count += 1
+        visit(document)
+
+    failed_count = len(errors)
+    return {
+        "types": _deduplicate_types(found),
+        "script_count": len(tags),
+        "parsed_count": parsed_count,
+        "failed_count": failed_count,
+        "errors": errors,
+        "state": (
+            "complete"
+            if failed_count == 0
+            else "partial"
+            if parsed_count > 0
+            else "failed"
+        ),
+    }
 
 
 def _microdata_types(soup: BeautifulSoup) -> list[str]:
@@ -163,10 +220,14 @@ def _microdata_types(soup: BeautifulSoup) -> list[str]:
     return _deduplicate_types(found)
 
 
-def _structured_data_types(soup: BeautifulSoup) -> list[str]:
+def _structured_data_types(
+    soup: BeautifulSoup,
+    *,
+    jsonld: dict[str, Any],
+) -> list[str]:
     return _deduplicate_types(
         [
-            *_jsonld_types(soup),
+            *(jsonld.get("types") or []),
             *_microdata_types(soup),
         ]
     )
@@ -198,10 +259,18 @@ def _empty_result() -> dict[str, Any]:
         "tag_paragraph_count": 0,
         "tag_link_count": 0,
         "script_count": 0,
+        "jsonld": {
+            "script_count": 0,
+            "parsed_count": 0,
+            "failed_count": 0,
+            "errors": [],
+            "state": "unknown",
+        },
         "title": None,
         "meta_description": None,
         "canonical_url": None,
         "structured_data_types": [],
+        "structured_data_complete": False,
         "render_strategy": "unknown",
         "render_strategy_confidence": "low",
         "render_strategy_reasons": [],
@@ -249,7 +318,8 @@ def extract_text_signals(body_text: str, content_type: str | None) -> dict[str, 
         if canonical_node and canonical_node.get("href")
         else None
     )
-    structured_types = _structured_data_types(soup)
+    jsonld = _jsonld_observation(soup)
+    structured_types = _structured_data_types(soup, jsonld=jsonld)
 
     script_count = len(soup.find_all("script"))
     link_count = len(soup.find_all("a", href=True))
@@ -361,10 +431,17 @@ def extract_text_signals(body_text: str, content_type: str | None) -> dict[str, 
         "tag_paragraph_count": paragraph_count,
         "tag_link_count": link_count,
         "script_count": script_count,
+        "jsonld": {
+            key: value for key, value in jsonld.items() if key != "types"
+        },
         "title": title,
         "meta_description": meta_description,
         "canonical_url": canonical_url,
         "structured_data_types": structured_types,
+        # A valid type found in another script remains positive evidence, but
+        # one malformed JSON-LD block makes absence claims about the complete
+        # machine-readable description unknown.
+        "structured_data_complete": jsonld["failed_count"] == 0,
         "render_strategy": render_strategy,
         "render_strategy_confidence": render_confidence,
         "render_strategy_reasons": render_reasons,
@@ -377,6 +454,9 @@ def extract_text_signals(body_text: str, content_type: str | None) -> dict[str, 
         "looks_like_geo_block": bool(geo_token_match or geo_structural_match),
         "looks_disproportionate_wrapper": disproportionate,
         "primary_language_guess": _language_guess(main_text or visible_text),
-        "main_text_excerpt": main_text[:24_000],
-        "visible_text_excerpt": visible_text[:6_000],
+        # The caller may persist or partition these values.  Do not silently
+        # turn a long page into a prefix here; transport-level body truncation
+        # is tracked separately as unknown/incomplete.
+        "main_text_excerpt": main_text,
+        "visible_text_excerpt": visible_text,
     }

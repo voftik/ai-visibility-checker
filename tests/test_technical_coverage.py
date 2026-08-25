@@ -13,6 +13,7 @@ from app.models import (
     RunStatus,
     SitePage,
 )
+from app.services import crawler
 from app.services.analyzer import (
     PROMPT_SET_VERSION,
     SITE_PAGE_MANIFEST_VERSION,
@@ -194,6 +195,51 @@ class TechnicalSummaryCoverageIntegrationTests(
     async def asyncSetUp(self) -> None:
         await init_db()
         self.run_id = f"test-{uuid.uuid4()}"
+        current_policy = crawler._body_read_policy(crawler.ProbeResult())
+        home = SitePage(
+            run_id=self.run_id,
+            url="https://example.com/",
+            page_kind="home",
+            http_status=200,
+            main_text="Home page",
+            text_length=100,
+            content_signals={
+                "render_strategy": "server_rendered",
+                "_body_read_policy": current_policy,
+                "_source_body_sha256": "home-source",
+            },
+        )
+        services = SitePage(
+            run_id=self.run_id,
+            url="https://example.com/services",
+            page_kind="product",
+            http_status=200,
+            main_text="Services page",
+            text_length=100,
+            content_signals={
+                "render_strategy": "server_rendered",
+                "_body_read_policy": current_policy,
+                "_source_body_sha256": "services-source",
+            },
+        )
+        stale = SitePage(
+            run_id=self.run_id,
+            url="https://example.com/stale",
+            page_kind="other",
+            http_status=200,
+            main_text="",
+            text_length=0,
+            content_signals={"render_strategy": "client_rendered_shell"},
+        )
+        pages = [
+            ("https://example.com/", "home"),
+            ("https://example.com/services", "product"),
+        ]
+        manifest_input = crawler._site_page_manifest_input("example.com")
+        page_receipt = crawler._site_page_receipt(
+            pages,
+            {home.url: home, services.url: services},
+        )
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -203,33 +249,7 @@ class TechnicalSummaryCoverageIntegrationTests(
                     config_json={},
                 )
             )
-            session.add_all(
-                [
-                    SitePage(
-                        run_id=self.run_id,
-                        url="https://example.com/",
-                        page_kind="home",
-                        text_length=100,
-                        content_signals={"render_strategy": "server_rendered"},
-                    ),
-                    SitePage(
-                        run_id=self.run_id,
-                        url="https://example.com/services",
-                        page_kind="product",
-                        text_length=100,
-                        content_signals={"render_strategy": "server_rendered"},
-                    ),
-                    SitePage(
-                        run_id=self.run_id,
-                        url="https://example.com/stale",
-                        page_kind="other",
-                        text_length=0,
-                        content_signals={
-                            "render_strategy": "client_rendered_shell"
-                        },
-                    ),
-                ]
-            )
+            session.add_all([home, services, stale])
             session.add(
                 RunArtifact(
                     run_id=self.run_id,
@@ -237,25 +257,24 @@ class TechnicalSummaryCoverageIntegrationTests(
                     artifact_key="site_page_manifest",
                     status="completed",
                     prompt_version=SITE_PAGE_MANIFEST_VERSION,
-                    input_json={
-                        "domain": "example.com",
-                        "selection_limit": 6,
-                    },
+                    input_json=manifest_input,
                     output_json={
-                        "pages": [
-                            {
-                                "url": "https://example.com/",
-                                "page_kind": "home",
-                            },
-                            {
-                                "url": "https://example.com/services",
-                                "page_kind": "product",
-                            },
-                        ],
-                        "discovered_count": 5,
+                        "pages": crawler._selected_page_records(pages),
+                        "expected_page_count": 2,
+                        "discovered_count": 2,
+                        "discovered_candidate_count": 2,
                         "selected_count": 2,
-                        "selection_limit": 6,
-                        "coverage_state": "limited",
+                        "selected_pages_sha256": (
+                            crawler._selected_pages_sha256(pages)
+                        ),
+                        "page_scope": crawler.PAGE_SCOPE,
+                        "selection_policy": manifest_input["selection_policy"],
+                        "selection_exhausted": True,
+                        "verified_exhaustion": True,
+                        "legacy_snapshot": False,
+                        "discovery_state": "complete",
+                        "coverage_state": "complete",
+                        "site_page_receipt": page_receipt,
                     },
                 )
             )
@@ -272,9 +291,9 @@ class TechnicalSummaryCoverageIntegrationTests(
         summary = await _technical_summary(self.run_id)
 
         self.assertEqual(summary["evaluated_pages"], 2)
-        self.assertEqual(summary["discovered_pages"], 5)
-        self.assertEqual(summary["coverage_rate"], 40.0)
-        self.assertEqual(summary["coverage_state"], "limited")
+        self.assertEqual(summary["discovered_pages"], 2)
+        self.assertEqual(summary["coverage_rate"], 100.0)
+        self.assertEqual(summary["coverage_state"], "complete")
         self.assertEqual(
             {page["url"] for page in summary["pages"]},
             {
@@ -283,7 +302,45 @@ class TechnicalSummaryCoverageIntegrationTests(
             },
         )
         self.assertEqual(summary["summary"]["evaluated_pages"], 2)
-        self.assertEqual(summary["summary"]["discovered_pages"], 5)
+        self.assertEqual(summary["summary"]["discovered_pages"], 2)
+
+    async def test_bounded_manifest_uses_selected_pages_not_candidate_frontier(
+        self,
+    ) -> None:
+        async with SessionLocal() as session:
+            artifact = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key == "site_page_manifest",
+                    )
+                )
+            ).scalar_one()
+            output = dict(artifact.output_json)
+            output.update(
+                {
+                    "discovered_count": 9,
+                    "discovered_candidate_count": 9,
+                    "selection_exhausted": True,
+                    "coverage_state": "bounded",
+                }
+            )
+            artifact.output_json = output
+            await session.commit()
+
+        summary = await _technical_summary(self.run_id)
+
+        self.assertEqual(summary["evaluated_pages"], 2)
+        self.assertEqual(summary["discovered_pages"], 9)
+        self.assertEqual(summary["coverage_rate"], 22.2)
+        self.assertEqual(summary["coverage_state"], "limited")
+        self.assertEqual(
+            {page["url"] for page in summary["pages"]},
+            {
+                "https://example.com/",
+                "https://example.com/services",
+            },
+        )
 
     async def test_unknown_rendering_stays_unknown_without_crashing(self) -> None:
         async with SessionLocal() as session:
@@ -321,6 +378,65 @@ class TechnicalSummaryCoverageIntegrationTests(
         self.assertIsNone(summary["rendering"]["server_readable_share"])
         self.assertEqual(server_html["value"], "2 из 2 не определено")
         self.assertEqual(server_html["state"], "unknown")
+
+    async def test_jsonld_parse_failure_is_unknown_not_schema_absence(self) -> None:
+        parse_evidence = {
+            "script_count": 2,
+            "parsed_count": 1,
+            "failed_count": 1,
+            "errors": [
+                {
+                    "script_index": 1,
+                    "error_type": "json_decode_error",
+                    "message": "Expecting value",
+                }
+            ],
+            "state": "partial",
+        }
+        async with SessionLocal() as session:
+            home = (
+                await session.execute(
+                    select(SitePage).where(
+                        SitePage.run_id == self.run_id,
+                        SitePage.url == "https://example.com/",
+                    )
+                )
+            ).scalar_one()
+            home.content_signals = {
+                "render_strategy": "server_rendered",
+                "structured_data_complete": False,
+                "structured_data_types": ["Organization"],
+                "jsonld": parse_evidence,
+            }
+            services = (
+                await session.execute(
+                    select(SitePage).where(
+                        SitePage.run_id == self.run_id,
+                        SitePage.url == "https://example.com/services",
+                    )
+                )
+            ).scalar_one()
+            services.content_signals = {
+                "render_strategy": "server_rendered",
+                "structured_data_complete": False,
+                "structured_data_types": [],
+                "jsonld": parse_evidence,
+            }
+            await session.commit()
+
+        summary = await _technical_summary(self.run_id)
+        home_result = next(
+            page
+            for page in summary["pages"]
+            if page["url"] == "https://example.com/"
+        )
+
+        self.assertIs(home_result["structured_data_complete"], False)
+        self.assertEqual(home_result["structured_data_types"], ["Organization"])
+        self.assertEqual(home_result["jsonld"], parse_evidence)
+        self.assertEqual(summary["structured_data"]["evaluated_pages"], 1)
+        self.assertEqual(summary["structured_data"]["unknown_pages"], 1)
+        self.assertEqual(summary["structured_data"]["entity_pages"], 1)
 
     async def test_taxonomy_marker_comes_from_saved_prompt_artifact(self) -> None:
         self.assertFalse(
@@ -378,7 +494,8 @@ class TechnicalSummaryCoverageIntegrationTests(
             ).scalar_one()
             artifact.input_json = {
                 "domain": "other.example",
-                "selection_limit": 6,
+                "page_scope": "complete_discovered_frontier_v1",
+                "semantic_page_count_cap": None,
             }
             artifact.output_json = {
                 "pages": [
@@ -389,7 +506,8 @@ class TechnicalSummaryCoverageIntegrationTests(
                 ],
                 "discovered_count": 1,
                 "selected_count": 1,
-                "selection_limit": 6,
+                "page_scope": "complete_discovered_frontier_v1",
+                "semantic_page_count_cap": None,
                 "coverage_state": "complete",
             }
             await session.commit()

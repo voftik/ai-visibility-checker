@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,12 +32,21 @@ from app.models import (
     VisibilityPrompt,
 )
 from app.services import crawler
+from app.services import openrouter as openrouter_service
+from app.services.offer_catalog import (
+    SourceUnit,
+    build_domain_research_payload,
+    build_offer_catalog,
+    build_offer_clusters,
+)
 from app.services.openrouter import (
+    OUTPUT_ENVELOPE_VERSION,
     WEB_ATTESTATION_VERSION,
     OpenRouterOutputLimitError,
     OpenRouterError,
     OpenRouterPolicyError,
     OpenRouterResponseContractError,
+    OutputTokenPolicy,
     PanelModel,
     WebSearchPolicy,
     attest_web_response,
@@ -46,10 +55,15 @@ from app.services.openrouter import (
 )
 from app.services.report_semantic_gate import (
     CANONICAL_OBSERVATIONAL_MEMORY_LIMITATION,
+    REPORT_SEMANTIC_MODEL,
+    semantic_provider_payload,
+    semantic_provider_request_utf8_bytes,
 )
 from app.services.analyzer import (
     _require_market_research_usable,
+    ANALYZER_REDUCER_HARNESS_VERSION,
     ANALYSIS_MODEL,
+    ANNOTATION_SCHEMA,
     ANNOTATION_VERSION,
     ENTITY_CATALOG_CHUNK_VERSION,
     ENTITY_CATALOG_VERSION,
@@ -69,25 +83,36 @@ from app.services.analyzer import (
     LEGACY_PROMPT_SET_VERSIONS,
     PROCESSING_BATCH_CONCURRENCY,
     PROCESSING_MODEL,
+    BOUNDED_PANEL_CONTRACT_VERSION,
     PANEL_ATTEMPT_AUDIT_VERSION,
     PANEL_CONTRACT_VERSION,
+    PANEL_OUTPUT_POLICY,
     MARKET_RESEARCH_SCHEMA,
     MARKET_RESEARCH_VERSION,
+    MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+    MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+    MARKET_RESEARCH_WEB_HARNESS_VERSION,
     METRICS_VERSION,
     PROMPT_SET_REVIEW_SCHEMA,
     PROMPT_SET_SCHEMA,
     PROMPT_SET_VERSION,
     SITE_PROFILE_SCHEMA,
     _annotate_answers,
+    _analyzer_model_input_window,
+    _annotation_context_payload,
     _annotation_context_sha256,
+    _annotation_split_oversized_record,
     _attribution_owner_aliases,
     _answers_for_catalog,
     _artifact_cache_matches,
+    _bounded_semantic_model_evidence_context,
     _build_public_report,
     _classify_site,
     _compute_metrics,
     _deterministic_annotation_warnings,
+    _deterministic_entity_catalog_union,
     _deterministic_prompt_fallback,
+    _deterministic_site_profile_union,
     _entity_catalog,
     _entity_alias_entries,
     _evidence_contains_complete_alias,
@@ -95,8 +120,22 @@ from app.services.analyzer import (
     _ensure_answer_rows,
     _expected_corpus_cells,
     _final_corpus_manifest,
+    _final_input_deterministic_passthrough,
+    _final_input_claim_ledger,
     _final_input_preflight,
+    _flatten_final_input_payload,
+    _final_model_input_window,
+    _normalize_final_evidence_packet,
+    _normalize_final_root_summary_packet,
+    _final_root_fact_refs,
+    _final_root_fact_table,
+    _final_root_parent_node,
+    _final_root_node_receipt,
+    _verify_final_root_tree,
+    _preserve_final_evidence_reduction,
+    _prepare_final_model_payload,
     _final_report,
+    _final_report_author_candidate,
     _final_report_payload,
     _full_answer_context,
     _full_answer_corpus_items,
@@ -111,17 +150,32 @@ from app.services.analyzer import (
     _legacy_panel_request_sha256,
     _legacy_panel_run_contract,
     _load_panel_resume_checkpoint,
+    _long_response_leaf,
+    _long_response_lineage,
     _panel_metric_access,
     _market_research,
+    _market_research_evidence_tree,
+    _market_research_model_window,
+    _market_research_structuring_shards,
+    _market_research_web_children,
+    _market_research_web_leaf,
+    _market_research_web_provider_payload,
+    _market_research_web_request_utf8_bytes,
+    _market_research_web_scope,
+    _validate_market_research_web_leaf,
     _market_research_sufficiency,
     _metric_rows,
+    _visibility_slice,
     _normalize_unpaired_memory_illustration,
     _panel_answer_attestation,
+    _bounded_panel_request_sha256,
     _panel_request_sha256,
     _panel_web_policy,
     _persist_prompts,
     _portfolio_entity_is_grounded,
     _portfolio_mention_policy,
+    _preserve_entity_catalog_reduction,
+    _preserve_site_profile_reduction,
     _prompt_review_errors,
     _processing_artifact,
     _probe_access_outcome,
@@ -133,8 +187,11 @@ from app.services.analyzer import (
     _review_prompt_set_semantics,
     _review_illustration,
     _reuse_saved_illustration_assets,
+    _restrict_partition_annotation_to_core,
     _scope_entity_catalog_to_profile,
+    _serialized_llm_request_bytes,
     _structured_artifact,
+    _structured_provider_request_utf8_bytes,
     _run_report_branches,
     _run_reused_report_branches,
     _rows_from_full_answer_models,
@@ -162,12 +219,243 @@ def _rules_by_bot(value: str) -> dict[str, tuple[str, str]]:
     return {bot: (rule, raw) for bot, rule, raw in parse_robots(value)}
 
 
+class LongResponseReducerSafetyTests(unittest.TestCase):
+    def test_lineage_rejects_missing_and_duplicate_units(self) -> None:
+        left = _long_response_leaf({"value": 1}, ["unit-1"])
+        right = _long_response_leaf({"value": 2}, ["unit-2"])
+
+        self.assertEqual(
+            _long_response_lineage(
+                [left, right],
+                expected_unit_ids=["unit-1", "unit-2"],
+            ),
+            ["unit-1", "unit-2"],
+        )
+        with self.assertRaisesRegex(OpenRouterError, "missing"):
+            _long_response_lineage(
+                [left],
+                expected_unit_ids=["unit-1", "unit-2"],
+            )
+        with self.assertRaisesRegex(OpenRouterError, "duplicated"):
+            _long_response_lineage([left, left])
+
+    def test_final_reducer_preserves_distinct_supporting_facts_from_same_unit(
+        self,
+    ) -> None:
+        first = {
+            "category": "context",
+            "statement": "Сайт отвечает HTTP 200.",
+            "source_paths": ["/technical/pages/0/status"],
+            "source_unit_ids": ["unit-1"],
+            "exact_values": ["200"],
+            "evidence_excerpt": "200",
+            "importance": "supporting",
+        }
+        second = {
+            "category": "context",
+            "statement": "Текст страницы доступен в HTML.",
+            "source_paths": ["/technical/pages/0/status"],
+            "source_unit_ids": ["unit-1"],
+            "exact_values": ["server_html"],
+            "evidence_excerpt": "server_html",
+            "importance": "supporting",
+        }
+        child = {
+            "observations": [first, second],
+            "uncertainties": [],
+            "report_focus": [],
+            "unit_coverage": [
+                {
+                    "source_unit_id": "unit-1",
+                    "disposition": "supporting_context",
+                    "rationale": "Оба факта принадлежат одной source unit.",
+                }
+            ],
+        }
+        reducer_output = {
+            **child,
+            "observations": [first],
+        }
+
+        preserved = _preserve_final_evidence_reduction(
+            reducer_output,
+            [child],
+        )
+
+        self.assertEqual(preserved["observations"], [first, second])
+
+    def test_annotation_context_fragments_send_overlap_with_core_ownership(
+        self,
+    ) -> None:
+        record = {
+            "record_id": "catalog:entity:0",
+            "kind": "catalog_entity",
+            "field": "entities",
+            "value": {
+                "canonical_name": (
+                    "L" * 250 + " BoundaryEntity " + "R" * 320
+                ),
+                "aliases": ["BoundaryEntity"],
+            },
+        }
+        serialized = json.dumps(
+            record["value"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        fragments = _annotation_split_oversized_record(
+            record,
+            target_chars=256,
+        )
+
+        self.assertGreater(len(fragments), 1)
+        reconstructed = "".join(
+            fragment["value"][
+                fragment["core_start_in_context"] : fragment[
+                    "core_end_in_context"
+                ]
+            ]
+            for fragment in fragments
+        )
+        self.assertEqual(reconstructed, serialized)
+        self.assertTrue(
+            any(
+                fragment["core_start_in_context"] > 0
+                or fragment["core_end_in_context"]
+                < len(fragment["value"])
+                for fragment in fragments
+            )
+        )
+
+        payload = _annotation_context_payload(
+            profile={"brand_name": "VK"},
+            catalog={"entities": [record["value"]]},
+            full_alias_map={"boundaryentity": ["VK"]},
+            all_records=[record],
+            selected_records=[record],
+            shard_records=fragments,
+            selection_rule="test",
+            answers=[],
+            research_guidance="",
+            repair_mode="",
+            shard_index=0,
+            shard_count=1,
+        )
+        sent_fragments = payload["context_fragments"]
+        self.assertEqual(
+            [item["json_fragment"] for item in sent_fragments],
+            [item["value"] for item in fragments],
+        )
+        self.assertEqual(
+            payload["entity_attribution_aliases"],
+            {"boundaryentity": ["VK"]},
+        )
+        self.assertTrue(
+            all(
+                item["ownership_rule"]
+                == "first_decisive_evidence_character_in_core"
+                and item["core_sha256"]
+                and item["context_sha256"]
+                for item in sent_fragments
+            )
+        )
+
+    def test_reducer_omissions_become_uncertainties_not_active_entities(self) -> None:
+        profile = _preserve_site_profile_reduction(
+            {
+                "brand_aliases": ["Target"],
+                "products": [],
+                "entity_scope": [],
+                "uncertainties": [],
+            },
+            [
+                {
+                    "brand_aliases": ["Target", "Leaf alias"],
+                    "products": ["Unconfirmed service"],
+                    "entity_scope": [{"canonical_name": "Leaf product"}],
+                    "uncertainties": [],
+                }
+            ],
+        )
+        self.assertEqual(profile["brand_aliases"], ["Target"])
+        self.assertEqual(profile["products"], [])
+        self.assertEqual(profile["entity_scope"], [])
+        self.assertTrue(
+            any("Leaf product" in value for value in profile["uncertainties"])
+        )
+
+        catalog = _preserve_entity_catalog_reduction(
+            {"target_aliases": ["Target"], "entities": [], "uncertainties": []},
+            [
+                {
+                    "target_aliases": ["Target", "Leaf alias"],
+                    "entities": [
+                        {
+                            "canonical_name": "Unconfirmed product",
+                            "aliases": ["Leaf product"],
+                        }
+                    ],
+                    "uncertainties": [],
+                }
+            ],
+        )
+        self.assertEqual(catalog["target_aliases"], ["Target"])
+        self.assertEqual(catalog["entities"], [])
+        self.assertTrue(
+            any(
+                "Unconfirmed product" in value
+                for value in catalog["uncertainties"]
+            )
+        )
+
+    def test_overlap_context_does_not_double_own_literal_facts(self) -> None:
+        context = "Realweb — владелец услуги.\nCORE: programmatic-реклама"
+        core_start = context.index("CORE")
+        unit = {
+            "answer": context,
+            "_lr_core_start_in_context": core_start,
+            "_lr_core_end_in_context": len(context),
+        }
+        annotation = {
+            "target_mentioned": True,
+            "target_position": 1,
+            "target_role": "recommended",
+            "entity_mentions": [
+                {"canonical_name": "Realweb", "evidence": "Realweb"},
+                {
+                    "canonical_name": "programmatic-реклама",
+                    "evidence": "programmatic-реклама",
+                },
+            ],
+            "evidence": ["Realweb", "programmatic-реклама"],
+        }
+
+        restricted = _restrict_partition_annotation_to_core(
+            annotation,
+            unit,
+            target_aliases=["Realweb"],
+        )
+
+        self.assertFalse(restricted["target_mentioned"])
+        self.assertIsNone(restricted["target_position"])
+        self.assertEqual(
+            [item["canonical_name"] for item in restricted["entity_mentions"]],
+            ["programmatic-реклама"],
+        )
+        self.assertEqual(restricted["evidence"], ["programmatic-реклама"])
+
+
 def _attested_panel_usage(
     *,
     prompt_text: str,
     mode: str,
     provider_key: str,
     model: str,
+    response_text: str | None = None,
+    contract_version: str = PANEL_CONTRACT_VERSION,
+    max_tokens: int | None = None,
 ) -> tuple[dict[str, object], list[dict[str, str]] | None]:
     policy = _panel_web_policy(mode, provider_key)
     _fields, request_policy = web_request_policy(
@@ -210,26 +498,67 @@ def _attested_panel_usage(
         citations=citations,
         router_metadata={},
     )
+    if contract_version == PANEL_CONTRACT_VERSION:
+        request_sha256 = _panel_request_sha256(
+            prompt_text=prompt_text,
+            mode=mode,
+            provider_key=provider_key,
+            model=model,
+        )
+    elif contract_version == BOUNDED_PANEL_CONTRACT_VERSION:
+        request_sha256 = _bounded_panel_request_sha256(
+            prompt_text=prompt_text,
+            mode=mode,
+            provider_key=provider_key,
+            model=model,
+            max_tokens=3_200 if max_tokens is None else max_tokens,
+        )
+    else:
+        raise ValueError(f"Unsupported test panel contract: {contract_version}")
+    panel_contract: dict[str, object] = {
+        "version": contract_version,
+        "request_sha256": request_sha256,
+        "request_policy_sha256": request_policy["sha256"],
+        "web_policy": request_policy["policy"],
+        "attestation_version": WEB_ATTESTATION_VERSION,
+        "web_attestation": attestation,
+    }
+    if contract_version == PANEL_CONTRACT_VERSION:
+        panel_contract["output_policy"] = PANEL_OUTPUT_POLICY
+        if response_text is not None:
+            panel_contract.update(
+                {
+                    "observation_completeness": "complete",
+                    "raw_response_sha256": hashlib.sha256(
+                        response_text.encode("utf-8")
+                    ).hexdigest(),
+                    "raw_response_chars": len(response_text),
+                }
+            )
+    elif max_tokens is not None:
+        panel_contract["max_tokens"] = max_tokens
+
     usage: dict[str, object] = {
         **raw_usage,
         "_aiv_request_policy": request_policy,
         "_aiv_response_annotations": annotations,
         "_aiv_router_metadata": {},
         "_aiv_web_attestation": attestation,
-        "_aiv_panel_contract": {
-            "version": PANEL_CONTRACT_VERSION,
-            "request_sha256": _panel_request_sha256(
-                prompt_text=prompt_text,
-                mode=mode,
-                provider_key=provider_key,
-                model=model,
-            ),
-            "request_policy_sha256": request_policy["sha256"],
-            "web_policy": request_policy["policy"],
-            "attestation_version": WEB_ATTESTATION_VERSION,
-            "web_attestation": attestation,
-        },
+        "_aiv_panel_contract": panel_contract,
     }
+    if contract_version == PANEL_CONTRACT_VERSION:
+        usage["_aiv_output_envelope"] = {
+            "version": OUTPUT_ENVELOPE_VERSION,
+            "policy": OutputTokenPolicy.MODEL_MAX.value,
+            "requested_model": model,
+            "resolution": "test_fixture",
+            "context_length": 128_000,
+            "max_completion_tokens": 32_000,
+        }
+        usage["_aiv_transport"] = {
+            "output_complete": True,
+            "output_limited": False,
+        }
     return usage, citations or None
 
 
@@ -337,6 +666,84 @@ def _ready_market_research(
     }
 
 
+def _profile_with_offer_contract(
+    profile: dict[str, Any],
+    *,
+    domain: str = "example.com",
+    source_url: str | None = None,
+    offer_name: str = "Платформа",
+) -> dict[str, Any]:
+    """Return a profile fixture with one source-proven commercial offer."""
+
+    enriched = copy.deepcopy(profile)
+    brand_name = str(enriched.get("brand_name") or "Example").strip()
+    source_url = source_url or f"https://{domain}/"
+    source_text = (
+        f"{brand_name} предлагает продукт «{offer_name}» "
+        "для анализа видимости."
+    )
+    source = SourceUnit.from_text(
+        source_unit_id=f"{source_url}:000000",
+        source_url=source_url,
+        text=source_text,
+    )
+    jobs = [
+        str(value).strip()
+        for value in enriched.get("customer_jobs") or []
+        if str(value).strip()
+    ] or ["Сравнить поставщиков аналитики"]
+    catalog = build_offer_catalog(
+        client_domain=domain,
+        client_aliases=[brand_name, *(enriched.get("brand_aliases") or [])],
+        source_units=[source],
+        candidates=[
+            {
+                "canonical_name": offer_name,
+                "aliases": [],
+                "kind": "product",
+                "source_url": source.source_url,
+                "evidence_excerpt": source_text,
+                "source_unit_id": source.source_unit_id,
+                "source_sha256": source.source_sha256,
+                "confidence": 0.95,
+                "user_jobs": jobs,
+                "commercially_relevant": True,
+            }
+        ],
+    )
+    clusters = build_offer_clusters(catalog)
+    enriched["products"] = list(catalog.legacy_product_strings())
+    enriched["offer_catalog"] = catalog.as_dict()
+    enriched["offer_clusters"] = [cluster.as_dict() for cluster in clusters]
+    enriched["offer_catalog_research_manifest"] = copy.deepcopy(
+        build_domain_research_payload(catalog).manifest
+    )
+    return enriched
+
+
+def _prompt_set_with_offer_coverage(
+    prompts: list[dict[str, Any]],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach the mandatory cluster mapping to a valid prompt-set fixture."""
+
+    cluster_ids = [
+        str(item.get("cluster_id") or "")
+        for item in profile.get("offer_clusters") or []
+        if isinstance(item, dict) and str(item.get("cluster_id") or "")
+    ]
+    first_discovery = True
+    for prompt in prompts:
+        if prompt.get("role") == "unbranded_discovery":
+            prompt["supporting_cluster_ids"] = (
+                list(cluster_ids) if first_discovery else []
+            )
+            first_discovery = False
+        else:
+            prompt["supporting_cluster_ids"] = []
+    return {"prompts": prompts, "cluster_exclusions": []}
+
+
 class RobotsParserTests(unittest.TestCase):
     def test_wildcard_group_applies_to_known_bots(self) -> None:
         rules = _rules_by_bot("User-agent: *\nDisallow: /\n")
@@ -436,7 +843,7 @@ class DomainAndJobSafetyTests(unittest.TestCase):
                 "example.com",
             )
         )
-        selected = crawler._select_representative_urls(
+        selected = crawler._semantic_frontier_urls(
             "https://example.com/",
             [
                 "https://example.com/success",
@@ -741,6 +1148,7 @@ class PanelRoutingTests(unittest.TestCase):
             mode="memory",
             provider_key="openai",
             model="openai/gpt-5.4",
+            response_text="Сохранённый ответ.",
         )
         answer = ModelAnswer(
             run_id="strict-run",
@@ -944,15 +1352,24 @@ class PanelRoutingTests(unittest.TestCase):
         self.assertNotEqual(web_hash, memory_hash)
         self.assertNotEqual(web_hash, changed_attestation_hash)
 
-    def test_panel_v2_missing_budget_attests_as_legacy_3200(self) -> None:
+    def test_panel_v3_model_max_envelope_is_attested(self) -> None:
         prompt_text = "Какие решения выбрать?"
         usage, citations = _attested_panel_usage(
             prompt_text=prompt_text,
             mode="web",
             provider_key="openai",
             model="test/model",
+            response_text="Ответ.",
         )
         self.assertNotIn("max_tokens", usage["_aiv_panel_contract"])
+        self.assertEqual(
+            usage["_aiv_panel_contract"]["output_policy"],
+            PANEL_OUTPUT_POLICY,
+        )
+        self.assertEqual(
+            usage["_aiv_output_envelope"]["policy"],
+            OutputTokenPolicy.MODEL_MAX.value,
+        )
         answer = ModelAnswer(
             run_id="run-id",
             prompt_id=1,
@@ -980,17 +1397,9 @@ class PanelRoutingTests(unittest.TestCase):
             mode="web",
             provider_key="openai",
             model="test/model",
-        )
-        provenance = dict(usage["_aiv_panel_contract"])
-        provenance["max_tokens"] = 6_400
-        provenance["request_sha256"] = _panel_request_sha256(
-            prompt_text=prompt_text,
-            mode="web",
-            provider_key="openai",
-            model="test/model",
+            contract_version=BOUNDED_PANEL_CONTRACT_VERSION,
             max_tokens=6_400,
         )
-        usage["_aiv_panel_contract"] = provenance
         answer = ModelAnswer(
             run_id="run-id",
             prompt_id=1,
@@ -1013,7 +1422,7 @@ class PanelRoutingTests(unittest.TestCase):
         unapproved_usage = copy.deepcopy(usage)
         unapproved = dict(unapproved_usage["_aiv_panel_contract"])
         unapproved["max_tokens"] = 4_800
-        unapproved["request_sha256"] = _panel_request_sha256(
+        unapproved["request_sha256"] = _bounded_panel_request_sha256(
             prompt_text=prompt_text,
             mode="web",
             provider_key="openai",
@@ -1403,17 +1812,22 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             }
             for index, intent in enumerate(("I", "E", "TR"), start=1)
         )
-        profile = {"brand_name": "RW+", "brand_aliases": ["Realweb Plus"]}
+        profile = _profile_with_offer_contract(
+            {"brand_name": "RW+", "brand_aliases": ["Realweb Plus"]},
+            domain="rw.plus",
+            source_url="https://rw.plus/",
+        )
+        prompt_set = _prompt_set_with_offer_coverage(prompts, profile)
 
-        self.assertEqual(_validate_prompt_set({"prompts": prompts}, profile), [])
+        self.assertEqual(_validate_prompt_set(prompt_set, profile), [])
 
         prompts[2]["text"] = (
             "Кого пригласить в тендер, чтобы получить сильное предложение?"
         )
-        self.assertEqual(_validate_prompt_set({"prompts": prompts}, profile), [])
+        self.assertEqual(_validate_prompt_set(prompt_set, profile), [])
 
         prompts[-1]["text"] = "Что известно об этом поставщике?"
-        errors = _validate_prompt_set({"prompts": prompts}, profile)
+        errors = _validate_prompt_set(prompt_set, profile)
         self.assertTrue(
             any("не содержит" in error and "Брендовый" in error for error in errors)
         )
@@ -1483,19 +1897,76 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 "domain": "example.com",
                 "url": "https://example.com/",
             },
-            "pages": [],
+            "pages": [
+                {
+                    "url": "https://example.com/",
+                    "main_text": "Example — аналитическая платформа.",
+                }
+            ],
         }
-        with patch(
-            "app.services.analyzer._structured_artifact",
-            new_callable=AsyncMock,
-            return_value={"brand_name": "Example"},
-        ) as structured:
-            await _classify_site("run-id", context)
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "site_type": "platform",
+            "category": "analytics",
+            "topics": [],
+            "market": "",
+            "business_model": "",
+            "products": [],
+            "audiences": [],
+            "customer_jobs": [],
+            "decision_criteria": [],
+            "geography": [],
+            "language": "ru",
+            "positioning": "",
+            "entity_scope": [],
+            "evidence": ["Example"],
+            "uncertainties": [],
+            "confidence": "medium",
+        }
 
-        structured.assert_awaited_once()
-        self.assertEqual(structured.await_args.kwargs["model"], ANALYSIS_MODEL)
-        self.assertEqual(structured.await_args.kwargs["reasoning_effort"], "high")
-        self.assertEqual(structured.await_args.kwargs["user_payload"], context)
+        models: list[str] = []
+
+        async def fake_structured(_run_id: str, **kwargs: Any) -> dict[str, Any]:
+            models.append(str(kwargs["model"]))
+            payload = kwargs["user_payload"]
+            if "page_unit" in payload:
+                claim = payload["core_claim"]
+                return {
+                    "profile": profile,
+                    "core_disposition": {
+                        "claim_id": claim["claim_id"],
+                        "unit_id": claim["unit_id"],
+                        "core_sha256": claim["core_sha256"],
+                        "disposition": "grounded_fact",
+                        "evidence_quote": "Example",
+                        "reason": "В core буквально назван бренд Example.",
+                    },
+                }
+            return profile
+
+        with (
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new=fake_structured,
+            ),
+            patch(
+                "app.services.analyzer._analyzer_model_input_window",
+                new=AsyncMock(
+                    return_value={
+                        "input_utf8_window": 200_000,
+                        "model_envelope": {
+                            "context_length": 200_000,
+                            "max_completion_tokens": 20_000,
+                        },
+                    }
+                ),
+            ),
+        ):
+            result = await _classify_site("run-id", context)
+
+        self.assertEqual(result["brand_name"], "Example")
+        self.assertEqual(models, [PROCESSING_MODEL, ANALYSIS_MODEL])
 
     async def test_structured_artifact_preserves_contract_failure_evidence(
         self,
@@ -1525,7 +1996,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as save_artifact,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 side_effect=contract_error,
             ),
@@ -1542,6 +2013,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         failed = save_artifact.await_args_list[-1].kwargs
+        running = save_artifact.await_args_list[0].kwargs
+        self.assertEqual(running["status"], "running")
+        self.assertIs(running["preserve_existing_evidence"], True)
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["raw_text"], '{"partial":')
         self.assertEqual(failed["usage_json"], usage)
@@ -1581,6 +2055,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "uncertainties": [],
             "confidence": "high",
         }
+        profile = _profile_with_offer_contract(profile)
         site_context = {
             "requested_site": {
                 "domain": "example.com",
@@ -1617,6 +2092,40 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             web_attestation=ready["web_evidence"]["attestation"],
             citations=ready["web_evidence"]["citations"],
         )
+        unit_id = "https://example.com/:000000"
+        evidence_tree = {
+            "packet": {
+                "findings": [
+                    {
+                        "dimension": "site_confirmed",
+                        "claim": "Сайт представляет платформу Example.",
+                        "evidence": "Example — аналитическая платформа.",
+                        "source_urls": ["https://example.com/"],
+                        "source_unit_ids": [unit_id],
+                        "confidence": "high",
+                    }
+                ],
+                "uncertainties": [],
+                "unit_coverage": [
+                    {
+                        "source_unit_id": unit_id,
+                        "state": "evidence",
+                        "note": "Фрагмент прочитан.",
+                    }
+                ],
+                "_aiv_source_unit_ids": [unit_id],
+            },
+            "manifest": {
+                "window": {"input_utf8_window": 96_000},
+                "source_unit_count": 1,
+                "source_unit_ids": [unit_id],
+                "source_unit_ids_sha256": "a" * 64,
+            },
+            "citations": ready["web_evidence"]["citations"],
+            "web_attestation": ready["web_evidence"]["attestation"],
+            "retrieval_leaf_count": 1,
+            "reducer_levels": 0,
+        }
         with (
             patch(
                 "app.services.analyzer._cached_market_research",
@@ -1624,7 +2133,24 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 return_value=None,
             ),
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer._market_research_evidence_tree",
+                new_callable=AsyncMock,
+                return_value=evidence_tree,
+            ) as tree_mock,
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value={
+                    "input_utf8_window": 1_000_000,
+                    "model_envelope": {
+                        "context_length": 1_000_000,
+                        "max_completion_tokens": 100_000,
+                    },
+                    "resolution": "test",
+                },
+            ),
+            patch(
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 return_value=response,
             ) as chat_mock,
@@ -1640,28 +2166,24 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        # Два вызова: исследование с обязательным вебом (без схемы) и
-        # структурирование по схеме без доступа к вебу.
-        self.assertEqual(chat_mock.await_count, 2)
-        research_request = chat_mock.await_args_list[0].kwargs
-        self.assertEqual(research_request["model"], ANALYSIS_MODEL)
-        self.assertEqual(
-            research_request["web_policy"], WebSearchPolicy.REQUIRED
-        )
-        self.assertNotIn("response_schema", research_request)
-        request_payload = json.loads(research_request["messages"][1]["content"])
-        self.assertEqual(request_payload["requested_site"], site_context["requested_site"])
-        self.assertEqual(request_payload["site_profile"], profile)
-        self.assertEqual(request_payload["site_evidence"], site_context["pages"])
-        structuring_request = chat_mock.await_args_list[1].kwargs
-        self.assertEqual(
-            structuring_request["web_policy"], WebSearchPolicy.FORBIDDEN
-        )
+        tree_payload = tree_mock.await_args.kwargs["payload"]
+        self.assertEqual(tree_payload["site_evidence"], site_context["pages"])
+        self.assertEqual(chat_mock.await_count, 1)
+        structuring_request = chat_mock.await_args.kwargs
+        self.assertNotIn("max_tokens", structuring_request)
+        self.assertNotIn("max_completion_tokens", structuring_request)
         self.assertIsNotNone(structuring_request.get("response_schema"))
+        self.assertTrue(callable(structuring_request.get("audit_checkpoint")))
+        self.assertIn("resume_checkpoint", structuring_request)
         structuring_payload = json.loads(
             structuring_request["messages"][1]["content"]
         )
-        self.assertIn("research_notes", structuring_payload)
+        self.assertIn("evidence_tree", structuring_payload)
+        self.assertNotIn("site_evidence", structuring_payload["site_input"])
+        self.assertEqual(
+            structuring_payload["evidence_tree_contract"]["source_unit_ids"],
+            [unit_id],
+        )
         self.assertEqual(
             structuring_payload["confirmed_source_urls"],
             sorted(
@@ -1677,6 +2199,1103 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             final_write["output_json"]["site_confirmed"]["primary_brand"],
             profile["brand_name"],
         )
+
+    async def test_oversized_market_structuring_uses_schema_valid_shards(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "site_type": "Сайт продукта",
+            "category": "Аналитика",
+            "topics": ["AI visibility"],
+            "market": "B2B-аналитика",
+            "business_model": "Подписка",
+            "products": ["Платформа"],
+            "audiences": ["Руководители маркетинга"],
+            "customer_jobs": ["Сравнить поставщиков"],
+            "decision_criteria": ["Точность"],
+            "geography": ["Россия"],
+            "language": "ru",
+            "positioning": "Аналитическая платформа",
+            "entity_scope": [],
+            "evidence": ["Описание на главной странице"],
+            "uncertainties": [],
+            "confidence": "high",
+        }
+        profile = _profile_with_offer_contract(profile)
+        site_context = {
+            "requested_site": {
+                "domain": "example.com",
+                "url": "https://example.com/",
+            },
+            "pages": [
+                {
+                    "url": "https://example.com/",
+                    "title": "Example",
+                    "main_text": "Example помогает измерять видимость.",
+                }
+            ],
+        }
+        ready = _ready_market_research()
+        parsed = {
+            key: value
+            for key, value in ready.items()
+            if key not in {"sufficiency", "web_evidence"}
+        }
+        unit_id = "https://example.com/:000000"
+        tail = "WHOLE-MARKET-STRUCTURING-TAIL"
+        evidence_tree = {
+            "packet": {
+                "findings": [
+                    {
+                        "dimension": "market",
+                        "claim": "Рынок аналитики.",
+                        "evidence": ("длинное доказательство " * 2_000) + tail,
+                        "source_urls": ["https://research.example/market"],
+                        "source_unit_ids": [unit_id],
+                        "confidence": "medium",
+                    }
+                ],
+                "uncertainties": [],
+                "unit_coverage": [
+                    {
+                        "source_unit_id": unit_id,
+                        "state": "evidence",
+                        "note": "Прочитано.",
+                    }
+                ],
+                "_aiv_source_unit_ids": [unit_id],
+            },
+            "manifest": {
+                "source_unit_count": 1,
+                "source_unit_ids": [unit_id],
+                "source_unit_ids_sha256": "a" * 64,
+            },
+            "citations": ready["web_evidence"]["citations"],
+            "web_attestation": ready["web_evidence"]["attestation"],
+            "retrieval_leaf_count": 1,
+            "reducer_levels": 0,
+        }
+        sharded_plan = {
+            "version": MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+            "mode": "bounded_schema_valid_shards",
+            "coverage_complete": True,
+        }
+        with (
+            patch(
+                "app.services.analyzer._cached_market_research",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._market_research_evidence_tree",
+                new_callable=AsyncMock,
+                return_value=evidence_tree,
+            ),
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value={
+                    "input_utf8_window": 128,
+                    "model_envelope": {
+                        "context_length": 128,
+                        "max_completion_tokens": 64,
+                    },
+                    "resolution": "test",
+                },
+            ),
+            patch(
+                "app.services.analyzer._market_research_structuring_shards",
+                new_callable=AsyncMock,
+                return_value=(
+                    parsed,
+                    sharded_plan,
+                    json.dumps(parsed, ensure_ascii=False),
+                    {"_aiv_market_structuring_shards": sharded_plan},
+                ),
+            ) as shard_mock,
+            patch(
+                "app.services.analyzer.chat_continuable_structured",
+                new_callable=AsyncMock,
+            ) as whole_document_chat,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await _market_research(
+                "run-id",
+                profile,
+                site_context,
+            )
+
+        whole_document_chat.assert_not_awaited()
+        shard_mock.assert_awaited_once()
+        sharded_source = shard_mock.await_args.kwargs["structuring_payload"]
+        self.assertIn(
+            tail,
+            sharded_source["evidence_tree"]["findings"][0]["evidence"],
+        )
+        self.assertEqual(result["status"], "ready")
+
+    async def test_market_research_losslessly_maps_huge_pages_and_notes(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Huge",
+            "evidence": ["Подтверждено сайтом"],
+            "customer_jobs": ["Выбрать поставщика"],
+            "decision_criteria": ["Надёжность"],
+        }
+        pages = [
+            {
+                "url": f"https://huge.example/page-{index}",
+                "title": f"Страница {index}",
+                "meta_description": "Большая страница",
+                "main_text": (f"unit-{index}-evidence " * 1_200),
+                "content_storage_state": (
+                    "prefix_only" if index == 2 else "complete"
+                ),
+                "absence_claims_allowed": index != 2,
+            }
+            for index in range(3)
+        ]
+        payload = {
+            "requested_site": {
+                "domain": "huge.example",
+                "url": "https://huge.example/",
+            },
+            "site_profile": profile,
+            "site_evidence": pages,
+        }
+        attestation = {
+            "version": WEB_ATTESTATION_VERSION,
+            "policy": WebSearchPolicy.REQUIRED.value,
+            "state": "verified",
+            "metric_eligible": True,
+            "web_search_requests": 1,
+            "violations": [],
+        }
+        web_payload_sizes: list[int] = []
+        expected_research_notes = ""
+        mapped_note_payloads: list[dict[str, Any]] = []
+        structured_stage_calls: list[dict[str, Any]] = []
+
+        async def fake_chat(**kwargs: Any) -> SimpleNamespace:
+            nonlocal expected_research_notes
+            request = json.loads(kwargs["messages"][1]["content"])
+            web_payload_sizes.append(
+                len(kwargs["messages"][1]["content"].encode("utf-8"))
+            )
+            unit_id = request["unit_contract"]["source_unit_id"]
+            self.assertEqual(unit_id, "market-domain:huge.example")
+            citation_url = "https://research.example/market"
+            notes = (
+                f"Подтверждённый вывод для {unit_id}. Источник {citation_url}. "
+                + ("Большие исследовательские заметки. " * 4_500)
+            )
+            expected_research_notes = notes
+            return SimpleNamespace(
+                parsed=None,
+                text=notes,
+                usage={},
+                web_attestation=copy.deepcopy(attestation),
+                citations=[{"url": citation_url, "title": "Источник"}],
+            )
+
+        async def fake_structured_artifact(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            structured_stage_calls.append(copy.deepcopy(kwargs))
+            user_payload = kwargs["user_payload"]
+            artifact_key = kwargs["artifact_key"]
+            if artifact_key.startswith("market_research_map_"):
+                mapped_note_payloads.append(copy.deepcopy(user_payload))
+                source = user_payload["source_unit"]
+                unit_id = source["source_unit_id"]
+                page_url = source["page_url"]
+                external_urls = user_payload["confirmed_external_urls"]
+                state = (
+                    "unknown"
+                    if source["content_storage_state"] == "prefix_only"
+                    else "evidence"
+                )
+                findings = [
+                        {
+                            "dimension": "site_confirmed",
+                            "claim": f"Положительный факт {unit_id}",
+                            "evidence": "Буквальный фрагмент.",
+                            "source_urls": [page_url],
+                            "source_unit_ids": [unit_id],
+                            "confidence": "high",
+                        },
+                ]
+                if external_urls:
+                    findings.append({
+                            "dimension": "market",
+                            "claim": f"Рыночный факт {unit_id}",
+                            "evidence": "Подтверждено внешним источником.",
+                            "source_urls": [external_urls[0]],
+                            "source_unit_ids": [unit_id],
+                            "confidence": "medium",
+                        })
+                return {
+                    "findings": findings,
+                    "uncertainties": (
+                        [
+                            {
+                                "statement": "Хвост prefix-only неизвестен.",
+                                "source_unit_ids": [unit_id],
+                            }
+                        ]
+                        if state == "unknown"
+                        else []
+                    ),
+                    "unit_coverage": [
+                        {
+                            "source_unit_id": unit_id,
+                            "state": state,
+                            "note": "Прочитан переданный unit.",
+                        }
+                    ],
+                }
+            packets = user_payload["evidence_packets"]
+            findings = [
+                copy.deepcopy(finding)
+                for packet in packets
+                for finding in packet["findings"]
+            ]
+            uncertainties = [
+                copy.deepcopy(item)
+                for packet in packets
+                for item in packet["uncertainties"]
+            ]
+            coverage = [
+                copy.deepcopy(item)
+                for packet in packets
+                for item in packet["unit_coverage"]
+            ]
+            return {
+                "findings": findings,
+                "uncertainties": uncertainties,
+                "unit_coverage": coverage,
+            }
+
+        with (
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new_callable=AsyncMock,
+                return_value={
+                    "context_length": 40_000,
+                    "max_completion_tokens": 8_000,
+                },
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+                side_effect=fake_chat,
+            ) as chat_mock,
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=fake_structured_artifact,
+            ),
+            patch(
+                "app.services.analyzer.asyncio.timeout",
+                side_effect=AssertionError(
+                    "a progressing retrieval tree must not have an "
+                    "aggregate wall-clock timeout"
+                ),
+            ) as aggregate_timeout,
+        ):
+            tree = await _market_research_evidence_tree(
+                "run-id",
+                payload=payload,
+                research_system="Исследуй один lossless unit.",
+            )
+
+        manifest = tree["manifest"]
+        self.assertEqual(
+            manifest["version"], MARKET_RESEARCH_INPUT_HARNESS_VERSION
+        )
+        self.assertGreater(manifest["source_unit_count"], len(pages))
+        self.assertEqual(chat_mock.await_count, 1)
+        self.assertEqual(manifest["web_retrieval_tree_count"], 1)
+        self.assertEqual(
+            manifest["web_retrieval_contract"]["retrieval_granularity"],
+            "one_domain_identity_tree",
+        )
+        aggregate_timeout.assert_not_called()
+        retrieval_contract = manifest["web_retrieval_contract"]
+        self.assertIsNone(
+            retrieval_contract["aggregate_liveness_deadline_seconds"]
+        )
+        self.assertNotIn("liveness_deadline_seconds", retrieval_contract)
+        self.assertEqual(
+            retrieval_contract["liveness_policy"],
+            "per_post_inactivity_and_cancellation_with_durable_resume",
+        )
+        self.assertEqual(
+            retrieval_contract["progress_guards"],
+            [
+                "exact_task_identity",
+                "finite_predeclared_facets",
+                "ancestor_raw_sha256_no_repeat",
+                "bounded_semantic_retry_tree",
+            ],
+        )
+        self.assertEqual(retrieval_contract["semantic_retry_post_cap"], 96)
+        self.assertEqual(retrieval_contract["facet_refinement_depth_cap"], 1)
+        self.assertEqual(
+            sum(item["source_chars"] for item in manifest["source_manifests"]),
+            sum(len(page["main_text"]) for page in pages),
+        )
+        self.assertEqual(
+            tree["packet"]["_aiv_source_unit_ids"],
+            sorted(manifest["source_unit_ids"]),
+        )
+        self.assertGreater(
+            len(mapped_note_payloads),
+            manifest["source_unit_count"],
+        )
+        note_payloads_by_source: dict[str, list[dict[str, Any]]] = (
+            defaultdict(list)
+        )
+        for item in mapped_note_payloads:
+            note_payloads_by_source[
+                str(item["source_unit"]["source_unit_id"])
+            ].append(item)
+        nonempty_note_sources = [
+            unit_id
+            for unit_id, fragments in note_payloads_by_source.items()
+            if any(fragment["research_notes"] for fragment in fragments)
+        ]
+        self.assertEqual(
+            nonempty_note_sources,
+            [manifest["external_notes_joined_source_unit_id"]],
+        )
+        for unit_id in nonempty_note_sources:
+            fragments = sorted(
+                note_payloads_by_source[unit_id],
+                key=lambda item: int(
+                    item["research_notes_contract"]["unit_index"]
+                ),
+            )
+            reconstructed = "".join(
+                item["research_notes"][
+                    int(
+                        item["research_notes_contract"][
+                            "core_start_in_context"
+                        ]
+                    ) : int(
+                        item["research_notes_contract"][
+                            "core_end_in_context"
+                        ]
+                    )
+                ]
+                for item in fragments
+            )
+            self.assertEqual(reconstructed, expected_research_notes)
+            self.assertTrue(
+                all(
+                    item["research_notes_contract"]["ownership_rule"]
+                    == "first_decisive_evidence_character_in_core"
+                    for item in fragments
+                )
+            )
+        self.assertLessEqual(
+            max(web_payload_sizes),
+            manifest["window"]["input_utf8_window"],
+        )
+        self.assertEqual(
+            {item["url"] for item in tree["citations"]},
+            {"https://research.example/market"},
+        )
+        self.assertTrue(
+            any(
+                item["state"] == "unknown"
+                for item in tree["packet"]["unit_coverage"]
+            )
+        )
+        self.assertTrue(structured_stage_calls)
+        self.assertTrue(
+            all(call.get("continuable") is True for call in structured_stage_calls)
+        )
+        self.assertTrue(
+            all(
+                str(call.get("artifact_key") or "").startswith(
+                    ("market_research_map_", "market_research_reduce_")
+                )
+                for call in structured_stage_calls
+            )
+        )
+        attempt_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs["artifact_key"].startswith(
+                "market_research_web_attempt_"
+            )
+            and call.kwargs["status"] == "completed"
+        ]
+        self.assertEqual(
+            len(attempt_writes), manifest["web_retrieval_post_count"]
+        )
+        self.assertTrue(all(call["raw_text"] for call in attempt_writes))
+
+    async def test_market_web_limit_refines_without_losing_unicode_prefix(
+        self,
+    ) -> None:
+        source_unit = {
+            "url": "https://unicode.example/",
+            "title": "Очень длинный рынок 🌍",
+            "meta_description": "Описание",
+            "main_text": "Контекст сайта",
+            "_lr_unit_id": "https://unicode.example/:000000",
+            "_lr_unit_index": 0,
+            "_lr_unit_count": 1,
+            "_lr_unit_sha256": "a" * 64,
+            "_lr_context_sha256": "b" * 64,
+            "_lr_start_char": 0,
+            "_lr_end_char": 14,
+        }
+        attestation = {
+            "version": WEB_ATTESTATION_VERSION,
+            "policy": WebSearchPolicy.REQUIRED.value,
+            "state": "verified",
+            "metric_eligible": True,
+            "web_search_requests": 1,
+            "violations": [],
+        }
+        root_prefix = "Начало 🌍漢字🙂 " * 20_000
+        raw_by_path = {
+            "root": root_prefix,
+            "root.0": "Рынок, темы и география подтверждены источником.",
+            "root.1": "Аудитории, задачи, критерии и термины подтверждены.",
+        }
+        seen_payloads: list[dict[str, Any]] = []
+
+        def result_for(path: str, *, limited: bool) -> SimpleNamespace:
+            citation = {
+                "url": f"https://research.example/{path}",
+                "title": path,
+                "content": "Подтверждение",
+            }
+            return SimpleNamespace(
+                text=raw_by_path[path],
+                usage={},
+                web_attestation=copy.deepcopy(attestation),
+                citations=[citation],
+                transport={
+                    "output_limited": limited,
+                    "output_complete": not limited,
+                },
+            )
+
+        async def fake_chat(**kwargs: Any) -> SimpleNamespace:
+            self.assertFalse(kwargs["accept_output_limited"])
+            payload = json.loads(kwargs["messages"][1]["content"])
+            seen_payloads.append(payload)
+            path = payload["research_scope"]["path"]
+            result = result_for(path, limited=path == "root")
+            if path == "root":
+                raise OpenRouterOutputLimitError(
+                    "provider output limit",
+                    result=result,
+                )
+            return result
+
+        model_envelope = {
+            "context_length": 1_000_000,
+            "max_completion_tokens": 100_000,
+        }
+        window_bytes = 800_000
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+                side_effect=fake_chat,
+            ) as chat_mock,
+        ):
+            output = await _market_research_web_leaf(
+                "run-id",
+                source_unit=source_unit,
+                requested_site={"domain": "unicode.example"},
+                site_profile={"brand_name": "Unicode"},
+                system="Исследуй рынок и цитируй источники.",
+                window_bytes=window_bytes,
+                model_envelope=model_envelope,
+            )
+
+        self.assertEqual(chat_mock.await_count, 3)
+        self.assertEqual(
+            output["research_notes"],
+            "\n\n".join(raw_by_path[path] for path in ("root", "root.0", "root.1")),
+        )
+        self.assertEqual(
+            output["observation_completeness"],
+            "scoped_composable_positive_evidence",
+        )
+        manifest = output["retrieval_manifest"]
+        self.assertEqual(manifest["version"], MARKET_RESEARCH_WEB_HARNESS_VERSION)
+        self.assertEqual(manifest["node_count"], 3)
+        self.assertEqual(output["web_attestation"]["leaf_count"], 3)
+        for row, raw in zip(
+            manifest["nodes"],
+            (root_prefix, raw_by_path["root.0"], raw_by_path["root.1"]),
+            strict=True,
+        ):
+            self.assertEqual(
+                output["research_notes"][
+                    row["raw_start_char"] : row["raw_end_char"]
+                ],
+                raw,
+            )
+        for payload in seen_payloads:
+            self.assertLessEqual(
+                _market_research_web_request_utf8_bytes(
+                    system="Исследуй рынок и цитируй источники.",
+                    input_json=payload,
+                    model_envelope=model_envelope,
+                ),
+                window_bytes,
+            )
+        coverage_tamper = copy.deepcopy(output)
+        root_row = coverage_tamper["retrieval_manifest"]["nodes"][0]
+        root_row["child_task_ids"] = list(reversed(root_row["child_task_ids"]))
+        manifest_core = copy.deepcopy(coverage_tamper["retrieval_manifest"])
+        manifest_core.pop("manifest_sha256", None)
+        coverage_tamper["retrieval_manifest"]["manifest_sha256"] = hashlib.sha256(
+            json.dumps(
+                manifest_core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(OpenRouterError, "lost child coverage"):
+            _validate_market_research_web_leaf(
+                coverage_tamper,
+                source_unit=source_unit,
+                requested_site={"domain": "unicode.example"},
+                site_profile={"brand_name": "Unicode"},
+            )
+
+    def test_market_web_smallest_facet_stops_at_bounded_retry_depth(
+        self,
+    ) -> None:
+        scope = _market_research_web_scope(
+            ["customer_jobs"],
+            path="root.facet.0",
+            facet="discovery_and_problem_definition_jobs",
+        )
+
+        children = _market_research_web_children(
+                scope,
+                predecessor_raw_sha256="a" * 64,
+                predecessor_citation_urls=["https://source.example/fact"],
+        )
+        self.assertEqual([item["refinement_path"] for item in children], ["0", "1"])
+        grandchildren = _market_research_web_children(
+            children[0],
+            predecessor_raw_sha256="b" * 64,
+            predecessor_citation_urls=["https://source.example/child"],
+        )
+        self.assertEqual(grandchildren, [])
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "segment index is invalid",
+        ):
+            _market_research_web_scope(
+                ["customer_jobs"],
+                path="root.facet.0.segment.1",
+                facet="discovery_and_problem_definition_jobs",
+                segment_index=1,
+                predecessor_raw_sha256="a" * 64,
+            )
+
+    async def test_market_structuring_shards_preserve_unbounded_tail(
+        self,
+    ) -> None:
+        tail = "MARKET-STRUCTURING-TAIL-7f31"
+        long_evidence = ("Подтверждённый рыночный контекст. " * 7_000) + tail
+        unit_id = "https://huge.example/:000000"
+        structuring_payload = {
+            "site_input": {
+                "requested_site": {
+                    "domain": "huge.example",
+                    "url": "https://huge.example/",
+                },
+                "site_profile": {
+                    "brand_name": "Huge",
+                    "brand_aliases": ["Huge Platform"],
+                    "site_type": "Сайт продукта",
+                    "category": "Аналитика",
+                    "products": ["Платформа"],
+                    "topics": ["AI visibility"],
+                    "geography": ["Россия"],
+                },
+            },
+            "evidence_tree": {
+                "findings": [
+                    {
+                        "dimension": "site_confirmed",
+                        "claim": "Huge представляет аналитическую платформу.",
+                        "evidence": "Huge — аналитическая платформа.",
+                        "source_urls": ["https://huge.example/"],
+                        "source_unit_ids": [unit_id],
+                        "confidence": "high",
+                    },
+                    {
+                        "dimension": "customer_jobs",
+                        "claim": "Сравнить поставщиков аналитики.",
+                        "evidence": long_evidence,
+                        "source_urls": ["https://research.example/market"],
+                        "source_unit_ids": [unit_id],
+                        "confidence": "medium",
+                    },
+                ],
+                "uncertainties": [],
+                "unit_coverage": [
+                    {
+                        "source_unit_id": unit_id,
+                        "state": "evidence",
+                        "note": "Фрагмент обработан.",
+                    }
+                ],
+            },
+            "evidence_tree_contract": {
+                "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+                "source_unit_count": 1,
+                "source_unit_ids": [unit_id],
+            },
+            "confirmed_source_urls": ["https://research.example/market"],
+            "confirmed_sources": [
+                {
+                    "url": "https://research.example/market",
+                    "title": "Market source",
+                    "content": "Подтверждение рынка.",
+                }
+            ],
+        }
+        seen_payloads: list[dict[str, Any]] = []
+
+        async def fake_structured_artifact(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            shard_payload = copy.deepcopy(kwargs["user_payload"])
+            seen_payloads.append(shard_payload)
+            return {
+                "research": {
+                    "status": "limited",
+                    "site_confirmed": {
+                        "primary_brand": "Huge",
+                        "brand_aliases": [],
+                        "site_type": "",
+                        "category": "",
+                        "products": [],
+                        "topics": [],
+                        "geography": [],
+                        "evidence": [],
+                    },
+                    "external_market_research": {
+                        "market": "",
+                        "topics": [],
+                        "geography": [],
+                        "audiences": [],
+                        "customer_jobs": [],
+                        "decision_criteria": [],
+                        "terminology": [],
+                        "evidence": [],
+                    },
+                    "sources": [],
+                    "uncertainties": [],
+                    "confidence": "low",
+                },
+                "unit_coverage": [
+                    {
+                        "source_unit_id": item["source_unit_id"],
+                        "core_sha256": item["core_sha256"],
+                        "disposition": "structured",
+                        "note": "Точный core учтён.",
+                    }
+                    for item in shard_payload["source_units"]
+                ],
+            }
+
+        window = {
+            "input_utf8_window": 60_000,
+            "model_envelope": {
+                "context_length": 100_000,
+                "max_completion_tokens": 20_000,
+            },
+            "resolution": "test",
+        }
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=window,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=fake_structured_artifact,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+        ):
+            output, plan, raw, usage = (
+                await _market_research_structuring_shards(
+                    "run-id",
+                    structuring_payload=structuring_payload,
+                    structuring_system="Структурируй только подтверждённые данные.",
+                )
+            )
+
+        self.assertGreater(len(seen_payloads), 1)
+        self.assertEqual(
+            plan["version"],
+            MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+        )
+        self.assertTrue(plan["coverage_complete"])
+        self.assertEqual(
+            plan["covered_unit_count"],
+            plan["source_unit_count"],
+        )
+        self.assertLessEqual(
+            plan["maximum_request_utf8_bytes"],
+            window["input_utf8_window"],
+        )
+        self.assertIsNone(plan["local_corpus_or_shard_count_cap"])
+        self.assertIn(
+            tail,
+            output["external_market_research"]["evidence"][0]["evidence"],
+        )
+        self.assertIn(tail, raw)
+        self.assertIn("_aiv_market_structuring_shards", usage)
+
+    async def test_market_web_cached_receipts_resume_without_rebilling(
+        self,
+    ) -> None:
+        source_unit = {
+            "url": "https://resume.example/",
+            "title": "Resume",
+            "main_text": "Содержательный контекст",
+            "_lr_unit_id": "https://resume.example/:000000",
+            "_lr_unit_index": 0,
+            "_lr_unit_count": 1,
+            "_lr_unit_sha256": "c" * 64,
+            "_lr_context_sha256": "d" * 64,
+            "_lr_start_char": 0,
+            "_lr_end_char": 23,
+        }
+        attestation = {
+            "version": WEB_ATTESTATION_VERSION,
+            "policy": WebSearchPolicy.REQUIRED.value,
+            "state": "verified",
+            "metric_eligible": True,
+            "web_search_requests": 1,
+            "violations": [],
+        }
+        stored: dict[str, dict[str, Any]] = {}
+
+        async def fake_artifact_output(
+            _run_id: str,
+            artifact_key: str,
+            **_kwargs: Any,
+        ) -> Any:
+            value = stored.get(artifact_key)
+            return copy.deepcopy(value["output_json"]) if value else None
+
+        async def fake_save_artifact(_run_id: str, **kwargs: Any) -> None:
+            if kwargs["status"] == "completed" and kwargs.get("output_json") is not None:
+                stored[kwargs["artifact_key"]] = copy.deepcopy(kwargs)
+
+        async def fake_chat(**kwargs: Any) -> SimpleNamespace:
+            payload = json.loads(kwargs["messages"][1]["content"])
+            path = payload["research_scope"]["path"]
+            result = SimpleNamespace(
+                text=f"Фрагмент {path}",
+                usage={},
+                web_attestation=copy.deepcopy(attestation),
+                citations=[{"url": f"https://source.example/{path}"}],
+                transport={
+                    "output_limited": path == "root",
+                    "output_complete": path != "root",
+                },
+            )
+            if path == "root":
+                raise OpenRouterOutputLimitError("cut", result=result)
+            return result
+
+        kwargs = {
+            "source_unit": source_unit,
+            "requested_site": {"domain": "resume.example"},
+            "site_profile": {"brand_name": "Resume"},
+            "system": "Исследуй рынок.",
+            "window_bytes": 800_000,
+            "model_envelope": {
+                "context_length": 1_000_000,
+                "max_completion_tokens": 100_000,
+            },
+        }
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                side_effect=fake_artifact_output,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+                side_effect=fake_save_artifact,
+            ),
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+                side_effect=fake_chat,
+            ) as chat_mock,
+        ):
+            first = await _market_research_web_leaf("run-id", **kwargs)
+            first_calls = chat_mock.await_count
+            leaf_key = next(
+                key for key in stored if key.startswith("market_research_web_leaf_")
+            )
+            stored.pop(leaf_key)
+            resumed = await _market_research_web_leaf("run-id", **kwargs)
+
+        self.assertEqual(first_calls, 3)
+        self.assertEqual(chat_mock.await_count, first_calls)
+        self.assertEqual(resumed["research_notes"], first["research_notes"])
+        self.assertEqual(resumed["retrieval_manifest"]["node_count"], 3)
+
+    async def test_market_web_cached_coverage_and_raw_tamper_fail_closed(
+        self,
+    ) -> None:
+        source_unit = {
+            "url": "https://tamper.example/",
+            "title": "Tamper",
+            "main_text": "Контекст",
+            "_lr_unit_id": "https://tamper.example/:000000",
+            "_lr_unit_index": 0,
+            "_lr_unit_count": 1,
+            "_lr_unit_sha256": "e" * 64,
+            "_lr_context_sha256": "f" * 64,
+            "_lr_start_char": 0,
+            "_lr_end_char": 8,
+        }
+        attestation = {
+            "version": WEB_ATTESTATION_VERSION,
+            "policy": WebSearchPolicy.REQUIRED.value,
+            "state": "verified",
+            "metric_eligible": True,
+            "web_search_requests": 1,
+            "violations": [],
+        }
+        stored: dict[str, dict[str, Any]] = {}
+
+        async def load(_run_id: str, key: str, **_kwargs: Any) -> Any:
+            return copy.deepcopy(stored[key]["output_json"]) if key in stored else None
+
+        async def save(_run_id: str, **kwargs: Any) -> None:
+            if kwargs["status"] == "completed" and kwargs.get("output_json") is not None:
+                stored[kwargs["artifact_key"]] = copy.deepcopy(kwargs)
+
+        async def complete_chat(**_kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                text="Подтверждённый факт",
+                usage={},
+                web_attestation=copy.deepcopy(attestation),
+                citations=[{"url": "https://source.example/fact"}],
+                transport={"output_limited": False, "output_complete": True},
+            )
+
+        kwargs = {
+            "source_unit": source_unit,
+            "requested_site": {"domain": "tamper.example"},
+            "site_profile": {"brand_name": "Tamper"},
+            "system": "Исследуй рынок.",
+            "window_bytes": 800_000,
+            "model_envelope": {
+                "context_length": 1_000_000,
+                "max_completion_tokens": 100_000,
+            },
+        }
+        with (
+            patch("app.services.analyzer._artifact_output", side_effect=load),
+            patch("app.services.analyzer._save_artifact", side_effect=save),
+            patch("app.services.analyzer.chat", side_effect=complete_chat) as chat_mock,
+        ):
+            await _market_research_web_leaf("run-id", **kwargs)
+            leaf_key = next(
+                key for key in stored if key.startswith("market_research_web_leaf_")
+            )
+            original_leaf_artifact = copy.deepcopy(stored[leaf_key])
+            tampered = stored[leaf_key]["output_json"]
+            tampered["research_notes"] += " подмена"
+            with self.assertRaisesRegex(OpenRouterError, "notes coverage mismatch"):
+                await _market_research_web_leaf("run-id", **kwargs)
+            self.assertEqual(chat_mock.await_count, 1)
+
+            stored[leaf_key] = copy.deepcopy(original_leaf_artifact)
+            stored[leaf_key]["output_json"]["citations"][0]["title"] = (
+                "Подменённый заголовок"
+            )
+            with self.assertRaisesRegex(OpenRouterError, "citation evidence"):
+                await _market_research_web_leaf("run-id", **kwargs)
+            self.assertEqual(chat_mock.await_count, 1)
+
+            stored[leaf_key] = copy.deepcopy(original_leaf_artifact)
+            stored[leaf_key]["output_json"]["web_attestation"][
+                "web_search_requests"
+            ] = 999
+            with self.assertRaisesRegex(OpenRouterError, "aggregate attestation"):
+                await _market_research_web_leaf("run-id", **kwargs)
+            self.assertEqual(chat_mock.await_count, 1)
+
+            stored.pop(leaf_key)
+            receipt_key = next(
+                key
+                for key in stored
+                if key.startswith("market_research_web_attempt_")
+            )
+            stored[receipt_key]["output_json"]["raw_text"] += " подмена"
+            with self.assertRaisesRegex(OpenRouterError, "checksum mismatch"):
+                await _market_research_web_leaf("run-id", **kwargs)
+            self.assertEqual(chat_mock.await_count, 1)
+
+    async def test_market_web_promotes_durable_post_after_finalize_crash(
+        self,
+    ) -> None:
+        source_unit = {
+            "url": "https://checkpoint.example/",
+            "title": "Checkpoint",
+            "main_text": "Контекст",
+            "_lr_unit_id": "https://checkpoint.example/:000000",
+            "_lr_unit_index": 0,
+            "_lr_unit_count": 1,
+            "_lr_unit_sha256": "1" * 64,
+            "_lr_context_sha256": "2" * 64,
+            "_lr_start_char": 0,
+            "_lr_end_char": 8,
+        }
+        attestation = {
+            "version": WEB_ATTESTATION_VERSION,
+            "policy": WebSearchPolicy.REQUIRED.value,
+            "state": "verified",
+            "metric_eligible": True,
+            "web_search_requests": 1,
+            "violations": [],
+        }
+        model_envelope = {
+            "context_length": 1_000_000,
+            "max_completion_tokens": 100_000,
+        }
+        stored: dict[str, dict[str, Any]] = {}
+
+        async def load(_run_id: str, key: str, **_kwargs: Any) -> Any:
+            return copy.deepcopy(stored[key]["output_json"]) if key in stored else None
+
+        async def save(_run_id: str, **kwargs: Any) -> None:
+            if kwargs["status"] == "completed" and kwargs.get("output_json") is not None:
+                stored[kwargs["artifact_key"]] = copy.deepcopy(kwargs)
+
+        async def checkpoint_then_crash(**kwargs: Any) -> SimpleNamespace:
+            task_input = json.loads(kwargs["messages"][1]["content"])
+            physical_payload = _market_research_web_provider_payload(
+                system="Исследуй рынок.",
+                input_json=task_input,
+                model_envelope=model_envelope,
+            )
+            citation = {"url": "https://source.example/checkpoint"}
+            usage = {
+                "_aiv_web_attestation": copy.deepcopy(attestation),
+                "_aiv_response_annotations": [
+                    {"type": "url_citation", "url_citation": citation}
+                ],
+            }
+            event = {
+                "model": ANALYSIS_MODEL,
+                "status": "accepted",
+                "request_payload": physical_payload,
+                "request_sha256": hashlib.sha256(
+                    json.dumps(
+                        physical_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "raw_text": "Уже оплаченный и сохранённый ответ",
+                "usage": usage,
+                "transport": {
+                    "output_limited": False,
+                    "output_complete": True,
+                },
+                "error": None,
+            }
+            await kwargs["audit_checkpoint"](event)
+            raise asyncio.CancelledError
+
+        kwargs = {
+            "source_unit": source_unit,
+            "requested_site": {"domain": "checkpoint.example"},
+            "site_profile": {"brand_name": "Checkpoint"},
+            "system": "Исследуй рынок.",
+            "window_bytes": 800_000,
+            "model_envelope": model_envelope,
+        }
+        with (
+            patch("app.services.analyzer._artifact_output", side_effect=load),
+            patch("app.services.analyzer._save_artifact", side_effect=save),
+            patch(
+                "app.services.analyzer.chat",
+                side_effect=checkpoint_then_crash,
+            ) as first_chat,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _market_research_web_leaf("run-id", **kwargs)
+            self.assertEqual(first_chat.await_count, 1)
+
+        with (
+            patch("app.services.analyzer._artifact_output", side_effect=load),
+            patch("app.services.analyzer._save_artifact", side_effect=save),
+            patch(
+                "app.services.analyzer.chat",
+                side_effect=AssertionError("provider must not be called"),
+            ) as replay_chat,
+        ):
+            resumed = await _market_research_web_leaf("run-id", **kwargs)
+
+        replay_chat.assert_not_awaited()
+        self.assertEqual(
+            resumed["research_notes"],
+            "Уже оплаченный и сохранённый ответ",
+        )
+        self.assertEqual(resumed["retrieval_manifest"]["node_count"], 1)
 
     def test_prose_evidence_with_embedded_url_counts_as_confirmed(self) -> None:
         # Критик пишет supporting_evidence прозой с URL внутри текста; парсинг
@@ -1816,6 +3435,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "uncertainties": [],
             "confidence": "high",
         }
+        profile = _profile_with_offer_contract(profile)
         requested_site = {
             "domain": "example.com",
             "url": "https://example.com/",
@@ -1847,9 +3467,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                     "choice_request": False,
                 }
             )
+        prompt_set = _prompt_set_with_offer_coverage(prompts, profile)
         response = SimpleNamespace(
-            parsed={"prompts": prompts},
-            text=json.dumps({"prompts": prompts}, ensure_ascii=False),
+            parsed=prompt_set,
+            text=json.dumps(prompt_set, ensure_ascii=False),
             usage={"total_tokens": 1},
         )
         with (
@@ -1880,7 +3501,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 market_research=market_research,
             )
 
-        self.assertEqual(result, {"prompts": prompts})
+        self.assertEqual(result, prompt_set)
         request = chat_mock.await_args.kwargs
         self.assertEqual(request["model"], ANALYSIS_MODEL)
         self.assertEqual(request["reasoning_effort"], "high")
@@ -1900,7 +3521,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         semantic_review.assert_awaited_once_with(
             "run-id",
             profile,
-            {"prompts": prompts},
+            prompt_set,
             market_research,
         )
         self.assertEqual(
@@ -1909,7 +3530,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_prompt_generation_retries_after_semantic_critic(self) -> None:
-        profile = {"brand_name": "Example", "brand_aliases": []}
+        profile = _profile_with_offer_contract(
+            {"brand_name": "Example", "brand_aliases": []}
+        )
         market_research = _ready_market_research()
 
         def prompt_set(suffix: str) -> dict[str, object]:
@@ -1942,7 +3565,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                         "choice_request": False,
                     }
                 )
-            return {"prompts": prompts}
+            return _prompt_set_with_offer_coverage(prompts, profile)
 
         first = prompt_set("первая версия")
         corrected = prompt_set("исправленная версия")
@@ -1972,7 +3595,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._save_artifact",
                 new_callable=AsyncMock,
-            ),
+            ) as save_artifact,
             patch(
                 "app.services.analyzer._review_prompt_set_semantics",
                 new_callable=AsyncMock,
@@ -1999,7 +3622,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_prompt_generator_budget_is_durable_across_restart_faults(
         self,
     ) -> None:
-        profile = {"brand_name": "Example", "brand_aliases": []}
+        profile = _profile_with_offer_contract(
+            {"brand_name": "Example", "brand_aliases": []}
+        )
         research = _ready_market_research()
         artifacts: dict[str, dict[str, Any]] = {}
         events: list[tuple[str, str]] = []
@@ -2116,6 +3741,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "decision_criteria": ["Точность"],
             "geography": ["Россия"],
         }
+        profile = _profile_with_offer_contract(profile)
         research = _ready_market_research()
         candidate = _deterministic_prompt_fallback(profile, research)
         contract_failure = OpenRouterResponseContractError(
@@ -2199,7 +3825,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_prompt_generator_exhausts_four_one_shot_failures_before_recovery(
         self,
     ) -> None:
-        profile = {"brand_name": "Example", "brand_aliases": []}
+        profile = _profile_with_offer_contract(
+            {"brand_name": "Example", "brand_aliases": []}
+        )
         research = _ready_market_research()
         recovered = {"recovery": "planned"}
         failures = [
@@ -2279,7 +3907,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_recovered_prompt_candidate_reexecutes_semantic_gate(
         self,
     ) -> None:
-        profile = {"brand_name": "Example", "brand_aliases": []}
+        profile = _profile_with_offer_contract(
+            {"brand_name": "Example", "brand_aliases": []}
+        )
         research = _ready_market_research()
         prompts = [
             {
@@ -2306,7 +3936,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             }
             for index, intent in enumerate(("I", "E", "TR"), start=1)
         )
-        candidate = {"prompts": prompts}
+        candidate = _prompt_set_with_offer_coverage(prompts, profile)
         artifacts: dict[str, dict[str, Any]] = {}
         events: list[str] = []
 
@@ -2453,6 +4083,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "decision_criteria": ["Точность"],
             "geography": ["Россия"],
         }
+        profile = _profile_with_offer_contract(profile)
 
         prompt_set = _deterministic_prompt_fallback(
             profile,
@@ -2486,6 +4117,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "decision_criteria": ["Точность"],
             "geography": ["Россия"],
         }
+        profile = _profile_with_offer_contract(profile)
         research = _ready_market_research()
         fallback = _deterministic_prompt_fallback(profile, research)
         queried_models: list[str] = []
@@ -2543,6 +4175,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "decision_criteria": ["Точность"],
             "geography": ["Россия"],
         }
+        profile = _profile_with_offer_contract(profile)
         research = _ready_market_research()
         payload = {
             "requested_site": {},
@@ -2636,6 +4269,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "decision_criteria": ["Точность"],
             "geography": ["Россия"],
         }
+        profile = _profile_with_offer_contract(profile)
         research = _ready_market_research()
         payload = {
             "requested_site": {},
@@ -2712,6 +4346,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "brand_aliases": [],
             "category": "Аналитика",
         }
+        profile = _profile_with_offer_contract(profile)
         research = _ready_market_research()
         payload = {
             "requested_site": {},
@@ -2769,6 +4404,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "brand_aliases": [],
             "category": "Аналитика",
         }
+        profile = _profile_with_offer_contract(profile)
         research = _ready_market_research()
         payload = {
             "requested_site": {},
@@ -2829,7 +4465,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_market_research_digest_invalidates_cached_prompt_set(
         self,
     ) -> None:
-        profile = {"brand_name": "Example", "brand_aliases": []}
+        profile = _profile_with_offer_contract(
+            {"brand_name": "Example", "brand_aliases": []}
+        )
 
         def prompt_set(suffix: str) -> dict[str, object]:
             prompts: list[dict[str, object]] = [
@@ -2857,7 +4495,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 }
                 for index, intent in enumerate(("I", "E", "TR"), start=1)
             )
-            return {"prompts": prompts}
+            return _prompt_set_with_offer_coverage(prompts, profile)
 
         cached = prompt_set("из кэша")
         regenerated = prompt_set("после изменения")
@@ -2992,23 +4630,55 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_entity_catalog_uses_processing_model(self) -> None:
+        calls: list[str] = []
+
+        async def fake_processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(str(kwargs["artifact_key"]))
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                claim = payload["answers"][0]["core_claim"]
+                return {
+                    "catalog": {
+                        "target_aliases": ["Example"],
+                        "entities": [],
+                        "uncertainties": ["Example"],
+                    },
+                    "core_dispositions": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "unit_id": claim["unit_id"],
+                            "core_sha256": claim["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": "Example",
+                            "reason": "В core буквально назван бренд Example.",
+                        }
+                    ],
+                }
+            return {
+                "target_aliases": ["Example"],
+                "entities": [],
+                "uncertainties": [],
+            }
+
         with patch(
             "app.services.analyzer._processing_artifact",
-            new_callable=AsyncMock,
-            return_value={"entities": []},
-        ) as processing:
+            new=fake_processing,
+        ):
             await _entity_catalog(
                 "run-id",
                 {"brand_name": "Example", "brand_aliases": [], "products": []},
-                [],
+                [{"answer_id": 1, "answer": "Example"}],
             )
 
-        processing.assert_awaited_once()
+        self.assertEqual(len(calls), 2)
 
-    async def test_entity_catalog_extracts_in_small_batches_before_merge(self) -> None:
+    async def test_entity_catalog_packs_by_full_request_bytes_before_merge(self) -> None:
         answers = [
             {
-                "answer_id": index,
+                "answer_id": index + 1,
                 "answer": f"Named entity {index}",
             }
             for index in range(17)
@@ -3035,11 +4705,11 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "target_aliases": ["merged"],
                     "entities": [],
-                    "uncertainties": [],
+                    "uncertainties": ["17"],
                 }
 
             chunk = kwargs["user_payload"]["answers"]  # type: ignore[index]
-            self.assertLessEqual(len(chunk), 8)
+            self.assertLessEqual(1_000 + len(chunk) * 1_000, 9_000)
             chunk_artifact_keys.append(str(kwargs["artifact_key"]))
             chunk_versions.append(str(kwargs["prompt_version"]))
             first_answer_id = int(chunk[0]["answer_id"])
@@ -3053,16 +4723,57 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 # depend on request completion order.
                 await asyncio.sleep((17 - first_answer_id) / 1000)
                 return {
-                    "target_aliases": [str(first_answer_id)],
-                    "entities": [],
-                    "uncertainties": [],
+                    "catalog": {
+                        "target_aliases": [str(first_answer_id)],
+                        "entities": [],
+                        "uncertainties": [
+                            str(item["core_claim"]["core_text"])
+                            for item in chunk
+                        ],
+                    },
+                    "core_dispositions": [
+                        {
+                            "claim_id": item["core_claim"]["claim_id"],
+                            "unit_id": item["core_claim"]["unit_id"],
+                            "core_sha256": item["core_claim"]["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": item["core_claim"]["core_text"],
+                            "reason": (
+                                "В core буквально присутствует именованная "
+                                "сущность для каталога."
+                            ),
+                        }
+                        for item in chunk
+                    ],
                 }
             finally:
                 active -= 1
 
-        with patch(
-            "app.services.analyzer._processing_artifact",
-            new=fake_processing,
+        with (
+            patch(
+                "app.services.analyzer._processing_artifact",
+                new=fake_processing,
+            ),
+            patch(
+                "app.services.analyzer._analyzer_model_input_window",
+                new=AsyncMock(
+                    return_value={
+                        "input_utf8_window": 9_000,
+                        "model_envelope": {
+                            "context_length": 12_000,
+                            "max_completion_tokens": 3_000,
+                        },
+                    }
+                ),
+            ),
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=lambda **kwargs: (
+                    1_000
+                    + len(kwargs["user_payload"].get("answers", []))
+                    * 1_000
+                ),
+            ),
         ):
             result = await _entity_catalog(
                 "run-id",
@@ -3092,7 +4803,247 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 catalog["target_aliases"][0]
                 for catalog in merge_payload["chunk_catalogs"]  # type: ignore[index]
             ],
-            ["0", "8", "16"],
+            ["1", "9", "17"],
+        )
+
+    async def test_site_profile_reducer_uses_byte_tree_and_lossless_terminal_union(
+        self,
+    ) -> None:
+        pages = [
+            {
+                "url": f"https://example.com/page-{index}",
+                "main_text": f"Page {index} " + ("raw " * 1_000),
+            }
+            for index in range(30)
+        ]
+        reducer_payloads: list[tuple[str, dict[str, Any]]] = []
+
+        def leaf_profile(name: str) -> dict[str, Any]:
+            return {
+                "brand_name": "Example",
+                "brand_aliases": [],
+                "site_type": "service",
+                "category": "test",
+                "topics": ["topic"],
+                "market": "market",
+                "business_model": "b2b",
+                "products": [f"product:{name}"],
+                "audiences": [],
+                "customer_jobs": [],
+                "decision_criteria": [],
+                "geography": [],
+                "language": "ru",
+                "positioning": "positioning",
+                "entity_scope": [],
+                "evidence": [name + ":" + ("e" * 2_200)],
+                "uncertainties": [],
+                "confidence": "medium",
+            }
+
+        async def fake_structured(
+            run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            self.assertEqual(run_id, "run-id")
+            payload = kwargs["user_payload"]
+            if "page_unit" in payload:
+                claim = payload["core_claim"]
+                profile = leaf_profile(str(payload["page_unit"]["url"]))
+                quote = str(claim["core_text"]).split(" ", 2)[0]
+                profile["evidence"].append(quote)
+                return {
+                    "profile": profile,
+                    "core_disposition": {
+                        "claim_id": claim["claim_id"],
+                        "unit_id": claim["unit_id"],
+                        "core_sha256": claim["core_sha256"],
+                        "disposition": "grounded_fact",
+                        "evidence_quote": quote,
+                        "reason": (
+                            "В core буквально присутствует профильный "
+                            "факт страницы."
+                        ),
+                    },
+                }
+            reducer_payloads.append(
+                (str(kwargs["system"]), copy.deepcopy(payload))
+            )
+            return _deterministic_site_profile_union(
+                list(payload["partial_profiles"])
+            )
+
+        envelope = {
+            "context_length": 40_000,
+            "max_completion_tokens": 2_000,
+        }
+        with (
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new=fake_structured,
+            ),
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new=AsyncMock(return_value=envelope),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            result = await _classify_site(
+                "run-id",
+                {
+                    "requested_site": {
+                        "domain": "example.com",
+                        "url": "https://example.com/",
+                    },
+                    "pages": pages,
+                },
+            )
+
+        self.assertEqual(len(result["products"]), len(pages))
+        self.assertTrue(reducer_payloads)
+        safe_window = 40_000 - 2_000
+        for system, payload in reducer_payloads:
+            self.assertLessEqual(
+                _serialized_llm_request_bytes(
+                    system=system,
+                    user_payload=payload,
+                ),
+                safe_window,
+            )
+        # The model sees compact digests; complete manifests and ids remain
+        # code-owned even when the terminal union is required.
+        for _system, payload in reducer_payloads:
+            reduction = payload["reduction"]
+            self.assertEqual(
+                reduction["version"],
+                ANALYZER_REDUCER_HARNESS_VERSION,
+            )
+            self.assertNotIn("source_unit_ids", reduction)
+            self.assertNotIn("source_manifests", reduction)
+        self.assertEqual(
+            save_artifact.await_args.kwargs["usage_json"][
+                "_aiv_analyzer_reducer"
+            ]["mode"],
+            "deterministic_terminal_union",
+        )
+
+    async def test_entity_catalog_reducer_uses_byte_tree_without_losing_leaves(
+        self,
+    ) -> None:
+        answers = [
+            {"answer_id": index + 1, "answer": f"Competitor {index}"}
+            for index in range(80)
+        ]
+        reducer_requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_processing(
+            run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            self.assertEqual(run_id, "run-id")
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                return {
+                    "catalog": {
+                        "target_aliases": [],
+                        "entities": [
+                            {
+                                "canonical_name": (
+                                    f"Competitor {item['answer_id']}"
+                                ),
+                                "aliases": [],
+                                "category": "competitor",
+                                "target_relationship": "competitor",
+                                "commercially_relevant": True,
+                                "mention_policy": "standalone",
+                                "evidence": (
+                                    str(item["core_claim"]["core_text"])
+                                    + ("e" * 2_000)
+                                ),
+                            }
+                            for item in payload["answers"]
+                        ],
+                        "uncertainties": [],
+                    },
+                    "core_dispositions": [
+                        {
+                            "claim_id": item["core_claim"]["claim_id"],
+                            "unit_id": item["core_claim"]["unit_id"],
+                            "core_sha256": item["core_claim"]["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": item["core_claim"]["core_text"],
+                            "reason": (
+                                "В core буквально присутствует имя "
+                                "конкурента для каталога."
+                            ),
+                        }
+                        for item in payload["answers"]
+                    ],
+                }
+            reducer_requests.append((str(kwargs["system"]), copy.deepcopy(payload)))
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
+
+        envelope = {
+            "context_length": 40_000,
+            "max_completion_tokens": 2_000,
+        }
+        with (
+            patch(
+                "app.services.analyzer._processing_artifact",
+                new=fake_processing,
+            ),
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new=AsyncMock(return_value=envelope),
+            ),
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=lambda **kwargs: (
+                    20_000
+                    + len(kwargs["user_payload"].get("answers", [])) * 6_000
+                    if "answers" in kwargs["user_payload"]
+                    else _structured_provider_request_utf8_bytes(**kwargs)
+                ),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            result = await _entity_catalog(
+                "run-id",
+                {
+                    "brand_name": "Example",
+                    "brand_aliases": [],
+                    "products": [],
+                    "topics": [],
+                    "entity_scope": [],
+                },
+                answers,
+            )
+
+        self.assertEqual(len(result["entities"]), len(answers))
+        self.assertTrue(reducer_requests)
+        safe_window = 40_000 - 2_000
+        for system, payload in reducer_requests:
+            self.assertLessEqual(
+                _serialized_llm_request_bytes(
+                    system=system,
+                    user_payload=payload,
+                ),
+                safe_window,
+            )
+            self.assertNotIn("source_unit_ids", payload["reduction"])
+            self.assertNotIn("partition_manifests", payload["reduction"])
+        self.assertEqual(
+            save_artifact.await_args.kwargs["usage_json"][
+                "_aiv_analyzer_reducer"
+            ]["mode"],
+            "deterministic_terminal_union",
         )
 
     async def test_annotation_requests_are_parallel_but_writes_stay_ordered(
@@ -3232,6 +5183,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             ) -> None:
                 del exc_type, exc, traceback
 
+        envelope = {
+            "context_length": 80_000,
+            "max_completion_tokens": 16_000,
+        }
         with (
             patch(
                 "app.services.analyzer._unannotated_answers",
@@ -3253,6 +5208,18 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.analyzer.SessionLocal",
                 new=lambda: FakeSessionContext(),
             ),
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new=AsyncMock(return_value=envelope),
+            ),
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=lambda **kwargs: (
+                    1_000
+                    + len(kwargs["user_payload"].get("answers", []))
+                    * 5_000
+                ),
+            ),
         ):
             await _annotate_answers(
                 "run-id",
@@ -3265,11 +5232,216 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             PROCESSING_BATCH_CONCURRENCY,
         )
         self.assertEqual(max_active_saves, 1)
-        self.assertEqual(save_order, [1, 11, 21])
+        # Partition requests may complete independently, but persistence is
+        # one code-owned all-or-nothing write for the reconstructed answers.
+        self.assertEqual(save_order, [1])
+        progress_values = [
+            call.kwargs["percent"] for call in progress.await_args_list
+        ]
+        self.assertEqual(progress_values[0], 76)
+        self.assertEqual(progress_values[-1], 80)
+        self.assertEqual(progress_values, sorted(progress_values))
+
+    async def test_annotation_preflights_full_wrapper_and_hash_joins_context_shards(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": ["Example brand"],
+            "site_type": "service",
+            "category": "test",
+            "topics": ["analytics"],
+            "market": "test market",
+            "business_model": "b2b",
+            "products": [],
+            "audiences": [],
+            "customer_jobs": [],
+            "decision_criteria": [],
+            "geography": [],
+            "language": "ru",
+            "positioning": "test",
+            "entity_scope": [],
+            "evidence": [],
+            "uncertainties": [],
+            "confidence": "medium",
+        }
+        catalog = {
+            "target_aliases": ["Example"],
+            "entities": [
+                {
+                    "canonical_name": f"Competitor {index}",
+                    "aliases": [f"C{index}"],
+                    "category": "competitor",
+                    "target_relationship": "competitor",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "e" * 900,
+                }
+                for index in range(80)
+            ],
+            "uncertainties": [],
+        }
+        raw_answer = "Example подробно описан в ответе. Упомянут Competitor 79."
+        envelope = {
+            "context_length": 80_000,
+            "max_completion_tokens": 16_000,
+        }
+        pending = [
+            {
+                "answer_id": 1,
+                "mode": "memory",
+                "system": "Test",
+                "answer_model": "test/model",
+                "answer_sha256": hashlib.sha256(
+                    raw_answer.encode("utf-8")
+                ).hexdigest(),
+                "scenario": "Что известно про Example?",
+                "scenario_role": "brand_diagnostic",
+                "intent_class": "I",
+                "answer": raw_answer,
+            }
+        ]
+        request_payloads: list[tuple[str, dict[str, Any]]] = []
+        saved_annotations: list[dict[str, Any]] = []
+
+        async def fake_processing(
+            run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            self.assertEqual(run_id, "run-id")
+            payload = copy.deepcopy(kwargs["user_payload"])
+            request_payloads.append((str(kwargs["system"]), payload))
+            return {
+                "answers": [
+                    {
+                        "answer_id": item["answer_id"],
+                        "valid": True,
+                        "target_mentioned": True,
+                        "target_position": None,
+                        "target_role": "mentioned",
+                        "sentiment": "neutral",
+                        "entity_mentions": [],
+                        "brand_answer": {
+                            "directness": "direct",
+                            "specificity": "generic",
+                            "supported_facets": [],
+                            "contradictions": [],
+                        },
+                        "evidence": ["Example"],
+                        "uncertainties": [],
+                    }
+                    for item in payload["answers"]
+                ]
+            }
+
+        async def fake_save(
+            run_id: str,
+            annotations: list[dict[str, Any]],
+            allowed_ids: set[int],
+        ) -> int:
+            self.assertEqual(run_id, "run-id")
+            self.assertEqual(allowed_ids, {1})
+            saved_annotations.extend(copy.deepcopy(annotations))
+            return len(annotations)
+
+        class FakeResult:
+            def all(self) -> list[tuple[SimpleNamespace, SimpleNamespace]]:
+                return [
+                    (
+                        SimpleNamespace(
+                            response_text=raw_answer,
+                            model="test/model",
+                        ),
+                        SimpleNamespace(annotation_json=saved_annotations[0]),
+                    )
+                ]
+
+        class FakeSession:
+            async def execute(self, statement: object) -> FakeResult:
+                del statement
+                return FakeResult()
+
+        class FakeSessionContext:
+            async def __aenter__(self) -> FakeSession:
+                return FakeSession()
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                del exc_type, exc, traceback
+
+        with (
+            patch(
+                "app.services.analyzer._unannotated_answers",
+                new=AsyncMock(return_value=pending),
+            ),
+            patch(
+                "app.services.analyzer._processing_artifact",
+                new=fake_processing,
+            ),
+            patch(
+                "app.services.analyzer._save_annotations",
+                new=fake_save,
+            ),
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.SessionLocal",
+                new=lambda: FakeSessionContext(),
+            ),
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new=AsyncMock(return_value=envelope),
+            ),
+        ):
+            await _annotate_answers("run-id", profile, catalog)
+
+        # The 79 irrelevant catalog rows are not repeated beside this answer;
+        # the literal tail entity and identity profile remain available.
+        self.assertLessEqual(len(request_payloads), 2)
+        seen_names: set[str] = set()
+        request_ids: list[int] = []
+        manifest_digests: set[str] = set()
+        for system, payload in request_payloads:
+            self.assertLessEqual(
+                _structured_provider_request_utf8_bytes(
+                    model=PROCESSING_MODEL,
+                    model_envelope=envelope,
+                    system=system,
+                    user_payload=payload,
+                    schema=ANNOTATION_SCHEMA,
+                    schema_name="aiv_annotations_0000000000000000",
+                    reasoning_effort="high",
+                    temperature=0.15,
+                ),
+                64_000,
+            )
+            self.assertEqual(payload["answers"][0]["answer"], raw_answer)
+            request_ids.append(int(payload["answers"][0]["answer_id"]))
+            manifest_digests.add(
+                str(payload["context_provenance"]["all_record_ids_sha256"])
+            )
+            seen_names.update(
+                str(entity["canonical_name"])
+                for entity in payload["entity_catalog"]
+            )
+        self.assertEqual(len(request_ids), len(set(request_ids)))
+        self.assertEqual(len(manifest_digests), 1)
         self.assertEqual(
-            [call.kwargs["percent"] for call in progress.await_args_list],
-            [76, 79, 80],
+            seen_names,
+            {"Competitor 79"},
         )
+        provenance = request_payloads[0][1]["context_provenance"]
+        self.assertEqual(provenance["all_record_count"], 89)
+        self.assertLess(provenance["selected_record_count"], 12)
+        self.assertGreater(provenance["omitted_irrelevant_record_count"], 70)
+        self.assertEqual(len(saved_annotations), 1)
+        self.assertEqual(saved_annotations[0]["answer_id"], 1)
 
     async def test_answer_processing_uses_terra_with_high_reasoning(self) -> None:
         with patch(
@@ -3299,20 +5471,19 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ),
             patch(
-                "app.services.analyzer._technical_summary",
-                new=AsyncMock(return_value={"score": 90}),
+                "app.services.analyzer._prepare_analysis_foundation",
+                new=AsyncMock(
+                    return_value=(
+                        {"score": 90},
+                        {"findings": []},
+                        {"brand_name": "Example"},
+                        {"requested_site": {}},
+                    )
+                ),
             ),
             patch(
-                "app.services.analyzer._review_technical_summary",
-                new=AsyncMock(return_value={"findings": []}),
-            ),
-            patch(
-                "app.services.analyzer._site_context",
-                new=AsyncMock(return_value={"requested_site": {}}),
-            ),
-            patch(
-                "app.services.analyzer._classify_site",
-                new=AsyncMock(return_value={"brand_name": "Example"}),
+                "app.services.analyzer._save_answer_set_receipt",
+                new=AsyncMock(),
             ),
             patch(
                 "app.services.analyzer._finish_saved_answer_analysis",
@@ -3385,7 +5556,15 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 return_value=None,
             ),
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                return_value=(
+                    {"prepared_complete_context": True},
+                    {"mode": "direct", "coverage_complete": True},
+                ),
+            ),
+            patch(
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 return_value=response,
             ) as chat_mock,
@@ -3413,6 +5592,8 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             request["response_schema"],
             ILLUSTRATION_CONCEPTS_SCHEMA,
         )
+        self.assertNotIn("max_completion_tokens", request)
+        self.assertNotIn("max_tokens", request)
         system_prompt = request["messages"][0]["content"]
         self.assertIn("report_data — единственный актуальный снимок", system_prompt)
         self.assertIn("n_pairs=0", system_prompt)
@@ -4364,7 +6545,13 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             corpus_manifest=manifest,
         )
 
-        self.assertLessEqual(len(selected), FINAL_CONTEXT_MAX_ANSWERS)
+        self.assertIsNone(FINAL_CONTEXT_MAX_ANSWERS)
+        self.assertEqual(len(selected), len(items))
+        self.assertEqual(selection_manifest["omitted_count"], 0)
+        self.assertEqual(
+            selection_manifest["policy"],
+            "complete_attested_corpus_no_local_cap_v1",
+        )
         self.assertTrue(selection_manifest["coverage_complete"])
         self.assertEqual(
             [item["answer_id"] for item in selected],
@@ -4473,6 +6660,8 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             return {
                 "answer_id": answer_id,
                 "prompt_id": 1,
+                "prompt_key": "u-1",
+                "intent_class": "I",
                 "provider_key": "openai",
                 "mode": "web",
                 "intent_class": "I",
@@ -4911,11 +7100,16 @@ class FinalAnswerCorpusTests(unittest.TestCase):
 
         preflight = _final_input_preflight(payload, token_budget=1)
 
-        self.assertEqual(preflight["state"], "limited")
-        self.assertFalse(preflight["accepted"])
+        self.assertEqual(preflight["state"], "direct")
+        self.assertTrue(preflight["accepted"])
+        self.assertFalse(preflight["legacy_budget_would_accept"])
+        self.assertEqual(
+            preflight["budget_enforcement"],
+            "disabled_diagnostics_only",
+        )
         self.assertEqual(
             preflight["estimated_input_tokens"],
-            (serialized_bytes + 2) // 3,
+            serialized_bytes,
         )
 
         estimated = preflight["estimated_input_tokens"]
@@ -4924,20 +7118,1783 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             token_budget=estimated + 9,
             reserve_tokens=10,
         )
-        self.assertFalse(reserved["accepted"])
+        self.assertTrue(reserved["accepted"])
+        self.assertFalse(reserved["legacy_budget_would_accept"])
         self.assertEqual(reserved["repair_reserve_tokens"], 10)
+
+    def test_unicode_payload_cannot_bypass_physical_token_window(self) -> None:
+        payload = {"answer": "видимость" * 200}
+        serialized_bytes = len(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+
+        preflight = _final_input_preflight(
+            payload,
+            physical_input_token_window=serialized_bytes - 1,
+        )
+
+        self.assertEqual(preflight["estimated_input_tokens"], serialized_bytes)
+        self.assertFalse(preflight["physical_direct_fit"])
+        self.assertEqual(preflight["state"], "partition_required")
+        self.assertEqual(
+            preflight["estimation_contract"],
+            "conservative_upper_bound:1_serialized_utf8_byte_per_token",
+        )
+
+
+class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _oversized_payload() -> dict[str, Any]:
+        return {
+            "report_data": {
+                "critical_metric": 73,
+                "data_state": "unknown",
+                "eligible": True,
+                "optional_value": None,
+                "long_narrative": "x" * 260_000,
+            }
+        }
+
+    @staticmethod
+    def _window() -> dict[str, Any]:
+        return {
+            "version": "test",
+            "resolution": "test",
+            "model_envelope": {},
+            "input_token_window": 192_000,
+            "input_utf8_window": 192_000,
+        }
+
+    @staticmethod
+    def _stable_sha(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _scalar_fact_binding(
+        cls,
+        *,
+        source_path: str,
+        json_literal: str,
+        value_type: str = "string",
+    ) -> dict[str, Any]:
+        contract = {
+            "contract": "code_owned_exact_scalar_binding",
+            "source_path": source_path,
+            "value_type": value_type,
+            "json_literal": json_literal,
+            "source_value_sha256": hashlib.sha256(
+                json_literal.encode("utf-8")
+            ).hexdigest(),
+        }
+        return {
+            "binding_id": "afb_scalar_" + cls._stable_sha(contract),
+            **contract,
+        }
+
+    @classmethod
+    def _bounded_leaf(
+        cls,
+        *,
+        node_id: str,
+        index: int,
+        semantic_text: str,
+        claim_count: int,
+        bindings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        table = _final_root_fact_table(bindings)
+        binding_ids = [str(binding["binding_id"]) for binding in bindings]
+        fact_provenance_sha256 = cls._stable_sha(
+            {
+                "domain": "aiv-final-root-leaf-facts-v1",
+                "mandatory_fact_bindings_sha256": cls._stable_sha(bindings),
+                "mandatory_fact_ids_sha256": cls._stable_sha(binding_ids),
+                "mandatory_fact_table_sha256": cls._stable_sha(table),
+            }
+        )
+        model_view = {
+            "source_node_id": node_id,
+            "context_value": semantic_text,
+            "mandatory_fact_count": len(bindings),
+            "mandatory_fact_provenance_sha256": fact_provenance_sha256,
+        }
+        return {
+            "node_id": node_id,
+            "level": 0,
+            "leaf_start": index,
+            "leaf_end": index + 1,
+            "descendant_source_node_count": 1,
+            "descendant_claim_count": claim_count,
+            "tree_commitment": f"leaf-commitment-{index}",
+            "model_view": model_view,
+            "source_text": json.dumps(model_view),
+            "semantic_text": semantic_text,
+            "mandatory_fact_bindings": copy.deepcopy(bindings),
+        }
+
+    @classmethod
+    def _bounded_proof(cls, parent: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "receipt": _final_root_node_receipt(parent),
+            "ordered_child_receipts": parent["child_receipts"],
+            "ordered_child_receipts_sha256": cls._stable_sha(
+                parent["child_receipts"]
+            ),
+            "packet_sha256": parent["packet_sha256"],
+            "model_view": copy.deepcopy(parent["model_view"]),
+            "mandatory_fact_count": parent["mandatory_fact_count"],
+            "mandatory_fact_provenance_sha256": parent[
+                "mandatory_fact_provenance_sha256"
+            ],
+            "fact_provenance": copy.deepcopy(parent["fact_provenance"]),
+        }
+
+    def test_structural_string_passthrough_is_not_length_gated(self) -> None:
+        metric_code = "metric-code-" + ("x" * 2_000)
+        narrative = "narrative-" + ("y" * 2_000)
+        units, _manifest = _flatten_final_input_payload(
+            {
+                "report_data": {
+                    "metric_code": metric_code,
+                    "long_narrative": narrative,
+                }
+            },
+            target_chars=4_096,
+        )
+
+        passthrough = {
+            item["source_path"]: item
+            for item in _final_input_deterministic_passthrough(units)
+        }
+
+        self.assertEqual(
+            passthrough["/report_data/metric_code"]["value"],
+            metric_code,
+        )
+        self.assertNotIn("/report_data/long_narrative", passthrough)
+
+    @staticmethod
+    def _packet_for_units(
+        units: list[dict[str, Any]],
+        *,
+        source_claims: list[dict[str, Any]] | None = None,
+        hide_values: bool = False,
+    ) -> dict[str, Any]:
+        claims = list(source_claims or [])
+        if not claims:
+            claims = [
+                {
+                    "claim_id": f"test-claim:{unit['source_unit_id']}",
+                    "excerpt_sha256": "0" * 64,
+                    "excerpt": str(unit.get("context_value") or ""),
+                    "source_unit_id": str(unit["source_unit_id"]),
+                    "source_path": str(unit["source_path"]),
+                }
+                for unit in units
+            ]
+        return {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": "Исходная единица учтена.",
+                    "source_paths": [str(claim["source_path"])],
+                    "source_unit_ids": [str(claim["source_unit_id"])],
+                    "source_claim_ids": [str(claim["claim_id"])],
+                    "exact_values": (
+                        []
+                        if hide_values
+                        else [str(claim.get("excerpt") or "")[:40]]
+                    ),
+                    "evidence_excerpt": str(claim.get("excerpt") or "")[:40],
+                    "importance": "supporting",
+                }
+                for claim in claims
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "unit_coverage": [
+                {
+                    "source_unit_id": str(unit["source_unit_id"]),
+                    "disposition": "supporting_context",
+                    "rationale": "Единица отражена в observation.",
+                }
+                for unit in units
+            ],
+            "claim_coverage": [
+                {
+                    "claim_id": str(claim["claim_id"]),
+                    "excerpt_sha256": str(claim["excerpt_sha256"]),
+                    "disposition": "supporting_context",
+                    "rationale": "Claim отражён в observation.",
+                }
+                for claim in claims
+            ],
+        }
+
+    @staticmethod
+    def _multi_claim_fixture() -> tuple[
+        str,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
+        source = (
+            "FIRST-CLAIM-MARKER "
+            + ("a" * 4_300)
+            + " SECOND-CLAIM-MARKER "
+            + ("b" * 4_300)
+            + " TAIL-CLAIM-MARKER"
+        )
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"narrative": source}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        if len(units) != 1 or len(claim_rows) < 2:
+            raise AssertionError("Fixture must create one unit and many claims")
+        return source, units, claim_rows, claim_objects
+
+    def test_one_observation_cannot_claim_multiple_source_fragments(self) -> None:
+        _source, units, claim_rows, claim_objects = (
+            self._multi_claim_fixture()
+        )
+        packet = self._packet_for_units(
+            units,
+            source_claims=claim_rows,
+        )
+        packet["observations"][0]["source_claim_ids"] = [
+            str(claim_rows[0]["claim_id"]),
+            str(claim_rows[1]["claim_id"]),
+        ]
+        packet["observations"].pop(1)
+
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "must bind exactly one source claim",
+        ):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths={
+                    str(unit["source_unit_id"]): str(unit["source_path"])
+                    for unit in units
+                },
+                allowed_claims={
+                    str(claim["claim_id"]): claim for claim in claim_rows
+                },
+                claim_objects=claim_objects,
+            )
+
+    def test_atomic_claim_rows_keep_distinct_evidence_for_every_claim(
+        self,
+    ) -> None:
+        source, units, claim_rows, claim_objects = (
+            self._multi_claim_fixture()
+        )
+        packet = self._packet_for_units(
+            units,
+            source_claims=claim_rows,
+        )
+        normalized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths={
+                str(unit["source_unit_id"]): str(unit["source_path"])
+                for unit in units
+            },
+            allowed_claims={
+                str(claim["claim_id"]): claim for claim in claim_rows
+            },
+            claim_objects=claim_objects,
+        )
+
+        observations_by_claim = {
+            str(observation["source_claim_ids"][0]): observation
+            for observation in normalized["observations"]
+        }
+        self.assertEqual(len(observations_by_claim), len(claim_rows))
+        for claim in claim_rows:
+            observation = observations_by_claim[str(claim["claim_id"])]
+            self.assertIn(
+                observation["evidence_excerpt"],
+                str(claim["excerpt"]),
+            )
+            self.assertEqual(
+                observation["source_unit_ids"],
+                [claim["source_unit_id"]],
+            )
+            self.assertEqual(
+                observation["source_paths"],
+                [claim["source_path"]],
+            )
+        reconstructed = "".join(
+            str(claim["excerpt"])
+            for claim in sorted(
+                claim_rows,
+                key=lambda item: int(item["fragment_index"]),
+            )
+        )
+        self.assertEqual(reconstructed, source)
+
+    def test_reducer_cannot_replace_atomic_claim_rows_with_rephrases(
+        self,
+    ) -> None:
+        _source, units, claim_rows, claim_objects = (
+            self._multi_claim_fixture()
+        )
+        canonical = _normalize_final_evidence_packet(
+            self._packet_for_units(units, source_claims=claim_rows),
+            allowed_unit_paths={
+                str(unit["source_unit_id"]): str(unit["source_path"])
+                for unit in units
+            },
+            allowed_claims={
+                str(claim["claim_id"]): claim for claim in claim_rows
+            },
+            claim_objects=claim_objects,
+        )
+        rewritten = copy.deepcopy(canonical)
+        for index, observation in enumerate(rewritten["observations"]):
+            observation["statement"] = f"Reducer rewrite {index}"
+            observation["evidence_excerpt"] = "shortened"
+
+        preserved = _preserve_final_evidence_reduction(
+            rewritten,
+            [canonical],
+        )
+
+        self.assertEqual(
+            preserved["observations"],
+            canonical["observations"],
+        )
+        self.assertEqual(
+            [
+                observation["source_claim_ids"][0]
+                for observation in preserved["observations"]
+            ],
+            [str(claim["claim_id"]) for claim in claim_rows],
+        )
+
+    @classmethod
+    def _successful_mapper(
+        cls,
+        *,
+        hide_values: bool = False,
+    ) -> Any:
+        async def mapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            if "source_units" in user_payload:
+                return cls._packet_for_units(
+                    user_payload["source_units"],
+                    source_claims=user_payload.get("source_claims"),
+                    hide_values=hide_values,
+                )
+            if "source_nodes" in user_payload:
+                source_nodes = user_payload["source_nodes"]
+                def semantic_text(node: dict[str, Any]) -> str:
+                    if isinstance(node.get("summary"), dict):
+                        return json.dumps(
+                            node["summary"],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    context = str(node.get("context_value") or "")
+                    start = int(node.get("core_start_in_context") or 0)
+                    end = int(node.get("core_end_in_context") or len(context))
+                    return context[start:end]
+
+                def grounded_excerpt(node: dict[str, Any]) -> str:
+                    value = semantic_text(node)
+                    return value[:240] if value else "Пустое значение."
+
+                def fact_table_values(
+                    node: dict[str, Any],
+                    column: str,
+                ) -> list[str]:
+                    table = node.get("mandatory_fact_table") or {}
+                    columns = table.get("columns") or []
+                    rows = table.get("rows") or []
+                    if column not in columns:
+                        return []
+                    index = columns.index(column)
+                    return [
+                        str(row[index])
+                        for row in rows
+                        if isinstance(row, list)
+                        and len(row) > index
+                        and row[index] not in {None, ""}
+                    ]
+
+                def grounded_statement(node: dict[str, Any]) -> str:
+                    excerpt = grounded_excerpt(node)
+                    lexemes = fact_table_values(node, "lexeme")
+                    if not lexemes:
+                        return excerpt
+                    return f"{excerpt} Факты: {'; '.join(lexemes)}."
+
+                return {
+                    "observations": [
+                        {
+                            "category": "context",
+                            "statement": grounded_statement(node),
+                            "source_node_ids": [
+                                str(node["source_node_id"])
+                            ],
+                            "exact_values": [],
+                            "fact_binding_ids": fact_table_values(
+                                node, "ref"
+                            ),
+                            "evidence_excerpts": [
+                                {
+                                    "source_node_id": str(
+                                        node["source_node_id"]
+                                    ),
+                                    "excerpt": grounded_excerpt(node),
+                                }
+                            ],
+                            "importance": "supporting",
+                        }
+                        for node in source_nodes
+                    ],
+                    "uncertainties": [],
+                    "report_focus": [],
+                    "node_coverage": [
+                        {
+                            "source_node_id": str(
+                                node["source_node_id"]
+                            ),
+                            "disposition": "supporting_context",
+                            "rationale": "Child node отражён в observation.",
+                        }
+                        for node in source_nodes
+                    ],
+                }
+            packets = user_payload["evidence_packets"]
+            return {
+                "observations": [
+                    copy.deepcopy(observation)
+                    for packet in packets
+                    for observation in packet["observations"]
+                ],
+                "uncertainties": [],
+                "report_focus": [],
+                "unit_coverage": [
+                    copy.deepcopy(item)
+                    for packet in packets
+                    for item in packet["unit_coverage"]
+                ],
+                "claim_coverage": [
+                    copy.deepcopy(item)
+                    for packet in packets
+                    for item in packet["claim_coverage"]
+                ],
+            }
+
+        return mapper
+
+    def test_mapper_cannot_swap_unit_and_source_path_provenance(self) -> None:
+        packet = {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": "Переставленная ссылка A.",
+                    "source_paths": ["/b"],
+                    "source_unit_ids": ["unit-a"],
+                    "exact_values": [],
+                    "evidence_excerpt": "A",
+                    "importance": "supporting",
+                },
+                {
+                    "category": "context",
+                    "statement": "Переставленная ссылка B.",
+                    "source_paths": ["/a"],
+                    "source_unit_ids": ["unit-b"],
+                    "exact_values": [],
+                    "evidence_excerpt": "B",
+                    "importance": "supporting",
+                },
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "unit_coverage": [
+                {
+                    "source_unit_id": "unit-a",
+                    "disposition": "supporting_context",
+                    "rationale": "A учтена.",
+                },
+                {
+                    "source_unit_id": "unit-b",
+                    "disposition": "supporting_context",
+                    "rationale": "B учтена.",
+                },
+            ],
+        }
+
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "mismatches its code-owned source unit paths",
+        ):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths={"unit-a": "/a", "unit-b": "/b"},
+            )
+
+    async def test_model_window_never_exceeds_residual_context(self) -> None:
+        envelope = {
+            "version": "test",
+            "resolution": "test",
+            "context_length": 16_000,
+            "max_completion_tokens": 16_000,
+        }
+        with patch(
+            "app.services.analyzer.model_output_envelope",
+            new_callable=AsyncMock,
+            return_value=envelope,
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "leaves no safe input window",
+            ):
+                await _final_model_input_window(model=ANALYSIS_MODEL)
+
+        positive_envelope = {
+            **envelope,
+            "context_length": 36_000,
+            "max_completion_tokens": 20_000,
+        }
+        with patch(
+            "app.services.analyzer.model_output_envelope",
+            new_callable=AsyncMock,
+            return_value=positive_envelope,
+        ):
+            window = await _final_model_input_window(model=ANALYSIS_MODEL)
+
+        self.assertEqual(
+            window["input_token_window"],
+            36_000 - 20_000,
+        )
+        self.assertEqual(
+            window["input_utf8_window"],
+            window["input_token_window"],
+        )
+        self.assertLessEqual(
+            window["input_token_window"]
+            + positive_envelope["max_completion_tokens"],
+            positive_envelope["context_length"],
+        )
+
+    async def test_all_analyzer_planners_share_one_byte_per_token_contract(
+        self,
+    ) -> None:
+        envelope = {
+            "version": "test",
+            "resolution": "test",
+            "context_length": 50_000,
+            "max_completion_tokens": 10_000,
+        }
+        expected = 50_000 - 10_000
+        with patch(
+            "app.services.analyzer.model_output_envelope",
+            new_callable=AsyncMock,
+            return_value=envelope,
+        ):
+            analyzer_window = await _analyzer_model_input_window(
+                PROCESSING_MODEL,
+                system="Системная инструкция",
+            )
+            market_window = await _market_research_model_window(
+                system="Исследовательская инструкция",
+            )
+            final_window = await _final_model_input_window(
+                model=ANALYSIS_MODEL,
+            )
+
+        for window in (analyzer_window, market_window, final_window):
+            self.assertEqual(window["input_token_window"], expected)
+            self.assertEqual(window["input_utf8_window"], expected)
+            self.assertEqual(
+                window["utf8_preflight_contract"],
+                "exact_serialized_request_utf8_bytes<=residual_input_tokens",
+            )
+
+    async def test_oversized_payload_has_complete_unit_coverage(self) -> None:
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=self._successful_mapper(),
+            ),
+        ):
+            model_payload, preflight = await _prepare_final_model_payload(
+                "run-id",
+                payload=self._oversized_payload(),
+                system="author",
+            )
+
+        contract = model_payload["long_input_contract"]
+        self.assertEqual(preflight["mode"], "hierarchical_evidence_tree")
+        self.assertTrue(contract["coverage_complete"])
+        self.assertEqual(
+            contract["covered_unit_count"],
+            contract["source_unit_count"],
+        )
+        self.assertEqual(
+            len(model_payload["evidence_digest"]["unit_coverage"]),
+            contract["source_unit_count"],
+        )
+
+    async def test_long_narrative_claims_cover_tail_exactly_once(self) -> None:
+        tail_marker = "TAIL-CLAIM-MUST-SURVIVE-7c2d3f"
+        narrative = "x" * 14_000 + tail_marker
+        seen_source_claims: list[dict[str, Any]] = []
+
+        async def capture_mapper(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            source_claims = kwargs["user_payload"].get("source_claims")
+            self.assertIsInstance(source_claims, list)
+            seen_source_claims.extend(copy.deepcopy(source_claims))
+            return self._packet_for_units(
+                kwargs["user_payload"]["source_units"],
+                source_claims=source_claims,
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=capture_mapper,
+            ),
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload={"report_data": {"long_narrative": narrative}},
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertGreater(plan["source_claim_count"], 1)
+        self.assertGreater(
+            plan["source_claim_count"],
+            plan["source_unit_count"],
+        )
+        self.assertEqual(
+            plan["covered_claim_count"],
+            plan["source_claim_count"],
+        )
+        self.assertEqual(
+            len(model_payload["evidence_digest"]["claim_coverage"]),
+            plan["source_claim_count"],
+        )
+        self.assertEqual(
+            len(
+                {
+                    item["claim_id"]
+                    for item in model_payload["evidence_digest"][
+                        "claim_coverage"
+                    ]
+                }
+            ),
+            plan["source_claim_count"],
+        )
+        reconstructed = "".join(
+            str(claim["excerpt"])
+            for claim in sorted(
+                seen_source_claims,
+                key=lambda claim: int(claim["fragment_index"]),
+            )
+        )
+        self.assertEqual(reconstructed, narrative)
+        self.assertTrue(reconstructed.endswith(tail_marker))
+
+    async def test_missing_or_tampered_claim_fails_closed(self) -> None:
+        narrative = "x" * 14_000 + "TAIL-CLAIM-FAIL-CLOSED"
+
+        for fault, expected in (
+            ("missing", "does not map every source claim exactly once"),
+            ("tampered", "Coverage digest mismatch"),
+        ):
+            with self.subTest(fault=fault):
+                async def broken_mapper(
+                    *_args: Any,
+                    **kwargs: Any,
+                ) -> dict[str, Any]:
+                    source_claims = kwargs["user_payload"]["source_claims"]
+                    self.assertGreater(len(source_claims), 1)
+                    packet = self._packet_for_units(
+                        kwargs["user_payload"]["source_units"],
+                        source_claims=source_claims,
+                    )
+                    if fault == "missing":
+                        packet["observations"].pop()
+                        packet["claim_coverage"].pop()
+                    else:
+                        packet["claim_coverage"][-1][
+                            "excerpt_sha256"
+                        ] = "f" * 64
+                    return packet
+
+                with (
+                    patch(
+                        "app.services.analyzer._final_model_input_window",
+                        new_callable=AsyncMock,
+                        return_value=self._window(),
+                    ),
+                    patch(
+                        "app.services.analyzer._save_artifact",
+                        new_callable=AsyncMock,
+                    ),
+                    patch(
+                        "app.services.analyzer._structured_artifact",
+                        new_callable=AsyncMock,
+                        side_effect=broken_mapper,
+                    ),
+                ):
+                    with self.assertRaisesRegex(OpenRouterError, expected):
+                        await _prepare_final_model_payload(
+                            "run-id",
+                            payload={
+                                "report_data": {
+                                    "long_narrative": narrative,
+                                }
+                            },
+                            system="author",
+                            force_hierarchical=True,
+                        )
+
+    async def test_compact_overflow_builds_bounded_transitive_root(self) -> None:
+        tail_marker = "BOUND-ROOT-TAIL-9d4a"
+        payload = {
+            "report_data": {
+                "metrics": [
+                    {
+                        "name": f"metric-{index}",
+                        "value": index,
+                        "note": "содержательный факт",
+                    }
+                    for index in range(180)
+                ],
+                "tail": "x" * 12_000 + tail_marker,
+            }
+        }
+        target_window = {
+            **self._window(),
+            "input_token_window": 45_000,
+            "input_utf8_window": 45_000,
+        }
+        worker_window = {
+            **self._window(),
+            "input_token_window": 150_000,
+            "input_utf8_window": 150_000,
+        }
+        structured_calls: list[dict[str, Any]] = []
+        mapper = self._successful_mapper()
+
+        async def capture_mapper(
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            structured_calls.append(copy.deepcopy(kwargs["user_payload"]))
+            return await mapper(*args, **kwargs)
+
+        def final_request_bytes(
+            candidate: dict[str, Any],
+            _envelope: dict[str, Any],
+        ) -> int:
+            mode = str(
+                (candidate.get("long_input_contract") or {}).get("mode")
+                or ""
+            )
+            if mode == "bounded_transitive_evidence_tree":
+                return len(
+                    json.dumps(
+                        candidate,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            # Force both the canonical and columnar O(N) views through the
+            # bounded-root fallback without imposing a source-data cap.
+            return 60_000
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                side_effect=[
+                    target_window,
+                    worker_window,
+                    worker_window,
+                    worker_window,
+                ],
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=capture_mapper,
+            ),
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+                final_request_utf8_bytes=final_request_bytes,
+            )
+
+        self.assertEqual(
+            plan["mode"],
+            "bounded_transitive_evidence_tree",
+        )
+        root_plan = plan["bounded_root_plan"]
+        self.assertTrue(root_plan["coverage_complete"])
+        self.assertLessEqual(
+            root_plan["model_request_utf8_bytes"],
+            target_window["input_utf8_window"],
+        )
+        root_nodes = model_payload["evidence_digest"]["root_nodes"]
+        self.assertEqual(
+            sum(int(node["descendant_claim_count"]) for node in root_nodes),
+            plan["source_claim_count"],
+        )
+        self.assertTrue(
+            all("mandatory_fact_table" not in node for node in root_nodes)
+        )
+        self.assertTrue(
+            all(
+                "mandatory_fact_provenance_sha256" in node
+                for node in root_nodes
+            )
+        )
+        self.assertTrue(
+            any(
+                tail_marker
+                in json.dumps(call, ensure_ascii=False)
+                for call in structured_calls
+                if "source_nodes" in call
+            )
+        )
+        self.assertTrue(
+            any(
+                str(call.kwargs.get("artifact_key") or "").startswith(
+                    "final_input_bounded_root_tree_"
+                )
+                for call in save_artifact.await_args_list
+            )
+        )
+        proof_outputs = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if "_bounded_root_node_"
+            in str(call.kwargs.get("artifact_key") or "")
+        ]
+        self.assertTrue(proof_outputs)
+        self.assertTrue(
+            all(
+                isinstance(output.get("fact_provenance"), list)
+                and "mandatory_fact_bindings" not in output
+                and "mandatory_fact_table" not in output
+                and "mandatory_fact_bindings"
+                not in (output.get("model_view") or {})
+                and "mandatory_fact_table"
+                not in (output.get("model_view") or {})
+                for output in proof_outputs
+            )
+        )
+
+    def test_bounded_root_rejects_invented_literals_and_missing_excerpts(
+        self,
+    ) -> None:
+        allowed = {
+            "node-a": "бренд не найден: 0 из 30 ответов",
+            "node-b": "память модели: unknown",
+        }
+        base = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": "Бренд не найден: 0 из 30 ответов.",
+                    "source_node_ids": ["node-a"],
+                    "exact_values": ["0 из 30"],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": "node-a",
+                            "excerpt": "0 из 30",
+                        }
+                    ],
+                    "importance": "critical",
+                },
+                {
+                    "category": "limitation",
+                    "statement": "Память модели: unknown.",
+                    "source_node_ids": ["node-b"],
+                    "exact_values": ["unknown"],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": "node-b",
+                            "excerpt": "unknown",
+                        },
+                    ],
+                    "importance": "critical",
+                }
+            ],
+            "uncertainties": [
+                {
+                    "text": "Память модели: unknown.",
+                    "source_node_ids": ["node-b"],
+                }
+            ],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": node_id,
+                    "disposition": "material_observation",
+                    "rationale": "Child отражён.",
+                }
+                for node_id in allowed
+            ],
+        }
+        accepted = _normalize_final_root_summary_packet(
+            base,
+            allowed_node_text=allowed,
+        )
+        self.assertEqual(len(accepted["node_coverage"]), 2)
+
+        invented = copy.deepcopy(base)
+        invented["observations"][0]["statement"] = (
+            "Бренд лидирует: 99,9%."
+        )
+        invented["observations"][0]["exact_values"] = ["99,9%"]
+        with self.assertRaisesRegex(OpenRouterError, "exact value|invented"):
+            _normalize_final_root_summary_packet(
+                invented,
+                allowed_node_text=allowed,
+            )
+
+        missing_excerpt = copy.deepcopy(base)
+        missing_excerpt["observations"][0]["evidence_excerpts"].pop()
+        with self.assertRaisesRegex(OpenRouterError, "omitted a child excerpt"):
+            _normalize_final_root_summary_packet(
+                missing_excerpt,
+                allowed_node_text=allowed,
+            )
+
+    def test_bounded_root_rejects_generic_acknowledgement(self) -> None:
+        packet = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": "Realweb учтён.",
+                    "source_node_ids": ["node-a"],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": "node-a",
+                            "excerpt": "Realweb",
+                        }
+                    ],
+                    "importance": "important",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-a",
+                    "disposition": "supporting_context",
+                    "rationale": "Узел отражён.",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "generic acknowledgement",
+        ):
+            _normalize_final_root_summary_packet(
+                packet,
+                allowed_node_text={
+                    "node-a": "Realweb показывает содержательный результат."
+                },
+            )
+
+    def test_bounded_root_rejects_cross_child_missing_and_tampered_fact_refs(
+        self,
+    ) -> None:
+        binding_a = self._scalar_fact_binding(
+            source_path="/models/chatgpt/mention_rate",
+            json_literal='"60%"',
+        )
+        binding_b = self._scalar_fact_binding(
+            source_path="/models/gemini/mention_rate",
+            json_literal='"30%"',
+        )
+        allowed = {
+            "node-a": "ChatGPT: mention rate 60%.",
+            "node-b": "Gemini: mention rate 30%.",
+        }
+        ledgers = {"node-a": [binding_a], "node-b": [binding_b]}
+        refs = {
+            node_id: _final_root_fact_refs(bindings)
+            for node_id, bindings in ledgers.items()
+        }
+        base = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": allowed[node_id],
+                    "source_node_ids": [node_id],
+                    "exact_values": ["60%" if node_id == "node-a" else "30%"],
+                    "fact_binding_ids": refs[node_id],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": node_id,
+                            "excerpt": allowed[node_id],
+                        }
+                    ],
+                    "importance": "important",
+                }
+                for node_id in allowed
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": node_id,
+                    "disposition": "material_observation",
+                    "rationale": "Факт сохранён.",
+                }
+                for node_id in allowed
+            ],
+        }
+        accepted = _normalize_final_root_summary_packet(
+            base,
+            allowed_node_text=allowed,
+            allowed_node_fact_bindings=ledgers,
+        )
+        self.assertEqual(
+            accepted["observations"][0]["fact_binding_ids"],
+            refs["node-a"],
+        )
+
+        cross_child = copy.deepcopy(base)
+        cross_child["observations"][0]["fact_binding_ids"] = refs["node-b"]
+        with self.assertRaisesRegex(OpenRouterError, "mandatory fact binding"):
+            _normalize_final_root_summary_packet(
+                cross_child,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings=ledgers,
+            )
+
+        missing = copy.deepcopy(base)
+        missing["observations"][0]["fact_binding_ids"] = []
+        with self.assertRaisesRegex(OpenRouterError, "mandatory fact binding"):
+            _normalize_final_root_summary_packet(
+                missing,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings=ledgers,
+            )
+
+        tampered = copy.deepcopy(base)
+        tampered["observations"][0]["fact_binding_ids"] = ["f_tampered"]
+        with self.assertRaisesRegex(OpenRouterError, "mandatory fact binding"):
+            _normalize_final_root_summary_packet(
+                tampered,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings=ledgers,
+            )
+
+    def test_bounded_root_proof_rejects_tampered_model_view(self) -> None:
+        leaves = [
+            self._bounded_leaf(
+                node_id=f"leaf-{index}",
+                index=index,
+                semantic_text=f"leaf evidence {index}",
+                claim_count=claim_count,
+                bindings=[],
+            )
+            for index, claim_count in enumerate((1, 2))
+        ]
+        packet = {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": f"leaf evidence {index}",
+                    "source_node_ids": [f"leaf-{index}"],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": f"leaf-{index}",
+                            "excerpt": f"leaf evidence {index}",
+                        }
+                    ],
+                    "importance": "supporting",
+                }
+                for index in range(2)
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": f"leaf-{index}",
+                    "disposition": "supporting_context",
+                    "rationale": "Leaf сохранён содержательно.",
+                }
+                for index in range(2)
+            ],
+        }
+        parent = _final_root_parent_node(
+            level=1,
+            children=leaves,
+            packet=packet,
+        )
+        evil = copy.deepcopy(parent)
+        evil["model_view"]["source_node_id"] = "evil-node"
+        proof = self._bounded_proof(evil)
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "model view failed|node id failed",
+        ):
+            _verify_final_root_tree(
+                roots=[evil],
+                source_leaves=leaves,
+                proof_records={str(evil["node_id"]): proof},
+                expected_claim_count=3,
+            )
+
+    def test_bounded_root_proof_rejects_tampered_fact_binding(self) -> None:
+        binding = self._scalar_fact_binding(
+            source_path="/models/chatgpt/mention_rate",
+            json_literal='"60%"',
+        )
+        leaf = self._bounded_leaf(
+            node_id="leaf-fact",
+            index=0,
+            semantic_text="ChatGPT mention rate 60%.",
+            claim_count=1,
+            bindings=[binding],
+        )
+        packet = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": "ChatGPT mention rate 60%.",
+                    "source_node_ids": ["leaf-fact"],
+                    "exact_values": ["60%"],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": "leaf-fact",
+                            "excerpt": "ChatGPT mention rate 60%.",
+                        }
+                    ],
+                    "importance": "important",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "leaf-fact",
+                    "disposition": "material_observation",
+                    "rationale": "Факт сохранён.",
+                }
+            ],
+        }
+        parent = _final_root_parent_node(
+            level=1,
+            children=[leaf],
+            packet=packet,
+        )
+        proof = self._bounded_proof(parent)
+        _verify_final_root_tree(
+            roots=[parent],
+            source_leaves=[leaf],
+            proof_records={str(parent["node_id"]): proof},
+            expected_claim_count=1,
+        )
+
+        tampered_leaf = copy.deepcopy(leaf)
+        tampered_leaf["mandatory_fact_bindings"][0]["json_literal"] = '"90%"'
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "binding|fact provenance|identity|digest",
+        ):
+            _verify_final_root_tree(
+                roots=[parent],
+                source_leaves=[tampered_leaf],
+                proof_records={str(parent["node_id"]): proof},
+                expected_claim_count=1,
+            )
+
+    async def test_reducer_no_fan_in_uses_lossless_terminal_union(self) -> None:
+        payload = {
+            "report_data": {
+                "metrics": [
+                    {"name": f"metric-{index}", "value": index}
+                    for index in range(300)
+                ]
+            }
+        }
+        worker_window = {
+            **self._window(),
+            "input_token_window": 100_000,
+            "input_utf8_window": 100_000,
+        }
+        final_window = {
+            **self._window(),
+            "input_token_window": 220_000,
+            "input_utf8_window": 220_000,
+        }
+
+        async def verbose_mapper(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            if "source_units" in user_payload:
+                units = user_payload["source_units"]
+                packet = self._packet_for_units(
+                    units,
+                    source_claims=user_payload.get("source_claims"),
+                )
+                for observation in packet["observations"]:
+                    exact_excerpt = str(
+                        observation.get("evidence_excerpt") or ""
+                    )
+                    observation["statement"] = (
+                        f"Отдельный подтверждённый факт: {exact_excerpt}. "
+                        * 8
+                    )
+                return packet
+            if "source_nodes" in user_payload:
+                return await self._successful_mapper()(*_args, **kwargs)
+            packets = user_payload["evidence_packets"]
+            return {
+                "observations": [
+                    copy.deepcopy(observation)
+                    for packet in packets
+                    for observation in packet["observations"]
+                ],
+                "uncertainties": [],
+                "report_focus": [],
+                "unit_coverage": [
+                    copy.deepcopy(item)
+                    for packet in packets
+                    for item in packet["unit_coverage"]
+                ],
+                "claim_coverage": [
+                    copy.deepcopy(item)
+                    for packet in packets
+                    for item in packet["claim_coverage"]
+                ],
+            }
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                side_effect=[
+                    final_window,
+                    worker_window,
+                    worker_window,
+                    worker_window,
+                ],
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=verbose_mapper,
+            ),
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertEqual(
+            plan["terminal_reducer_mode"],
+            "deterministic_lossless_union",
+        )
+        self.assertIn(
+            plan["mode"],
+            {
+                "hierarchical_evidence_tree_compact_ledger",
+                "bounded_transitive_evidence_tree",
+            },
+        )
+        terminal_ledgers = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if "_terminal_ledger_"
+            in str(call.kwargs.get("artifact_key") or "")
+        ]
+        self.assertEqual(len(terminal_ledgers), 1)
+        terminal_evidence = terminal_ledgers[0]["evidence_digest"]
+        self.assertEqual(
+            len(terminal_evidence["observations"]),
+            plan["source_unit_count"],
+        )
+        self.assertEqual(
+            len(terminal_evidence["unit_coverage"]),
+            plan["source_unit_count"],
+        )
+        self.assertEqual(
+            sorted(
+                str(item["source_unit_id"])
+                for item in terminal_evidence["unit_coverage"]
+            ),
+            sorted(
+                str(source_unit_id)
+                for item in terminal_evidence["observations"]
+                for source_unit_id in item["source_unit_ids"]
+            ),
+        )
+        self.assertEqual(
+            model_payload["long_input_contract"]["source_unit_count"],
+            plan["source_unit_count"],
+        )
+        self.assertLessEqual(
+            plan["model_request_utf8_bytes"],
+            plan["input_utf8_window"],
+        )
+
+    async def test_empty_mapper_and_unobserved_units_fail_closed(self) -> None:
+        empty_packet = {
+            "observations": [],
+            "uncertainties": [],
+            "report_focus": [],
+            "unit_coverage": [],
+        }
+
+        async def coverage_only(
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            units = kwargs["user_payload"]["source_units"]
+            return {
+                **empty_packet,
+                "unit_coverage": [
+                    {
+                        "source_unit_id": str(unit["source_unit_id"]),
+                        "disposition": "supporting_context",
+                        "rationale": "Заявлено без observation.",
+                    }
+                    for unit in units
+                ],
+            }
+
+        for response, expected in (
+            (empty_packet, "does not account for every source unit"),
+            (coverage_only, "without an explicit observation"),
+        ):
+            with self.subTest(expected=expected):
+                side_effect = response if callable(response) else None
+                return_value = None if side_effect else response
+                with (
+                    patch(
+                        "app.services.analyzer._final_model_input_window",
+                        new_callable=AsyncMock,
+                        return_value=self._window(),
+                    ),
+                    patch(
+                        "app.services.analyzer._save_artifact",
+                        new_callable=AsyncMock,
+                    ),
+                    patch(
+                        "app.services.analyzer._structured_artifact",
+                        new_callable=AsyncMock,
+                        side_effect=side_effect,
+                        return_value=return_value,
+                    ),
+                ):
+                    with self.assertRaisesRegex(OpenRouterError, expected):
+                        await _prepare_final_model_payload(
+                            "run-id",
+                            payload=self._oversized_payload(),
+                            system="author",
+                        )
+
+    async def test_mapper_cannot_hide_metric_scalar(self) -> None:
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=self._successful_mapper(hide_values=True),
+            ),
+        ):
+            model_payload, _ = await _prepare_final_model_payload(
+                "run-id",
+                payload=self._oversized_payload(),
+                system="author",
+            )
+
+        self.assertFalse(
+            any(
+                observation["exact_values"]
+                for observation in model_payload["evidence_digest"][
+                    "observations"
+                ]
+            )
+        )
+        passthrough = {
+            item["source_path"]: item
+            for item in model_payload["deterministic_passthrough"]["values"]
+        }
+        metric = passthrough["/report_data/critical_metric"]
+        self.assertEqual(metric["value"], 73)
+        self.assertEqual(metric["value_type"], "number")
+        self.assertEqual(metric["json_literal"], "73")
+        self.assertEqual(
+            passthrough["/report_data/data_state"]["value"],
+            "unknown",
+        )
+        self.assertIs(
+            passthrough["/report_data/eligible"]["value"],
+            True,
+        )
+        self.assertIsNone(
+            passthrough["/report_data/optional_value"]["value"]
+        )
+
+    async def test_mapper_and_reducer_use_their_own_exact_envelopes(self) -> None:
+        envelopes = {
+            PROCESSING_MODEL: {
+                "version": "test",
+                "resolution": "test-processing",
+                "context_length": 36_000,
+                "max_completion_tokens": 20_000,
+            },
+            ANALYSIS_MODEL: {
+                "version": "test",
+                "resolution": "test-analysis",
+                "context_length": 80_000,
+                "max_completion_tokens": 16_000,
+            },
+        }
+
+        async def envelope_for(model: str) -> dict[str, Any]:
+            return copy.deepcopy(envelopes[model])
+
+        with (
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new_callable=AsyncMock,
+                side_effect=envelope_for,
+            ) as envelope_mock,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=self._successful_mapper(),
+            ),
+        ):
+            _model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=self._oversized_payload(),
+                system="author",
+            )
+
+        requested_models = [
+            call.args[0] if call.args else call.kwargs["model"]
+            for call in envelope_mock.await_args_list
+        ]
+        self.assertIn(PROCESSING_MODEL, requested_models)
+        self.assertIn(ANALYSIS_MODEL, requested_models)
+        self.assertLess(
+            plan["mapper_request_window_utf8_bytes"],
+            plan["reducer_request_window_utf8_bytes"],
+        )
+        self.assertLessEqual(
+            plan["mapper_max_request_utf8_bytes"],
+            plan["mapper_request_window_utf8_bytes"],
+        )
+        self.assertLessEqual(
+            plan["reducer_max_request_utf8_bytes"],
+            plan["reducer_request_window_utf8_bytes"],
+        )
+        manifests = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if "_manifest_" in call.kwargs.get("artifact_key", "")
+        ]
+        self.assertEqual(len(manifests), 1)
+        self.assertLess(manifests[0]["map_target_chars"], 32_000)
+
+    async def test_oversized_semantic_evidence_is_bounded_for_provider(
+        self,
+    ) -> None:
+        full_only_marker = "FULL-EVIDENCE-ONLY-TAIL-9fd0f4"
+        review_input = {
+            "evidence_document": {
+                "report_data": {
+                    "long_narrative": "x" * 260_000 + full_only_marker,
+                    "critical_metric": 73,
+                },
+                "selected_answer_context": [],
+                "answer_selection_manifest": {"digest": "selection"},
+            },
+            "metric_availability_contract": [],
+            "candidate_report": {
+                "headline": "Итог",
+                "headline_emphasis": [],
+                "sections": [{"heading": "Раздел", "body": "Текст"}],
+                "actions": [{"title": "Шаг", "why": "Причина"}],
+                "limitations": [],
+            },
+            "deterministic_precheck_errors": [],
+        }
+        envelopes = {
+            PROCESSING_MODEL: {
+                "version": "test",
+                "resolution": "test-processing",
+                "context_length": 36_000,
+                "max_completion_tokens": 20_000,
+            },
+            ANALYSIS_MODEL: {
+                "version": "test",
+                "resolution": "test-analysis",
+                "context_length": 80_000,
+                "max_completion_tokens": 16_000,
+            },
+            REPORT_SEMANTIC_MODEL: {
+                "version": "test",
+                "resolution": "test-semantic",
+                "context_length": 80_000,
+                "max_completion_tokens": 16_000,
+            },
+        }
+
+        async def envelope_for(model: str) -> dict[str, Any]:
+            return copy.deepcopy(envelopes[model])
+
+        with (
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new_callable=AsyncMock,
+                side_effect=envelope_for,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=self._successful_mapper(hide_values=True),
+            ),
+        ):
+            model_context, plan = (
+                await _bounded_semantic_model_evidence_context(
+                    "run-id",
+                    review_input=review_input,
+                    attempt=1,
+                )
+            )
+
+        provider_probe = copy.deepcopy(review_input)
+        provider_probe["model_evidence_context"] = model_context
+        provider_bytes = semantic_provider_request_utf8_bytes(
+            provider_probe,
+            attempt=1,
+            model_envelope=plan["model_envelope"],
+        )
+        provider_payload = semantic_provider_payload(provider_probe)
+        provider_serialized = json.dumps(
+            provider_payload,
+            ensure_ascii=False,
+        )
+
+        self.assertEqual(
+            plan["mode"],
+            "hierarchical_evidence_tree_compact_ledger",
+        )
+        self.assertLessEqual(provider_bytes, plan["input_utf8_window"])
+        self.assertEqual(
+            provider_bytes,
+            plan["model_request_utf8_bytes"],
+        )
+        self.assertNotEqual(
+            provider_payload["evidence_document"],
+            review_input["evidence_document"],
+        )
+        self.assertNotIn(full_only_marker, provider_serialized)
+        self.assertTrue(
+            review_input["evidence_document"]["report_data"][
+                "long_narrative"
+            ].endswith(full_only_marker)
+        )
+
+    async def test_semantic_wrapper_overhead_forces_near_window_partition(
+        self,
+    ) -> None:
+        review_input = {
+            "evidence_document": {
+                "report_data": {"long_narrative": "x" * 45_000},
+                "selected_answer_context": [],
+                "answer_selection_manifest": {},
+            },
+            "metric_availability_contract": [],
+            "candidate_report": {
+                "headline": "Итог",
+                "headline_emphasis": [],
+                "sections": [],
+                "actions": [],
+                "limitations": [],
+            },
+            "deterministic_precheck_errors": [],
+        }
+        envelopes = {
+            PROCESSING_MODEL: {
+                "version": "test",
+                "resolution": "test-processing",
+                "context_length": 36_000,
+                "max_completion_tokens": 20_000,
+            },
+            ANALYSIS_MODEL: {
+                "version": "test",
+                "resolution": "test-analysis",
+                "context_length": 80_000,
+                "max_completion_tokens": 16_000,
+            },
+            REPORT_SEMANTIC_MODEL: {
+                "version": "test",
+                "resolution": "test-semantic",
+                "context_length": 68_000,
+                "max_completion_tokens": 16_000,
+            },
+        }
+
+        async def envelope_for(model: str) -> dict[str, Any]:
+            return copy.deepcopy(envelopes[model])
+
+        direct_probe = copy.deepcopy(review_input)
+        direct_probe["model_evidence_context"] = copy.deepcopy(
+            review_input["evidence_document"]
+        )
+        expected_window = 68_000 - 16_000
+        evidence_bytes = len(
+            json.dumps(
+                review_input["evidence_document"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        direct_request_bytes = semantic_provider_request_utf8_bytes(
+            direct_probe,
+            attempt=1,
+            model_envelope=envelopes[REPORT_SEMANTIC_MODEL],
+        )
+        self.assertLess(evidence_bytes, expected_window)
+        self.assertGreater(direct_request_bytes, expected_window)
+
+        with (
+            patch(
+                "app.services.analyzer.model_output_envelope",
+                new_callable=AsyncMock,
+                side_effect=envelope_for,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=self._successful_mapper(hide_values=True),
+            ),
+        ):
+            _model_context, plan = (
+                await _bounded_semantic_model_evidence_context(
+                    "run-id",
+                    review_input=review_input,
+                    attempt=1,
+                )
+            )
+
+        self.assertEqual(plan["input_utf8_window"], expected_window)
+        self.assertEqual(plan["mode"], "hierarchical_evidence_tree")
+        self.assertLessEqual(
+            plan["model_request_utf8_bytes"],
+            plan["input_utf8_window"],
+        )
 
 
 class FinalReportPreflightTests(unittest.IsolatedAsyncioTestCase):
-    async def test_oversized_full_corpus_fails_before_opus_and_is_recorded(
+    async def test_legacy_local_budget_cannot_reject_a_final_document(
         self,
     ) -> None:
-        answer_corpus = {
-            "manifest": {"digest": "corpus-digest"},
-            "answers": [{"answer_text": "я" * 100}],
+        payload = {
+            "report_data": {"brand": {"name": "Example"}},
+            "answer_selection_manifest": {"digest": "selection"},
+            "answer_corpus_manifest": {"digest": "corpus-digest"},
+            "selected_full_answers": [{"answer_text": "я" * 100}],
+        }
+        candidate = {
+            "headline": "Итог",
+            "headline_emphasis": [],
+            "sections": [{"heading": "Раздел", "body": "Текст"}],
+            "actions": [{"title": "Действие", "why": "Причина"}],
         }
         with (
             patch.object(settings, "FINAL_INPUT_TOKEN_BUDGET", 1),
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
             patch(
                 "app.services.analyzer._save_artifact",
                 new_callable=AsyncMock,
@@ -4947,30 +8904,48 @@ class FinalReportPreflightTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as artifact_output,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
-            ) as chat_mock,
+                return_value=SimpleNamespace(
+                    parsed=candidate,
+                    text=json.dumps(candidate, ensure_ascii=False),
+                    usage={},
+                ),
+            ) as final_chat,
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                return_value={"verdict": "pass"},
+            ),
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+                return_value=[],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(
+                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
+                ),
+            ),
         ):
-            with self.assertRaisesRegex(
-                OpenRouterError,
-                "exceeds the configured context budget",
-            ):
-                await _final_report(
-                    "run-id",
-                    {"brand": {"name": "Example"}},
-                    answer_corpus,
-                )
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus-digest"}, "answers": [{}]},
+            )
 
-        artifact_output.assert_not_awaited()
-        chat_mock.assert_not_awaited()
-        saved = save_artifact.await_args.kwargs
-        self.assertEqual(saved["artifact_key"], "final_report_preflight")
-        self.assertEqual(saved["status"], "failed")
-        self.assertEqual(saved["output_json"]["state"], "limited")
-        self.assertEqual(saved["output_json"]["input_token_budget"], 1)
-        self.assertGreater(
-            saved["output_json"]["estimated_input_tokens"],
-            1,
+        self.assertEqual(result, candidate)
+        self.assertGreaterEqual(artifact_output.await_count, 1)
+        self.assertEqual(final_chat.await_count, 1)
+        preflight_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == "final_report_preflight"
+        ]
+        self.assertEqual(preflight_writes[-1]["status"], "completed")
+        self.assertTrue(preflight_writes[-1]["output_json"]["accepted"])
+        self.assertFalse(
+            preflight_writes[-1]["output_json"]["legacy_budget_would_accept"]
         )
 
 
@@ -4991,6 +8966,144 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             "headline_emphasis": [],
             "sections": [{"heading": "Раздел", "body": marker}],
             "actions": [{"title": "Действие", "why": marker}],
+        }
+
+    async def test_structure_repair_is_repreflighted_before_provider_call(
+        self,
+    ) -> None:
+        payload = self._payload()
+        rejected = {
+            "headline": "Неполный ответ",
+            "sections": [],
+            "actions": [],
+        }
+        repaired = self._candidate("Исправлено")
+        prepared_repair = {
+            "long_input_contract": {"mode": "hierarchical_evidence_tree"},
+            "evidence_digest": {"marker": "prepared-structure-repair"},
+        }
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                return_value=(prepared_repair, {"mode": "hierarchical"}),
+            ) as prepare,
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                side_effect=[
+                    SimpleNamespace(parsed=rejected, text="bad", usage={}),
+                    SimpleNamespace(parsed=repaired, text="good", usage={}),
+                ],
+            ) as attempt,
+        ):
+            candidate, _raw, _usage = await _final_report_author_candidate(
+                "run-id",
+                system="author",
+                payload=payload,
+            )
+
+        self.assertEqual(candidate, repaired)
+        prepare.assert_awaited_once()
+        repair_source = prepare.await_args.kwargs["payload"]
+        self.assertEqual(repair_source["rejected_report"], rejected)
+        self.assertIn("structure_validation_errors_to_fix", repair_source)
+        self.assertIs(
+            attempt.await_args_list[1].kwargs["user_payload"],
+            prepared_repair,
+        )
+
+    async def test_semantic_repair_is_repreflighted_before_provider_call(
+        self,
+    ) -> None:
+        payload = self._payload()
+        candidate = self._candidate("Первый кандидат")
+        repaired = self._candidate("Семантика исправлена")
+        initial_prepared = {"prepared": "initial"}
+        repair_prepared = {
+            "long_input_contract": {"mode": "hierarchical_evidence_tree"},
+            "evidence_digest": {"marker": "prepared-semantic-repair"},
+        }
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                side_effect=[
+                    (initial_prepared, self._window_plan()),
+                    (repair_prepared, self._window_plan()),
+                ],
+            ) as prepare,
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "raw", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"verdict": "revise"},
+                    {"verdict": "pass"},
+                ],
+            ),
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+                side_effect=[["Исправьте вывод."], []],
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(
+                    parsed=repaired,
+                    text="repair",
+                    usage={},
+                ),
+            ) as attempt,
+        ):
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus"}, "answers": [{}]},
+            )
+
+        self.assertEqual(result, repaired)
+        self.assertEqual(prepare.await_count, 2)
+        repair_source = prepare.await_args_list[1].kwargs["payload"]
+        self.assertEqual(repair_source["rejected_report"], candidate)
+        self.assertEqual(
+            repair_source["semantic_review_to_fix"]["verdict"],
+            "revise",
+        )
+        self.assertIs(attempt.await_args.kwargs["user_payload"], repair_prepared)
+
+    @staticmethod
+    def _window_plan() -> dict[str, Any]:
+        return {
+            "input_token_window": 192_000,
+            "input_utf8_window": 192_000,
+            "mode": "direct",
         }
 
     async def test_structure_repair_keeps_semantic_repair_budget(self) -> None:
@@ -5030,7 +9143,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as save_artifact,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 side_effect=chat_results,
             ) as final_chat,
@@ -5045,6 +9158,12 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer.report_semantic_blockers",
                 side_effect=[["Исправьте семантическую ошибку."], []],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(
+                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
+                ),
             ),
         ):
             result = await _final_report(
@@ -5120,7 +9239,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as save_artifact,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 side_effect=[
                     SimpleNamespace(parsed=empty, text="one", usage={}),
@@ -5191,7 +9310,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as save_artifact,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
             ) as final_chat,
             patch(
@@ -5202,6 +9321,12 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer.report_semantic_blockers",
                 return_value=[],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(
+                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
+                ),
             ),
         ):
             result = await _final_report(
@@ -5279,7 +9404,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=save_artifact),
             ),
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 side_effect=[
                     SimpleNamespace(
@@ -5305,6 +9430,12 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer.report_semantic_blockers",
                 side_effect=[["Неподтверждённое утверждение."], []],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(
+                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
+                ),
             ),
         ):
             with self.assertRaisesRegex(
@@ -5406,6 +9537,7 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
                             mode=mode,
                             provider_key=panel.key,
                             model=model,
+                            response_text=answer_text,
                         )
                         answer = ModelAnswer(
                             run_id=run_id,
@@ -5513,6 +9645,44 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ContentExtractionTests(unittest.TestCase):
+    def test_jsonld_keeps_all_types_and_exposes_every_parse_failure(self) -> None:
+        type_names = [f"CustomType{index:02d}" for index in range(45)]
+        valid = json.dumps(
+            {
+                "@context": "https://schema.org",
+                "@graph": [{"@type": value} for value in type_names],
+            },
+            ensure_ascii=False,
+        )
+        html = f"""
+        <html><head>
+          <script type="Application/LD+JSON; charset=utf-8">{valid}</script>
+          <script type="application/ld+json">
+            {{"@context":"https://schema.org","@type":"Broken",
+          </script>
+          <script>window.app = true;</script>
+        </head><body><main><h1>Example</h1></main></body></html>
+        """
+
+        signals = extract_text_signals(html, "text/html")
+
+        self.assertEqual(signals["script_count"], 3)
+        self.assertEqual(signals["structured_data_types"], type_names)
+        self.assertEqual(len(signals["structured_data_types"]), 45)
+        self.assertIs(signals["structured_data_complete"], False)
+        self.assertEqual(signals["jsonld"]["script_count"], 2)
+        self.assertEqual(signals["jsonld"]["parsed_count"], 1)
+        self.assertEqual(signals["jsonld"]["failed_count"], 1)
+        self.assertEqual(signals["jsonld"]["state"], "partial")
+        self.assertEqual(len(signals["jsonld"]["errors"]), 1)
+        error = signals["jsonld"]["errors"][0]
+        self.assertEqual(error["script_index"], 1)
+        self.assertEqual(error["error_type"], "json_decode_error")
+        self.assertIn("property name", error["message"])
+        self.assertGreater(error["line"], 0)
+        self.assertGreater(error["column"], 0)
+        self.assertGreater(error["char_offset"], 0)
+
     def test_schema_org_microdata_types_support_http_and_https(self) -> None:
         html = """
         <html><body>
@@ -5740,6 +9910,59 @@ class TechnicalProbeOutcomeTests(unittest.TestCase):
 
 
 class DeterministicMetricTests(unittest.TestCase):
+    def test_two_character_real_entity_alias_is_supported(self) -> None:
+        entries = _entity_alias_entries(
+            {
+                "canonical_name": "VK",
+                "aliases": ["ВКонтакте"],
+                "mention_policy": "standalone",
+            },
+            {"brand_name": "VK"},
+            excluded_aliases=[],
+        )
+
+        self.assertIn(("VK", "standalone"), entries)
+        self.assertTrue(
+            _evidence_contains_complete_alias(
+                "VK развивает рекламную платформу.",
+                entries,
+            )
+        )
+
+    def test_unknown_mentioned_position_is_not_a_top3_failure(self) -> None:
+        def row(
+            *, mentioned: bool, position: int | None, role: str
+        ) -> dict[str, Any]:
+            return {
+                "mode": "web",
+                "role": "unbranded_discovery",
+                "provider_key": "test",
+                "intent_class": "I",
+                "status": "completed",
+                "answer_text": "Непустой ответ",
+                "metric_eligible": True,
+                "annotation": {
+                    "valid": True,
+                    "target_mentioned": mentioned,
+                    "target_position": position,
+                    "target_role": role,
+                },
+            }
+
+        result = _visibility_slice(
+            [
+                row(mentioned=True, position=None, role="mentioned"),
+                row(mentioned=False, position=None, role="absent"),
+                row(mentioned=True, position=2, role="recommended"),
+            ],
+            mode="web",
+        )
+
+        self.assertEqual(result["valid_answers"], 3)
+        self.assertEqual(result["top3_denominator"], 2)
+        self.assertEqual(result["top3_count"], 1)
+        self.assertEqual(result["top3_rate"], 50.0)
+
     def test_evidence_must_be_an_exact_contiguous_raw_substring(self) -> None:
         raw = "**Jois**\nквартиры с зелёными террасами"
 
@@ -6132,6 +10355,8 @@ class DeterministicMetricTests(unittest.TestCase):
                 "prompt_id": 1,
                 "prompt_key": "u-1",
                 "intent_class": "I",
+                "prompt_key": "u-1",
+                "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
                 "annotation": {
@@ -6168,6 +10393,8 @@ class DeterministicMetricTests(unittest.TestCase):
                 "prompt_id": 2,
                 "prompt_key": "u-2",
                 "intent_class": "E",
+                "prompt_key": "u-2",
+                "intent_class": "E",
                 "role": "unbranded_discovery",
                 "status": "completed",
                 "annotation": {
@@ -6190,6 +10417,8 @@ class DeterministicMetricTests(unittest.TestCase):
                 "mode": "memory",
                 "provider_key": "openai",
                 "prompt_id": 2,
+                "prompt_key": "u-2",
+                "intent_class": "E",
                 "prompt_key": "u-2",
                 "intent_class": "E",
                 "role": "unbranded_discovery",
@@ -6238,6 +10467,76 @@ class DeterministicMetricTests(unittest.TestCase):
         self.assertIsNone(metrics["knowledge_gap"])
         self.assertEqual(metrics["quality"]["state"], "limited")
         self.assertEqual(metrics["quality"]["coverage_rate"], 50.0)
+
+    def test_paired_lift_is_limited_when_one_planned_half_failed(self) -> None:
+        valid = {
+            "valid": True,
+            "target_mentioned": False,
+            "target_position": None,
+            "target_role": "absent",
+            "sentiment": "unknown",
+            "entity_mentions": [],
+        }
+        rows = [
+            {
+                "answer_id": 1,
+                "mode": "web",
+                "provider_key": "openai",
+                "prompt_id": 1,
+                "prompt_key": "pair-1",
+                "intent_class": "I",
+                "role": "unbranded_discovery",
+                "status": "completed",
+                "annotation": dict(valid),
+            },
+            {
+                "answer_id": 2,
+                "mode": "memory",
+                "provider_key": "openai",
+                "prompt_id": 1,
+                "prompt_key": "pair-1",
+                "intent_class": "I",
+                "role": "unbranded_discovery",
+                "status": "completed",
+                "annotation": dict(valid),
+            },
+            {
+                "answer_id": 3,
+                "mode": "web",
+                "provider_key": "openai",
+                "prompt_id": 2,
+                "prompt_key": "pair-2",
+                "intent_class": "E",
+                "role": "unbranded_discovery",
+                "status": "completed",
+                "annotation": dict(valid),
+            },
+            {
+                "answer_id": 4,
+                "mode": "memory",
+                "provider_key": "openai",
+                "prompt_id": 2,
+                "prompt_key": "pair-2",
+                "intent_class": "E",
+                "role": "unbranded_discovery",
+                "status": "failed",
+                "annotation": {},
+            },
+        ]
+        metrics = _compute_metrics(rows, {"brand_name": "Цель"}, {"entities": []})
+        paired = metrics["paired_web_lift"]
+        self.assertEqual(paired["n_pairs"], 1)
+        self.assertEqual(paired["expected_pairs"], 2)
+        self.assertEqual(paired["completed_pairs"], 1)
+        self.assertEqual(paired["missing_pairs"], 1)
+        self.assertEqual(paired["coverage_rate"], 50.0)
+        self.assertEqual(paired["data_state"], "limited")
+        self.assertEqual(
+            paired["limitation_reason"],
+            "incomplete_paired_coverage",
+        )
+        self.assertEqual(paired["parent"]["web"]["data_state"], "limited")
+        self.assertEqual(paired["parent"]["memory"]["data_state"], "limited")
 
     def test_entity_ranking_deduplicates_case_variants_per_answer(
         self,
@@ -6958,9 +11257,8 @@ class DeterministicMetricTests(unittest.TestCase):
         )
         self.assertEqual(metrics["brand_knowledge"]["memory"]["specific_rate"], 100.0)
         self.assertEqual(metrics["paired_web_lift"]["n_pairs"], 1)
-        self.assertEqual(
+        self.assertIsNone(
             metrics["paired_web_lift"]["portfolio"]["score_lift"],
-            25.0,
         )
         self.assertEqual(metrics["competitors"][0]["name"], "RW+")
         self.assertEqual(metrics["competitors"][0]["mention_count"], 0)
@@ -8039,6 +12337,11 @@ class DeterministicMetricTests(unittest.TestCase):
                 "Сильная сторона: performance\n"
                 "Компетенции: цифровая наружная реклама"
             ),
+            (
+                "### Realweb\nОписание: "
+                + ("подробный подтверждённый контекст агентства " * 36)
+                + "\n- Сильная сторона: DOOH"
+            ),
         ]
 
         for answer_text in structured_fragments:
@@ -8595,9 +12898,77 @@ class DeterministicMetricTests(unittest.TestCase):
                 ],
             }
         )
+        self.assertEqual(report["headline_emphasis"], [])
+
+
+    def test_competitor_series_retains_every_observed_entity(self) -> None:
+        competitor_names = [f"Конкурент {index:02d}" for index in range(20)]
+        answer_text = ", ".join(competitor_names)
+        rows = [
+            {
+                "answer_id": 501,
+                "mode": "web",
+                "provider_key": "openai",
+                "prompt_id": 51,
+                "prompt_key": "all-competitors",
+                "intent_class": "E",
+                "role": "unbranded_discovery",
+                "status": "completed",
+                "answer_text": answer_text,
+                "annotation": {
+                    "valid": True,
+                    "target_mentioned": False,
+                    "target_position": None,
+                    "target_role": "absent",
+                    "sentiment": "unknown",
+                    "entity_mentions": [
+                        {
+                            "canonical_name": name,
+                            "position": index + 1,
+                            "role": "mentioned",
+                            "attributed_to_target": False,
+                            "evidence": name,
+                        }
+                        for index, name in enumerate(competitor_names)
+                    ],
+                },
+            }
+        ]
+        profile = {
+            "brand_name": "Целевой бренд",
+            "brand_aliases": [],
+            "products": [],
+            "entity_scope": [],
+        }
+        catalog = {
+            "target_aliases": ["Целевой бренд"],
+            "entities": [
+                {
+                    "canonical_name": name,
+                    "aliases": [],
+                    "category": "competitor",
+                    "target_relationship": "competitor",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                }
+                for name in competitor_names
+            ],
+        }
+
+        metrics = _compute_metrics(rows, profile, catalog)
+
+        self.assertEqual(len(metrics["competitors"]), 21)
         self.assertEqual(
-            report["headline_emphasis"],
-            ["знают", "редко предлагают"],
+            {item["name"] for item in metrics["competitors"]},
+            {"Целевой бренд", *competitor_names},
+        )
+        self.assertEqual(
+            metrics["competitor_series_contract"]["canonical_rows_omitted"],
+            0,
+        )
+        self.assertEqual(
+            metrics["competitor_series_contract"]["total_rows"],
+            21,
         )
 
 
@@ -9063,6 +13434,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     mode="web",
                     provider_key=provider,
                     model=model,
+                    response_text=raw,
                 )
                 answer = ModelAnswer(
                     run_id=run_id,
@@ -9139,8 +13511,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(discovery["annotated_answers"], 1)
             self.assertEqual(discovery["valid_answers"], 1)
             self.assertEqual(discovery["mention_count"], 1)
-            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v16"))
-            self.assertTrue(METRICS_VERSION.endswith("metrics-v18"))
+            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v18"))
+            self.assertTrue(METRICS_VERSION.endswith("metrics-v20"))
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
@@ -9260,25 +13632,16 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_panel_output_limit_retries_once_with_6400(self) -> None:
+    async def test_panel_output_limit_is_persisted_as_one_atomic_prefix(
+        self,
+    ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
         partial = self._panel_result(
             prompt_text=prompt.text,
-            text_value="Частичный ответ 3 200.",
+            text_value="Полный сохранённый префикс до лимита провайдера.",
             limited=True,
             prompt_tokens=101,
-            completion_tokens=3_200,
-        )
-        complete = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Полный ответ после повтора.",
-            limited=False,
-            prompt_tokens=101,
-            completion_tokens=4_125,
-        )
-        first_limit = OpenRouterOutputLimitError(
-            "first output limit",
-            result=partial,
+            completion_tokens=31_997,
         )
         try:
             with (
@@ -9289,7 +13652,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=[first_limit, complete],
+                    return_value=partial,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -9304,20 +13667,17 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     end_percent=60,
                 )
 
+            panel_chat.assert_awaited_once()
+            request = panel_chat.await_args.kwargs
             self.assertEqual(
-                [
-                    call.kwargs["max_tokens"]
-                    for call in panel_chat.await_args_list
-                ],
-                [3_200, 6_400],
+                request["output_token_policy"],
+                OutputTokenPolicy.MODEL_MAX,
             )
-            self.assertTrue(
-                all(
-                    call.kwargs["retry_response_contract_errors"] is False
-                    and call.kwargs["retry_transport_errors"] is False
-                    for call in panel_chat.await_args_list
-                )
-            )
+            self.assertTrue(request["accept_output_limited"])
+            self.assertFalse(request["retry_response_contract_errors"])
+            self.assertFalse(request["retry_transport_errors"])
+            self.assertNotIn("max_tokens", request)
+            self.assertNotIn("max_completion_tokens", request)
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -9342,27 +13702,30 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     .all()
                 )
             self.assertEqual(answer.status, "completed")
-            self.assertEqual(answer.response_text, complete.text)
-            self.assertEqual(len(audit_rows), 2)
+            self.assertEqual(answer.response_text, partial.text)
+            self.assertEqual(len(audit_rows), 1)
+            audit = audit_rows[0]
+            self.assertEqual(audit.input_json["max_tokens"], None)
             self.assertEqual(
-                [row.input_json["max_tokens"] for row in audit_rows],
-                [3_200, 6_400],
+                audit.input_json["output_policy"],
+                PANEL_OUTPUT_POLICY,
             )
+            self.assertEqual(audit.status, "completed")
+            self.assertEqual(audit.raw_text, partial.text)
+            self.assertIsNone(audit.output_json["error_type"])
+            self.assertTrue(audit.output_json["transport"]["output_limited"])
+            self.assertFalse(audit.output_json["transport"]["output_complete"])
             self.assertEqual(
-                [row.status for row in audit_rows],
-                ["failed", "completed"],
-            )
-            self.assertEqual(
-                [row.raw_text for row in audit_rows],
-                [partial.text, complete.text],
-            )
-            self.assertEqual(len({row.artifact_key for row in audit_rows}), 2)
-            self.assertEqual(
-                audit_rows[0].output_json["error_type"],
-                "OpenRouterOutputLimitError",
+                audit.output_json["response_text_sha256"],
+                hashlib.sha256(partial.text.encode("utf-8")).hexdigest(),
             )
             provenance = answer.usage_json["_aiv_panel_contract"]
-            self.assertEqual(provenance["max_tokens"], 6_400)
+            self.assertEqual(provenance["version"], PANEL_CONTRACT_VERSION)
+            self.assertEqual(provenance["output_policy"], PANEL_OUTPUT_POLICY)
+            self.assertEqual(
+                provenance["observation_completeness"],
+                "provider_limited_prefix",
+            )
             self.assertEqual(
                 provenance["request_sha256"],
                 _panel_request_sha256(
@@ -9370,60 +13733,14 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     mode="web",
                     provider_key="openai",
                     model="test/model",
-                    max_tokens=6_400,
                 ),
             )
-            retry = answer.usage_json["_aiv_panel_retry"]
-            self.assertEqual(retry["version"], "aiv-panel-retry-v1")
-            attempts = retry["attempts"]
-            self.assertEqual(len(attempts), 2)
             self.assertEqual(
-                [attempt["max_tokens"] for attempt in attempts],
-                [3_200, 6_400],
-            )
-            expected_attempt_keys = {
-                "max_tokens",
-                "output_limited",
-                "output_complete",
-                "response_text_sha256",
-                "response_char_count",
-                "citation_count",
-                "token_usage",
-            }
-            for attempt in attempts:
-                self.assertEqual(set(attempt), expected_attempt_keys)
-            self.assertTrue(attempts[0]["output_limited"])
-            self.assertFalse(attempts[0]["output_complete"])
-            self.assertFalse(attempts[1]["output_limited"])
-            self.assertTrue(attempts[1]["output_complete"])
-            self.assertEqual(
-                attempts[0]["response_text_sha256"],
+                provenance["raw_response_sha256"],
                 hashlib.sha256(partial.text.encode("utf-8")).hexdigest(),
             )
-            self.assertEqual(
-                attempts[0]["response_char_count"],
-                len(partial.text),
-            )
-            self.assertEqual(
-                attempts[1]["response_text_sha256"],
-                hashlib.sha256(complete.text.encode("utf-8")).hexdigest(),
-            )
-            self.assertEqual(
-                attempts[0]["token_usage"],
-                {
-                    "completion_tokens": 3_200,
-                    "prompt_tokens": 101,
-                    "total_tokens": 3_301,
-                },
-            )
-            self.assertNotIn(
-                partial.text,
-                json.dumps(retry, ensure_ascii=False),
-            )
-            self.assertNotIn(
-                complete.text,
-                json.dumps(retry, ensure_ascii=False),
-            )
+            self.assertEqual(provenance["raw_response_chars"], len(partial.text))
+            self.assertNotIn("_aiv_panel_retry", answer.usage_json)
             self.assertEqual(
                 _panel_answer_attestation(
                     answer,
@@ -9436,37 +13753,24 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_second_panel_output_limit_persists_failed_audit_evidence(
+    async def test_unexpected_panel_output_limit_exception_fails_one_call(
         self,
     ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
-        first_partial = self._panel_result(
+        partial = self._panel_result(
             prompt_text=prompt.text,
-            text_value="Частичный ответ 3 200.",
+            text_value="Префикс, после которого transport ошибочно поднял исключение.",
             limited=True,
             prompt_tokens=87,
-            completion_tokens=3_200,
+            completion_tokens=31_997,
         )
-        second_partial = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Частичный ответ 6 400 для аудита.",
-            limited=True,
-            prompt_tokens=87,
-            completion_tokens=6_400,
-        )
-        second_partial.citations = [
+        partial.citations = [
             {"url": "https://source.example/second", "title": "Second"}
         ]
-        limits = [
-            OpenRouterOutputLimitError(
-                "first output limit",
-                result=first_partial,
-            ),
-            OpenRouterOutputLimitError(
-                "second output limit",
-                result=second_partial,
-            ),
-        ]
+        failure = OpenRouterOutputLimitError(
+            "unexpected output limit exception",
+            result=partial,
+        )
         try:
             with (
                 patch(
@@ -9476,7 +13780,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=limits,
+                    side_effect=failure,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -9495,7 +13799,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     end_percent=60,
                 )
 
-            self.assertEqual(panel_chat.await_count, 2)
+            panel_chat.assert_awaited_once()
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -9505,17 +13809,18 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "failed")
-            self.assertEqual(answer.response_text, second_partial.text)
+            self.assertEqual(answer.response_text, partial.text)
             self.assertEqual(
                 answer.citations_json,
-                second_partial.citations,
+                partial.citations,
             )
-            self.assertIn("second output limit", answer.error_message)
+            self.assertIn("unexpected output limit", answer.error_message)
             self.assertTrue(
                 answer.usage_json["_aiv_transport"]["output_limited"]
             )
             provenance = answer.usage_json["_aiv_panel_contract"]
-            self.assertEqual(provenance["max_tokens"], 6_400)
+            self.assertEqual(provenance["version"], PANEL_CONTRACT_VERSION)
+            self.assertEqual(provenance["output_policy"], PANEL_OUTPUT_POLICY)
             self.assertEqual(
                 provenance["request_sha256"],
                 _panel_request_sha256(
@@ -9523,68 +13828,42 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     mode="web",
                     provider_key="openai",
                     model="test/model",
-                    max_tokens=6_400,
                 ),
             )
-            retry = answer.usage_json["_aiv_panel_retry"]
-            self.assertEqual(retry["version"], "aiv-panel-retry-v1")
-            attempts = retry["attempts"]
-            self.assertEqual(len(attempts), 2)
+            self.assertNotIn("_aiv_panel_retry", answer.usage_json)
+            async with SessionLocal() as session:
+                audit_rows = list(
+                    (
+                        await session.execute(
+                            select(RunArtifact).where(
+                                RunArtifact.run_id == run_id,
+                                RunArtifact.prompt_version
+                                == PANEL_ATTEMPT_AUDIT_VERSION,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            self.assertEqual(len(audit_rows), 1)
+            self.assertEqual(audit_rows[0].status, "failed")
+            self.assertEqual(audit_rows[0].raw_text, partial.text)
             self.assertEqual(
-                [attempt["max_tokens"] for attempt in attempts],
-                [3_200, 6_400],
-            )
-            self.assertEqual(
-                attempts[0]["response_text_sha256"],
-                hashlib.sha256(
-                    first_partial.text.encode("utf-8")
-                ).hexdigest(),
-            )
-            self.assertEqual(
-                attempts[0]["token_usage"],
-                {
-                    "completion_tokens": 3_200,
-                    "prompt_tokens": 87,
-                    "total_tokens": 3_287,
-                },
-            )
-            self.assertTrue(attempts[0]["output_limited"])
-            self.assertFalse(attempts[0]["output_complete"])
-            self.assertTrue(attempts[1]["output_limited"])
-            self.assertFalse(attempts[1]["output_complete"])
-            self.assertEqual(
-                attempts[1]["response_text_sha256"],
-                hashlib.sha256(
-                    second_partial.text.encode("utf-8")
-                ).hexdigest(),
-            )
-            self.assertNotIn(
-                first_partial.text,
-                json.dumps(retry, ensure_ascii=False),
-            )
-            self.assertNotIn(
-                second_partial.text,
-                json.dumps(retry, ensure_ascii=False),
+                audit_rows[0].output_json["error_type"],
+                "OpenRouterOutputLimitError",
             )
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_cancelled_retry_keeps_attempts_and_imported_failed_raw(
+    async def test_cancelled_atomic_call_keeps_reservation_and_imported_raw(
         self,
     ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
         historical_raw = "Исторический failed raw до новой системы аудита."
         historical_citations = [{"url": "https://old.example/source"}]
         historical_usage = {"prompt_tokens": 11, "completion_tokens": 19}
-        partial = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Частичный ответ первой попытки 3 200.",
-            limited=True,
-            prompt_tokens=73,
-            completion_tokens=3_200,
-        )
         resumed = self._panel_result(
             prompt_text=prompt.text,
             text_value="Новый полный ответ после следующего run attempt.",
@@ -9616,18 +13895,10 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
             await session.commit()
 
-        second_started = asyncio.Event()
-        first_worker_calls = 0
+        call_started = asyncio.Event()
 
-        async def first_limit_then_wait(**_kwargs: object) -> SimpleNamespace:
-            nonlocal first_worker_calls
-            first_worker_calls += 1
-            if first_worker_calls == 1:
-                raise OpenRouterOutputLimitError(
-                    "first output limit",
-                    result=partial,
-                )
-            second_started.set()
+        async def wait_in_atomic_call(**_kwargs: object) -> SimpleNamespace:
+            call_started.set()
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
@@ -9641,7 +13912,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=first_limit_then_wait,
+                    side_effect=wait_in_atomic_call,
                 ) as first_worker_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -9657,8 +13928,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                         end_percent=60,
                     )
                 )
-                await asyncio.wait_for(second_started.wait(), timeout=5)
-                self.assertEqual(first_worker_chat.await_count, 2)
+                await asyncio.wait_for(call_started.wait(), timeout=5)
+                first_worker_chat.assert_awaited_once()
                 task.cancel()
                 outcomes = await asyncio.gather(task, return_exceptions=True)
                 self.assertIsInstance(outcomes[0], asyncio.CancelledError)
@@ -9697,7 +13968,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(answer.response_text, historical_raw)
             self.assertEqual(annotation_count, 0)
-            self.assertEqual(len(artifacts_before_resume), 3)
+            self.assertEqual(len(artifacts_before_resume), 2)
             imported = [
                 row
                 for row in artifacts_before_resume
@@ -9716,10 +13987,9 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(
                 [row.status for row in attempted],
-                ["failed", "running"],
+                ["running"],
             )
-            self.assertEqual(attempted[0].raw_text, partial.text)
-            self.assertIsNone(attempted[1].raw_text)
+            self.assertIsNone(attempted[0].raw_text)
 
             async with SessionLocal() as session:
                 await session.execute(
@@ -9774,11 +14044,11 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(answer.status, "completed")
             self.assertEqual(answer.response_text, resumed.text)
-            self.assertEqual(len(all_artifacts), 4)
+            self.assertEqual(len(all_artifacts), 3)
             self.assertEqual(imported[0].raw_text, historical_raw)
             self.assertEqual(
                 [row.status for row in all_artifacts],
-                ["completed", "failed", "running", "completed"],
+                ["completed", "running", "completed"],
             )
         finally:
             if task is not None and not task.done():
@@ -9788,18 +14058,11 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_panel_retry_policy_failure_persists_both_attempts(self) -> None:
+    async def test_panel_policy_failure_persists_one_atomic_attempt(self) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
-        first_partial = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Первый частичный ответ.",
-            limited=True,
-            prompt_tokens=73,
-            completion_tokens=3_200,
-        )
         policy_result = self._panel_result(
             prompt_text=prompt.text,
-            text_value="Второй ответ с нарушенной web-policy.",
+            text_value="Ответ с нарушенной web-policy.",
             limited=False,
             prompt_tokens=73,
             completion_tokens=931,
@@ -9811,16 +14074,10 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "violations": ["web_search_requests_not_confirmed"],
             }
         )
-        failures = [
-            OpenRouterOutputLimitError(
-                "first output limit",
-                result=first_partial,
-            ),
-            OpenRouterPolicyError(
-                "second policy failure",
-                result=policy_result,
-            ),
-        ]
+        failure = OpenRouterPolicyError(
+            "policy failure",
+            result=policy_result,
+        )
         try:
             with (
                 patch(
@@ -9830,7 +14087,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=failures,
+                    side_effect=failure,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -9849,7 +14106,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     end_percent=60,
                 )
 
-            self.assertEqual(panel_chat.await_count, 2)
+            panel_chat.assert_awaited_once()
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -9861,23 +14118,26 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(answer.status, "failed")
             self.assertEqual(answer.response_text, policy_result.text)
             self.assertEqual(answer.usage_json["total_tokens"], 1_004)
-            attempts = answer.usage_json["_aiv_panel_retry"]["attempts"]
-            self.assertEqual(len(attempts), 2)
+            self.assertNotIn("_aiv_panel_retry", answer.usage_json)
             self.assertEqual(
-                [attempt["max_tokens"] for attempt in attempts],
-                [3_200, 6_400],
+                answer.usage_json["_aiv_panel_contract"]["output_policy"],
+                PANEL_OUTPUT_POLICY,
             )
+            async with SessionLocal() as session:
+                audit = (
+                    await session.execute(
+                        select(RunArtifact).where(
+                            RunArtifact.run_id == run_id,
+                            RunArtifact.prompt_version
+                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(audit.status, "failed")
+            self.assertEqual(audit.raw_text, policy_result.text)
             self.assertEqual(
-                attempts[0]["response_text_sha256"],
-                hashlib.sha256(
-                    first_partial.text.encode("utf-8")
-                ).hexdigest(),
-            )
-            self.assertEqual(
-                attempts[1]["response_text_sha256"],
-                hashlib.sha256(
-                    policy_result.text.encode("utf-8")
-                ).hexdigest(),
+                audit.output_json["error_type"],
+                "OpenRouterPolicyError",
             )
             metric_rows = await _metric_rows(
                 run_id,
@@ -9889,35 +14149,201 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_panel_retry_contract_failure_persists_both_attempts(
+    async def test_panel_paid_response_is_promoted_after_crash_without_post(
         self,
     ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
-        first_partial = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Первый частичный ответ.",
-            limited=True,
-            prompt_tokens=79,
-            completion_tokens=3_200,
-        )
+        raw_text = "Содержательный ответ, сохранённый до аварии воркера."
+        response_body = {
+            "id": "generation-test",
+            "model": "test/model",
+            "provider": "Test Provider",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "native_finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": raw_text,
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "url_citation": {
+                                    "url": "https://source.example",
+                                    "title": "Source",
+                                    "content": "Fact",
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 31,
+                "completion_tokens": 47,
+                "total_tokens": 78,
+                "server_tool_use": {"web_search_requests": 1},
+            },
+            "openrouter_metadata": {},
+        }
+
+        class Response:
+            status_code = 200
+
+            def json(self) -> dict[str, Any]:
+                return copy.deepcopy(response_body)
+
+        class Client:
+            posts = 0
+
+            async def __aenter__(self) -> "Client":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def post(
+                self,
+                _url: str,
+                *,
+                headers: dict[str, str],
+                content: bytes,
+            ) -> Response:
+                self.posts += 1
+                self.assert_request = json.loads(content.decode("utf-8"))
+                return Response()
+
+        client = Client()
+        real_chat = openrouter_service.chat
+
+        async def paid_then_crash(**kwargs: Any) -> Any:
+            await real_chat(**kwargs)
+            raise asyncio.CancelledError()
+
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    side_effect=paid_then_crash,
+                ),
+                patch(
+                    "app.services.openrouter.httpx.AsyncClient",
+                    return_value=client,
+                ),
+                patch(
+                    "app.services.openrouter._headers",
+                    return_value={"Authorization": "Bearer test"},
+                ),
+                patch(
+                    "app.services.openrouter.model_output_envelope",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "version": OUTPUT_ENVELOPE_VERSION,
+                        "policy": OutputTokenPolicy.MODEL_MAX.value,
+                        "requested_model": "test/model",
+                        "resolution": "test_fixture",
+                        "context_length": 128_000,
+                        "max_completion_tokens": 32_000,
+                    },
+                ),
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+            self.assertEqual(client.posts, 1)
+
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(Run)
+                    .where(Run.id == run_id)
+                    .values(attempt_count=Run.attempt_count + 1)
+                )
+                await session.commit()
+
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=AssertionError("replay must not issue a POST"),
+                ) as forbidden_post,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+            forbidden_post.assert_not_awaited()
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
+                    )
+                ).scalar_one()
+                artifacts = list(
+                    (
+                        await session.execute(
+                            select(RunArtifact).where(
+                                RunArtifact.run_id == run_id,
+                                RunArtifact.prompt_version
+                                == PANEL_ATTEMPT_AUDIT_VERSION,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            self.assertEqual(answer.status, "completed")
+            self.assertEqual(answer.response_text, raw_text)
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(artifacts[0].status, "completed")
+            self.assertEqual(
+                artifacts[0].output_json["provider_event"]["status"],
+                "accepted",
+            )
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_panel_contract_failure_persists_one_atomic_attempt(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
         contract_result = self._panel_result(
             prompt_text=prompt.text,
-            text_value="Второй незавершённый ответ.",
+            text_value="Незавершённый ответ.",
             limited=False,
             output_complete=False,
             prompt_tokens=79,
             completion_tokens=1_207,
         )
-        failures = [
-            OpenRouterOutputLimitError(
-                "first output limit",
-                result=first_partial,
-            ),
-            OpenRouterResponseContractError(
-                "second response contract failure",
-                result=contract_result,
-            ),
-        ]
+        failure = OpenRouterResponseContractError(
+            "response contract failure",
+            result=contract_result,
+        )
         try:
             with (
                 patch(
@@ -9927,7 +14353,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=failures,
+                    side_effect=failure,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -9946,7 +14372,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     end_percent=60,
                 )
 
-            self.assertEqual(panel_chat.await_count, 2)
+            panel_chat.assert_awaited_once()
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -9958,19 +14384,24 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(answer.status, "failed")
             self.assertEqual(answer.response_text, contract_result.text)
             self.assertEqual(answer.usage_json["total_tokens"], 1_286)
-            attempts = answer.usage_json["_aiv_panel_retry"]["attempts"]
-            self.assertEqual(len(attempts), 2)
+            self.assertNotIn("_aiv_panel_retry", answer.usage_json)
+            async with SessionLocal() as session:
+                audit = (
+                    await session.execute(
+                        select(RunArtifact).where(
+                            RunArtifact.run_id == run_id,
+                            RunArtifact.prompt_version
+                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(audit.status, "failed")
+            self.assertEqual(audit.raw_text, contract_result.text)
+            self.assertFalse(audit.output_json["transport"]["output_limited"])
+            self.assertFalse(audit.output_json["transport"]["output_complete"])
             self.assertEqual(
-                [attempt["max_tokens"] for attempt in attempts],
-                [3_200, 6_400],
-            )
-            self.assertFalse(attempts[1]["output_limited"])
-            self.assertFalse(attempts[1]["output_complete"])
-            self.assertEqual(
-                attempts[0]["response_text_sha256"],
-                hashlib.sha256(
-                    first_partial.text.encode("utf-8")
-                ).hexdigest(),
+                audit.output_json["error_type"],
+                "OpenRouterResponseContractError",
             )
             metric_rows = await _metric_rows(
                 run_id,
@@ -9982,24 +14413,11 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
-    async def test_panel_retry_transport_failure_preserves_first_partial(
+    async def test_panel_transport_failure_persists_empty_atomic_audit(
         self,
     ) -> None:
         run_id, prompt, panel = await self._single_panel_fixture()
-        first_partial = self._panel_result(
-            prompt_text=prompt.text,
-            text_value="Первый частичный ответ для аудита.",
-            limited=True,
-            prompt_tokens=83,
-            completion_tokens=3_200,
-        )
-        failures = [
-            OpenRouterOutputLimitError(
-                "first output limit",
-                result=first_partial,
-            ),
-            OpenRouterError("second transport failure"),
-        ]
+        failure = OpenRouterError("atomic transport failure")
         try:
             with (
                 patch(
@@ -10009,7 +14427,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "app.services.analyzer.chat",
                     new_callable=AsyncMock,
-                    side_effect=failures,
+                    side_effect=failure,
                 ) as panel_chat,
                 patch(
                     "app.services.analyzer.update_progress",
@@ -10028,7 +14446,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     end_percent=60,
                 )
 
-            self.assertEqual(panel_chat.await_count, 2)
+            panel_chat.assert_awaited_once()
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
@@ -10038,30 +14456,32 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "failed")
-            self.assertEqual(answer.response_text, first_partial.text)
-            self.assertIn("second transport failure", answer.error_message)
+            self.assertIsNone(answer.response_text)
+            self.assertIsNone(answer.usage_json)
+            self.assertIn("atomic transport failure", answer.error_message)
+            async with SessionLocal() as session:
+                audit = (
+                    await session.execute(
+                        select(RunArtifact).where(
+                            RunArtifact.run_id == run_id,
+                            RunArtifact.prompt_version
+                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(audit.status, "failed")
+            self.assertIsNone(audit.raw_text)
+            self.assertEqual(audit.input_json["max_tokens"], None)
             self.assertEqual(
-                answer.usage_json["_aiv_panel_contract"]["max_tokens"],
-                3_200,
-            )
-            attempts = answer.usage_json["_aiv_panel_retry"]["attempts"]
-            self.assertEqual(len(attempts), 2)
-            self.assertEqual(
-                [attempt["max_tokens"] for attempt in attempts],
-                [3_200, 6_400],
+                audit.input_json["output_policy"],
+                PANEL_OUTPUT_POLICY,
             )
             self.assertEqual(
-                attempts[0]["response_text_sha256"],
-                hashlib.sha256(
-                    first_partial.text.encode("utf-8")
-                ).hexdigest(),
+                audit.output_json["error_type"],
+                "OpenRouterError",
             )
-            self.assertIsNone(attempts[1]["response_text_sha256"])
-            self.assertEqual(attempts[1]["response_char_count"], 0)
-            self.assertEqual(attempts[1]["citation_count"], 0)
-            self.assertEqual(attempts[1]["token_usage"], {})
-            self.assertIsNone(attempts[1]["output_limited"])
-            self.assertIsNone(attempts[1]["output_complete"])
+            self.assertIsNone(audit.output_json["response_text_sha256"])
+            self.assertEqual(audit.output_json["response_char_count"], 0)
             metric_rows = await _metric_rows(
                 run_id,
                 annotation_input_sha256="unused",
@@ -10284,6 +14704,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 mode="web",
                 provider_key="openai",
                 model="test/model",
+                response_text="Сохранённый ответ",
             )
             answer = ModelAnswer(
                 run_id=run_id,
@@ -10771,6 +15192,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
         panel = AsyncMock()
         finish = AsyncMock()
         fail = AsyncMock()
+        save_foundation = AsyncMock()
         try:
             with (
                 patch(
@@ -10795,6 +15217,10 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.services.analyzer._market_research", new=market),
                 patch("app.services.analyzer._generate_prompt_set", new=generate),
                 patch("app.services.analyzer._persist_prompts", new=persist),
+                patch(
+                    "app.services.analyzer._save_prompt_foundation",
+                    new=save_foundation,
+                ),
                 patch("app.services.analyzer._run_panel", new=panel),
                 patch(
                     "app.services.analyzer._finish_saved_answer_analysis",
@@ -10806,6 +15232,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
 
             market.assert_awaited_once()
             generate.assert_awaited_once()
+            save_foundation.assert_awaited_once()
             persist.assert_awaited_once_with(run_id, prompt_set)
             self.assertEqual(panel.await_count, 2)
             finish.assert_awaited_once()

@@ -51,8 +51,11 @@ def _parse_blocks(text: str) -> list[tuple[list[str], list[tuple[str, str]]]]:
 
     def flush() -> None:
         nonlocal cur_uas, cur_dirs, seen_directive
-        if cur_uas:
-            blocks.append((cur_uas, cur_dirs))
+        # Sitemap is a global robots.txt directive and is valid before any
+        # User-agent block. Preserve it as wildcard metadata instead of
+        # silently discarding the discovery root during ``flush``.
+        if cur_uas or any(key == "sitemap" for key, _value in cur_dirs):
+            blocks.append((cur_uas or ["*"], cur_dirs))
         cur_uas = []
         cur_dirs = []
         seen_directive = False

@@ -644,7 +644,7 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn('"текст в серверном HTML"', self.html)
         self.assertIn('"ответы с расхождениями в фактах"', self.html)
         self.assertNotIn("final-v6", self.analyzer)
-        self.assertIn("final-v17", self.analyzer)
+        self.assertIn("final-v28", self.analyzer)
 
     def test_intent_zeroes_show_scope_and_evidence(self) -> None:
         self.assertIn("const intentMetricPresentation =", self.html)

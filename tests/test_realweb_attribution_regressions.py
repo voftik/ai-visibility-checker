@@ -1,6 +1,9 @@
 import unittest
 
-from app.services.analyzer import _reconcile_annotation
+from app.services.analyzer import (
+    _literal_target_attribution_evidence,
+    _reconcile_annotation,
+)
 
 
 def _profile() -> dict:
@@ -112,6 +115,68 @@ def _mentions(report: dict) -> dict[str, dict]:
 
 
 class RealwebAttributionRegressionTests(unittest.TestCase):
+    def test_long_markdown_claim_cannot_hide_competing_product_owner(self) -> None:
+        detail = (
+            "с подробным описанием условий размещения, интеграции, "
+            "аналитики и сопровождения "
+            * 12
+        )
+        competitor_claim = (
+            f"## Realweb\n- programmatic {detail[:700]} — продукт OtherAgency"
+        )
+        target_claim = (
+            f"## Realweb\n- programmatic {detail[:700]} — продукт Realweb"
+        )
+        separate_claim = (
+            f"## Realweb\n- programmatic {detail[:700]}.\n"
+            "## OtherAgency\n- отдельный продукт"
+        )
+
+        self.assertFalse(
+            _literal_target_attribution_evidence(
+                competitor_claim,
+                ["programmatic"],
+                ["realweb"],
+                direct_target_aliases=["realweb"],
+            )
+        )
+        self.assertTrue(
+            _literal_target_attribution_evidence(
+                target_claim,
+                ["programmatic"],
+                ["realweb"],
+                direct_target_aliases=["realweb"],
+            )
+        )
+        self.assertTrue(
+            _literal_target_attribution_evidence(
+                separate_claim,
+                ["programmatic"],
+                ["realweb"],
+                direct_target_aliases=["realweb"],
+            )
+        )
+
+    def test_long_same_sentence_programmatic_binding_is_kept(self) -> None:
+        qualifiers = (
+            "после подробного сопоставления каналов, аудиторий, инвентаря, "
+            "географии, требований к brand safety и измерению результата "
+            * 4
+        )
+        raw = (
+            f"Realweb {qualifiers}предлагает programmatic DOOH "
+            "для рекламодателей."
+        )
+        self.assertGreater(
+            raw.index("programmatic DOOH") - (raw.index("Realweb") + 7),
+            320,
+        )
+
+        mention = _mentions(_reconcile(raw))["DOOH Realweb"]
+
+        self.assertTrue(mention["attributed_to_target"])
+        self.assertEqual(mention["evidence"], raw)
+
     def test_literal_single_line_dooh_binding_is_kept(self) -> None:
         raw = "- **Realweb** — закупка DOOH через рекламные платформы."
         mention = _mentions(_reconcile(raw))["DOOH Realweb"]

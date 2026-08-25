@@ -1,7 +1,10 @@
 import unittest
 from typing import Any
 
-from app.services.analyzer import _reconcile_annotation
+from app.services.analyzer import (
+    _has_markdown_scoped_target_attribution,
+    _reconcile_annotation,
+)
 
 
 class JoisAttributionAdversarialTests(unittest.TestCase):
@@ -448,6 +451,10 @@ class JoisAttributionAdversarialTests(unittest.TestCase):
 
     def test_later_scope_qualification_cancels_owner_claim(self) -> None:
         online_purchase = "Онлайн-покупка MR Group"
+        neutral_lines = "\n".join(
+            f"Промежуточное уточнение {index} сохраняет общий контекст."
+            for index in range(8)
+        )
         for raw in (
             (
                 "MR Group предлагает онлайн-покупку.\n"
@@ -477,6 +484,16 @@ class JoisAttributionAdversarialTests(unittest.TestCase):
             (
                 "Только City Bay и Symphony 34 поддерживают "
                 "онлайн-покупку MR Group."
+            ),
+            (
+                "MR Group предлагает онлайн-покупку.\n"
+                f"{neutral_lines}\n"
+                "Для JOIS сервис недоступен."
+            ),
+            (
+                "MR Group предлагает онлайн-покупку.\n"
+                f"{neutral_lines}\n"
+                "Однако услуга доступна только в City Bay."
             ),
         ):
             with self.subTest(raw=raw):
@@ -670,6 +687,33 @@ class JoisAttributionAdversarialTests(unittest.TestCase):
         )
 
         self.assertNotAttributed(reconciled, terraces)
+
+    def test_owner_scope_keeps_entity_beyond_legacy_1200_character_boundary(
+        self,
+    ) -> None:
+        filler = "контекст " * 200
+        raw = (
+            "### JOIS\n"
+            f"- {filler}"
+            "UNIQUE_TAIL_MARKER White Box."
+        )
+        self.assertGreater(len(raw), 1_200)
+
+        self.assertTrue(
+            _has_markdown_scoped_target_attribution(
+                raw,
+                ["White Box"],
+                ["JOIS"],
+                direct_target_aliases=["JOIS"],
+                confirmed_owner_aliases=["JOIS"],
+            )
+        )
+        mr_base = "MR Base"
+        reconciled = self._reconcile(
+            raw,
+            [(mr_base, ["White Box"])],
+        )
+        self.assertAttributed(reconciled, mr_base, raw)
 
 
 if __name__ == "__main__":

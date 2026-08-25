@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.db import SessionLocal, engine
-from app.models import ModelAnswer, Run, RunStatus
+from app.models import ModelAnswer, Run, RunStatus, VisibilityPrompt
 from app.services import analyzer
 from app.services.run_coordinator import (
     SAVED_ANSWERS_ONLY_MARKER_KEY,
@@ -41,6 +41,16 @@ ACTIVE_QUEUE_STATUSES = (
     RunStatus.crawling,
     RunStatus.analyzing,
 )
+EXPECTED_PROMPT_COUNT = 9
+EXPECTED_DISCOVERY_PROMPT_COUNT = 6
+EXPECTED_BRAND_PROMPT_COUNT = 3
+EXPECTED_WEB_PROVIDERS = frozenset(
+    {"openai", "gemini", "perplexity", "deepseek", "claude"}
+)
+EXPECTED_MEMORY_PROVIDERS = frozenset(
+    {"openai", "gemini", "deepseek", "claude"}
+)
+EXPECTED_PANEL_CELL_COUNT = 81
 
 
 class ReprocessGuardError(RuntimeError):
@@ -202,6 +212,62 @@ async def _model_answer_fingerprint(run_id: str) -> tuple[int, str]:
     return len(rows), _model_answer_fingerprint_rows(rows)
 
 
+def _validate_complete_saved_panel(
+    prompt_rows: list[Mapping[str, object]],
+    answer_rows: list[Mapping[str, object]],
+) -> None:
+    """Reject partial panels before any downstream LLM token is spent."""
+
+    if len(prompt_rows) != EXPECTED_PROMPT_COUNT:
+        raise ReprocessGuardError(
+            "Saved-answer reprocess requires exactly nine persisted prompts."
+        )
+    roles = [str(row.get("role") or "") for row in prompt_rows]
+    if roles.count("unbranded_discovery") != EXPECTED_DISCOVERY_PROMPT_COUNT or roles.count(
+        "brand_diagnostic"
+    ) != EXPECTED_BRAND_PROMPT_COUNT:
+        raise ReprocessGuardError(
+            "Persisted prompt roles do not match the 6 discovery + 3 brand contract."
+        )
+    prompt_ids = {int(row["id"]) for row in prompt_rows}
+    if len(answer_rows) != EXPECTED_PANEL_CELL_COUNT:
+        raise ReprocessGuardError(
+            "Saved-answer reprocess requires the complete 81-cell panel; "
+            f"found {len(answer_rows)} cells."
+        )
+    cells_by_prompt: dict[int, dict[str, set[str]]] = {
+        prompt_id: {"web": set(), "memory": set()}
+        for prompt_id in prompt_ids
+    }
+    for row in answer_rows:
+        prompt_id = int(row.get("prompt_id") or 0)
+        provider = str(row.get("provider_key") or "")
+        mode = str(row.get("mode") or "")
+        response_text = str(row.get("response_text") or "").strip()
+        if prompt_id not in cells_by_prompt or mode not in {"web", "memory"}:
+            raise ReprocessGuardError(
+                "Saved panel contains a cell outside the persisted 9-prompt grid."
+            )
+        if str(row.get("status") or "") != "completed" or not response_text:
+            raise ReprocessGuardError(
+                "Every saved panel cell must be completed and contain raw text."
+            )
+        if provider in cells_by_prompt[prompt_id][mode]:
+            raise ReprocessGuardError(
+                "Saved panel contains a duplicate provider/mode cell."
+            )
+        cells_by_prompt[prompt_id][mode].add(provider)
+    for prompt_id, modes in cells_by_prompt.items():
+        if modes["web"] != EXPECTED_WEB_PROVIDERS or modes[
+            "memory"
+        ] != EXPECTED_MEMORY_PROVIDERS:
+            raise ReprocessGuardError(
+                "Saved panel is incomplete for prompt "
+                f"{prompt_id}: web={sorted(modes['web'])}, "
+                f"memory={sorted(modes['memory'])}."
+            )
+
+
 async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
     """Check the whole durable queue and reserve its only execution slot."""
 
@@ -335,6 +401,26 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
                 .mappings()
                 .all()
             )
+            prompt_rows = list(
+                (
+                    await connection.execute(
+                        select(
+                            VisibilityPrompt.id,
+                            VisibilityPrompt.prompt_key,
+                            VisibilityPrompt.role,
+                            VisibilityPrompt.sequence,
+                        )
+                        .where(VisibilityPrompt.run_id == run_id)
+                        .order_by(
+                            VisibilityPrompt.sequence,
+                            VisibilityPrompt.id,
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            _validate_complete_saved_panel(prompt_rows, answer_rows)
             raw_answers_sha256 = _model_answer_fingerprint_rows(answer_rows)
 
             previous = PreviousRunState(

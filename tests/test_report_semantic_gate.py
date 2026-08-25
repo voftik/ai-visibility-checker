@@ -1,19 +1,55 @@
+import copy
+import hashlib
 import json
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import delete, func, select
+
+from app.db import SessionLocal, init_db
+from app.models import Run, RunArtifact, RunStatus
 from app.services.analyzer import (
     _eligible_illustration_answer_context,
     _final_report,
+    _load_final_semantic_part_checkpoint,
+    _load_final_semantic_physical_result,
+    _persist_final_semantic_audit_event,
     _select_final_answer_context,
 )
-from app.services.openrouter import OpenRouterError
+from app.services.openrouter import (
+    PHYSICAL_POST_AUDIT_VERSION,
+    OpenRouterError,
+    OutputTokenPolicy,
+)
 from app.services.report_semantic_gate import (
     CANONICAL_OBSERVATIONAL_MEMORY_LIMITATION,
     CANONICAL_UNAVAILABLE_PORTFOLIO_LIMITATION,
-    REPORT_SEMANTIC_MAX_TOKENS,
+    REPORT_SEMANTIC_MODEL,
+    REPORT_SEMANTIC_PARTITION_VERSION,
     REPORT_SEMANTIC_REASONING_EFFORT,
+    REPORT_SEMANTIC_REVIEW_SYSTEM,
+    _reduce_semantic_receipts,
+    _semantic_atomic_claim_spans,
+    _semantic_evidence_path_contract,
+    _semantic_disposition_manifest,
+    _semantic_exact_output_utf8_bytes,
+    _semantic_final_user_payload,
+    _semantic_finding_ledger_entry,
+    _semantic_finding_ledger_manifest,
+    _semantic_json_sha256,
+    _semantic_part_receipt,
+    _semantic_partition_parts,
+    _semantic_prepare_finding_shards,
+    _semantic_reducer_user_payload,
+    _semantic_required_summary_tokens,
+    _semantic_summary_tokens,
+    _semantic_validate_fragment_reconstruction,
+    _validate_semantic_final_response,
+    _validate_semantic_part_response,
+    _validate_semantic_partition_coverage,
+    _validate_semantic_reducer_result,
     deterministic_report_semantic_errors,
     metric_availability_contract,
     normalize_report_semantic_review,
@@ -21,6 +57,202 @@ from app.services.report_semantic_gate import (
     review_final_report_semantics,
     validate_report_semantic_review,
 )
+
+
+def _reduced_material_findings(user_payload: dict) -> list[dict]:
+    if not user_payload["input_finding_manifest"]:
+        return []
+    nodes = {
+        node["node_id"]: node for node in user_payload["source_nodes"]
+    }
+    source_ids: list[str] = []
+    evidence_paths: list[str] = []
+    semantic_literals: list[str] = []
+    for item in user_payload["input_finding_manifest"]:
+        source = nodes[item["source_node_id"]]["material_findings"][
+            item["finding_index"]
+        ]
+        source_paths = (
+            list(source.get("evidence_paths") or [])
+            if isinstance(source, dict)
+            else []
+        )
+        if isinstance(source, dict):
+            for key in ("claim", "interpretation", "statement"):
+                literal = source.get(key)
+                if (
+                    isinstance(literal, str)
+                    and literal
+                    and literal not in semantic_literals
+                ):
+                    semantic_literals.append(literal)
+        elif isinstance(source, str) and source not in semantic_literals:
+            semantic_literals.append(source)
+        source_ids.append(item["source_finding_id"])
+        for path in source_paths:
+            if path not in evidence_paths:
+                evidence_paths.append(path)
+    return [
+        {
+            "source_finding_ids": source_ids,
+            "statement": "\n".join(semantic_literals)
+            or "Все входные material findings учтены без пропуска.",
+            "evidence_paths": evidence_paths,
+        }
+    ]
+
+
+def _grounded_reducer_summary(user_payload: dict) -> str:
+    anchors: list[str] = []
+    for node in user_payload.get("source_nodes") or []:
+        for finding in node.get("material_findings") or []:
+            tokens = sorted(_semantic_required_summary_tokens(finding))
+            if tokens:
+                anchors.extend(tokens)
+    return " ".join(anchors) or "Нет материальных findings."
+
+
+class FinalSemanticAuditStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        await init_db()
+        self.run_id = f"semantic-audit-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=self.run_id,
+                    domain="semantic-audit.example",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            await session.commit()
+
+    async def asyncTearDown(self) -> None:
+        async with SessionLocal() as session:
+            await session.execute(delete(Run).where(Run.id == self.run_id))
+            await session.commit()
+
+    async def test_physical_and_part_receipts_are_durable_and_resumable(
+        self,
+    ) -> None:
+        request_payload = {
+            "model": REPORT_SEMANTIC_MODEL,
+            "messages": [{"role": "user", "content": "audit"}],
+        }
+        request_sha256 = hashlib.sha256(
+            json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        raw_text = json.dumps(_pass_review(), ensure_ascii=False)
+        physical_event = {
+            "version": PHYSICAL_POST_AUDIT_VERSION,
+            "event_id": "a" * 32,
+            "event_kind": "provider_post",
+            "logical_call_id": "b" * 32,
+            "document_id": "semantic:test",
+            "sequence": 0,
+            "attempt": 1,
+            "status": "accepted",
+            "model": REPORT_SEMANTIC_MODEL,
+            "request_payload": request_payload,
+            "request_sha256": request_sha256,
+            "response": {},
+            "raw_text": raw_text,
+            "usage": {"prompt_tokens": 3},
+            "transport": {},
+            "resume_contract": None,
+            "error": None,
+            "partial_text": "",
+            "manifest": None,
+            "aggregate_usage": {},
+            "call_records": [],
+        }
+        candidate_sha256 = "c" * 64
+        manifest_sha256 = "d" * 64
+        semantic_event = {
+            "version": REPORT_SEMANTIC_PARTITION_VERSION,
+            "kind": "semantic_part_accepted",
+            "candidate_sha256": candidate_sha256,
+            "source_part_receipts_sha256": manifest_sha256,
+            "part_receipt": {"part_id": "part-1", "part_index": 0},
+            "request_sha256": request_sha256,
+            "parsed_review": _pass_review(),
+            "semantic_receipt": {"summary": "Проверено.", "claims": []},
+            "raw_text": raw_text,
+            "usage": {"prompt_tokens": 3},
+        }
+        with patch(
+            "app.services.analyzer.assert_run_lease",
+            new=AsyncMock(),
+        ):
+            await _persist_final_semantic_audit_event(
+                self.run_id,
+                attempt=1,
+                event=physical_event,
+            )
+            await _persist_final_semantic_audit_event(
+                self.run_id,
+                attempt=1,
+                event=physical_event,
+            )
+            await _persist_final_semantic_audit_event(
+                self.run_id,
+                attempt=1,
+                event=semantic_event,
+            )
+            resumed = await _load_final_semantic_physical_result(
+                self.run_id,
+                attempt=1,
+                descriptor={
+                    "version": REPORT_SEMANTIC_PARTITION_VERSION,
+                    "kind": "atomic-a1",
+                    "model": REPORT_SEMANTIC_MODEL,
+                    "request_payload": request_payload,
+                    "request_sha256": request_sha256,
+                    "response_schema_sha256": "e" * 64,
+                    "schema_name": "audit",
+                },
+            )
+            part_checkpoint = await _load_final_semantic_part_checkpoint(
+                self.run_id,
+                attempt=1,
+            )
+
+        self.assertIsNotNone(resumed)
+        self.assertEqual(resumed.text, raw_text)
+        self.assertEqual(resumed.usage["prompt_tokens"], 3)
+        self.assertEqual(
+            part_checkpoint["accepted_parts"], [semantic_event]
+        )
+        async with SessionLocal() as session:
+            physical_count = (
+                await session.execute(
+                    select(func.count(RunArtifact.id)).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key >= "frsg_a1_post_",
+                        RunArtifact.artifact_key < "frsg_a1_post_\uffff",
+                    )
+                )
+            ).scalar_one()
+        self.assertEqual(physical_count, 1)
+
+
+class SemanticPromptCoverageTests(unittest.TestCase):
+    def test_prompt_requires_every_material_violation_without_count_cap(
+        self,
+    ) -> None:
+        self.assertIn(
+            "не ограничивай их\nколичество",
+            REPORT_SEMANTIC_REVIEW_SYSTEM,
+        )
+        self.assertNotIn(
+            "не более 16",
+            REPORT_SEMANTIC_REVIEW_SYSTEM.casefold(),
+        )
 
 
 def _unavailable_slice() -> dict[str, object]:
@@ -191,6 +423,20 @@ def _candidate(summary: str) -> dict[str, object]:
 
 def _pass_review() -> dict[str, object]:
     return {"verdict": "pass", "summary": "Противоречий нет.", "violations": []}
+
+
+def _part_semantic_claims(
+    part: dict[str, object],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "report_path": span["report_path"],
+            "claim": span["claim"],
+            "evidence_paths": ["/report_data"],
+            "interpretation": "Фрагмент сохранён для глобальной сверки.",
+        }
+        for span in _semantic_atomic_claim_spans(part)
+    ]
 
 
 def _revise_review() -> dict[str, object]:
@@ -1608,8 +1854,1451 @@ class ReportSemanticGateUnitTests(unittest.TestCase):
         self.assertEqual(contract["withheld_metadata_only_count"], 1)
         self.assertFalse(contract["unattested_raw_content_included"])
 
+    def test_visual_context_keeps_every_attested_long_answer(self) -> None:
+        answers = [
+            {
+                "answer_id": index,
+                "provider_key": "current",
+                "mode": "web",
+                "metric_eligible": True,
+                "answer_text": f"answer-{index}-" + ("я" * 20_000),
+                "annotation": {"evidence": [f"evidence-{index}"]},
+                "panel_evidence": {"reason": "web_search_attested"},
+            }
+            for index in range(1, 22)
+        ]
+
+        selected, contract = _eligible_illustration_answer_context(answers)
+
+        self.assertEqual(len(selected), len(answers))
+        self.assertEqual(contract["selected_raw_context_count"], len(answers))
+        self.assertEqual(
+            contract["context_policy"],
+            "all_attested_answers_no_local_cap_v1",
+        )
+        self.assertTrue(selected[-1]["answer_text"].endswith("я" * 20_000))
+
+
+class SemanticPartitionCoverageTests(unittest.TestCase):
+    def _partition_payload(self, summary: str) -> dict[str, object]:
+        return {
+            "evidence_document": {"report_data": {}},
+            "model_evidence_context": {"report_data": {}},
+            "metric_availability_contract": [],
+            "candidate_report": _candidate(summary),
+            "deterministic_precheck_errors": [],
+        }
+
+    def test_lossless_partition_covers_every_report_record_exactly(self) -> None:
+        source = "Точный длинный фрагмент. " * 180
+        payload = self._partition_payload(source)
+        parts, manifest = _semantic_partition_parts(payload, target_chars=256)
+        receipts = [
+            _semantic_part_receipt(part, _pass_review()) for part in parts
+        ]
+
+        digest = _validate_semantic_partition_coverage(
+            manifest,
+            receipts,
+            candidate_report=payload["candidate_report"],
+            reviews=[_pass_review() for _part in parts],
+        )
+
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(manifest["part_count"], len(parts))
+        self.assertEqual(
+            manifest["record_count"],
+            len({part["record_index"] for part in parts}),
+        )
+        section_parts = sorted(
+            (
+                part["unit_index"],
+                part["context_text"][
+                    part["core_start_in_context"] : part["core_end_in_context"]
+                ],
+            )
+            for part in parts
+            if part["report_path"] == "/sections/0"
+        )
+        reconstructed_section = "".join(
+            text for _index, text in section_parts
+        )
+        self.assertIn(source, reconstructed_section)
+        section_receipt = next(
+            item
+            for item in manifest["record_receipts"]
+            if item["report_path"] == "/sections/0"
+        )
+        body_receipt = next(
+            item
+            for item in section_receipt["field_receipts"]
+            if item["report_path"] == "/sections/0/body"
+        )
+        self.assertEqual(body_receipt["source_chars"], len(source))
+
+    def test_part_receipt_cannot_cover_multi_clause_tail_with_one_token(
+        self,
+    ) -> None:
+        source = (
+            "A подтверждённая метрика равна 17%. "
+            "TAIL_STATE остаётся unknown и не равен нулю."
+        )
+        payload = self._partition_payload(source)
+        parts, _manifest = _semantic_partition_parts(payload, target_chars=512)
+        part = next(
+            item
+            for item in parts
+            if item["report_path"] == "/sections/0"
+            and "TAIL_STATE" in item["context_text"]
+        )
+        exact_claims = _part_semantic_claims(part)
+        self.assertTrue(
+            any("TAIL_STATE" in str(item["claim"]) for item in exact_claims)
+        )
+        parsed = {
+            "part_id": part["part_id"],
+            "source_sha256": part["source_sha256"],
+            "unit_sha256": part["unit_sha256"],
+            "review": _pass_review(),
+            "semantic_receipt": {
+                "summary": "A",
+                "claims": [
+                    {
+                        "report_path": "/sections/0/body",
+                        "claim": "A",
+                        "evidence_paths": ["/report_data"],
+                        "interpretation": "A",
+                    }
+                ],
+            },
+        }
+        with self.assertRaisesRegex(OpenRouterError, "atomic spans"):
+            _validate_semantic_part_response(
+                parsed,
+                part=part,
+                candidate_report=payload["candidate_report"],
+                evidence_document=payload["evidence_document"],
+            )
+
+    def test_partition_rejects_missing_or_tampered_receipt(self) -> None:
+        payload = self._partition_payload("Проверяемый текст. " * 80)
+        parts, manifest = _semantic_partition_parts(payload, target_chars=256)
+        receipts = [
+            _semantic_part_receipt(part, _pass_review()) for part in parts
+        ]
+
+        with self.assertRaisesRegex(OpenRouterError, "coverage is incomplete"):
+            _validate_semantic_partition_coverage(
+                manifest,
+                receipts[:-1],
+                candidate_report=payload["candidate_report"],
+            )
+
+        tampered = [dict(item) for item in receipts]
+        tampered[0]["unit_sha256"] = "0" * 64
+        with self.assertRaisesRegex(OpenRouterError, "changed unit_sha256"):
+            _validate_semantic_partition_coverage(
+                manifest,
+                tampered,
+                candidate_report=payload["candidate_report"],
+            )
+
+        tampered_review = [dict(item) for item in receipts]
+        tampered_review[0]["review_sha256"] = "f" * 64
+        with self.assertRaisesRegex(OpenRouterError, "review digest mismatch"):
+            _validate_semantic_partition_coverage(
+                manifest,
+                tampered_review,
+                candidate_report=payload["candidate_report"],
+                reviews=[_pass_review() for _part in parts],
+            )
+
+    def test_part_receipt_rejects_internal_digest_evidence_path(self) -> None:
+        payload = self._partition_payload("Проверяемый текст. " * 20)
+        parts, _manifest = _semantic_partition_parts(payload, target_chars=256)
+        part = next(
+            item
+            for item in parts
+            if item["report_path"] == "/sections/0"
+            and item["unit_index"] == 0
+        )
+        claims = _part_semantic_claims(part)
+        for claim in claims:
+            claim["evidence_paths"] = ["/evidence_digest/fake"]
+        parsed = {
+            "part_id": part["part_id"],
+            "source_sha256": part["source_sha256"],
+            "unit_sha256": part["unit_sha256"],
+            "review": _pass_review(),
+            "semantic_receipt": {
+                "summary": "Проверяется буквальное утверждение.",
+                "claims": claims,
+            },
+        }
+
+        with self.assertRaisesRegex(OpenRouterError, "evidence path is missing"):
+            _validate_semantic_part_response(
+                parsed,
+                part=part,
+                candidate_report=payload["candidate_report"],
+                evidence_document=payload["evidence_document"],
+            )
+
+    def test_hierarchical_receipt_accepts_only_advertised_original_path(
+        self,
+    ) -> None:
+        payload = self._partition_payload("Проверяемый текст. " * 20)
+        payload["evidence_document"] = {
+            "report_data": {"allowed": True, "hidden": False}
+        }
+        parts, _manifest = _semantic_partition_parts(payload, target_chars=256)
+        part = next(
+            item
+            for item in parts
+            if item["report_path"] == "/sections/0"
+            and item["unit_index"] == 0
+        )
+        compact_evidence = {
+            "long_input_contract": {
+                "mode": "bounded_transitive_evidence_tree"
+            },
+            "evidence_digest": {
+                "observations": [
+                    {"source_paths": ["/report_data/allowed"]}
+                ]
+            },
+        }
+        path_contract = _semantic_evidence_path_contract(compact_evidence)
+        self.assertEqual(
+            path_contract["citation_rule"],
+            "cite_only_original_source_paths",
+        )
+        claim_records = _part_semantic_claims(part)
+        for claim_record in claim_records:
+            claim_record["evidence_paths"] = ["/report_data/allowed"]
+            claim_record["interpretation"] = (
+                "Утверждение связано с исходным фактом."
+            )
+        parsed = {
+            "part_id": part["part_id"],
+            "source_sha256": part["source_sha256"],
+            "unit_sha256": part["unit_sha256"],
+            "review": _pass_review(),
+            "semantic_receipt": {
+                "summary": "Проверяется буквальное утверждение.",
+                "claims": claim_records,
+            },
+        }
+
+        validated = _validate_semantic_part_response(
+            parsed,
+            part=part,
+            candidate_report=payload["candidate_report"],
+            evidence_document=payload["evidence_document"],
+            evidence_path_contract=path_contract,
+        )
+        self.assertEqual(
+            validated["semantic_receipt"]["claims"][0]["evidence_paths"],
+            ["/report_data/allowed"],
+        )
+
+        for claim_record in parsed["semantic_receipt"]["claims"]:
+            claim_record["evidence_paths"] = ["/report_data/hidden"]
+        with self.assertRaisesRegex(
+            OpenRouterError, "outside the original hierarchical"
+        ):
+            _validate_semantic_part_response(
+                parsed,
+                part=part,
+                candidate_report=payload["candidate_report"],
+                evidence_document=payload["evidence_document"],
+                evidence_path_contract=path_contract,
+            )
+
+
+    def test_oversized_single_finding_is_fragmented_and_reconstructed(self) -> None:
+        node = {
+            "node_id": "semantic-singleton",
+            "level": 0,
+            "source_part_ids": ["part-singleton"],
+            "source_part_ids_sha256": _semantic_json_sha256(
+                ["part-singleton"]
+            ),
+            "source_part_count": 1,
+            "verdict": "pass",
+            "summary": "Один очень длинный finding.",
+            "material_findings": [
+                {
+                    "report_path": "/summary",
+                    "claim": "A" * 30_000,
+                    "interpretation": "B" * 30_000,
+                    "evidence_paths": [],
+                }
+            ],
+            "metric_availability_rows": [],
+            "violations": [],
+        }
+        for input_window_bytes in (12_000, 100_000):
+            with self.subTest(input_window_bytes=input_window_bytes):
+                shards, coverage, audit = _semantic_prepare_finding_shards(
+                    [node],
+                    model_envelope={"max_completion_tokens": 32_000},
+                    input_window_bytes=input_window_bytes,
+                )
+                decision_entries = [
+                    entry
+                    for shard in shards
+                    for entry in coverage[shard["node_id"]]
+                ]
+                source_entries = [
+                    entry
+                    for shard in audit["source_shards"]
+                    for entry in shard["entries"]
+                ]
+                self.assertEqual(audit["source_manifest"]["finding_count"], 1)
+                self.assertGreater(audit["manifest"]["finding_count"], 1)
+                self.assertGreater(len(shards), 1)
+                self.assertTrue(
+                    all(
+                        _semantic_exact_output_utf8_bytes(
+                            coverage[shard["node_id"]]
+                        )
+                        <= 16_384
+                        for shard in shards
+                    )
+                )
+                self.assertEqual(
+                    _semantic_validate_fragment_reconstruction(
+                        source_entries,
+                        decision_entries,
+                    ),
+                    audit["reconstruction_manifest"],
+                )
+                tampered = copy.deepcopy(decision_entries)
+                tampered[0]["finding"]["statement"] += "X"
+                with self.assertRaisesRegex(OpenRouterError, "digest"):
+                    _semantic_validate_fragment_reconstruction(
+                        source_entries,
+                        tampered,
+                    )
+
 
 class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finding_ledger_shards_more_than_one_context_without_omission(
+        self,
+    ) -> None:
+        findings: list[dict[str, object]] = []
+        for index in range(90):
+            if index % 2 == 0:
+                claim = (
+                    f"Метрика {index} равна {index}, знаменатель {index + 100}. "
+                    + ("Числовой контекст. " * 22)
+                )
+                interpretation = (
+                    "Числовой вывод сохраняет значение и знаменатель."
+                )
+            else:
+                claim = (
+                    f"Качественное наблюдение {index}: статус unknown не ноль. "
+                    + ("Качественный контекст. " * 20)
+                )
+                interpretation = (
+                    "Качественный вывод сохраняет data-state и ограничение."
+                )
+            findings.append(
+                {
+                    "report_path": "/summary",
+                    "claim": claim,
+                    "interpretation": interpretation,
+                    "evidence_paths": [],
+                }
+            )
+        node = {
+            "node_id": "semantic-leaf-adversarial",
+            "level": 0,
+            "source_part_ids": ["part-adversarial"],
+            "source_part_ids_sha256": hashlib.sha256(
+                json.dumps(
+                    ["part-adversarial"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "source_part_count": 1,
+            "verdict": "pass",
+            "summary": "Все числовые и качественные findings значимы.",
+            "material_findings": findings,
+            "metric_availability_rows": [
+                {
+                    "path": f"/report_data/metric_{index}",
+                    "available": index % 3 != 0,
+                    "signals": {
+                        "data_state": (
+                            "available" if index % 3 != 0 else "unavailable"
+                        ),
+                        "state": "known" if index % 3 != 0 else "unknown",
+                        "value": index if index % 3 != 0 else None,
+                        "context": "Точный metric-row контекст. " * 8,
+                    },
+                }
+                for index in range(100)
+            ],
+            "violations": [
+                {
+                    "code": "other",
+                    "severity": "important",
+                    "report_path": "/summary",
+                    "claim": "Проверяемый отчёт.",
+                    "evidence_paths": [],
+                    "finding": f"Исходное замечание {index}.",
+                    "repair_instruction": f"Исправить замечание {index}.",
+                }
+                for index in range(100)
+            ],
+        }
+        calls: list[dict[str, object]] = []
+        raw_parts: list[dict[str, object]] = []
+
+        async def fake_chat(**kwargs: object) -> SimpleNamespace:
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            source_nodes = user_payload["source_nodes"]
+            parsed = {
+                "source_node_ids": [
+                    source_node["node_id"] for source_node in source_nodes
+                ],
+                "summary": _grounded_reducer_summary(user_payload),
+                "material_findings": _reduced_material_findings(user_payload),
+                "global_violations": [],
+                "verdict": "pass",
+            }
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
+            )
+
+        input_window_bytes = 23_744
+        with patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=fake_chat),
+        ) as chat_mock:
+            root, finding_audit = await _reduce_semantic_receipts(
+                [node],
+                model_envelope={
+                    "context_length": 32_000,
+                    "max_completion_tokens": 8_000,
+                },
+                input_window_bytes=input_window_bytes,
+                candidate_report=_candidate("Проверяемый отчёт."),
+                evidence_document={"report_data": {}},
+                audit_checkpoint=None,
+                calls=calls,
+                raw_parts=raw_parts,
+                manifest={
+                    "candidate_sha256": "a" * 64,
+                    "part_receipts_sha256": "b" * 64,
+                    "part_receipts": [{"part_id": "part-adversarial"}],
+                },
+            )
+
+        ledger_entries = [
+            entry
+            for shard in finding_audit["shards"]
+            for entry in shard["entries"]
+        ]
+        self.assertGreater(finding_audit["shard_count"], 1)
+        self.assertEqual(finding_audit["manifest"]["finding_count"], 290)
+        self.assertEqual(
+            finding_audit["manifest"]["item_kind_counts"],
+            {
+                "material_finding": 90,
+                "metric_availability_row": 100,
+                "semantic_violation": 100,
+            },
+        )
+        self.assertEqual(len(ledger_entries), 290)
+        self.assertEqual(
+            [
+                entry["finding"]
+                for entry in ledger_entries
+                if entry["item_kind"] == "material_finding"
+            ],
+            findings,
+        )
+        self.assertEqual(
+            len({entry["finding_id"] for entry in ledger_entries}),
+            290,
+        )
+        self.assertEqual(
+            root["finding_ledger_manifest"], finding_audit["root_manifest"]
+        )
+        self.assertEqual(root["finding_ledger_manifest"]["finding_count"], 290)
+        self.assertEqual(
+            finding_audit["exact_disposition_manifest"]["disposition_count"],
+            290,
+        )
+        self.assertEqual(len(finding_audit["exact_dispositions"]), 290)
+        self.assertEqual(
+            finding_audit["source_manifest"]["finding_count"], 290
+        )
+        self.assertEqual(
+            root["finding_reconstruction_manifest"]["decision_atom_count"],
+            290,
+        )
+        self.assertEqual(len(root["metric_availability_rows"]), 100)
+        self.assertEqual(len(root["violations"]), 100)
+        self.assertEqual(len(root["material_findings"]), 1)
+        self.assertGreater(chat_mock.await_count, 1)
+        self.assertTrue(
+            all(
+                int(call["request_utf8_bytes"]) <= input_window_bytes
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            all(
+                int(call["minimum_response_utf8_bytes"]) <= 4_000
+                for call in calls
+            )
+        )
+
+    async def test_reducer_rejects_lineage_only_semantic_erasure(self) -> None:
+        source_finding = {
+            "report_path": "/summary",
+            "claim": "TAIL_ALPHA равен 17.",
+            "interpretation": "TAIL_BETA остаётся unknown, а не нулём.",
+            "evidence_paths": [],
+        }
+        child = {
+            "node_id": "child-semantic-tail",
+            "level": 0,
+            "source_part_ids": ["part-semantic-tail"],
+            "source_part_ids_sha256": hashlib.sha256(
+                json.dumps(
+                    ["part-semantic-tail"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "source_part_count": 1,
+            "verdict": "pass",
+            "summary": "Два самостоятельных факта.",
+            "material_findings": [source_finding],
+            "metric_availability_rows": [],
+            "violations": [],
+        }
+        source_finding_id = _semantic_reducer_user_payload(
+            [child], level=1, group_index=0
+        )["input_finding_manifest"][0]["source_finding_id"]
+
+        with self.assertRaisesRegex(
+            OpenRouterError, "dropped literal meaning"
+        ):
+            _validate_semantic_reducer_result(
+                {
+                    "source_node_ids": [child["node_id"]],
+                    "summary": "Данные обработаны.",
+                    "material_findings": [
+                        {
+                            "source_finding_ids": [source_finding_id],
+                            "statement": "Данные обработаны.",
+                            "evidence_paths": [],
+                        }
+                    ],
+                    "global_violations": [],
+                    "verdict": "pass",
+                },
+                children=[child],
+                candidate_report=_candidate("TAIL_ALPHA равен 17."),
+                evidence_document={"report_data": {}},
+            )
+
+    async def test_reducer_rejects_exact_findings_with_unrelated_summary(
+        self,
+    ) -> None:
+        source_finding = {
+            "report_path": "/limitations/0",
+            "claim": "TAIL_STATE остаётся unknown.",
+            "interpretation": "Unknown нельзя превращать в ноль.",
+            "evidence_paths": ["/report_data/state"],
+        }
+        child = {
+            "node_id": "child-exact-tail",
+            "level": 0,
+            "source_part_ids": ["part-exact-tail"],
+            "source_part_ids_sha256": _semantic_json_sha256(
+                ["part-exact-tail"]
+            ),
+            "source_part_count": 1,
+            "verdict": "pass",
+            "summary": "Состояние метрики проверено.",
+            "material_findings": [source_finding],
+            "metric_availability_rows": [],
+            "violations": [],
+        }
+        source_id = _semantic_reducer_user_payload(
+            [child], level=1, group_index=0
+        )["input_finding_manifest"][0]["source_finding_id"]
+        with self.assertRaisesRegex(OpenRouterError, "not grounded"):
+            _validate_semantic_reducer_result(
+                {
+                    "source_node_ids": [child["node_id"]],
+                    "summary": "ok",
+                    "material_findings": [
+                        {
+                            "source_finding_ids": [source_id],
+                            "statement": (
+                                source_finding["claim"]
+                                + "\n"
+                                + source_finding["interpretation"]
+                            ),
+                            "evidence_paths": ["/report_data/state"],
+                        }
+                    ],
+                    "global_violations": [],
+                    "verdict": "pass",
+                },
+                children=[child],
+                candidate_report=_candidate(source_finding["claim"]),
+                evidence_document={"report_data": {"state": "unknown"}},
+            )
+
+    async def test_global_reducer_cannot_replace_receipt_with_one_token(
+        self,
+    ) -> None:
+        source_finding = {
+            "source_finding_ids": ["ledger-child"],
+            "statement": (
+                "TAIL_ALPHA равен 17%, а состояние TAIL_BETA остаётся unknown."
+            ),
+            "evidence_paths": [],
+        }
+        child = {
+            "node_id": "sealed-child-tail",
+            "level": 1,
+            "source_part_ids": ["part-tail"],
+            "source_part_ids_sha256": _semantic_json_sha256(["part-tail"]),
+            "source_part_count": 1,
+            "verdict": "pass",
+            "summary": source_finding["statement"],
+            "material_findings": [source_finding],
+            "metric_availability_rows": [],
+            "violations": [],
+            "finding_decision_sealed": True,
+        }
+        reducer_payload = _semantic_reducer_user_payload(
+            [child], level=2, group_index=0
+        )
+        source_id = reducer_payload["input_finding_manifest"][0][
+            "source_finding_id"
+        ]
+        with self.assertRaisesRegex(
+            OpenRouterError, "global reducer dropped bounded finding meaning"
+        ):
+            _validate_semantic_reducer_result(
+                {
+                    "source_node_ids": [child["node_id"]],
+                    "summary": _grounded_reducer_summary(reducer_payload),
+                    "material_findings": [
+                        {
+                            "source_finding_ids": [source_id],
+                            "statement": "TAIL_ALPHA",
+                            "evidence_paths": [],
+                        }
+                    ],
+                    "global_violations": [],
+                    "verdict": "pass",
+                },
+                children=[child],
+                candidate_report=_candidate("TAIL_ALPHA равен 17%."),
+                evidence_document={"report_data": {}},
+            )
+
+    async def test_compact_final_root_keeps_manifests_and_inherited_verdict(
+        self,
+    ) -> None:
+        metric_row = {
+            "path": "/report_data/metric_0",
+            "available": False,
+            "signals": {"state": "unknown", "value": None},
+        }
+        violation = {
+            "code": "other",
+            "severity": "important",
+            "report_path": "/summary",
+            "claim": "Проверяемый отчёт.",
+            "evidence_paths": [],
+            "finding": "Замечание 0.",
+            "repair_instruction": "Исправить 0.",
+        }
+        finding_entries = [
+            _semantic_finding_ledger_entry(
+                source_node_id="source-1",
+                finding_index=0,
+                item_kind="metric_availability_row",
+                finding={
+                    "semantic_item_kind": "metric_availability_row",
+                    "metric_row": metric_row,
+                    "statement": _semantic_json_sha256(metric_row),
+                    "evidence_paths": [metric_row["path"]],
+                },
+            ),
+            _semantic_finding_ledger_entry(
+                source_node_id="source-1",
+                finding_index=0,
+                item_kind="semantic_violation",
+                finding={
+                    "semantic_item_kind": "semantic_violation",
+                    "violation": violation,
+                    "statement": _semantic_json_sha256(violation),
+                    "evidence_paths": [],
+                },
+            ),
+        ]
+        finding_manifest = _semantic_finding_ledger_manifest(finding_entries)
+        reconstruction_manifest = _semantic_validate_fragment_reconstruction(
+            finding_entries,
+            finding_entries,
+        )
+        exact_dispositions = [
+            {
+                "finding_id": entry["finding_id"],
+                "finding_sha256": entry["finding_sha256"],
+                "source_finding_id": f"source-{index}",
+                "statement": entry["finding"]["statement"],
+                "statement_sha256": hashlib.sha256(
+                    entry["finding"]["statement"].encode("utf-8")
+                ).hexdigest(),
+                "evidence_paths": list(
+                    entry["finding"].get("evidence_paths") or []
+                ),
+            }
+            for index, entry in enumerate(finding_entries)
+        ]
+        exact_disposition_manifest = _semantic_disposition_manifest(
+            exact_dispositions
+        )
+        decision_receipt = {
+            "source_node_ids": ["source-1"],
+            "summary": "Проверяемый отчёт и unknown сохранены.",
+            "verdict": "revise",
+            "material_findings": [],
+            "metric_availability_rows": [metric_row],
+            "violations": [],
+            "finding_ledger_manifest": finding_manifest,
+            "exact_dispositions": exact_dispositions,
+            "exact_disposition_manifest": exact_disposition_manifest,
+        }
+        decision_shard = {
+            "stage": "source_decision",
+            "node_id": "decision-1",
+            "receipt_sha256": _semantic_json_sha256(decision_receipt),
+            "receipt": decision_receipt,
+        }
+        decision_manifest = {
+            "decision_shard_count": 1,
+            "decision_receipts_sha256": _semantic_json_sha256(
+                [
+                    {
+                        "stage": "source_decision",
+                        "node_id": "decision-1",
+                        "receipt_sha256": decision_shard["receipt_sha256"],
+                    }
+                ]
+            ),
+            "exact_disposition_manifest": exact_disposition_manifest,
+            "coverage_complete": True,
+        }
+        finding_ledger_audit = {
+            "manifest": finding_manifest,
+            "source_manifest": finding_manifest,
+            "source_shards": [
+                {
+                    "source_node_id": "source-1",
+                    "manifest": finding_manifest,
+                    "entries": finding_entries,
+                }
+            ],
+            "reconstruction_manifest": reconstruction_manifest,
+            "shards": [
+                {
+                    "manifest": finding_manifest,
+                    "entries": finding_entries,
+                }
+            ],
+            "decision_shards": [decision_shard],
+            "decision_manifest": decision_manifest,
+            "exact_dispositions": exact_dispositions,
+            "exact_disposition_manifest": exact_disposition_manifest,
+        }
+        semantic_root = {
+            "node_id": "semantic-root-compact",
+            "level": 2,
+            "source_part_ids": ["part-1"],
+            "source_part_count": 1,
+            "source_part_ids_sha256": "a" * 64,
+            "finding_ledger_manifest": finding_manifest,
+            "source_finding_manifest": finding_manifest,
+            "finding_reconstruction_manifest": reconstruction_manifest,
+            "decision_manifest": decision_manifest,
+            "verdict": "revise",
+            "summary": "Все decision shards проверены; verdict унаследован.",
+            "material_findings": [
+                {
+                    "source_finding_ids": ["ledger-root"],
+                    "statement": "Проверены числовые и качественные выводы.",
+                    "evidence_paths": [],
+                }
+            ],
+            "metric_availability_rows": [metric_row],
+            "violations": [violation],
+        }
+        provider_payload = {
+            "evidence_document": {"report_data": {}},
+            "metric_availability_contract": [],
+            "deterministic_precheck_errors": [],
+        }
+        compact = _semantic_final_user_payload(
+            provider_payload,
+            manifest={
+                "candidate_sha256": "e" * 64,
+                "candidate_utf8_bytes": 1,
+                "record_count": 1,
+                "part_count": 1,
+                "section_count": 0,
+                "action_count": 0,
+                "limitation_count": 0,
+                "record_receipts_sha256": "f" * 64,
+                "part_receipts_sha256": "1" * 64,
+            },
+            receipts=[
+                {
+                    "verdict": "revise",
+                    "violation_count": 1,
+                    "blocking_violation_count": 1,
+                }
+            ],
+            receipts_sha256="2" * 64,
+            verdict_floor="revise",
+            semantic_root=semantic_root,
+            attempt=1,
+            include_exact_ledgers=False,
+        )
+
+        self.assertEqual(compact["semantic_root"]["metric_availability_rows"], [])
+        self.assertEqual(compact["semantic_root"]["violations"], [])
+        self.assertEqual(
+            compact["semantic_root"]["finding_ledger_manifest"],
+            semantic_root["finding_ledger_manifest"],
+        )
+        self.assertEqual(
+            compact["semantic_root"]["decision_manifest"],
+            semantic_root["decision_manifest"],
+        )
+        inherited = _validate_semantic_final_response(
+            {
+                "review": {
+                    "verdict": "revise",
+                    "summary": "Строгий verdict сохранён из decision ledger.",
+                    "violations": [],
+                },
+                "candidate_sha256": "e" * 64,
+                "part_receipts_sha256": "2" * 64,
+                "coverage_complete": True,
+            },
+            candidate_sha256="e" * 64,
+            receipts_sha256="2" * 64,
+            verdict_floor="revise",
+            candidate_report=_candidate("Проверяемый отчёт."),
+            evidence_document={"report_data": {}},
+            semantic_root=semantic_root,
+            finding_ledger_audit=finding_ledger_audit,
+        )
+        self.assertEqual(inherited["verdict"], "revise")
+        tampered_root = dict(semantic_root)
+        tampered_root["violations"] = []
+        with self.assertRaisesRegex(OpenRouterError, "violation union"):
+            _validate_semantic_final_response(
+                {
+                    "review": {
+                        "verdict": "revise",
+                        "summary": "Попытка скрыть локальное нарушение.",
+                        "violations": [],
+                    },
+                    "candidate_sha256": "e" * 64,
+                    "part_receipts_sha256": "2" * 64,
+                    "coverage_complete": True,
+                },
+                candidate_sha256="e" * 64,
+                receipts_sha256="2" * 64,
+                verdict_floor="revise",
+                candidate_report=_candidate("Проверяемый отчёт."),
+                evidence_document={"report_data": {}},
+                semantic_root=tampered_root,
+                finding_ledger_audit=finding_ledger_audit,
+            )
+
+    async def test_reducer_cannot_acknowledge_child_and_drop_its_finding(
+        self,
+    ) -> None:
+        child = {
+            "node_id": "child-1",
+            "level": 0,
+            "source_part_ids": ["part-1"],
+            "verdict": "pass",
+            "material_findings": [
+                {
+                    "report_path": "/summary",
+                    "claim": "Содержательный TAIL_MARKER.",
+                    "interpretation": "Материальный качественный вывод.",
+                    "evidence_paths": [],
+                }
+            ],
+            "metric_availability_rows": [],
+            "violations": [],
+        }
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "omitted, reordered, or duplicated",
+        ):
+            _validate_semantic_reducer_result(
+                {
+                    "source_node_ids": ["child-1"],
+                    "summary": "Узел формально покрыт.",
+                    "material_findings": [],
+                    "global_violations": [],
+                    "verdict": "pass",
+                },
+                children=[child],
+                candidate_report=_candidate("Содержательный TAIL_MARKER."),
+                evidence_document={"report_data": {}},
+            )
+
+    async def test_huge_report_uses_lossless_parts_and_one_receipt_root(
+        self,
+    ) -> None:
+        summary = "Подтверждённый содержательный вывод. " * 1_000
+        payload = {
+            "evidence_document": {"report_data": {}},
+            "model_evidence_context": {"report_data": {}},
+            "metric_availability_contract": [],
+            "candidate_report": _candidate(summary),
+            "deterministic_precheck_errors": [],
+        }
+        observed_cores: dict[str, list[tuple[int, str]]] = {}
+        audit_checkpoint = AsyncMock()
+
+        async def fake_chat(**kwargs: object) -> SimpleNamespace:
+            messages = kwargs["messages"]
+            user_payload = json.loads(messages[1]["content"])
+            if "candidate_part" in user_payload:
+                part = user_payload["candidate_part"]
+                core = part["context_text"][
+                    part["core_start_in_context"] : part["core_end_in_context"]
+                ]
+                observed_cores.setdefault(part["report_path"], []).append(
+                    (part["unit_index"], core)
+                )
+                parsed = {
+                    "part_id": part["part_id"],
+                    "source_sha256": part["source_sha256"],
+                    "unit_sha256": part["unit_sha256"],
+                    "review": _pass_review(),
+                    "semantic_receipt": {
+                        "summary": "Фрагмент не содержит противоречий.",
+                        "claims": _part_semantic_claims(part),
+                    },
+                }
+                return SimpleNamespace(
+                    parsed=parsed,
+                    text=json.dumps(parsed, ensure_ascii=False),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                )
+            if "source_nodes" in user_payload:
+                nodes = user_payload["source_nodes"]
+                parsed = {
+                    "source_node_ids": [node["node_id"] for node in nodes],
+                    "summary": _grounded_reducer_summary(user_payload),
+                    "material_findings": _reduced_material_findings(
+                        user_payload
+                    ),
+                    "global_violations": [],
+                    "verdict": "pass",
+                }
+                return SimpleNamespace(
+                    parsed=parsed,
+                    text=json.dumps(parsed, ensure_ascii=False),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                )
+            receipt_manifest = user_payload["audit_receipts_manifest"]
+            candidate_manifest = user_payload["candidate_manifest"]
+            parsed = {
+                "review": {
+                    "verdict": user_payload["global_invariants"][
+                        "verdict_floor"
+                    ],
+                    "summary": "Покрытие подтверждено.",
+                    "violations": [],
+                },
+                "candidate_sha256": candidate_manifest["candidate_sha256"],
+                "part_receipts_sha256": receipt_manifest[
+                    "part_receipts_sha256"
+                ],
+                "coverage_complete": True,
+            }
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
+            )
+
+        with patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 32_000,
+                    "max_completion_tokens": 8_000,
+                }
+            ),
+        ), patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=fake_chat),
+        ) as chat_mock:
+            review, raw_text, usage = await review_final_report_semantics(
+                payload,
+                attempt=1,
+                audit_checkpoint=audit_checkpoint,
+            )
+
+        self.assertEqual(review, _pass_review() | {"summary": "Покрытие подтверждено."})
+        partition = usage["_aiv_semantic_partition"]
+        self.assertGreater(partition["manifest"]["part_count"], 1)
+        self.assertEqual(
+            partition["manifest"]["physical_input_window_utf8_bytes"],
+            23_744,
+        )
+        self.assertGreater(chat_mock.await_count, partition["manifest"]["part_count"])
+        self.assertEqual(audit_checkpoint.await_count, chat_mock.await_count)
+        self.assertEqual(
+            audit_checkpoint.await_args_list[-1].args[0]["kind"],
+            "semantic_receipt_root_accepted",
+        )
+        self.assertTrue(partition["coverage_complete"])
+        self.assertTrue(json.loads(raw_text)["coverage_complete"])
+        self.assertIn(
+            summary,
+            "".join(
+                text
+                for _index, text in sorted(observed_cores["/sections/0"])
+            ),
+        )
+        self.assertTrue(
+            all(
+                call["request_utf8_bytes"] <= 23_744
+                for call in partition["provider_calls"]
+            )
+        )
+
+    async def test_physical_receipts_resume_parts_reducers_and_root_without_post(
+        self,
+    ) -> None:
+        payload = {
+            "evidence_document": {"report_data": {}},
+            "model_evidence_context": {"report_data": {}},
+            "metric_availability_contract": [],
+            "candidate_report": _candidate("Проверяемый вывод. " * 1_000),
+            "deterministic_precheck_errors": [],
+        }
+        lookup_kinds: list[str] = []
+        accepted_events: list[str] = []
+
+        async def checkpoint(event: dict[str, object]) -> None:
+            accepted_events.append(str(event.get("kind") or ""))
+
+        async def lookup(descriptor: dict[str, object]) -> SimpleNamespace:
+            kind = str(descriptor["kind"])
+            lookup_kinds.append(kind)
+            request_payload = descriptor["request_payload"]
+            user_payload = json.loads(
+                request_payload["messages"][1]["content"]
+            )
+            if "candidate_part" in user_payload:
+                part = user_payload["candidate_part"]
+                parsed = {
+                    "part_id": part["part_id"],
+                    "source_sha256": part["source_sha256"],
+                    "unit_sha256": part["unit_sha256"],
+                    "review": _pass_review(),
+                    "semantic_receipt": {
+                        "summary": "Фрагмент проверен по сохранённому ответу.",
+                        "claims": _part_semantic_claims(part),
+                    },
+                }
+            elif "source_nodes" in user_payload:
+                nodes = user_payload["source_nodes"]
+                parsed = {
+                    "source_node_ids": [node["node_id"] for node in nodes],
+                    "summary": _grounded_reducer_summary(user_payload),
+                    "material_findings": _reduced_material_findings(
+                        user_payload
+                    ),
+                    "global_violations": [],
+                    "verdict": "pass",
+                }
+            else:
+                parsed = {
+                    "review": _pass_review()
+                    | {"summary": "Физический root-ответ восстановлен."},
+                    "candidate_sha256": user_payload["candidate_manifest"][
+                        "candidate_sha256"
+                    ],
+                    "part_receipts_sha256": user_payload[
+                        "audit_receipts_manifest"
+                    ]["part_receipts_sha256"],
+                    "coverage_complete": True,
+                }
+            return SimpleNamespace(
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={"prompt_tokens": 17},
+            )
+
+        setattr(checkpoint, "lookup_completed", lookup)
+        with patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 32_000,
+                    "max_completion_tokens": 8_000,
+                }
+            ),
+        ), patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(
+                side_effect=AssertionError("provider POST must not run")
+            ),
+        ) as chat_mock:
+            review, _raw, usage = await review_final_report_semantics(
+                payload,
+                attempt=1,
+                audit_checkpoint=checkpoint,
+            )
+
+        self.assertEqual(review["verdict"], "pass")
+        self.assertEqual(chat_mock.await_count, 0)
+        self.assertTrue(any(kind.startswith("part-") for kind in lookup_kinds))
+        self.assertTrue(
+            any(kind.startswith("reduce-") for kind in lookup_kinds)
+        )
+        self.assertIn("receipt-root", lookup_kinds)
+        self.assertIn("semantic_part_accepted", accepted_events)
+        self.assertIn("semantic_reduce_accepted", accepted_events)
+        self.assertIn("semantic_receipt_root_accepted", accepted_events)
+        self.assertNotIn("prompt_tokens", usage)
+        self.assertTrue(
+            all(
+                str(call["kind"]).endswith("_physical_resumed")
+                for call in usage["_aiv_semantic_partition"][
+                    "provider_calls"
+                ]
+            )
+        )
+
+    async def test_global_root_detects_cross_field_unknown_as_zero(self) -> None:
+        candidate = _candidate("Фоновый проверяемый контекст. " * 1_000)
+        candidate["sections"] = [
+            {
+                "heading": "Метрика равна 0%.",
+                "body": "Состояние этой метрики — unknown.",
+            }
+        ]
+        metric_row = {
+            "path": "/report_data/metric",
+            "available": False,
+            "signals": {
+                "data_state": "unavailable",
+                "state": "unknown",
+                "score": None,
+                "valid_answers": 0,
+            },
+        }
+        evidence = {
+            "report_data": {
+                "metric": {
+                    "data_state": "unavailable",
+                    "state": "unknown",
+                    "score": None,
+                    "valid_answers": 0,
+                }
+            },
+            "metric_availability_contract": [metric_row],
+        }
+        payload = {
+            "evidence_document": evidence,
+            "model_evidence_context": evidence,
+            "metric_availability_contract": [metric_row],
+            "candidate_report": candidate,
+            "deterministic_precheck_errors": [],
+        }
+        global_violation = {
+            "code": "missing_data_as_zero",
+            "severity": "critical",
+            "report_path": "/sections/0/heading",
+            "claim": "Метрика равна 0%.",
+            "evidence_paths": ["/report_data/metric/data_state"],
+            "finding": "Unknown ошибочно представлен как измеренный ноль.",
+            "repair_instruction": "Заменить ноль явным статусом недоступности.",
+        }
+        exact_metric_row_seen = False
+        exact_metric_row_reached_final = False
+
+        async def fake_chat(**kwargs: object) -> SimpleNamespace:
+            nonlocal exact_metric_row_reached_final, exact_metric_row_seen
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            if "candidate_part" in user_payload:
+                part = user_payload["candidate_part"]
+                claims = _part_semantic_claims(part)
+                for claim_record in claims:
+                    if str(claim_record["report_path"]).startswith(
+                        "/sections/0/"
+                    ):
+                        claim_record["evidence_paths"] = [
+                            "/report_data/metric/data_state"
+                        ]
+                        claim_record["interpretation"] = (
+                            "Сопоставление статуса и опубликованного значения."
+                        )
+                parsed = {
+                    "part_id": part["part_id"],
+                    "source_sha256": part["source_sha256"],
+                    "unit_sha256": part["unit_sha256"],
+                    "review": _pass_review(),
+                    "semantic_receipt": {
+                        "summary": "Проверен смысл связанного контейнера.",
+                        "claims": claims,
+                    },
+                }
+            elif "source_nodes" in user_payload:
+                nodes = user_payload["source_nodes"]
+                serialized = json.dumps(nodes, ensure_ascii=False)
+                exact_metric_row_seen = exact_metric_row_seen or (
+                    '"data_state": "unavailable"' in serialized
+                    and '"available": false' in serialized
+                )
+                has_conflict = (
+                    "Метрика равна 0%." in serialized
+                    and "unknown" in serialized
+                    and '"data_state": "unavailable"' in serialized
+                ) or (
+                    "missing_data_as_zero" in serialized
+                    and "/report_data/metric/data_state" in serialized
+                )
+                violations = [global_violation] if has_conflict else []
+                parsed = {
+                    "source_node_ids": [node["node_id"] for node in nodes],
+                    "summary": _grounded_reducer_summary(user_payload),
+                    "material_findings": _reduced_material_findings(
+                        user_payload
+                    ),
+                    "global_violations": violations,
+                    "verdict": (
+                        "revise"
+                        if violations
+                        or any(node["verdict"] != "pass" for node in nodes)
+                        else "pass"
+                    ),
+                }
+            else:
+                semantic_root = user_payload["semantic_root"]
+                exact_metric_row_reached_final = metric_row in semantic_root[
+                    "metric_availability_rows"
+                ]
+                receipt_manifest = user_payload["audit_receipts_manifest"]
+                candidate_manifest = user_payload["candidate_manifest"]
+                parsed = {
+                    "review": {
+                        "verdict": "revise",
+                        "summary": "Финальный арбитр сохранил строгий verdict.",
+                        # The provider deliberately omits the exact local
+                        # violation. Code must re-open the sealed ledger and
+                        # put it back into the publication review.
+                        "violations": [],
+                    },
+                    "candidate_sha256": candidate_manifest[
+                        "candidate_sha256"
+                    ],
+                    "part_receipts_sha256": receipt_manifest[
+                        "part_receipts_sha256"
+                    ],
+                    "coverage_complete": True,
+                }
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={},
+            )
+
+        with patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 32_000,
+                    "max_completion_tokens": 8_000,
+                }
+            ),
+        ), patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=fake_chat),
+        ):
+            review, _raw_text, _usage = await review_final_report_semantics(
+                payload,
+                attempt=1,
+            )
+
+        self.assertEqual(review["verdict"], "revise")
+        self.assertTrue(
+            any(
+                item["code"] == "missing_data_as_zero"
+                for item in review["violations"]
+            )
+        )
+        self.assertTrue(exact_metric_row_seen)
+        self.assertTrue(exact_metric_row_reached_final)
+
+    async def test_mid_run_failure_resumes_without_rebilling_accepted_part(
+        self,
+    ) -> None:
+        payload = {
+            "evidence_document": {"report_data": {}},
+            "model_evidence_context": {"report_data": {}},
+            "metric_availability_contract": [],
+            "candidate_report": _candidate("Длинный отчёт. " * 1_000),
+            "deterministic_precheck_errors": [],
+        }
+        checkpoint = AsyncMock()
+        physical_call = 0
+
+        def part_result(part: dict[str, object]) -> SimpleNamespace:
+            parsed = {
+                "part_id": part["part_id"],
+                "source_sha256": part["source_sha256"],
+                "unit_sha256": part["unit_sha256"],
+                "review": _pass_review(),
+                "semantic_receipt": {
+                    "summary": "Фрагмент проверен.",
+                    "claims": _part_semantic_claims(part),
+                },
+            }
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={"prompt_tokens": 1},
+            )
+
+        async def fail_second_part(**kwargs: object) -> SimpleNamespace:
+            nonlocal physical_call
+            physical_call += 1
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            if physical_call == 2:
+                error = OpenRouterError("provider interrupted")
+                error.result = SimpleNamespace(
+                    text="failed-raw",
+                    usage={"prompt_tokens": 2},
+                )
+                raise error
+            return part_result(user_payload["candidate_part"])
+
+        envelope = {
+            "context_length": 32_000,
+            "max_completion_tokens": 8_000,
+        }
+        with patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(return_value=envelope),
+        ), patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=fail_second_part),
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError, "provider interrupted"
+            ) as failure:
+                await review_final_report_semantics(
+                    payload,
+                    attempt=1,
+                    audit_checkpoint=checkpoint,
+                )
+
+        prefix = failure.exception.result.usage[
+            "_aiv_semantic_partition_failure_prefix"
+        ]
+        self.assertEqual(prefix["accepted_call_count"], 1)
+        accepted = [
+            call.args[0]
+            for call in checkpoint.await_args_list
+            if call.args[0]["kind"] == "semantic_part_accepted"
+        ]
+        self.assertEqual(len(accepted), 1)
+        resume_checkpoint = {
+            "version": accepted[0]["version"],
+            "candidate_sha256": accepted[0]["candidate_sha256"],
+            "source_part_receipts_sha256": accepted[0][
+                "source_part_receipts_sha256"
+            ],
+            "accepted_parts": accepted,
+        }
+
+        async def finish_chat(**kwargs: object) -> SimpleNamespace:
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            if "candidate_part" in user_payload:
+                return part_result(user_payload["candidate_part"])
+            if "source_nodes" in user_payload:
+                nodes = user_payload["source_nodes"]
+                parsed = {
+                    "source_node_ids": [node["node_id"] for node in nodes],
+                    "summary": _grounded_reducer_summary(user_payload),
+                    "material_findings": _reduced_material_findings(
+                        user_payload
+                    ),
+                    "global_violations": [],
+                    "verdict": "pass",
+                }
+            else:
+                parsed = {
+                    "review": _pass_review(),
+                    "candidate_sha256": user_payload["candidate_manifest"][
+                        "candidate_sha256"
+                    ],
+                    "part_receipts_sha256": user_payload[
+                        "audit_receipts_manifest"
+                    ]["part_receipts_sha256"],
+                    "coverage_complete": True,
+                }
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={"prompt_tokens": 1},
+            )
+
+        with patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(return_value=envelope),
+        ), patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=finish_chat),
+        ) as resumed_chat:
+            review, _raw, usage = await review_final_report_semantics(
+                payload,
+                attempt=1,
+                resume_checkpoint=resume_checkpoint,
+            )
+
+        self.assertEqual(review["verdict"], "pass")
+        provider_calls = usage["_aiv_semantic_partition"]["provider_calls"]
+        self.assertEqual(provider_calls[0]["kind"], "part_resumed")
+        self.assertEqual(resumed_chat.await_count, len(provider_calls) - 1)
+        self.assertEqual(usage["prompt_tokens"], len(provider_calls) - 1)
+
     async def test_semantic_reviewer_has_bounded_nontruncating_contract(
         self,
     ) -> None:
@@ -1622,18 +3311,30 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
             text="{}",
             usage={},
         )
+        checkpoint = AsyncMock()
         with patch(
             "app.services.report_semantic_gate.chat",
             new=AsyncMock(return_value=response),
-        ) as chat_mock:
+        ) as chat_mock, patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 1_000_000,
+                    "max_completion_tokens": 100_000,
+                }
+            ),
+        ):
             review, _text, _usage = await review_final_report_semantics(
                 {
                     "evidence_document": {"report_data": {}},
+                    "model_evidence_context": {"report_data": {}},
                     "metric_availability_contract": [],
                     "candidate_report": {},
                     "deterministic_precheck_errors": [],
                 },
                 attempt=1,
+                audit_checkpoint=checkpoint,
+                resume_checkpoint={"document_id": "must-not-be-forwarded"},
             )
 
         self.assertEqual(review["verdict"], "pass")
@@ -1642,7 +3343,88 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
             kwargs["reasoning_effort"],
             REPORT_SEMANTIC_REASONING_EFFORT,
         )
-        self.assertEqual(kwargs["max_tokens"], REPORT_SEMANTIC_MAX_TOKENS)
+        self.assertEqual(
+            kwargs["output_token_policy"],
+            OutputTokenPolicy.MODEL_MAX,
+        )
+        self.assertIs(kwargs["retry_response_contract_errors"], False)
+        self.assertIs(kwargs["retry_transport_errors"], False)
+        self.assertNotIn("max_completion_tokens", kwargs)
+        self.assertNotIn("document_id", kwargs)
+        self.assertIs(kwargs["audit_checkpoint"], checkpoint)
+        self.assertEqual(kwargs["audit_context"]["sequence"], 0)
+        self.assertNotIn("resume_checkpoint", kwargs)
+        self.assertNotIn("max_continuations", kwargs)
+
+    async def test_semantic_reviewer_sends_only_bounded_evidence_context(
+        self,
+    ) -> None:
+        response = SimpleNamespace(
+            parsed={
+                "verdict": "pass",
+                "summary": "Смысловых противоречий не найдено.",
+                "violations": [],
+            },
+            text="{}",
+            usage={},
+        )
+        payload = {
+            "evidence_document": {
+                "report_data": {"full_only": "FULL-EVIDENCE-SENTINEL"},
+            },
+            "model_evidence_context": {
+                "evidence_digest": {"bounded": "BOUNDED-CONTEXT-SENTINEL"},
+            },
+            "metric_availability_contract": [],
+            "candidate_report": {},
+            "deterministic_precheck_errors": [],
+        }
+        with patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(return_value=response),
+        ) as chat_mock, patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 1_000_000,
+                    "max_completion_tokens": 100_000,
+                }
+            ),
+        ):
+            review, _text, _usage = await review_final_report_semantics(
+                payload,
+                attempt=1,
+            )
+
+        self.assertEqual(review["verdict"], "pass")
+        provider_user_payload = json.loads(
+            chat_mock.await_args.kwargs["messages"][1]["content"]
+        )
+        serialized = json.dumps(provider_user_payload, ensure_ascii=False)
+        self.assertNotIn("model_evidence_context", provider_user_payload)
+        self.assertNotIn("FULL-EVIDENCE-SENTINEL", serialized)
+        self.assertIn("BOUNDED-CONTEXT-SENTINEL", serialized)
+        self.assertEqual(
+            provider_user_payload["evidence_document"],
+            payload["model_evidence_context"],
+        )
+
+    async def test_semantic_reviewer_rejects_unpreflighted_evidence(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "no preflighted evidence context",
+        ):
+            await review_final_report_semantics(
+                {
+                    "evidence_document": {"report_data": {}},
+                    "metric_availability_contract": [],
+                    "candidate_report": {},
+                    "deterministic_precheck_errors": [],
+                },
+                attempt=1,
+            )
 
     async def test_one_repair_is_reviewed_before_publication(self) -> None:
         rejected = _candidate("Память моделей не знает бренд.")
@@ -1676,7 +3458,7 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as save_artifact,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 side_effect=chat_results,
             ) as final_chat,
@@ -1685,6 +3467,10 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
                 side_effect=[_revise_review(), _pass_review()],
             ) as semantic_review,
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(return_value=repaired),
+            ),
         ):
             result = await _final_report(
                 "run-id",
@@ -1749,7 +3535,7 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as save_artifact,
             patch(
-                "app.services.analyzer.chat",
+                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
                 side_effect=[
                     SimpleNamespace(parsed=rejected, text="one", usage={}),

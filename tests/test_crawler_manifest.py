@@ -59,50 +59,113 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                         run_id=run_id,
                         url=url,
                         page_kind=page_kind,
+                        http_status=200,
+                        main_text="Saved page",
                         text_length=10,
+                        content_signals={
+                            "_body_truncated": False,
+                            "_body_read_policy": {
+                                "version": crawler.BODY_READ_POLICY_VERSION,
+                                "response_size_limit_bytes": None,
+                                "result": "complete_eof",
+                                "terminal": True,
+                            },
+                            "_source_body_sha256": "saved-source",
+                        },
                     )
                 )
             await session.commit()
         return run_id
 
     def _completed_artifact(self, pages: list[tuple[str, str]]) -> RunArtifact:
+        receipt = {
+            "expected_page_count": len(pages),
+            "usable_page_count": len(pages),
+            "pages": [
+                {
+                    "ordinal": ordinal,
+                    "url": url,
+                    "page_kind": page_kind,
+                    "http_status": 200,
+                    "text_length": 10,
+                    "content_sha256": crawler.hashlib.sha256(
+                        b"Saved page"
+                    ).hexdigest(),
+                    "source_body_sha256": "saved-source",
+                    "body_policy_version": crawler.BODY_READ_POLICY_VERSION,
+                    "usable": True,
+                }
+                for ordinal, (url, page_kind) in enumerate(pages)
+            ],
+            "retryable_urls": [],
+            "unusable_urls": [],
+            "legacy_snapshot": False,
+            "complete": True,
+        }
+        receipt["receipt_sha256"] = crawler._json_sha256(receipt)
         return RunArtifact(
             run_id="replaced-by-helper",
             stage_key="site_discovery",
             artifact_key=crawler.SITE_PAGE_MANIFEST_KEY,
             status="completed",
             prompt_version=crawler.SITE_PAGE_MANIFEST_VERSION,
-            input_json={
-                "domain": "example.com",
-                "selection_limit": len(pages),
-            },
+            input_json=crawler._site_page_manifest_input("example.com"),
             output_json={
-                "pages": [
-                    {"url": url, "page_kind": page_kind}
-                    for url, page_kind in pages
-                ],
+                "pages": crawler._selected_page_records(pages),
+                "expected_page_count": len(pages),
                 "discovered_count": len(pages),
+                "discovered_candidate_count": len(pages),
                 "selected_count": len(pages),
-                "selection_limit": len(pages),
+                "selected_pages_sha256": crawler._selected_pages_sha256(pages),
+                "page_scope": crawler.PAGE_SCOPE,
+                "selection_policy": crawler._site_page_manifest_input(
+                    "example.com"
+                )["selection_policy"],
+                "selection_exhausted": True,
+                "verified_exhaustion": len(pages) < crawler.AUDIT_PAGE_MIN,
+                "legacy_snapshot": False,
+                "discovery_state": "complete",
                 "coverage_state": "complete",
+                "site_page_receipt": receipt,
             },
         )
 
     def test_manifest_rejects_pages_from_another_domain(self) -> None:
         manifest = {
             "pages": [
-                {"url": "https://other.example/", "page_kind": "home"},
+                {
+                    "ordinal": 0,
+                    "url": "https://other.example/",
+                    "page_kind": "home",
+                },
             ],
+            "expected_page_count": 1,
             "discovered_count": 1,
+            "discovered_candidate_count": 1,
             "selected_count": 1,
-            "selection_limit": 1,
+            "page_scope": crawler.PAGE_SCOPE,
             "coverage_state": "complete",
         }
         self.assertIsNone(
             crawler._manifest_pages(
                 manifest,
                 domain="example.com",
-                limit=1,
+            )
+        )
+
+    def test_manifest_rejects_legacy_sampled_page_contract(self) -> None:
+        self.assertIsNone(
+            crawler._manifest_pages(
+                {
+                    "pages": [
+                        {"url": "https://example.com/", "page_kind": "home"}
+                    ],
+                    "discovered_count": 20,
+                    "selected_count": 1,
+                    "selection_limit": 6,
+                    "coverage_state": "limited",
+                },
+                domain="example.com",
             )
         )
 
@@ -167,7 +230,6 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             selected = await crawler.discover_site_pages(
                 run_id,
                 "example.com",
-                limit=3,
                 timeout_seconds=5,
                 concurrency=1,
             )
@@ -194,7 +256,6 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             second = await crawler.discover_site_pages(
                 run_id,
                 "example.com",
-                limit=3,
                 timeout_seconds=5,
                 concurrency=1,
             )
@@ -225,7 +286,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
     async def test_absent_incomplete_and_mismatched_manifests_rediscover(
         self,
     ) -> None:
-        exact_input = {"domain": "example.com", "selection_limit": 2}
+        exact_input = crawler._site_page_manifest_input("example.com")
         cases = {
             "absent": None,
             "incomplete": RunArtifact(
@@ -249,7 +310,8 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     "discovered_count": 1,
                     "selected_count": 1,
-                    "selection_limit": 2,
+                    "page_scope": "complete_discovered_frontier_v1",
+                    "semantic_page_count_cap": None,
                     "coverage_state": "complete",
                 },
             ),
@@ -291,6 +353,8 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                         )
                     if url == "https://example.com/sitemap.xml":
                         return _probe(url, status=404), {}, None
+                    if url == "https://example.com/robots.txt":
+                        return _probe(url, status=404), {}, None
                     if url == "https://example.com/services":
                         return _probe(url, body="<main>Services</main>"), {}, None
                     self.fail(f"Unexpected URL: {url}")
@@ -312,7 +376,6 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     selected = await crawler.discover_site_pages(
                         run_id,
                         "example.com",
-                        limit=2,
                         timeout_seconds=5,
                         concurrency=1,
                     )
@@ -321,6 +384,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     [call.kwargs["url"] for call in probe_call.await_args_list],
                     [
                         "https://example.com/",
+                        "https://example.com/robots.txt",
                         "https://example.com/sitemap.xml",
                         "https://example.com/services",
                     ],
@@ -332,7 +396,10 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                         ("https://example.com/services", "product"),
                     ],
                 )
-                self.assertEqual(persisted_after_completion, ["completed", "completed"])
+                self.assertEqual(
+                    persisted_after_completion,
+                    ["running", "running"],
+                )
 
                 async with SessionLocal() as session:
                     manifest = (
@@ -351,26 +418,25 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(manifest.input_json, exact_input)
                     self.assertEqual(
-                        manifest.output_json,
-                        {
-                            "pages": [
-                                {
-                                    "url": "https://example.com/",
-                                    "page_kind": "home",
-                                },
-                                {
-                                    "url": "https://example.com/services",
-                                    "page_kind": "product",
-                                },
-                            ],
-                            "discovered_count": None,
-                            "selected_count": 2,
-                            "selection_limit": 2,
-                            "coverage_state": "unknown",
-                        },
+                        manifest.output_json["pages"],
+                        crawler._selected_page_records(selected),
+                    )
+                    self.assertEqual(manifest.output_json["discovered_count"], 2)
+                    self.assertEqual(manifest.output_json["selected_count"], 2)
+                    self.assertEqual(manifest.output_json["page_scope"], crawler.PAGE_SCOPE)
+                    self.assertEqual(manifest.output_json["expected_page_count"], 2)
+                    self.assertEqual(
+                        manifest.output_json["selected_pages_sha256"],
+                        crawler._selected_pages_sha256(selected),
+                    )
+                    self.assertEqual(manifest.output_json["coverage_state"], "bounded")
+                    self.assertFalse(
+                        manifest.output_json["sitemap_discovery"]["complete"]
                     )
 
-    async def test_bounded_urlset_records_limited_discovery_coverage(self) -> None:
+    async def test_urlset_materializes_complete_semantic_frontier_without_cap(
+        self,
+    ) -> None:
         run_id = await self._create_run()
         sitemap = """
             <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
@@ -387,8 +453,14 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 return _probe(url, body="<main>Home</main>"), {}, None
             if url == "https://example.com/sitemap.xml":
                 return _probe(url, body=sitemap), {}, None
-            if url == "https://example.com/services":
-                return _probe(url, body="<main>Services</main>"), {}, None
+            if url == "https://example.com/robots.txt":
+                return _probe(url, status=404), {}, None
+            if url in {
+                "https://example.com/services",
+                "https://example.com/about",
+                "https://example.com/contact",
+            }:
+                return _probe(url, body=f"<main>{url}</main>"), {}, None
             self.fail(f"Unexpected URL: {url}")
 
         with (
@@ -403,7 +475,6 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             selected = await crawler.discover_site_pages(
                 run_id,
                 "example.com",
-                limit=2,
                 timeout_seconds=5,
                 concurrency=1,
             )
@@ -413,6 +484,8 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("https://example.com/", "home"),
                 ("https://example.com/services", "product"),
+                ("https://example.com/about", "about"),
+                ("https://example.com/contact", "contact"),
             ],
         )
         async with SessionLocal() as session:
@@ -426,9 +499,387 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).scalar_one()
         self.assertEqual(manifest.output_json["discovered_count"], 4)
-        self.assertEqual(manifest.output_json["selected_count"], 2)
-        self.assertEqual(manifest.output_json["selection_limit"], 2)
-        self.assertEqual(manifest.output_json["coverage_state"], "limited")
+        self.assertEqual(manifest.output_json["selected_count"], 4)
+        self.assertEqual(manifest.output_json["expected_page_count"], 4)
+        self.assertEqual(manifest.output_json["coverage_state"], "complete")
+
+    def test_sitemap_tail_after_six_hundred_is_considered_for_selection(
+        self,
+    ) -> None:
+        locations = "".join(
+            f"<url><loc>https://example.com/page-{index}</loc></url>"
+            for index in range(600)
+        )
+        sitemap = (
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + locations
+            + "<url><loc>https://example.com/pricing</loc></url></urlset>"
+        )
+        links = crawler._links_from_sitemap(
+            sitemap,
+            "https://example.com/sitemap.xml",
+            "example.com",
+        )
+        self.assertEqual(len(links), 601)
+        self.assertIn("https://example.com/pricing", links)
+        selected = crawler._semantic_frontier_urls(
+            "https://example.com/",
+            links,
+        )
+        self.assertEqual(len(selected), crawler.AUDIT_PAGE_DEFAULT)
+        self.assertEqual(selected[0], ("https://example.com/", "home"))
+        self.assertIn(("https://example.com/pricing", "pricing"), selected)
+
+    async def test_more_than_eight_semantic_pages_are_bounded_in_manifest(
+        self,
+    ) -> None:
+        run_id = await self._create_run()
+        urls = [f"https://example.com/services/{index}" for index in range(18)]
+        sitemap = (
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + "".join(f"<url><loc>{url}</loc></url>" for url in urls)
+            + "</urlset>"
+        )
+
+        async def discovery_probe(**kwargs):
+            url = kwargs["url"]
+            if url == "https://example.com/":
+                return _probe(url, body="<main>Home</main>"), {}, None
+            if url == "https://example.com/robots.txt":
+                return _probe(url, status=404), {}, None
+            if url == "https://example.com/sitemap.xml":
+                return _probe(url, body=sitemap), {}, None
+            if url in urls:
+                return _probe(url, body=f"<main>{url}</main>"), {}, None
+            self.fail(f"Unexpected discovery URL: {url}")
+
+        with (
+            patch.object(
+                crawler,
+                "_probe_with_transport",
+                AsyncMock(side_effect=discovery_probe),
+            ),
+            patch.object(crawler, "update_progress", AsyncMock()),
+            patch.object(crawler.asyncio, "sleep", AsyncMock()),
+        ):
+            selected = await crawler.discover_site_pages(
+                run_id,
+                "example.com",
+                timeout_seconds=5,
+                concurrency=1,
+            )
+
+        self.assertEqual(len(selected), crawler.AUDIT_PAGE_DEFAULT)
+        self.assertEqual(selected[0], ("https://example.com/", "home"))
+        async with SessionLocal() as session:
+            manifest = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                    )
+                )
+            ).scalar_one()
+        self.assertEqual(
+            manifest.output_json["selected_count"],
+            crawler.AUDIT_PAGE_DEFAULT,
+        )
+        self.assertEqual(manifest.output_json["discovered_count"], 19)
+        self.assertEqual(
+            manifest.output_json["selection_policy"]["max_page_count"],
+            crawler.AUDIT_PAGE_HARD_MAX,
+        )
+
+    async def test_sitemap_index_is_walked_once_with_complete_manifest(
+        self,
+    ) -> None:
+        run_id = await self._create_run()
+        root_index = """
+            <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <sitemap><loc>https://example.com/nested.xml</loc></sitemap>
+              <sitemap><loc>https://example.com/nested.xml</loc></sitemap>
+            </sitemapindex>
+        """
+        nested = """
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <url><loc>https://example.com/</loc></url>
+              <url><loc>https://example.com/services</loc></url>
+              <url><loc>https://example.com/about</loc></url>
+            </urlset>
+        """
+
+        async def discovery_probe(**kwargs):
+            url = kwargs["url"]
+            if url == "https://example.com/":
+                return _probe(url, body="<main>Home</main>"), {}, None
+            if url == "https://example.com/sitemap.xml":
+                return _probe(url, body=root_index), {}, None
+            if url == "https://example.com/robots.txt":
+                return _probe(url, status=404), {}, None
+            if url == "https://example.com/nested.xml":
+                return _probe(url, body=nested), {}, None
+            if url == "https://example.com/services":
+                return _probe(url, body="<main>Services</main>"), {}, None
+            if url == "https://example.com/about":
+                return _probe(url, body="<main>About</main>"), {}, None
+            self.fail(f"Unexpected URL: {url}")
+
+        with (
+            patch.object(
+                crawler,
+                "_probe_with_transport",
+                AsyncMock(side_effect=discovery_probe),
+            ) as probe_call,
+            patch.object(crawler, "update_progress", AsyncMock()),
+            patch.object(crawler.asyncio, "sleep", AsyncMock()),
+        ):
+            selected = await crawler.discover_site_pages(
+                run_id,
+                "example.com",
+                timeout_seconds=5,
+                concurrency=1,
+            )
+
+        self.assertEqual(
+            selected,
+            [
+                ("https://example.com/", "home"),
+                ("https://example.com/services", "product"),
+                ("https://example.com/about", "about"),
+            ],
+        )
+        requested = [call.kwargs["url"] for call in probe_call.await_args_list]
+        self.assertEqual(requested.count("https://example.com/nested.xml"), 1)
+        async with SessionLocal() as session:
+            manifest = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                    )
+                )
+            ).scalar_one()
+        sitemap_manifest = manifest.output_json["sitemap_discovery"]
+        self.assertTrue(sitemap_manifest["complete"])
+        self.assertEqual(sitemap_manifest["document_count"], 2)
+        self.assertEqual(sitemap_manifest["candidate_count"], 3)
+        self.assertEqual(manifest.output_json["discovered_count"], 3)
+        self.assertEqual(manifest.output_json["coverage_state"], "complete")
+
+    async def test_incomplete_sitemap_graph_resumes_successful_documents(
+        self,
+    ) -> None:
+        run_id = await self._create_run()
+        root_index = """
+            <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <sitemap><loc>https://example.com/child.xml</loc></sitemap>
+            </sitemapindex>
+        """
+        recovered_child = """
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <url><loc>https://example.com/</loc></url>
+              <url><loc>https://example.com/TAIL_MARKER</loc></url>
+            </urlset>
+        """
+        child_attempts = 0
+
+        async def discovery_probe(**kwargs):
+            nonlocal child_attempts
+            url = kwargs["url"]
+            if url == "https://example.com/":
+                return _probe(url, body="<main>Home</main>"), {}, None
+            if url == "https://example.com/robots.txt":
+                return _probe(url, status=404), {}, None
+            if url == "https://example.com/sitemap.xml":
+                return _probe(url, body=root_index), {}, None
+            if url == "https://example.com/child.xml":
+                child_attempts += 1
+                if child_attempts == 1:
+                    return _probe(url, status=503), {}, None
+                return _probe(url, body=recovered_child), {}, None
+            if url == "https://example.com/TAIL_MARKER":
+                return _probe(url, body="<main>Tail</main>"), {}, None
+            self.fail(f"Unexpected URL: {url}")
+
+        with (
+            patch.object(
+                crawler,
+                "_probe_with_transport",
+                AsyncMock(side_effect=discovery_probe),
+            ) as probe_call,
+            patch.object(crawler, "update_progress", AsyncMock()),
+            patch.object(crawler.asyncio, "sleep", AsyncMock()),
+        ):
+            with self.assertRaises(crawler.SitemapFrontierIncomplete):
+                await crawler.discover_site_pages(
+                    run_id,
+                    "example.com",
+                    timeout_seconds=5,
+                    concurrency=1,
+                )
+
+            async with SessionLocal() as session:
+                partial_artifact = (
+                    await session.execute(
+                        select(RunArtifact).where(
+                            RunArtifact.run_id == run_id,
+                            RunArtifact.artifact_key
+                            == crawler.SITE_PAGE_MANIFEST_KEY,
+                        )
+                    )
+                ).scalar_one()
+                partial_pages = list(
+                    (
+                        await session.execute(
+                            select(SitePage).where(SitePage.run_id == run_id)
+                        )
+                    ).scalars()
+                )
+            self.assertEqual(partial_artifact.status, "running")
+            self.assertTrue(
+                partial_artifact.output_json["sitemap_discovery"]["resume_required"]
+            )
+            self.assertEqual(partial_pages, [])
+
+            second = await crawler.discover_site_pages(
+                run_id,
+                "example.com",
+                timeout_seconds=5,
+                concurrency=1,
+            )
+
+        self.assertEqual(
+            second,
+            [
+                ("https://example.com/", "home"),
+                ("https://example.com/TAIL_MARKER", "other"),
+            ],
+        )
+        requested = [call.kwargs["url"] for call in probe_call.await_args_list]
+        self.assertEqual(requested.count("https://example.com/sitemap.xml"), 1)
+        self.assertEqual(requested.count("https://example.com/child.xml"), 2)
+        async with SessionLocal() as session:
+            artifact = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                    )
+                )
+            ).scalar_one()
+        self.assertEqual(artifact.status, "completed")
+        self.assertTrue(artifact.output_json["sitemap_discovery"]["complete"])
+        self.assertEqual(
+            artifact.output_json["sitemap_discovery"]["candidate_count"],
+            2,
+        )
+
+    async def test_incomplete_frontier_never_reaches_analysis(self) -> None:
+        run_id = await self._create_run()
+        async with SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+            run.status = RunStatus.pending
+            await session.commit()
+
+        with (
+            patch.object(
+                crawler,
+                "discover_site_pages",
+                AsyncMock(
+                    side_effect=crawler.SitemapFrontierIncomplete(
+                        "saved retryable frontier"
+                    )
+                ),
+            ),
+            patch("app.services.analyzer.analyze_run", AsyncMock()) as analyze,
+            patch.object(crawler, "fail_run", AsyncMock()) as fail,
+            patch.object(crawler, "update_progress", AsyncMock()),
+        ):
+            await crawler._run_crawl_impl(run_id)
+
+        analyze.assert_not_awaited()
+        fail.assert_not_awaited()
+        async with SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertEqual(run.status, RunStatus.crawling)
+
+    async def test_robots_advertised_sitemap_replaces_default_fallback(
+        self,
+    ) -> None:
+        run_id = await self._create_run()
+        custom = """
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <url><loc>https://example.com/</loc></url>
+              <url><loc>https://example.com/pricing</loc></url>
+            </urlset>
+        """
+
+        async def discovery_probe(**kwargs):
+            url = kwargs["url"]
+            if url == "https://example.com/":
+                return _probe(url, body="<main>Home</main>"), {}, None
+            if url == "https://example.com/robots.txt":
+                return (
+                    _probe(
+                        url,
+                        body="Sitemap: https://example.com/custom.xml\n",
+                    ),
+                    {},
+                    None,
+                )
+            if url == "https://example.com/custom.xml":
+                return _probe(url, body=custom), {}, None
+            if url == "https://example.com/pricing":
+                return _probe(url, body="<main>Pricing</main>"), {}, None
+            self.fail(f"Unexpected URL: {url}")
+
+        with (
+            patch.object(
+                crawler,
+                "_probe_with_transport",
+                AsyncMock(side_effect=discovery_probe),
+            ) as probe_call,
+            patch.object(crawler, "update_progress", AsyncMock()),
+            patch.object(crawler.asyncio, "sleep", AsyncMock()),
+        ):
+            selected = await crawler.discover_site_pages(
+                run_id,
+                "example.com",
+                timeout_seconds=5,
+                concurrency=1,
+            )
+
+        self.assertEqual(
+            selected,
+            [
+                ("https://example.com/", "home"),
+                ("https://example.com/pricing", "pricing"),
+            ],
+        )
+        requested = [call.kwargs["url"] for call in probe_call.await_args_list]
+        self.assertIn("https://example.com/custom.xml", requested)
+        self.assertNotIn("https://example.com/sitemap.xml", requested)
+        async with SessionLocal() as session:
+            artifact = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                    )
+                )
+            ).scalar_one()
+        robots_manifest = artifact.output_json["robots_sitemap_discovery"]
+        self.assertEqual(robots_manifest["advertised_sitemap_count"], 1)
+        self.assertFalse(robots_manifest["used_default_sitemap"])
+        self.assertTrue(artifact.output_json["sitemap_discovery"]["complete"])
 
     async def test_completed_keys_retry_latest_transient_and_5xx_results(
         self,
@@ -451,6 +902,14 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 probe_type=ProbeType.main_page,
                 http_status=status,
                 error_class=error_class,
+                content_signals={
+                    "_body_read_policy": {
+                        "version": crawler.BODY_READ_POLICY_VERSION,
+                        "response_size_limit_bytes": None,
+                        "result": "complete_eof",
+                        "terminal": True,
+                    }
+                },
                 challenge_detected=False,
                 body_looks_empty=True,
             )

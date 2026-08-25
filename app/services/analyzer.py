@@ -14,11 +14,14 @@ import json
 import logging
 import math
 import re
+import time
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -43,23 +46,67 @@ from app.models import (
     VisibilityPrompt,
 )
 from app.services.openrouter import (
+    PHYSICAL_POST_AUDIT_VERSION,
     WEB_ATTESTATION_VERSION,
+    ChatResult,
     ImageResult,
     OpenRouterError,
     OpenRouterOutputLimitError,
     OpenRouterPolicyError,
     OpenRouterResponseContractError,
+    OpenRouterStructuredContinuationError,
+    OutputTokenPolicy,
     PanelModel,
     WebSearchPolicy,
+    _apply_model_output_headroom,
+    _non_citing_providers,
     chat,
+    chat_continuable_structured,
     generate_image,
+    model_output_envelope,
     panel_models,
+    restore_completed_chat_provider_event,
     web_request_policy,
 )
+from app.services.structured_audit_store import (
+    load_structured_checkpoint,
+    structured_audit_checkpoint,
+)
+from app.services.claim_ledger import (
+    SourceClaim,
+    build_claim_ledger,
+    reconstruct_claim_ledger,
+    validate_claim_coverage,
+)
+from app.services.fact_binding import (
+    AtomicFactBinding,
+    FactBindingError,
+    extract_fact_bindings,
+)
+from app.services.long_response import (
+    DEFAULT_CONTEXT_OVERLAP_CHARS,
+    DEFAULT_STRUCTURED_CONTINUATION_OVERLAP_CHARS,
+    LONG_RESPONSE_HARNESS_VERSION,
+    ResponseMode,
+    partition_text_records,
+    split_lossless_text,
+    text_sha256,
+)
+from app.services.sharded_artifact_store import (
+    create_sharded_artifact_store,
+)
+from app.services.sharded_document import (
+    GeneratedShard,
+    ShardComposability,
+    ShardRequest,
+    ShardSpec,
+    build_shard_plan,
+    compose_sharded_document,
+)
 from app.services.analysis_critic import (
+    CRITIC_CALL_AUDIT_VERSION,
     CRITIC_MODEL,
-    CRITIC_PRIMARY_MAX_RAW_ANSWERS,
-    CRITIC_PRIMARY_RAW_CHAR_BUDGET,
+    CRITIC_TRANSPORT_CONTRACT_VERSION,
     CRITIC_VERSION,
     MAX_CRITIC_RECOVERY_FINAL_REVIEWS,
     MAX_CRITIC_ITERATIONS,
@@ -72,12 +119,45 @@ from app.services.report_semantic_gate import (
     MAX_FINAL_REPORT_REPAIRS,
     REPORT_SEMANTIC_GATE_VERSION,
     REPORT_SEMANTIC_MODEL,
+    REPORT_SEMANTIC_PARTITION_VERSION,
+    REPORT_SEMANTIC_REVIEW_SYSTEM,
     deterministic_report_semantic_errors,
     metric_availability_contract,
     normalize_report_semantic_review,
     report_semantic_blockers,
     review_final_report_semantics,
+    semantic_provider_request_utf8_bytes,
     validate_report_semantic_review,
+)
+from app.services.report_editor import (
+    EDITOR_CRITIC_POLICY,
+    EDITOR_CRITIC_SCHEMA,
+    EDITOR_UNIT_SCHEMA,
+    EDITORIAL_POLICY,
+    REPORT_EDITOR_HARNESS_VERSION,
+    REPORT_EDITOR_POLICY_VERSION,
+    edit_report,
+    technical_review_narrative_paths,
+)
+from app.services.offer_catalog import (
+    AnswerSetReceipt,
+    ClusterExclusion,
+    IntentPrompt,
+    OfferCatalog,
+    OfferCatalogError,
+    OfferCluster,
+    PromptFoundation,
+    ResumeCompatibilityError,
+    SourceUnit,
+    artifact_digest as offer_artifact_digest,
+    build_answer_set_receipt,
+    build_domain_research_payload,
+    build_offer_catalog,
+    build_offer_clusters,
+    build_prompt_foundation,
+    build_upstream_artifact_digests,
+    normalize_offer_candidates_against_sources,
+    validate_resume_compatibility,
 )
 from app.services.recovery_orchestrator import (
     ACTION_DETERMINISTIC_FALLBACK,
@@ -106,41 +186,116 @@ from app.services.run_lease import (
     assert_run_lease,
     lease_owner_for,
 )
+from app.services.run_coordinator import SAVED_ANSWERS_ONLY_MARKER_KEY
 from app.services.site_preview import get_saved_site_preview
+from app.services.crawler import (
+    CrawlAdmissionIncomplete,
+    PAGE_SCOPE,
+    SITE_PAGE_MANIFEST_KEY,
+    SITE_PAGE_MANIFEST_VERSION,
+    bootstrap_legacy_crawl_admission,
+    require_crawl_admission,
+    validated_site_page_manifest_output,
+)
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
-MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v2"
-PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v4"
+SITE_PROFILE_VERSION = f"{PROMPT_VERSION}-site-profile-v5"
+OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v1"
+PROMPT_FOUNDATION_PIPELINE_VERSION = f"{PROMPT_VERSION}-prompt-foundation-v1"
+ANSWER_SET_RECEIPT_PIPELINE_VERSION = f"{PROMPT_VERSION}-answer-receipt-v1"
+LEGACY_FOUNDATION_AUDIT_VERSION = f"{PROMPT_VERSION}-legacy-foundation-v1"
+MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v7"
+PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v5"
 PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v5"
 PROMPT_GENERATOR_MAX_ATTEMPTS = 4
 PROMPT_CANDIDATE_ARTIFACT_PREFIX = "prompt_set_candidate_"
-PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
+PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v3"
+BOUNDED_PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
 LEGACY_PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v1"
-PANEL_DEFAULT_MAX_TOKENS = 3_200
-PANEL_RETRY_MAX_TOKENS = 6_400
-PANEL_MAX_TOKENS_ALLOWLIST = frozenset(
-    {PANEL_DEFAULT_MAX_TOKENS, PANEL_RETRY_MAX_TOKENS}
+LEGACY_PANEL_DEFAULT_MAX_TOKENS = 3_200
+LEGACY_PANEL_RETRY_MAX_TOKENS = 6_400
+LEGACY_PANEL_MAX_TOKENS_ALLOWLIST = frozenset(
+    {LEGACY_PANEL_DEFAULT_MAX_TOKENS, LEGACY_PANEL_RETRY_MAX_TOKENS}
 )
+PANEL_OUTPUT_POLICY = "single_turn_model_max_available_v1"
 PANEL_RETRY_PROVENANCE_VERSION = "aiv-panel-retry-v1"
-PANEL_ATTEMPT_AUDIT_VERSION = "aiv-panel-attempt-v1"
+PANEL_ATTEMPT_AUDIT_VERSION = "aiv-panel-attempt-v3"
 PANEL_ATTEMPT_ARTIFACT_PREFIX = "panel_attempt_"
-ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
-ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v8"
-ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v16"
-METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v18"
+ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v9"
+ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v11"
+CORE_UNIT_DECISION_LEDGER_VERSION = "aiv-core-unit-decision-ledger-v1"
+ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v18"
+METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v20"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
-FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v17"
-FINAL_CORPUS_MANIFEST_VERSION = f"{PROMPT_VERSION}-final-corpus-v3"
-FINAL_CONTEXT_SELECTION_VERSION = f"{PROMPT_VERSION}-final-selection-v4"
-FINAL_CONTEXT_MAX_ANSWERS = 12
-FINAL_REPAIR_TOKEN_RESERVE = 45_000
+FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v28"
+FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v2"
+TECHNICAL_EDITORIAL_VERSION = f"{TECHNICAL_REVIEW_VERSION}-ru-editor-v2"
+FINAL_REPORT_SHARD_PLAN_VERSION = "aiv-final-report-shards-v5"
+FINAL_REPORT_SHARD_MERGE_VERSION = "aiv-final-report-merge-v5"
+FINAL_CORPUS_MANIFEST_VERSION = f"{PROMPT_VERSION}-final-corpus-v4"
+FINAL_CONTEXT_SELECTION_VERSION = f"{PROMPT_VERSION}-final-context-v5"
+# Compatibility symbol for older imports.  ``None`` is deliberate: the
+# production path supplies the complete attested corpus to the lossless final
+# input harness instead of selecting an arbitrary number of examples.
+FINAL_CONTEXT_MAX_ANSWERS: None = None
 FINAL_REPORT_AUTHOR_ARTIFACT_KEY = "final_report_author_candidate"
 MAX_FINAL_STRUCTURE_REPAIRS = 1
+FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v9"
+FINAL_INPUT_CLAIM_LEDGER_VERSION = "aiv-final-input-claim-ledger-v2"
+FINAL_ANSWER_ACCOUNTING_VERSION = "aiv-final-answer-accounting-v1"
+FINAL_INPUT_ROOT_SUMMARY_VERSION = "aiv-final-input-bounded-root-v3"
+# Per-call working windows.  They trigger more map/reduce leaves; they never
+# cap the source payload or the number of leaves.
+FINAL_INPUT_FALLBACK_WINDOW_BYTES = 192_000
+# Exact UTF-8 admission already assumes the worst case of one byte per token.
+# An extra fixed reserve would be an arbitrary local length ceiling on top of
+# that conservative inequality, so all wrapper/schema overhead is measured
+# directly instead.
+FINAL_INPUT_SAFETY_TOKENS = 0
+FINAL_INPUT_MAP_UNIT_CHARS = 32_000
+FINAL_INPUT_REDUCE_FAN_IN = 6
+FINAL_INPUT_CLAIM_FRAGMENT_UTF8_BYTES = 4_096
+FINAL_ANALYSIS_DIMENSIONS = (
+    "technical_access",
+    "prompt_context",
+    "answer_response",
+    "brand_discovery",
+    "portfolio_visibility",
+    "recommendation",
+    "competitor_presence",
+    "brand_knowledge",
+    "web_memory_comparison",
+    "model_comparison",
+    "intent_performance",
+    "citation_evidence",
+    "uncertainty",
+    "action",
+    "context",
+)
+
+# Market-research input limits are provider working windows, never corpus caps.
+# Every site character belongs to one exact source unit and every unit must
+# survive the evidence tree lineage before the final structuring call.
+MARKET_RESEARCH_INPUT_HARNESS_VERSION = "aiv-market-research-evidence-tree-v4"
+MARKET_RESEARCH_WEB_HARNESS_VERSION = "aiv-market-web-retrieval-tree-v5"
+MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION = (
+    "aiv-market-research-structuring-shards-v1"
+)
+MARKET_RESEARCH_FALLBACK_WINDOW_BYTES = 96_000
+MARKET_RESEARCH_SAFETY_TOKENS = 0
+MARKET_RESEARCH_MAP_UNIT_CHARS = 24_000
+MARKET_RESEARCH_REDUCE_FAN_IN = 4
+# Safety bounds apply to independent retry/research branches, never to the
+# number of characters accepted from one provider response.  A limited prefix
+# is preserved verbatim at the terminal depth and remains positive evidence;
+# it is not treated as proof that the missing suffix contains no facts.
+MARKET_RESEARCH_MAX_REFINEMENT_DEPTH = 1
+MARKET_RESEARCH_MAX_WEB_POSTS = 96
 LEGACY_PANEL_EVIDENCE_VERSION = "aiv-legacy-panel-evidence-v2"
 LEGACY_MEMORY_OBSERVATION_REASON = "legacy_memory_request_not_enforced"
 LEGACY_PANEL_MODELS = {
@@ -165,7 +320,7 @@ CANONICAL_INTENT_PROMPT_SET_VERSIONS = {
     f"{PROMPT_VERSION}-intent-v3",
     PROMPT_SET_VERSION,
 }
-ILLUSTRATION_CONCEPTS_VERSION = f"{PROMPT_VERSION}-visual-v13"
+ILLUSTRATION_CONCEPTS_VERSION = f"{PROMPT_VERSION}-visual-v15"
 ILLUSTRATION_COPY_FALLBACK_VERSION = f"{PROMPT_VERSION}-visual-fallback-v1"
 ILLUSTRATION_GENERATION_VERSION = f"{PROMPT_VERSION}-image-gen-v2"
 ILLUSTRATION_QA_VERSION = f"{PROMPT_VERSION}-image-qa-v8"
@@ -179,13 +334,16 @@ ILLUSTRATION_CONCEPT_MODEL = (
 )
 PROCESSING_BATCH_CONCURRENCY = 3
 ANNOTATION_COMPLETION_ATTEMPTS = 2
-ANSWER_ANALYSIS_CHAR_LIMIT = 16_000
-CRITIC_ANSWER_CHAR_LIMIT = 24_000
+# Processing windows. They control one partition, never the amount of source
+# text retained or analysed.
+ANSWER_ANALYSIS_PARTITION_CHARS = 16_000
+CRITIC_EVIDENCE_PARTITION_CHARS = 24_000
 ENTITY_CATALOG_CHUNK_CHAR_LIMIT = 48_000
-ANNOTATION_BATCH_CHAR_LIMIT = 64_000
+ANALYZER_REDUCER_HARNESS_VERSION = "aiv-analyzer-byte-tree-v1"
+ANALYZER_REDUCER_FALLBACK_WINDOW_BYTES = 96_000
+ANALYZER_REDUCER_SAFETY_TOKENS = 0
+ANNOTATION_CONTEXT_HARNESS_VERSION = "aiv-annotation-context-shards-v2"
 _CACHE_UNSET = object()
-SITE_PAGE_MANIFEST_KEY = "site_page_manifest"
-SITE_PAGE_MANIFEST_VERSION = "aiv-2026-07-30-site-page-manifest-v1"
 AI_LABELS = {
     "GPTBot",
     "OAI-SearchBot",
@@ -251,8 +409,12 @@ LIVE_RUSSIAN_RULES = """
 противопоставления вида «это не X, а Y».
 Заголовок должен сообщать конкретный вывод и читаться как законченное
 предложение. Не превращай отчёт в набор слоганов.
-Русская типографика: кавычки «ёлочки», длинное тире, знак №, неразрывные
-пробелы между числом и единицей.
+Убирай мета-повествование о структуре отчёта и очевидные пояснения интерфейса.
+Отделяй наблюдение от вывода и называй источник наблюдения. Не добавляй и не
+усиливай факты ради гладкой формулировки.
+Русская типографика: кавычки «ёлочки», знак №, десятичная запятая и
+неразрывные пробелы между числом и единицей. Не используй длинное тире:
+перестрой фразу, поставь точку, двоеточие или союз по смыслу.
 """.strip()
 
 
@@ -274,6 +436,50 @@ SITE_PROFILE_SCHEMA: dict[str, Any] = {
         "geography": {"type": "array", "items": {"type": "string"}},
         "language": {"type": "string"},
         "positioning": {"type": "string"},
+        "offer_candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "canonical_name": {"type": "string"},
+                    "aliases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["product", "service", "direction"],
+                    },
+                    "source_url": {"type": "string"},
+                    "evidence_excerpt": {"type": "string"},
+                    "source_unit_id": {"type": "string"},
+                    "source_sha256": {"type": "string"},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                    "user_jobs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "commercially_relevant": {"type": "boolean"},
+                },
+                "required": [
+                    "canonical_name",
+                    "aliases",
+                    "kind",
+                    "source_url",
+                    "evidence_excerpt",
+                    "source_unit_id",
+                    "source_sha256",
+                    "confidence",
+                    "user_jobs",
+                    "commercially_relevant",
+                ],
+            },
+        },
         "entity_scope": {
             "type": "array",
             "items": {
@@ -339,11 +545,50 @@ SITE_PROFILE_SCHEMA: dict[str, Any] = {
         "geography",
         "language",
         "positioning",
+        "offer_candidates",
         "entity_scope",
         "evidence",
         "uncertainties",
         "confidence",
     ],
+}
+
+# The public profile/catalog schemas deliberately stay free of transport
+# bookkeeping.  Leaf calls use an internal envelope so every non-overlapping
+# source core receives one explicit, independently verifiable decision before
+# any reducer is allowed to summarize it.
+CORE_UNIT_DISPOSITION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "claim_id": {"type": "string"},
+        "unit_id": {"type": "string"},
+        "core_sha256": {"type": "string"},
+        "disposition": {
+            "type": "string",
+            "enum": ["grounded_fact", "explicit_no_fact"],
+        },
+        "evidence_quote": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": [
+        "claim_id",
+        "unit_id",
+        "core_sha256",
+        "disposition",
+        "evidence_quote",
+        "reason",
+    ],
+}
+
+SITE_PROFILE_LEAF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "profile": SITE_PROFILE_SCHEMA,
+        "core_disposition": CORE_UNIT_DISPOSITION_SCHEMA,
+    },
+    "required": ["profile", "core_disposition"],
 }
 
 MARKET_RESEARCH_SCHEMA: dict[str, Any] = {
@@ -532,6 +777,117 @@ MARKET_RESEARCH_SCHEMA: dict[str, Any] = {
     ],
 }
 
+
+# A market-research structuring shard is independently valid and carries an
+# exact code-owned receipt for every lossless input core it was asked to read.
+# The final MARKET_RESEARCH_SCHEMA document is merged locally from an
+# unbounded number of these bounded shards plus the original evidence ledger;
+# it is never forced through one provider output window.
+MARKET_RESEARCH_STRUCTURING_SHARD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "research": MARKET_RESEARCH_SCHEMA,
+        "unit_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "source_unit_id": {"type": "string"},
+                    "core_sha256": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": ["structured", "uncertain"],
+                    },
+                    "note": {"type": "string"},
+                },
+                "required": [
+                    "source_unit_id",
+                    "core_sha256",
+                    "disposition",
+                    "note",
+                ],
+            },
+        },
+    },
+    "required": ["research", "unit_coverage"],
+}
+
+MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "dimension": {
+                        "type": "string",
+                        "enum": [
+                            "site_confirmed", "market", "topics", "geography",
+                            "audiences", "customer_jobs", "decision_criteria",
+                            "terminology",
+                        ],
+                    },
+                    "claim": {"type": "string"},
+                    "evidence": {"type": "string"},
+                    "source_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "source_unit_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+                "required": [
+                    "dimension", "claim", "evidence", "source_urls",
+                    "source_unit_ids", "confidence",
+                ],
+            },
+        },
+        "uncertainties": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "statement": {"type": "string"},
+                    "source_unit_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["statement", "source_unit_ids"],
+            },
+        },
+        "unit_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "source_unit_id": {"type": "string"},
+                    "state": {
+                        "type": "string",
+                        "enum": ["evidence", "unknown"],
+                    },
+                    "note": {"type": "string"},
+                },
+                "required": ["source_unit_id", "state", "note"],
+            },
+        },
+    },
+    "required": ["findings", "uncertainties", "unit_coverage"],
+}
+
 PROMPT_SET_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -554,6 +910,10 @@ PROMPT_SET_SCHEMA: dict[str, Any] = {
                     "text": {"type": "string"},
                     "rationale": {"type": "string"},
                     "choice_request": {"type": "boolean"},
+                    "supporting_cluster_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                 },
                 "required": [
                     "prompt_key",
@@ -562,11 +922,24 @@ PROMPT_SET_SCHEMA: dict[str, Any] = {
                     "text",
                     "rationale",
                     "choice_request",
+                    "supporting_cluster_ids",
                 ],
             },
-        }
+        },
+        "cluster_exclusions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "cluster_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["cluster_id", "reason"],
+            },
+        },
     },
-    "required": ["prompts"],
+    "required": ["prompts", "cluster_exclusions"],
 }
 
 PROMPT_SET_REVIEW_SCHEMA: dict[str, Any] = {
@@ -740,6 +1113,19 @@ ENTITY_CATALOG_SCHEMA: dict[str, Any] = {
         "uncertainties": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["target_aliases", "entities", "uncertainties"],
+}
+
+ENTITY_CATALOG_LEAF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "catalog": ENTITY_CATALOG_SCHEMA,
+        "core_dispositions": {
+            "type": "array",
+            "items": CORE_UNIT_DISPOSITION_SCHEMA,
+        },
+    },
+    "required": ["catalog", "core_dispositions"],
 }
 
 ANNOTATION_SCHEMA: dict[str, Any] = {
@@ -951,6 +1337,386 @@ FINAL_REPORT_SCHEMA: dict[str, Any] = {
     ],
 }
 
+# A failed monolithic author turn can be decomposed only along code-owned,
+# semantically independent evidence records.  One shard always yields one
+# visible section, while its action and limitation arrays remain uncapped.
+# The complete report is assembled deterministically; the model never sees or
+# rewrites an accumulated output prefix from an earlier shard.
+FINAL_REPORT_SHARD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "source_shard_id": {"type": "string"},
+        "source_sha256": {"type": "string"},
+        "core": {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "headline": {"type": "string"},
+                        "headline_emphasis": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "verdict": {"type": "string"},
+                        "executive_summary": {"type": "string"},
+                    },
+                    "required": [
+                        "headline",
+                        "headline_emphasis",
+                        "verdict",
+                        "executive_summary",
+                    ],
+                },
+            ]
+        },
+        "section": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "heading": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["heading", "body"],
+        },
+        "actions": FINAL_REPORT_SCHEMA["properties"]["actions"],
+        "limitations": FINAL_REPORT_SCHEMA["properties"]["limitations"],
+        "claim_dispositions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "excerpt_sha256": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "material_observation",
+                            "supporting_context",
+                            "explicit_limitation",
+                        ],
+                    },
+                    "evidence_excerpt": {"type": "string"},
+                },
+                "required": [
+                    "claim_id",
+                    "excerpt_sha256",
+                    "disposition",
+                    "evidence_excerpt",
+                ],
+            },
+        },
+        "fact_dispositions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "fact_ref": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "asserted",
+                            "supporting_context",
+                            "explicit_limitation",
+                        ],
+                    },
+                    "assertion": {"type": "string"},
+                },
+                "required": ["fact_ref", "disposition", "assertion"],
+            },
+        },
+    },
+    "required": [
+        "source_shard_id",
+        "source_sha256",
+        "core",
+        "section",
+        "actions",
+        "limitations",
+        "claim_dispositions",
+        "fact_dispositions",
+    ],
+}
+
+FINAL_INPUT_EVIDENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "observations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "technical",
+                            "visibility",
+                            "entity",
+                            "comparison",
+                            "limitation",
+                            "action",
+                            "context",
+                        ],
+                    },
+                    "analysis_dimension": {
+                        "type": "string",
+                        "enum": list(FINAL_ANALYSIS_DIMENSIONS),
+                    },
+                    "domain_context_id": {"type": "string"},
+                    "statement": {"type": "string", "minLength": 1},
+                    "source_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "source_unit_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "source_claim_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "exact_values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "fact_binding_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "evidence_excerpt": {"type": "string"},
+                    "importance": {
+                        "type": "string",
+                        "enum": ["critical", "important", "supporting"],
+                    },
+                },
+                "required": [
+                    "category",
+                    "statement",
+                    "source_paths",
+                    "source_unit_ids",
+                    "source_claim_ids",
+                    "exact_values",
+                    "evidence_excerpt",
+                    "importance",
+                ],
+            },
+        },
+        "uncertainties": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "report_focus": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "unit_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "source_unit_id": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "material_observation",
+                            "supporting_context",
+                            "explicit_uncertainty",
+                        ],
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": [
+                    "source_unit_id",
+                    "disposition",
+                    "rationale",
+                ],
+            },
+        },
+        "claim_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "excerpt_sha256": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "material_observation",
+                            "supporting_context",
+                            "explicit_uncertainty",
+                        ],
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": [
+                    "claim_id",
+                    "excerpt_sha256",
+                    "disposition",
+                    "rationale",
+                ],
+            },
+        },
+    },
+    "required": [
+        "observations",
+        "uncertainties",
+        "report_focus",
+        "unit_coverage",
+        "claim_coverage",
+    ],
+}
+
+# This schema is deliberately node-based rather than source-claim-based.  A
+# leaf call above has already proved exact coverage for every source claim.
+# Higher levels only need to account for their bounded set of immediate child
+# nodes; the immutable artifact chain provides the transitive proof back to
+# the byte-exact claim ledger without copying every descendant id into the
+# root request.
+FINAL_INPUT_ROOT_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "observations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "technical",
+                            "visibility",
+                            "entity",
+                            "comparison",
+                            "limitation",
+                            "action",
+                            "context",
+                        ],
+                    },
+                    "statement": {"type": "string"},
+                    "source_node_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "exact_values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "fact_binding_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "evidence_excerpts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "source_node_id": {"type": "string"},
+                                "excerpt": {"type": "string"},
+                            },
+                            "required": ["source_node_id", "excerpt"],
+                        },
+                    },
+                    "importance": {
+                        "type": "string",
+                        "enum": ["critical", "important", "supporting"],
+                    },
+                },
+                "required": [
+                    "category",
+                    "statement",
+                    "source_node_ids",
+                    "exact_values",
+                    "fact_binding_ids",
+                    "evidence_excerpts",
+                    "importance",
+                ],
+            },
+        },
+        "uncertainties": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "text": {"type": "string"},
+                    "source_node_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["text", "source_node_ids"],
+            },
+        },
+        "report_focus": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "text": {"type": "string"},
+                    "source_node_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["text", "source_node_ids"],
+            },
+        },
+        "node_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "source_node_id": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "material_observation",
+                            "supporting_context",
+                            "explicit_uncertainty",
+                        ],
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": [
+                    "source_node_id",
+                    "disposition",
+                    "rationale",
+                ],
+            },
+        },
+    },
+    "required": [
+        "observations",
+        "uncertainties",
+        "report_focus",
+        "node_coverage",
+    ],
+}
+
 ILLUSTRATION_CONCEPTS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -1142,6 +1908,7 @@ async def _save_artifact(
     usage_json: dict[str, Any] | None = None,
     error_message: str | None = None,
     prompt_version: str = PROMPT_VERSION,
+    preserve_existing_evidence: bool = False,
 ) -> None:
     await assert_run_lease(run_id)
     async with SessionLocal() as session:
@@ -1165,11 +1932,65 @@ async def _save_artifact(
         artifact.model = model
         artifact.prompt_version = prompt_version
         artifact.input_json = input_json
-        artifact.output_json = output_json
-        artifact.raw_text = raw_text
-        artifact.usage_json = usage_json
-        artifact.error_message = error_message[:1000] if error_message else None
+        if not preserve_existing_evidence or output_json is not None:
+            artifact.output_json = output_json
+        if not preserve_existing_evidence or raw_text is not None:
+            artifact.raw_text = raw_text
+        if not preserve_existing_evidence or usage_json is not None:
+            artifact.usage_json = usage_json
+        artifact.error_message = error_message
         await session.commit()
+
+
+async def _durable_structured_transport(
+    run_id: str,
+    *,
+    stage_key: str,
+    owner_artifact_key: str,
+    source_input: dict[str, Any] | list[Any],
+    model: str,
+    owner_prompt_version: str,
+    messages: list[dict[str, Any]],
+    schema_name: str,
+    response_schema: dict[str, Any],
+    document_id: str,
+    reasoning_effort: str,
+    temperature: float,
+    overlap_chars: int = DEFAULT_STRUCTURED_CONTINUATION_OVERLAP_CHARS,
+) -> tuple[Callable[[dict[str, Any]], Any], dict[str, Any] | None]:
+    """Bind a logical structured call to its durable, exact-contract ledger.
+
+    The provider may end any physical response at its own output ceiling.  The
+    application therefore persists every receipt and every accepted fragment
+    before continuing.  On restart the exact model/messages/schema contract is
+    revalidated and the last complete or partial checkpoint is resumed without
+    repeating an already paid POST.
+    """
+
+    checkpoint = structured_audit_checkpoint(
+        run_id,
+        stage_key=stage_key,
+        owner_artifact_key=owner_artifact_key,
+        source_input=source_input,
+        model=model,
+        owner_prompt_version=owner_prompt_version,
+    )
+    resume = await load_structured_checkpoint(
+        run_id,
+        owner_artifact_key=owner_artifact_key,
+        source_input=source_input,
+        model=model,
+        owner_prompt_version=owner_prompt_version,
+        messages=messages,
+        schema_name=schema_name,
+        response_schema=response_schema,
+        document_id=document_id,
+        reasoning_effort=reasoning_effort,
+        temperature=temperature,
+        overlap_chars=overlap_chars,
+        complete=None,
+    )
+    return checkpoint, resume
 
 
 async def _structured_artifact(
@@ -1181,10 +2002,10 @@ async def _structured_artifact(
     schema_name: str,
     system: str,
     user_payload: dict[str, Any] | list[Any],
-    max_tokens: int = 12_000,
     model: str = ANALYSIS_MODEL,
     reasoning_effort: str = "high",
     prompt_version: str = PROMPT_VERSION,
+    continuable: bool = True,
 ) -> dict[str, Any]:
     cached = await _artifact_output(
         run_id,
@@ -1203,23 +2024,66 @@ async def _structured_artifact(
         model=model,
         input_json=user_payload,
         prompt_version=prompt_version,
+        # A retry changes workflow state, not history. Keep the paid raw
+        # response/usage from the previous failed attempt until a new provider
+        # response can replace it.
+        preserve_existing_evidence=True,
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": json.dumps(user_payload, ensure_ascii=False),
+        },
+    ]
+    document_id = (
+        f"{run_id}:{artifact_key}:"
+        f"{_stable_json_sha256(user_payload)[:20]}"
     )
     try:
-        result = await chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": json.dumps(user_payload, ensure_ascii=False),
-                },
-            ],
-            response_schema=schema,
-            schema_name=schema_name,
-            reasoning_effort=reasoning_effort,
-            max_tokens=max_tokens,
-            temperature=0.15,
-        )
+        if continuable:
+            audit_checkpoint, resume_checkpoint = (
+                await _durable_structured_transport(
+                    run_id,
+                    stage_key=stage_key,
+                    owner_artifact_key=artifact_key,
+                    source_input=user_payload,
+                    model=model,
+                    owner_prompt_version=prompt_version,
+                    messages=messages,
+                    schema_name=schema_name,
+                    response_schema=schema,
+                    document_id=document_id,
+                    reasoning_effort=reasoning_effort,
+                    temperature=0.15,
+                )
+            )
+            result = await chat_continuable_structured(
+                model=model,
+                messages=messages,
+                response_schema=schema,
+                schema_name=schema_name,
+                reasoning_effort=reasoning_effort,
+                temperature=0.15,
+                document_id=document_id,
+                audit_checkpoint=audit_checkpoint,
+                resume_checkpoint=resume_checkpoint,
+            )
+        else:
+            # An authoritative verdict is one model decision. Concatenating a
+            # second generation could rewrite that decision, so it remains an
+            # atomic MODEL_MAX response and fails closed if incomplete.
+            result = await chat(
+                model=model,
+                messages=messages,
+                response_schema=schema,
+                schema_name=schema_name,
+                reasoning_effort=reasoning_effort,
+                output_token_policy=OutputTokenPolicy.MODEL_MAX,
+                temperature=0.15,
+                retry_response_contract_errors=False,
+                retry_transport_errors=False,
+            )
         if not isinstance(result.parsed, dict):
             raise OpenRouterError("Structured response is not an object")
         await _save_artifact(
@@ -1270,6 +2134,37 @@ async def _processing_artifact(
     )
 
 
+async def _mark_completed_artifact_contract_failed(
+    run_id: str,
+    *,
+    stage_key: str,
+    artifact_key: str,
+    model: str,
+    input_json: dict[str, Any] | list[Any],
+    prompt_version: str,
+    error: Exception,
+) -> None:
+    """Make a semantically invalid cached result ineligible for reuse.
+
+    The provider receipt/raw output stays attached for audit and crash
+    recovery; only the mutable owner status changes from completed to failed.
+    A subsequent run therefore retries the semantic leaf instead of looping on
+    the same invalid cache entry.
+    """
+
+    await _save_artifact(
+        run_id,
+        stage_key=stage_key,
+        artifact_key=artifact_key,
+        status="failed",
+        model=model,
+        input_json=input_json,
+        error_message=str(error),
+        prompt_version=prompt_version,
+        preserve_existing_evidence=True,
+    )
+
+
 async def _site_context(run_id: str) -> dict[str, Any]:
     async with SessionLocal() as session:
         domain = (
@@ -1286,23 +2181,76 @@ async def _site_context(run_id: str) -> dict[str, Any]:
             .scalars()
             .all()
         )
+        page_manifest_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == "site_page_manifest",
+                )
+            )
+        ).scalar_one_or_none()
+    context_pages: list[dict[str, Any]] = []
+    for page in pages:
+        main_text = page.main_text or ""
+        declared_text_length = (
+            int(page.text_length)
+            if isinstance(page.text_length, int)
+            and not isinstance(page.text_length, bool)
+            and page.text_length >= 0
+            else None
+        )
+        signals = page.content_signals or {}
+        stored_prefix_only = bool(signals.get("_body_truncated")) or (
+            declared_text_length is not None
+            and declared_text_length > len(main_text)
+        )
+        source_unit_id = str(page.url)
+        source_sha256 = text_sha256(main_text)
+        context_pages.append(
+            {
+                "url": page.url,
+                "source_unit_id": source_unit_id,
+                "source_sha256": source_sha256,
+                "page_kind": page.page_kind,
+                "title": page.title,
+                "meta_description": page.meta_description,
+                "main_text": main_text,
+                "text_length": page.text_length,
+                "stored_text_chars": len(main_text),
+                "content_storage_state": (
+                    "prefix_only" if stored_prefix_only else "complete"
+                ),
+                "absence_claims_allowed": not stored_prefix_only,
+                "signals": signals,
+            }
+        )
+    manifest_output = (
+        copy.deepcopy(page_manifest_artifact.output_json)
+        if page_manifest_artifact is not None
+        and page_manifest_artifact.status == "completed"
+        and isinstance(page_manifest_artifact.output_json, dict)
+        else {
+            "version": "aiv-site-page-manifest-derived-v1",
+            "pages": [
+                {
+                    "ordinal": index,
+                    "url": page["url"],
+                    "page_kind": page.get("page_kind"),
+                    "source_sha256": page["source_sha256"],
+                }
+                for index, page in enumerate(context_pages)
+            ],
+            "selected_count": len(context_pages),
+            "derived_from_saved_site_pages": True,
+        }
+    )
     return {
         "requested_site": {
             "domain": domain,
             "url": f"https://{domain}/",
         },
-        "pages": [
-            {
-                "url": page.url,
-                "page_kind": page.page_kind,
-                "title": page.title,
-                "meta_description": page.meta_description,
-                "main_text": (page.main_text or "")[:16_000],
-                "text_length": page.text_length,
-                "signals": page.content_signals or {},
-            }
-            for page in pages
-        ]
+        "pages": context_pages,
+        "selected_pages_manifest": manifest_output,
     }
 
 
@@ -1481,72 +2429,13 @@ def _validated_site_page_manifest(
     *,
     run_domain: str,
 ) -> dict[str, Any] | None:
-    """Accept only a manifest that belongs to the requested run domain."""
+    """Accept only the content-addressed v5 bounded manifest for this domain."""
 
-    if (
-        artifact is None
-        or artifact.status != "completed"
-        or artifact.prompt_version != SITE_PAGE_MANIFEST_VERSION
-        or not isinstance(artifact.input_json, dict)
-        or not isinstance(artifact.output_json, dict)
-    ):
-        return None
-
-    normalized_domain = str(run_domain or "").casefold().removeprefix("www.")
-    input_domain = (
-        str(artifact.input_json.get("domain") or "")
-        .casefold()
-        .removeprefix("www.")
+    return validated_site_page_manifest_output(
+        artifact,
+        domain=run_domain,
+        allow_legacy_snapshot=True,
     )
-    selection_limit = artifact.input_json.get("selection_limit")
-    output = artifact.output_json
-    pages = output.get("pages")
-    if (
-        not normalized_domain
-        or input_domain != normalized_domain
-        or type(selection_limit) is not int
-        or selection_limit < 1
-        or output.get("selection_limit") != selection_limit
-        or not isinstance(pages, list)
-        or not pages
-        or len(pages) > selection_limit
-        or output.get("selected_count") != len(pages)
-    ):
-        return None
-
-    seen: set[str] = set()
-    for index, page in enumerate(pages):
-        if not isinstance(page, dict):
-            return None
-        url = page.get("url")
-        if not isinstance(url, str) or url in seen:
-            return None
-        parsed = urlparse(url)
-        page_domain = (
-            str(parsed.hostname or "").casefold().removeprefix("www.")
-        )
-        if (
-            parsed.scheme not in {"http", "https"}
-            or page_domain != normalized_domain
-            or not isinstance(page.get("page_kind"), str)
-            or (index == 0 and page.get("page_kind") != "home")
-        ):
-            return None
-        seen.add(url)
-
-    discovered = output.get("discovered_count")
-    if discovered is not None and (
-        type(discovered) is not int or discovered < len(pages)
-    ):
-        return None
-    expected_coverage = (
-        "unknown"
-        if discovered is None
-        else ("complete" if len(pages) >= discovered else "limited")
-    )
-    if output.get("coverage_state") != expected_coverage:
-        return None
-    return dict(output)
 
 
 def _checked_pages_label(count: int) -> str:
@@ -1795,6 +2684,18 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
             unknown_checks += page_unknown_checks
         page_signals = page.content_signals or {}
         body_truncated = bool(page_signals.get("_body_truncated"))
+        stored_text_chars = len(page.main_text or "")
+        declared_text_length = (
+            int(page.text_length)
+            if isinstance(page.text_length, int)
+            and not isinstance(page.text_length, bool)
+            and page.text_length >= 0
+            else None
+        )
+        stored_prefix_only = body_truncated or (
+            declared_text_length is not None
+            and declared_text_length > stored_text_chars
+        )
         structured_data_complete = (
             not body_truncated
             and page_signals.get("structured_data_complete") is not False
@@ -1807,6 +2708,11 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
                 "title": page.title or page.url,
                 "http_status": page.http_status,
                 "text_length": page.text_length,
+                "stored_text_chars": stored_text_chars,
+                "content_storage_state": (
+                    "prefix_only" if stored_prefix_only else "complete"
+                ),
+                "absence_claims_allowed": not stored_prefix_only,
                 "render_strategy": (
                     "unknown"
                     if body_truncated
@@ -1818,6 +2724,7 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
                 "body_truncated": body_truncated,
                 "structured_data_complete": structured_data_complete,
                 "structured_data_types": structured_data_types,
+                "jsonld": copy.deepcopy(page_signals.get("jsonld")),
                 "entity_structured_data_types": _entity_structured_data_types(
                     structured_data_types
                 ),
@@ -1910,22 +2817,44 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
     rendering = _rendering_assessment(render_counts)
     render_ratio = rendering["ratio"]
     content_page_count = max(0, len(pages) - utility_pages)
-    structured_known_pages = [
+    stored_prefix_page_count = sum(
+        1
+        for page in page_results
+        if not page.get("is_utility")
+        and page.get("content_storage_state") == "prefix_only"
+    )
+    structured_content_pages = [
         page
         for page in pages
         if not _is_utility_page(page.url, page.page_kind)
-        and not bool((page.content_signals or {}).get("_body_truncated"))
-        and (page.content_signals or {}).get("structured_data_complete") is not False
     ]
-    structured_pages = sum(
-        bool(
-            _entity_structured_data_types(
-                (page.content_signals or {}).get("structured_data_types")
-            )
+    structured_positive_pages = [
+        page
+        for page in structured_content_pages
+        if _entity_structured_data_types(
+            (page.content_signals or {}).get("structured_data_types")
         )
-        for page in structured_known_pages
+    ]
+    structured_positive_object_ids = {
+        id(page) for page in structured_positive_pages
+    }
+    structured_complete_negative_pages = [
+        page
+        for page in structured_content_pages
+        if id(page) not in structured_positive_object_ids
+        and not bool((page.content_signals or {}).get("_body_truncated"))
+        and (
+            (page.content_signals or {}).get("structured_data_complete")
+            is not False
+        )
+    ]
+    # A successfully parsed entity type is positive evidence even when a
+    # different JSON-LD script failed.  Incompleteness only forbids absence
+    # claims; it must not erase a fact already observed in the stored prefix.
+    structured_pages = len(structured_positive_pages)
+    structured_total = (
+        structured_pages + len(structured_complete_negative_pages)
     )
-    structured_total = len(structured_known_pages)
     structured_unknown_pages = max(0, content_page_count - structured_total)
     page_coverage = _technical_page_coverage(content_page_count, manifest)
     structured_ratio = (
@@ -2051,6 +2980,8 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
             "coverage_rate": page_coverage["coverage_rate"],
             "coverage_state": page_coverage["coverage_state"],
             "utility_pages_excluded": utility_pages,
+            "stored_prefix_pages": stored_prefix_page_count,
+            "stored_text_complete": stored_prefix_page_count == 0,
             "passed_checks": passed_checks,
             "total_checks": known_checks,
             "unknown_checks": unknown_checks,
@@ -2196,6 +3127,1184 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
     }
 
 
+_LONG_RESPONSE_LINEAGE_KEY = "_aiv_source_unit_ids"
+_CORE_UNIT_DECISION_SHARDS_KEY = "_aiv_core_unit_decision_shards"
+_CORE_UNIT_DECISION_HEAD_KEY = "_aiv_core_unit_decision_head"
+
+
+def _long_response_leaf(
+    result: dict[str, Any],
+    unit_ids: Iterable[str],
+) -> dict[str, Any]:
+    """Attach code-owned lineage to an LLM result after schema validation."""
+
+    normalized = [str(value) for value in unit_ids if str(value)]
+    if len(normalized) != len(set(normalized)):
+        raise OpenRouterError("Long-response leaf lineage contains duplicates")
+    output = copy.deepcopy(result)
+    output[_LONG_RESPONSE_LINEAGE_KEY] = sorted(normalized)
+    return output
+
+
+def _long_response_lineage(
+    inputs: list[dict[str, Any]],
+    *,
+    expected_unit_ids: Iterable[str] | None = None,
+) -> list[str]:
+    """Union reducer lineage and fail closed on omission or double counting."""
+
+    values: list[str] = []
+    for item in inputs:
+        raw = item.get(_LONG_RESPONSE_LINEAGE_KEY)
+        if not isinstance(raw, list) or any(
+            not isinstance(value, str) or not value for value in raw
+        ):
+            raise OpenRouterError("Long-response reducer input has no lineage")
+        values.extend(raw)
+    duplicates = sorted(
+        value for value, count in Counter(values).items() if count != 1
+    )
+    if duplicates:
+        raise OpenRouterError(
+            "Long-response reducer lineage duplicated units: "
+            + ", ".join(duplicates)
+        )
+    normalized = sorted(values)
+    if expected_unit_ids is not None:
+        expected = sorted(str(value) for value in expected_unit_ids)
+        if normalized != expected:
+            missing = sorted(set(expected) - set(normalized))
+            unexpected = sorted(set(normalized) - set(expected))
+            raise OpenRouterError(
+                "Long-response reducer lineage mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+    return normalized
+
+
+def _model_payload_view(value: dict[str, Any]) -> dict[str, Any]:
+    """Remove only opaque lineage before exposing an analytic object to an LLM.
+
+    The core-unit decision shards intentionally remain visible.  They are
+    bounded leaf receipts, and each reducer must see the exact decisions it is
+    responsible for carrying forward.  If their union no longer fits a model
+    request, the existing byte planner terminates with the deterministic merge
+    instead of silently replacing them with a summary.
+    """
+
+    output = copy.deepcopy(value)
+    output.pop(_LONG_RESPONSE_LINEAGE_KEY, None)
+    return output
+
+
+def _core_unit_claim(item: dict[str, Any]) -> dict[str, Any]:
+    """Create the content-addressed claim for one exact partition core."""
+
+    unit_id = str(item.get("_lr_unit_id") or "")
+    core_text = item.get("_lr_core_text")
+    core_sha256 = str(item.get("_lr_unit_sha256") or "")
+    if not unit_id or not isinstance(core_text, str) or not core_sha256:
+        raise OpenRouterError("Core-unit claim metadata is incomplete")
+    if text_sha256(core_text) != core_sha256:
+        raise OpenRouterError(f"Core-unit source digest mismatch: {unit_id}")
+    identity = {
+        "version": CORE_UNIT_DECISION_LEDGER_VERSION,
+        "unit_id": unit_id,
+        "core_sha256": core_sha256,
+        "core_chars": len(core_text),
+        "core_utf8_bytes": len(core_text.encode("utf-8")),
+        "source_sha256": str(item.get("_lr_source_sha256") or ""),
+        "start_char": int(item.get("_lr_start_char") or 0),
+        "end_char": int(item.get("_lr_end_char") or 0),
+    }
+    return {
+        **identity,
+        "claim_id": f"cuc_{_stable_json_sha256(identity)}",
+        # Kept in the code-owned receipt and in the bounded leaf request.  It
+        # is never copied into an ancestor pointer or cumulative manifest.
+        "core_text": core_text,
+    }
+
+
+def _core_unit_claims(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    claims = [_core_unit_claim(item) for item in items]
+    claim_ids = [str(item["claim_id"]) for item in claims]
+    unit_ids = [str(item["unit_id"]) for item in claims]
+    if len(claim_ids) != len(set(claim_ids)):
+        raise OpenRouterError("Core-unit claim ledger contains duplicate claims")
+    if len(unit_ids) != len(set(unit_ids)):
+        raise OpenRouterError("Core-unit claim ledger contains duplicate units")
+    return claims
+
+
+def _string_leaves(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _string_leaves(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _string_leaves(child)
+
+
+def _site_profile_has_material_fact(profile: dict[str, Any]) -> bool:
+    # A schema-shaped answer such as ``site_type=website, language=ru`` is a
+    # generic summary, not a recovered site identity.  Accept a named brand or
+    # portfolio entity directly; otherwise require at least two independent
+    # substantive dimensions. Evidence/uncertainty text never counts here.
+    if str(profile.get("brand_name") or "").strip():
+        return True
+    if profile.get("products") or profile.get("entity_scope"):
+        return True
+    substantive_fields = (
+        "category",
+        "market",
+        "business_model",
+        "positioning",
+        "brand_aliases",
+        "topics",
+        "audiences",
+        "customer_jobs",
+        "decision_criteria",
+        "geography",
+    )
+    return sum(bool(profile.get(field)) for field in substantive_fields) >= 2
+
+
+def _entity_catalog_has_material_fact(catalog: dict[str, Any]) -> bool:
+    return bool(catalog.get("target_aliases") or catalog.get("entities"))
+
+
+def _specific_no_fact_reason(reason: str) -> bool:
+    normalized = " ".join(reason.casefold().split())
+    generic = {
+        "нет фактов",
+        "факты не найдены",
+        "релевантных фактов нет",
+        "нет релевантных фактов",
+        "no facts",
+        "no relevant facts",
+        "none",
+        "n/a",
+    }
+    words = re.findall(r"[\w-]+", normalized, re.UNICODE)
+    return bool(
+        normalized not in generic
+        and len(normalized) >= 20
+        and len(words) >= 4
+    )
+
+
+def _normalize_core_dispositions(
+    raw_dispositions: Any,
+    *,
+    expected_claims: list[dict[str, Any]],
+    analytic_output: dict[str, Any],
+    output_kind: str,
+) -> list[dict[str, Any]]:
+    """Validate exact per-core coverage and return immutable receipts."""
+
+    if not isinstance(raw_dispositions, list):
+        raise OpenRouterError("Core-unit dispositions are missing")
+    if len(raw_dispositions) != len(expected_claims):
+        raise OpenRouterError(
+            "Core-unit disposition count mismatch: "
+            f"expected={len(expected_claims)}, actual={len(raw_dispositions)}"
+        )
+    if output_kind == "site_profile":
+        material = _site_profile_has_material_fact(analytic_output)
+    elif output_kind == "entity_catalog":
+        material = _entity_catalog_has_material_fact(analytic_output)
+    else:
+        raise OpenRouterError(f"Unknown core-unit output kind: {output_kind}")
+    output_strings = list(_string_leaves(analytic_output))
+    normalized: list[dict[str, Any]] = []
+    for position, (raw, claim) in enumerate(
+        zip(raw_dispositions, expected_claims, strict=True)
+    ):
+        if not isinstance(raw, dict):
+            raise OpenRouterError(
+                f"Core-unit disposition {position} is not an object"
+            )
+        for field in ("claim_id", "unit_id", "core_sha256"):
+            if str(raw.get(field) or "") != str(claim.get(field) or ""):
+                raise OpenRouterError(
+                    f"Core-unit disposition identity mismatch at {position}: {field}"
+                )
+        disposition = str(raw.get("disposition") or "")
+        quote = str(raw.get("evidence_quote") or "")
+        reason = str(raw.get("reason") or "").strip()
+        if disposition == "grounded_fact":
+            if not quote.strip():
+                raise OpenRouterError(
+                    f"Grounded core-unit disposition has no quote: {claim['unit_id']}"
+                )
+            if quote not in str(claim.get("core_text") or ""):
+                raise OpenRouterError(
+                    f"Core-unit quote is not an exact core substring: {claim['unit_id']}"
+                )
+            if not material:
+                raise OpenRouterError(
+                    f"Grounded core-unit output is blank: {claim['unit_id']}"
+                )
+            if not any(quote in value for value in output_strings):
+                raise OpenRouterError(
+                    "Grounded core-unit quote is absent from the analytic output: "
+                    + str(claim["unit_id"])
+                )
+            if not reason:
+                raise OpenRouterError(
+                    f"Grounded core-unit disposition has no reason: {claim['unit_id']}"
+                )
+        elif disposition == "explicit_no_fact":
+            if quote:
+                raise OpenRouterError(
+                    f"No-fact core-unit disposition contains a quote: {claim['unit_id']}"
+                )
+            if not _specific_no_fact_reason(reason):
+                raise OpenRouterError(
+                    f"No-fact reason is blank or generic: {claim['unit_id']}"
+                )
+        else:
+            raise OpenRouterError(
+                f"Unknown core-unit disposition: {disposition or '<blank>'}"
+            )
+        claim_receipt = {
+            key: copy.deepcopy(value)
+            for key, value in claim.items()
+            if key != "core_text"
+        }
+        receipt = {
+            "version": CORE_UNIT_DECISION_LEDGER_VERSION,
+            "claim": claim_receipt,
+            "disposition": disposition,
+            "evidence_quote": quote,
+            "evidence_quote_sha256": text_sha256(quote),
+            "reason": reason,
+        }
+        receipt["decision_sha256"] = _stable_json_sha256(receipt)
+        normalized.append(receipt)
+
+    # A one-core site leaf cannot claim that the core has no relevant fact and
+    # simultaneously return a populated profile.  Catalog leaves can contain
+    # several cores, so their shared output may be supported by a sibling core.
+    if (
+        output_kind == "site_profile"
+        and normalized
+        and all(item["disposition"] == "explicit_no_fact" for item in normalized)
+        and material
+    ):
+        raise OpenRouterError("No-fact site-profile leaf returned material claims")
+    if (
+        normalized
+        and all(item["disposition"] == "explicit_no_fact" for item in normalized)
+        and material
+        and output_kind == "entity_catalog"
+    ):
+        raise OpenRouterError("No-fact entity-catalog leaf returned material claims")
+    return normalized
+
+
+def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OpenRouterError("Core-unit decision receipt is not an object")
+    receipt = copy.deepcopy(value)
+    digest = str(receipt.pop("decision_sha256", ""))
+    if not digest or _stable_json_sha256(receipt) != digest:
+        raise OpenRouterError("Core-unit decision receipt digest mismatch")
+    claim = receipt.get("claim")
+    if not isinstance(claim, dict):
+        raise OpenRouterError("Core-unit decision receipt has no claim")
+    identity = {
+        key: claim.get(key)
+        for key in (
+            "version",
+            "unit_id",
+            "core_sha256",
+            "core_chars",
+            "core_utf8_bytes",
+            "source_sha256",
+            "start_char",
+            "end_char",
+        )
+    }
+    if str(claim.get("claim_id") or "") != (
+        f"cuc_{_stable_json_sha256(identity)}"
+    ):
+        raise OpenRouterError("Core-unit decision claim identity mismatch")
+    quote = str(receipt.get("evidence_quote") or "")
+    if text_sha256(quote) != str(receipt.get("evidence_quote_sha256") or ""):
+        raise OpenRouterError("Core-unit decision quote digest mismatch")
+    receipt["decision_sha256"] = digest
+    return receipt
+
+
+def _core_decisions_from_inputs(
+    inputs: list[dict[str, Any]],
+    *,
+    expected_claims: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    for item in inputs:
+        raw = item.get(_CORE_UNIT_DECISION_SHARDS_KEY)
+        if not isinstance(raw, list) or not raw:
+            raise OpenRouterError("Reducer input has no core-unit decisions")
+        receipts.extend(_validate_core_decision_receipt(value) for value in raw)
+    claim_ids = [str(item["claim"].get("claim_id") or "") for item in receipts]
+    unit_ids = [str(item["claim"].get("unit_id") or "") for item in receipts]
+    if len(claim_ids) != len(set(claim_ids)) or len(unit_ids) != len(set(unit_ids)):
+        raise OpenRouterError("Reducer core-unit decisions contain duplicates")
+    if expected_claims is not None:
+        expected_ids = [str(item["claim_id"]) for item in expected_claims]
+        if claim_ids != expected_ids:
+            raise OpenRouterError("Reducer core-unit decision coverage/order mismatch")
+        for receipt, expected in zip(receipts, expected_claims, strict=True):
+            claim = receipt["claim"]
+            for field in (
+                "claim_id",
+                "unit_id",
+                "core_sha256",
+                "core_chars",
+                "core_utf8_bytes",
+                "source_sha256",
+                "start_char",
+                "end_char",
+            ):
+                if claim.get(field) != expected.get(field):
+                    raise OpenRouterError(
+                        f"Reducer core-unit claim mismatch: {field}"
+                    )
+    return receipts
+
+
+def _attach_core_decisions(
+    result: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    unit_ids: Iterable[str],
+) -> dict[str, Any]:
+    output = _long_response_leaf(result, unit_ids)
+    output[_CORE_UNIT_DECISION_SHARDS_KEY] = [
+        _validate_core_decision_receipt(value) for value in receipts
+    ]
+    output[_CORE_UNIT_DECISION_HEAD_KEY] = _core_decision_pointer(receipts)
+    return output
+
+
+def _core_decision_pointer(receipts: list[dict[str, Any]]) -> dict[str, Any]:
+    validated = sorted(
+        (_validate_core_decision_receipt(value) for value in receipts),
+        key=lambda item: str(item["claim"].get("unit_id") or ""),
+    )
+    return {
+        "version": CORE_UNIT_DECISION_LEDGER_VERSION,
+        "decision_count": len(validated),
+        "decision_sha256": _stable_json_sha256(
+            [str(item["decision_sha256"]) for item in validated]
+        ),
+        "unit_ids_sha256": _stable_json_sha256(
+            [str(item["claim"].get("unit_id") or "") for item in validated]
+        ),
+        "first_unit_id": (
+            str(validated[0]["claim"].get("unit_id") or "")
+            if validated
+            else None
+        ),
+        "last_unit_id": (
+            str(validated[-1]["claim"].get("unit_id") or "")
+            if validated
+            else None
+        ),
+    }
+
+
+def _attach_core_decision_head(
+    result: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    unit_ids: Iterable[str],
+) -> dict[str, Any]:
+    """Attach fixed-size provenance to a reducer result.
+
+    Raw immutable receipts remain in their independently persisted leaves.
+    Ancestors carry only a content-addressed head, preventing an O(N) receipt
+    array from becoming a singleton provider payload.
+    """
+
+    output = _long_response_leaf(result, unit_ids)
+    output[_CORE_UNIT_DECISION_HEAD_KEY] = _core_decision_pointer(receipts)
+    return output
+
+
+def _core_decision_index(
+    receipts: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for raw in receipts:
+        receipt = _validate_core_decision_receipt(raw)
+        unit_id = str(receipt["claim"].get("unit_id") or "")
+        if not unit_id or unit_id in index:
+            raise OpenRouterError("Core-unit decision index has duplicate units")
+        index[unit_id] = receipt
+    return index
+
+
+def _core_decisions_for_unit_ids(
+    unit_ids: Iterable[str],
+    decision_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for raw_unit_id in unit_ids:
+        unit_id = str(raw_unit_id)
+        receipt = decision_index.get(unit_id)
+        if receipt is None:
+            raise OpenRouterError(
+                f"Core-unit decision index is missing unit: {unit_id}"
+            )
+        output.append(receipt)
+    return output
+
+
+def _validate_core_decision_item(
+    item: dict[str, Any],
+    decision_index: dict[str, dict[str, Any]],
+) -> None:
+    lineage = _long_response_lineage([item])
+    expected = _core_decisions_for_unit_ids(lineage, decision_index)
+    if item.get(_CORE_UNIT_DECISION_HEAD_KEY) != _core_decision_pointer(expected):
+        raise OpenRouterError("Reducer core-unit decision head mismatch")
+    raw = item.get(_CORE_UNIT_DECISION_SHARDS_KEY)
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise OpenRouterError("Leaf core-unit decision shard is malformed")
+        actual = [_validate_core_decision_receipt(value) for value in raw]
+        actual_by_unit = {
+            str(value["claim"].get("unit_id") or ""): value
+            for value in actual
+        }
+        expected_by_unit = {
+            str(value["claim"].get("unit_id") or ""): value
+            for value in expected
+        }
+        if (
+            len(actual_by_unit) != len(actual)
+            or actual_by_unit != expected_by_unit
+        ):
+            raise OpenRouterError("Leaf core-unit decision shard mismatch")
+
+
+def _preserve_site_profile_core_decisions(
+    profile: dict[str, Any],
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    output = copy.deepcopy(profile)
+    evidence = list(output.get("evidence") or [])
+    for receipt in receipts:
+        if receipt.get("disposition") == "grounded_fact":
+            evidence = _append_unique_strings(
+                evidence,
+                [receipt.get("evidence_quote")],
+            )
+    output["evidence"] = evidence
+    return output
+
+
+def _preserve_entity_catalog_core_decisions(
+    catalog: dict[str, Any],
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    output = copy.deepcopy(catalog)
+    visible_strings = list(_string_leaves(output))
+    uncertainties = list(output.get("uncertainties") or [])
+    for receipt in receipts:
+        if receipt.get("disposition") != "grounded_fact":
+            continue
+        quote = str(receipt.get("evidence_quote") or "")
+        if quote and not any(quote in value for value in visible_strings):
+            unit_id = str(receipt.get("claim", {}).get("unit_id") or "")
+            uncertainties = _append_unique_strings(
+                uncertainties,
+                [f"Доказательство из {unit_id}: {quote}"],
+            )
+            visible_strings.append(quote)
+    output["uncertainties"] = uncertainties
+    return output
+
+
+def _validate_final_core_decisions(
+    output: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    *,
+    output_kind: str,
+) -> None:
+    grounded = [
+        item for item in receipts if item.get("disposition") == "grounded_fact"
+    ]
+    if not grounded:
+        raise OpenRouterError(
+            f"{output_kind} has no grounded core-unit decision"
+        )
+    material = (
+        _site_profile_has_material_fact(output)
+        if output_kind == "site_profile"
+        else _entity_catalog_has_material_fact(output)
+    )
+    if not material:
+        raise OpenRouterError(f"{output_kind} output is blank or generic")
+    visible_strings = list(_string_leaves(output))
+    missing = [
+        str(item.get("claim", {}).get("claim_id") or "")
+        for item in grounded
+        if not any(
+            str(item.get("evidence_quote") or "") in value
+            for value in visible_strings
+        )
+    ]
+    if missing:
+        raise OpenRouterError(
+            f"{output_kind} lost grounded core-unit quotes: "
+            + ", ".join(missing)
+        )
+
+
+def _validate_reducer_core_decisions(
+    output: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    *,
+    output_kind: str,
+    source_inputs: list[dict[str, Any]] | None = None,
+) -> None:
+    """Reject an invented reducer result even before the root is reached."""
+
+    material = (
+        _site_profile_has_material_fact(output)
+        if output_kind == "site_profile"
+        else _entity_catalog_has_material_fact(output)
+    )
+    grounded = any(
+        item.get("disposition") == "grounded_fact" for item in receipts
+    )
+    if grounded and not material:
+        raise OpenRouterError(
+            f"{output_kind} reducer collapsed grounded cores to a blank summary"
+        )
+    if grounded and source_inputs:
+        candidates: list[str] = []
+        if output_kind == "site_profile":
+            for item in source_inputs:
+                candidates = _append_unique_strings(
+                    candidates,
+                    [
+                        item.get("brand_name"),
+                        item.get("category"),
+                        item.get("market"),
+                        item.get("business_model"),
+                        item.get("positioning"),
+                        *list(item.get("brand_aliases") or []),
+                        *list(item.get("topics") or []),
+                        *list(item.get("products") or []),
+                        *list(item.get("audiences") or []),
+                        *list(item.get("customer_jobs") or []),
+                        *list(item.get("decision_criteria") or []),
+                        *[
+                            entity.get("canonical_name")
+                            for entity in (item.get("entity_scope") or [])
+                            if isinstance(entity, dict)
+                        ],
+                    ],
+                )
+        else:
+            for item in source_inputs:
+                candidates = _append_unique_strings(
+                    candidates,
+                    [
+                        *list(item.get("target_aliases") or []),
+                        *[
+                            entity.get("canonical_name")
+                            for entity in (item.get("entities") or [])
+                            if isinstance(entity, dict)
+                        ],
+                    ],
+                )
+        visible = [value.casefold() for value in _string_leaves(output)]
+        if candidates and not any(
+            candidate.casefold() in value
+            for candidate in candidates
+            if len(candidate.strip()) >= 2
+            for value in visible
+        ):
+            raise OpenRouterError(
+                f"{output_kind} reducer returned only a general summary"
+            )
+    if not grounded and material:
+        raise OpenRouterError(
+            f"{output_kind} reducer invented material from no-fact cores"
+        )
+
+
+def _serialized_llm_request_bytes(
+    *,
+    system: str,
+    user_payload: dict[str, Any] | list[Any],
+) -> int:
+    """Measure the complete messages body, including the repeated wrapper."""
+
+    return len(
+        json.dumps(
+            [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        user_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _conservative_model_input_window(
+    envelope: dict[str, Any],
+    *,
+    safety_tokens: int,
+    fallback_window_bytes: int,
+    minimum_input_tokens: int,
+    no_window_error: str,
+    system: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one fail-safe byte contract for every analyzer planner.
+
+    Provider metadata is token-based, while local routing measures the exact
+    serialized UTF-8 request.  We therefore permit at most one serialized
+    byte per residual input token.  This deliberately conservative inequality
+    is model/tokenizer independent and, unlike the former ``tokens * 3``
+    heuristic, cannot admit a request merely because its text is non-ASCII.
+    """
+
+    context_length = envelope.get("context_length")
+    output_maximum = envelope.get("max_completion_tokens")
+    if (
+        isinstance(context_length, int)
+        and not isinstance(context_length, bool)
+        and context_length > 0
+    ):
+        reserved_output = (
+            output_maximum
+            if isinstance(output_maximum, int)
+            and not isinstance(output_maximum, bool)
+            and output_maximum > 0
+            else max(8_192, context_length // 4)
+        )
+        input_tokens = context_length - reserved_output - safety_tokens
+        if input_tokens < minimum_input_tokens:
+            raise OpenRouterError(no_window_error)
+        window_bytes = input_tokens
+        resolution = "openrouter_model_metadata"
+    else:
+        input_tokens = None
+        window_bytes = fallback_window_bytes
+        resolution = "conservative_partition_fallback"
+
+    empty_request_bytes = (
+        _serialized_llm_request_bytes(system=system, user_payload={})
+        if system is not None
+        else None
+    )
+    if empty_request_bytes is not None and empty_request_bytes >= window_bytes:
+        raise OpenRouterError(no_window_error)
+    return {
+        "resolution": resolution,
+        "model_envelope": envelope,
+        "input_token_window": input_tokens,
+        "input_utf8_window": window_bytes,
+        "utf8_preflight_contract": (
+            "exact_serialized_request_utf8_bytes<=residual_input_tokens"
+            if input_tokens is not None
+            else "exact_serialized_request_utf8_bytes<=fallback_byte_window"
+        ),
+        "empty_request_utf8_bytes": empty_request_bytes,
+    }
+
+
+async def _analyzer_model_input_window(
+    model: str,
+    *,
+    system: str,
+) -> dict[str, Any]:
+    """Resolve a whole-message byte window without imposing a corpus limit."""
+
+    envelope = await model_output_envelope(model)
+    resolved = _conservative_model_input_window(
+        envelope,
+        safety_tokens=ANALYZER_REDUCER_SAFETY_TOKENS,
+        fallback_window_bytes=ANALYZER_REDUCER_FALLBACK_WINDOW_BYTES,
+        minimum_input_tokens=256,
+        no_window_error=(
+            f"Model metadata leaves no safe analyzer input window: {model}"
+        ),
+        system=system,
+    )
+    return {
+        **resolved,
+        "version": ANALYZER_REDUCER_HARNESS_VERSION,
+    }
+
+
+def _long_response_lineage_pointer(unit_ids: Iterable[str]) -> dict[str, Any]:
+    values = sorted(str(value) for value in unit_ids if str(value))
+    if len(values) != len(set(values)):
+        raise OpenRouterError("Cannot create a pointer for duplicate unit ids")
+    return {
+        "unit_count": len(values),
+        "unit_ids_sha256": _stable_json_sha256(values),
+        "first_unit_id": values[0] if values else None,
+        "last_unit_id": values[-1] if values else None,
+    }
+
+
+def _long_response_manifest_pointer(
+    manifests: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "manifest_count": len(manifests),
+        "manifests_sha256": _stable_json_sha256(manifests),
+        "document_ids_sha256": _stable_json_sha256(
+            [str(item.get("document_id") or "") for item in manifests]
+        ),
+        "source_chars": sum(
+            int(item.get("source_chars") or item.get("char_count") or 0)
+            for item in manifests
+        ),
+        "unit_count": sum(int(item.get("unit_count") or 0) for item in manifests),
+    }
+
+
+def _byte_bounded_reducer_groups(
+    inputs: list[dict[str, Any]],
+    *,
+    window_bytes: int,
+    request_utf8_bytes: Callable[[list[dict[str, Any]]], int],
+) -> list[list[dict[str, Any]]]:
+    """Greedily pack complete reducer inputs by the full physical POST."""
+
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for item in inputs:
+        candidate = [*current, item]
+        if current and request_utf8_bytes(candidate) > window_bytes:
+            groups.append(current)
+            current = [item]
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _confidence_floor(values: Iterable[Any]) -> str:
+    ranks = {"low": 0, "medium": 1, "high": 2}
+    normalized = [str(value or "").casefold() for value in values]
+    known = [value for value in normalized if value in ranks]
+    return min(known, key=lambda value: ranks[value]) if known else "low"
+
+
+def _deterministic_site_profile_union(
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Losslessly terminate an oversized profile tree without another POST."""
+
+    clean = [_model_payload_view(item) for item in inputs]
+    output: dict[str, Any] = {}
+    uncertainties: list[str] = []
+    scalar_fields = (
+        "brand_name",
+        "site_type",
+        "category",
+        "market",
+        "business_model",
+        "language",
+        "positioning",
+    )
+    for field in scalar_fields:
+        candidates = _append_unique_strings(
+            [],
+            (item.get(field) for item in clean),
+        )
+        output[field] = candidates[0] if candidates else ""
+        if len(candidates) > 1:
+            uncertainties = _append_unique_strings(
+                uncertainties,
+                [
+                    f"Профильные фрагменты дали несколько значений поля "
+                    f"{field}: " + "; ".join(candidates)
+                ],
+            )
+    for field in (
+        "brand_aliases",
+        "topics",
+        "products",
+        "audiences",
+        "customer_jobs",
+        "decision_criteria",
+        "geography",
+        "evidence",
+    ):
+        output[field] = _append_unique_strings(
+            [],
+            (
+                value
+                for item in clean
+                for value in (item.get(field) or [])
+            ),
+        )
+
+    offer_candidates: list[dict[str, Any]] = []
+    seen_offer_candidates: set[str] = set()
+    for item in clean:
+        for raw_candidate in item.get("offer_candidates") or []:
+            if not isinstance(raw_candidate, dict):
+                continue
+            candidate_key = _stable_json_sha256(raw_candidate)
+            if candidate_key in seen_offer_candidates:
+                continue
+            seen_offer_candidates.add(candidate_key)
+            offer_candidates.append(copy.deepcopy(raw_candidate))
+    output["offer_candidates"] = offer_candidates
+
+    entities: list[dict[str, Any]] = []
+    entity_index: dict[str, int] = {}
+    for item in clean:
+        uncertainties = _append_unique_strings(
+            uncertainties,
+            item.get("uncertainties") or [],
+        )
+        for raw_entity in item.get("entity_scope") or []:
+            if not isinstance(raw_entity, dict):
+                continue
+            canonical = str(raw_entity.get("canonical_name") or "").strip()
+            if not canonical:
+                continue
+            key = canonical.casefold()
+            if key not in entity_index:
+                entity_index[key] = len(entities)
+                entities.append(copy.deepcopy(raw_entity))
+                continue
+            entity = entities[entity_index[key]]
+            entity["aliases"] = _append_unique_strings(
+                list(entity.get("aliases") or []),
+                raw_entity.get("aliases") or [],
+            )
+            entity["evidence"] = "\n\n".join(
+                _append_unique_strings(
+                    [],
+                    [entity.get("evidence"), raw_entity.get("evidence")],
+                )
+            )
+            for field in ("entity_type", "relationship"):
+                values = _append_unique_strings(
+                    [],
+                    [entity.get(field), raw_entity.get(field)],
+                )
+                if len(values) > 1:
+                    if field == "relationship":
+                        entity[field] = "unclear"
+                    uncertainties = _append_unique_strings(
+                        uncertainties,
+                        [
+                            f"Сущность «{canonical}» имеет конфликт поля "
+                            f"{field}: " + "; ".join(values)
+                        ],
+                    )
+            entity["commercially_relevant"] = bool(
+                entity.get("commercially_relevant")
+                or raw_entity.get("commercially_relevant")
+            )
+            entity["confidence"] = _confidence_floor(
+                [entity.get("confidence"), raw_entity.get("confidence")]
+            )
+    output["entity_scope"] = entities
+    output["uncertainties"] = uncertainties
+    output["confidence"] = _confidence_floor(
+        item.get("confidence") for item in clean
+    )
+    return output
+
+
+def _deterministic_entity_catalog_union(
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Losslessly terminate an oversized catalog tree without another POST."""
+
+    clean = [_model_payload_view(item) for item in inputs]
+    output: dict[str, Any] = {
+        "target_aliases": _append_unique_strings(
+            [],
+            (
+                value
+                for item in clean
+                for value in (item.get("target_aliases") or [])
+            ),
+        ),
+        "entities": [],
+        "uncertainties": _append_unique_strings(
+            [],
+            (
+                value
+                for item in clean
+                for value in (item.get("uncertainties") or [])
+            ),
+        ),
+    }
+    entity_index: dict[str, int] = {}
+    for item in clean:
+        for raw_entity in item.get("entities") or []:
+            if not isinstance(raw_entity, dict):
+                continue
+            canonical = str(raw_entity.get("canonical_name") or "").strip()
+            if not canonical:
+                continue
+            key = canonical.casefold()
+            if key not in entity_index:
+                entity_index[key] = len(output["entities"])
+                output["entities"].append(copy.deepcopy(raw_entity))
+                continue
+            entity = output["entities"][entity_index[key]]
+            aliases = [
+                *list(entity.get("aliases") or []),
+                *list(raw_entity.get("aliases") or []),
+            ]
+            seen_aliases: set[str] = set()
+            entity["aliases"] = []
+            for alias in aliases:
+                alias_key = _stable_json_sha256(alias)
+                if alias_key in seen_aliases:
+                    continue
+                seen_aliases.add(alias_key)
+                entity["aliases"].append(copy.deepcopy(alias))
+            entity["evidence"] = "\n\n".join(
+                _append_unique_strings(
+                    [],
+                    [entity.get("evidence"), raw_entity.get("evidence")],
+                )
+            )
+            categories = _append_unique_strings(
+                [],
+                [entity.get("category"), raw_entity.get("category")],
+            )
+            relationships = _append_unique_strings(
+                [],
+                [
+                    entity.get("target_relationship"),
+                    raw_entity.get("target_relationship"),
+                ],
+            )
+            if len(categories) > 1:
+                entity["category"] = "other"
+            if len(relationships) > 1:
+                entity["target_relationship"] = "unclear"
+            if len(categories) > 1 or len(relationships) > 1:
+                output["uncertainties"] = _append_unique_strings(
+                    output["uncertainties"],
+                    [
+                        f"Каталожные фрагменты конфликтуют по сущности "
+                        f"«{canonical}»: category={categories}, "
+                        f"target_relationship={relationships}."
+                    ],
+                )
+            entity["commercially_relevant"] = bool(
+                entity.get("commercially_relevant")
+                or raw_entity.get("commercially_relevant")
+            )
+            if "requires_target_attribution" in {
+                entity.get("mention_policy"),
+                raw_entity.get("mention_policy"),
+            }:
+                entity["mention_policy"] = "requires_target_attribution"
+    return output
+
+
+def _append_unique_strings(target: list[Any], values: Iterable[Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            text
+            for value in [*target, *values]
+            if (text := str(value or "").strip())
+        )
+    )
+
+
+def _preserve_site_profile_reduction(
+    merged: dict[str, Any],
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prevent a hierarchical profile reducer from silently dropping facts."""
+
+    output = copy.deepcopy(merged)
+    # Leaf models may themselves be wrong.  Never re-promote a candidate that
+    # the global reducer deliberately rejected.  Preserve every dropped
+    # candidate as an explicit uncertainty instead of losing it silently or
+    # turning it into an active product/alias.
+    uncertainties = _append_unique_strings(
+        list(output.get("uncertainties") or []),
+        (
+            value
+            for item in inputs
+            for value in (item.get("uncertainties") or [])
+        ),
+    )
+    for field in (
+        "brand_aliases",
+        "topics",
+        "products",
+        "audiences",
+        "customer_jobs",
+        "decision_criteria",
+        "geography",
+    ):
+        retained = {
+            str(value or "").strip().casefold()
+            for value in output.get(field) or []
+            if str(value or "").strip()
+        }
+        for item in inputs:
+            for raw_value in item.get(field) or []:
+                value = str(raw_value or "").strip()
+                if value and value.casefold() not in retained:
+                    uncertainties = _append_unique_strings(
+                        uncertainties,
+                        [
+                            "Промежуточный профиль содержал кандидат "
+                            f"«{value}» в поле {field}, но итоговый "
+                            "редьюсер его не подтвердил."
+                        ],
+                    )
+
+    scope = [item for item in output.get("entity_scope") or [] if isinstance(item, dict)]
+    names = {
+        str(item.get("canonical_name") or "").strip().casefold()
+        for item in scope
+        if str(item.get("canonical_name") or "").strip()
+    }
+    for partial in inputs:
+        for entity in partial.get("entity_scope") or []:
+            if not isinstance(entity, dict):
+                continue
+            name = str(entity.get("canonical_name") or "").strip()
+            if name and name.casefold() not in names:
+                uncertainties = _append_unique_strings(
+                    uncertainties,
+                    [
+                        "Промежуточный профиль содержал сущность "
+                        f"«{name}», но итоговый редьюсер её не подтвердил."
+                    ],
+                )
+    output["uncertainties"] = uncertainties
+    return output
+
+
+def _entity_alias_values(entity: dict[str, Any]) -> list[str]:
+    values = [str(entity.get("canonical_name") or "").strip()]
+    for alias in entity.get("aliases") or []:
+        value = (
+            str(alias.get("value") or "").strip()
+            if isinstance(alias, dict)
+            else str(alias or "").strip()
+        )
+        if value:
+            values.append(value)
+    return [value for value in values if value]
+
+
+def _preserve_entity_catalog_reduction(
+    merged: dict[str, Any],
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Expose reducer omissions without promoting unconfirmed leaf candidates."""
+
+    output = copy.deepcopy(merged)
+    uncertainties = _append_unique_strings(
+        list(output.get("uncertainties") or []),
+        (
+            value
+            for item in inputs
+            for value in (item.get("uncertainties") or [])
+        ),
+    )
+    retained_aliases = {
+        str(value or "").strip().casefold()
+        for value in output.get("target_aliases") or []
+        if str(value or "").strip()
+    }
+    for item in inputs:
+        for raw_value in item.get("target_aliases") or []:
+            value = str(raw_value or "").strip()
+            if value and value.casefold() not in retained_aliases:
+                uncertainties = _append_unique_strings(
+                    uncertainties,
+                    [
+                        "Промежуточный каталог содержал алиас цели "
+                        f"«{value}», но итоговый редьюсер его не подтвердил."
+                    ],
+                )
+
+    entities = [
+        item
+        for item in output.get("entities") or []
+        if isinstance(item, dict)
+    ]
+
+    def rebuild_name_index() -> dict[str, int]:
+        index: dict[str, int] = {}
+        for position, entity in enumerate(entities):
+            for value in _entity_alias_values(entity):
+                index.setdefault(value.casefold(), position)
+        return index
+
+    name_index = rebuild_name_index()
+    for partial in inputs:
+        for raw_entity in partial.get("entities") or []:
+            if not isinstance(raw_entity, dict):
+                continue
+            canonical = str(raw_entity.get("canonical_name") or "").strip()
+            if not canonical:
+                continue
+            position = name_index.get(canonical.casefold())
+            if position is None:
+                uncertainties = _append_unique_strings(
+                    uncertainties,
+                    [
+                        "Промежуточный каталог содержал сущность "
+                        f"«{canonical}», но итоговый редьюсер её не подтвердил."
+                    ],
+                )
+                continue
+            existing = entities[position]
+            existing_values = {
+                value.casefold() for value in _entity_alias_values(existing)
+            }
+            for alias in raw_entity.get("aliases") or []:
+                value = (
+                    str(alias.get("value") or "").strip()
+                    if isinstance(alias, dict)
+                    else str(alias or "").strip()
+                )
+                if value and value.casefold() not in existing_values:
+                    uncertainties = _append_unique_strings(
+                        uncertainties,
+                        [
+                            "Промежуточный каталог содержал алиас "
+                            f"«{value}» сущности «{canonical}», но итоговый "
+                            "редьюсер его не подтвердил."
+                        ],
+                    )
+    output["uncertainties"] = uncertainties
+    return output
+
+
 async def _classify_site(run_id: str, site_context: dict[str, Any]) -> dict[str, Any]:
     system = f"""
 Ты классифицируешь один сайт только по переданному серверному содержанию.
@@ -2206,23 +4315,573 @@ async def _classify_site(run_id: str, site_context: dict[str, Any]) -> dict[str,
 дочерних брендов, продуктов, сервисов и платформ, которые представляет сайт.
 Для каждой сущности укажи связь с основным брендом и коммерческую значимость.
 Не считай обычный пункт меню или стороннего партнёра частью целевого портфеля.
+Отдельно верни offer_candidates: только реальные продукты, услуги или
+направления, которые сайт явно предлагает клиенту. Для каждого кандидата
+скопируй source_url, source_unit_id и source_sha256 из page_unit без изменений,
+а evidence_excerpt возьми дословно из core_claim.core_text. Фрагмент обязан одновременно
+называть предложение и показывать, что его предлагает исследуемая компания.
+Общие названия рынка вроде DOOH, programmatic, SEO или «маркетинг» сами по себе
+не являются продуктами. Если сайт сам является продуктом, платформой,
+маркетплейсом или сервисом, включи его только при таком же дословном
+коммерческом подтверждении. confidence — число от 0 до 1; user_jobs — задачи
+клиента, которые прямо следуют из того же фрагмента. Не выдумывай кандидата
+ради заполнения списка.
 Поле requested_site — это домен, который ввёл пользователь; анализируй именно
 его и подтверждай выводы содержимым pages. Не додумывай: сомнения запиши отдельно.
 Название бренда подтверждай заголовком, описанием или повторяющимся текстом.
+Если у страницы content_storage_state=prefix_only или
+absence_claims_allowed=false, передан весь сохранённый исторический префикс,
+но не весь исходный текст. Положительный буквальный факт из него допустим;
+отсутствие бренда, продукта, темы или разметки по такому префиксу не доказано
+и должно остаться uncertainty.
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    return await _structured_artifact(
+    pages = [
+        page
+        for page in site_context.get("pages") or []
+        if isinstance(page, dict)
+    ]
+    if not pages:
+        raise OpenRouterError("Site profile input has no page core units")
+
+    leaf_system = (
+        system
+        + "\n\nПередан один точный фрагмент страницы. Фиксируй "
+        "только наблюдаемые в нём факты; отсутствие факта в этом "
+        "фрагменте не доказывает отсутствие на сайте. Верни profile и "
+        "ровно один core_disposition для переданного core_claim. Если core "
+        "содержит профильный факт, выбери grounded_fact, перенеси в "
+        "evidence_quote точную буквальную цитату только из core_text и "
+        "обязательно включи ту же цитату в profile.evidence либо evidence "
+        "сущности. Если профильного факта в core нет, выбери "
+        "explicit_no_fact, оставь evidence_quote пустым и конкретно объясни "
+        "содержание core, из-за которого оно нерелевантно. Общие фразы вроде "
+        "«факты не найдены» запрещены. claim_id, unit_id и core_sha256 "
+        "скопируй без изменений."
+    )
+
+    def leaf_payload(item: dict[str, Any]) -> dict[str, Any]:
+        claim = _core_unit_claim(item)
+        return {
+            "requested_site": site_context.get("requested_site"),
+            "page_unit": {
+                key: value
+                for key, value in item.items()
+                if not key.startswith("_")
+            },
+            "unit_contract": {
+                "version": LONG_RESPONSE_HARNESS_VERSION,
+                "unit_id": item.get("_lr_unit_id"),
+                "unit_index": item.get("_lr_unit_index"),
+                "unit_count": item.get("_lr_unit_count"),
+            },
+            "core_claim": claim,
+        }
+
+    leaf_window = await _analyzer_model_input_window(
+        PROCESSING_MODEL,
+        system=leaf_system,
+    )
+    target_chars = ENTITY_CATALOG_CHUNK_CHAR_LIMIT
+    while True:
+        page_units, manifests = partition_text_records(
+            pages,
+            text_key="main_text",
+            id_key="url",
+            target_chars=target_chars,
+        )
+        leaf_request_sizes = [
+            _structured_provider_request_utf8_bytes(
+                model=PROCESSING_MODEL,
+                model_envelope=leaf_window["model_envelope"],
+                system=leaf_system,
+                user_payload=leaf_payload(item),
+                schema=SITE_PROFILE_LEAF_SCHEMA,
+                schema_name="aiv_site_profile_unit_" + ("0" * 24),
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            for item in page_units
+        ]
+        if all(
+            value <= int(leaf_window["input_utf8_window"])
+            for value in leaf_request_sizes
+        ):
+            break
+        if target_chars <= 256:
+            raise OpenRouterError(
+                "Site profile leaf cannot fit the physical model input "
+                "window even at the minimum lossless text unit"
+            )
+        target_chars = max(256, target_chars // 2)
+    semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
+
+    async def classify_unit(item: dict[str, Any]) -> dict[str, Any]:
+        # The content digest alone is not an identity: two different pages can
+        # legitimately contain identical text.  Bind the durable artifact to
+        # the code-owned unit id and source URL as well, otherwise concurrent
+        # leaves race on the unique (run_id, artifact_key) constraint and a
+        # sequential resume may reuse the wrong page's cached result.
+        digest = _stable_json_sha256(
+            {
+                "unit_id": item.get("_lr_unit_id"),
+                "source_url": item.get("url"),
+                "unit_sha256": item.get("_lr_unit_sha256")
+                or text_sha256(str(item.get("main_text") or "")),
+            }
+        )[:24]
+        artifact_key = f"site_profile_unit_{digest}"
+        payload = leaf_payload(item)
+        claim = _core_unit_claim(item)
+        async with semaphore:
+            wrapped = await _structured_artifact(
+                run_id,
+                stage_key="scenario_design",
+                artifact_key=artifact_key,
+                schema=SITE_PROFILE_LEAF_SCHEMA,
+                schema_name=f"aiv_site_profile_unit_{digest}",
+                system=leaf_system,
+                user_payload=payload,
+                model=PROCESSING_MODEL,
+                reasoning_effort="high",
+                prompt_version=SITE_PROFILE_VERSION,
+            )
+        try:
+            profile = wrapped.get("profile")
+            if not isinstance(profile, dict):
+                raise OpenRouterError("Site-profile leaf has no profile")
+            receipts = _normalize_core_dispositions(
+                [wrapped.get("core_disposition")],
+                expected_claims=[claim],
+                analytic_output=profile,
+                output_kind="site_profile",
+            )
+            return _attach_core_decisions(
+                profile,
+                receipts,
+                [str(item.get("_lr_unit_id") or "")],
+            )
+        except Exception as exc:
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key="scenario_design",
+                artifact_key=artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=payload,
+                prompt_version=SITE_PROFILE_VERSION,
+                error=exc,
+            )
+            raise
+
+    outcomes = await asyncio.gather(
+        *(classify_unit(item) for item in page_units),
+        return_exceptions=True,
+    )
+    profiles: list[dict[str, Any]] = []
+    for _item, outcome in zip(page_units, outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        profiles.append(outcome)
+
+    merge_system = f"""
+Объедини частичные профили одного и того же сайта в единый профиль. Каждый
+частичный профиль построен по точному фрагменту сохранённой страницы. Сохрани
+все подтверждённые сущности, продукты, аудитории, задачи и доказательства;
+объединяй только дубли и настоящие алиасы. Отсутствие факта в одном фрагменте
+не отменяет факт из другого. Конфликт перенеси в uncertainties, не выдумывай
+разрешение. requested_site определяет анализируемый домен. Профиль-лист
+содержит bounded _aiv_core_unit_decision_shards, а профиль-предок — их
+фиксированный _aiv_core_unit_decision_head. Не удаляй точные evidence из
+частичных профилей и не подменяй подтверждённые факты общей сводкой.
+В offer_candidates оставь только кандидатов с дословным evidence_excerpt и
+неизменёнными source_url, source_unit_id и source_sha256. Не превращай общую
+тематику рынка в предложение клиента. Сохрани до десяти наиболее важных
+коммерческих предложений; сомнительные кандидаты перенеси в uncertainties.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    expected_unit_ids = [
+        str(item.get("_lr_unit_id") or "") for item in page_units
+    ]
+    expected_claims = _core_unit_claims(page_units)
+    leaf_profiles = list(profiles)
+    all_decisions = _core_decisions_from_inputs(
+        leaf_profiles,
+        expected_claims=expected_claims,
+    )
+    decision_index = _core_decision_index(all_decisions)
+    processing_window = await _analyzer_model_input_window(
+        PROCESSING_MODEL,
+        system=merge_system,
+    )
+
+    analysis_window = await _analyzer_model_input_window(
+        ANALYSIS_MODEL,
+        system=merge_system,
+    )
+
+    def site_profile_request_bytes(
+        *,
+        model: str,
+        window: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=model,
+            model_envelope=window["model_envelope"],
+            system=merge_system,
+            user_payload=payload,
+            schema=SITE_PROFILE_SCHEMA,
+            schema_name="aiv_site_profile",
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    def reduction_payload(
+        group: list[dict[str, Any]],
+        *,
+        level: int,
+    ) -> dict[str, Any]:
+        lineage = _long_response_lineage(group)
+        for item in group:
+            _validate_core_decision_item(item, decision_index)
+        decisions = _core_decisions_for_unit_ids(lineage, decision_index)
+        return {
+            "requested_site": site_context.get("requested_site"),
+            "partial_profiles": [_model_payload_view(item) for item in group],
+            "reduction": {
+                "version": ANALYZER_REDUCER_HARNESS_VERSION,
+                "level": level,
+                "input_count": len(group),
+                "source_lineage": _long_response_lineage_pointer(lineage),
+                "core_decision_coverage": _core_decision_pointer(decisions),
+            },
+        }
+
+    level = 0
+    while True:
+        complete_lineage = _long_response_lineage(
+            profiles,
+            expected_unit_ids=expected_unit_ids,
+        )
+        # ``_long_response_lineage`` is set-canonicalized for duplicate
+        # detection.  Root evidence remains in the original source order that
+        # was already verified against ``expected_claims``.
+        complete_decisions = all_decisions
+        final_payload = reduction_payload(profiles, level=level)
+        final_payload["reduction"].update(
+            {
+                "leaf_unit_count": len(page_units),
+                "source_manifest": _long_response_manifest_pointer(manifests),
+                "complete_lineage": _long_response_lineage_pointer(
+                    complete_lineage
+                ),
+            }
+        )
+        if site_profile_request_bytes(
+            model=ANALYSIS_MODEL,
+            window=analysis_window,
+            payload=final_payload,
+        ) <= int(analysis_window["input_utf8_window"]):
+            try:
+                final_profile = await _structured_artifact(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key="site_profile",
+                    schema=SITE_PROFILE_SCHEMA,
+                    schema_name="aiv_site_profile",
+                    system=merge_system,
+                    user_payload=final_payload,
+                    model=ANALYSIS_MODEL,
+                    reasoning_effort="high",
+                    prompt_version=SITE_PROFILE_VERSION,
+                )
+                _validate_reducer_core_decisions(
+                    final_profile,
+                    complete_decisions,
+                    output_kind="site_profile",
+                    source_inputs=leaf_profiles,
+                )
+                final_profile = _preserve_site_profile_reduction(
+                    final_profile,
+                    leaf_profiles,
+                )
+                final_profile = _preserve_site_profile_core_decisions(
+                    final_profile,
+                    complete_decisions,
+                )
+                _validate_final_core_decisions(
+                    final_profile,
+                    complete_decisions,
+                    output_kind="site_profile",
+                )
+                return final_profile
+            except Exception as exc:
+                await _mark_completed_artifact_contract_failed(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key="site_profile",
+                    model=ANALYSIS_MODEL,
+                    input_json=final_payload,
+                    prompt_version=SITE_PROFILE_VERSION,
+                    error=exc,
+                )
+                raise
+
+        groups = _byte_bounded_reducer_groups(
+            profiles,
+            window_bytes=int(processing_window["input_utf8_window"]),
+            request_utf8_bytes=lambda group: site_profile_request_bytes(
+                model=PROCESSING_MODEL,
+                window=processing_window,
+                payload=reduction_payload(group, level=level),
+            ),
+        )
+        if not any(len(group) > 1 for group in groups):
+            terminal = _deterministic_site_profile_union(leaf_profiles)
+            terminal = _preserve_site_profile_core_decisions(
+                terminal,
+                complete_decisions,
+            )
+            _validate_final_core_decisions(
+                terminal,
+                complete_decisions,
+                output_kind="site_profile",
+            )
+            await _save_artifact(
+                run_id,
+                stage_key="scenario_design",
+                artifact_key="site_profile",
+                status="completed",
+                model=None,
+                input_json={
+                    "reduction": final_payload["reduction"],
+                    "terminal_reason": "no_provider_group_fits_input_window",
+                },
+                output_json=terminal,
+                usage_json={
+                    "_aiv_analyzer_reducer": {
+                        "version": ANALYZER_REDUCER_HARNESS_VERSION,
+                        "mode": "deterministic_terminal_union",
+                        "processing_window": processing_window,
+                        "analysis_window": analysis_window,
+                    }
+                },
+                prompt_version=SITE_PROFILE_VERSION,
+            )
+            return terminal
+
+        async def merge_group(
+            index: int,
+            group: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            if len(group) == 1:
+                return group[0]
+            payload = reduction_payload(group, level=level)
+            digest = _stable_json_sha256(payload)[:16]
+            lineage = _long_response_lineage(group)
+            decisions = _core_decisions_for_unit_ids(lineage, decision_index)
+            artifact_key = f"site_profile_merge_{level}_{index}_{digest}"
+            async with semaphore:
+                merged = await _structured_artifact(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key=artifact_key,
+                    schema=SITE_PROFILE_SCHEMA,
+                    schema_name=f"aiv_site_profile_merge_{level}_{index}",
+                    system=merge_system,
+                    user_payload=payload,
+                    model=PROCESSING_MODEL,
+                    reasoning_effort="high",
+                    prompt_version=SITE_PROFILE_VERSION,
+                )
+            try:
+                _validate_reducer_core_decisions(
+                    merged,
+                    decisions,
+                    output_kind="site_profile",
+                    source_inputs=group,
+                )
+                preserved = _preserve_site_profile_reduction(merged, group)
+                return _attach_core_decision_head(
+                    preserved,
+                    decisions,
+                    lineage,
+                )
+            except Exception as exc:
+                await _mark_completed_artifact_contract_failed(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key=artifact_key,
+                    model=PROCESSING_MODEL,
+                    input_json=payload,
+                    prompt_version=SITE_PROFILE_VERSION,
+                    error=exc,
+                )
+                raise
+
+        merged_outcomes = await asyncio.gather(
+            *(merge_group(index, group) for index, group in enumerate(groups)),
+            return_exceptions=True,
+        )
+        next_profiles: list[dict[str, Any]] = []
+        for outcome in merged_outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            next_profiles.append(outcome)
+        if len(next_profiles) >= len(profiles):
+            raise OpenRouterError("Site-profile reducer made no progress")
+        profiles = next_profiles
+        level += 1
+
+
+def _offer_source_units(site_context: dict[str, Any]) -> list[SourceUnit]:
+    """Reconstruct the exact saved page units used to prove client offers."""
+
+    units: list[SourceUnit] = []
+    for page in site_context.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        url = str(page.get("url") or "").strip()
+        text = str(page.get("main_text") or "")
+        source_unit_id = str(page.get("source_unit_id") or url).strip()
+        if not url or not source_unit_id:
+            continue
+        unit = SourceUnit.from_text(
+            source_unit_id=source_unit_id,
+            source_url=url,
+            text=text,
+        )
+        declared_digest = str(page.get("source_sha256") or "").strip()
+        if declared_digest and declared_digest != unit.source_sha256:
+            raise OfferCatalogError(
+                f"Saved page source digest mismatch: {source_unit_id}"
+            )
+        units.append(unit)
+    if not units:
+        raise OfferCatalogError("Offer catalog has no saved site source units")
+    return units
+
+
+async def _bind_offer_catalog(
+    run_id: str,
+    profile: dict[str, Any],
+    site_context: dict[str, Any],
+) -> tuple[dict[str, Any], OfferCatalog, tuple[OfferCluster, ...]]:
+    """Admit only source-bound offers and make them the downstream truth."""
+
+    source_units = _offer_source_units(site_context)
+    requested_site = site_context.get("requested_site") or {}
+    domain = str(requested_site.get("domain") or "").strip()
+    aliases = [
+        str(profile.get("brand_name") or "").strip(),
+        *(str(value or "").strip() for value in profile.get("brand_aliases") or []),
+        domain,
+    ]
+    normalized_candidates, normalization_audit = (
+        normalize_offer_candidates_against_sources(
+            source_units=source_units,
+            candidates=[
+                copy.deepcopy(value)
+                for value in profile.get("offer_candidates") or []
+            ],
+        )
+    )
+    catalog = build_offer_catalog(
+        client_domain=domain,
+        client_aliases=[value for value in aliases if value],
+        source_units=source_units,
+        candidates=normalized_candidates,
+        max_offers=10,
+    )
+    clusters = build_offer_clusters(catalog, max_clusters=6)
+    research_payload = build_domain_research_payload(catalog)
+    enriched = copy.deepcopy(profile)
+    raw_products = [str(value or "").strip() for value in profile.get("products") or []]
+    accepted_products = list(catalog.legacy_product_strings())
+    rejected_product_names = [
+        value
+        for value in raw_products
+        if value
+        and value.casefold()
+        not in {item.casefold() for item in accepted_products}
+    ]
+    enriched["products"] = accepted_products
+    enriched["offer_catalog"] = catalog.as_dict()
+    enriched["offer_clusters"] = [cluster.as_dict() for cluster in clusters]
+    enriched["offer_catalog_research_manifest"] = copy.deepcopy(
+        research_payload.manifest
+    )
+    if rejected_product_names:
+        enriched["uncertainties"] = _append_unique_strings(
+            list(enriched.get("uncertainties") or []),
+            [
+                "Профиль назвал предложения без достаточной дословной "
+                "привязки к сайту: " + "; ".join(rejected_product_names)
+            ],
+        )
+    if (
+        int(normalization_audit.get("malformed_candidate_count") or 0)
+        or int(normalization_audit.get("unresolved_evidence_count") or 0)
+    ):
+        enriched["uncertainties"] = _append_unique_strings(
+            list(enriched.get("uncertainties") or []),
+            [
+                "Часть кандидатов в предложения не прошла проверку структуры "
+                "или однозначной привязки к сохранённым страницам и не вошла "
+                "в расчёт."
+            ],
+        )
+    artifact_input = {
+        "profile_sha256": offer_artifact_digest(profile),
+        "source_manifest_digest": catalog.source_manifest_digest,
+        "candidate_count": len(profile.get("offer_candidates") or []),
+        "candidate_normalization_sha256": normalization_audit[
+            "manifest_sha256"
+        ],
+    }
+    await _save_artifact(
         run_id,
         stage_key="scenario_design",
-        artifact_key="site_profile",
-        schema=SITE_PROFILE_SCHEMA,
-        schema_name="aiv_site_profile",
-        system=system,
-        user_payload=site_context,
-        model=ANALYSIS_MODEL,
-        reasoning_effort="high",
+        artifact_key="offer_candidate_normalization_audit",
+        status="completed",
+        model=None,
+        input_json={
+            "profile_sha256": offer_artifact_digest(profile),
+            "source_manifest_digest": normalization_audit[
+                "source_manifest_digest"
+            ],
+        },
+        output_json=normalization_audit,
+        prompt_version=OFFER_CATALOG_PIPELINE_VERSION,
     )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="offer_catalog",
+        status="completed",
+        model=None,
+        input_json=artifact_input,
+        output_json=catalog.as_dict(),
+        usage_json={
+            "accepted_offer_count": len(catalog.accepted_offers),
+            "disposition_count": len(catalog.dispositions),
+            "source_unit_count": len(source_units),
+        },
+        prompt_version=OFFER_CATALOG_PIPELINE_VERSION,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="offer_catalog_research_payload",
+        status="completed",
+        model=None,
+        input_json={"catalog_digest": catalog.catalog_digest},
+        output_json=research_payload.as_dict(),
+        prompt_version=OFFER_CATALOG_PIPELINE_VERSION,
+    )
+    return enriched, catalog, clusters
 
 
 # Структурный дефект самого ревью (не сценариев): не тот состав checks.
@@ -2251,6 +4910,2016 @@ _MARKET_RESEARCH_DIMENSIONS = (
     "decision_criteria",
     "terminology",
 )
+
+
+# These are semantic search lanes, not a result-count budget.  They are used
+# only after a provider physically cuts off a narrower one-turn response.  A
+# complete root response therefore still costs one request for short inputs.
+_MARKET_RESEARCH_DIMENSION_FACETS: dict[str, tuple[str, ...]] = {
+    "market": (
+        "market_definition_and_boundaries",
+        "category_structure_and_business_models",
+        "market_change_and_demand_signals",
+    ),
+    "topics": (
+        "core_problem_topics",
+        "adjacent_and_emerging_topics",
+        "topic_language_used_by_buyers",
+    ),
+    "geography": (
+        "served_geographies_and_local_constraints",
+        "regional_demand_and_competition",
+        "language_regulation_and_localization",
+    ),
+    "audiences": (
+        "economic_buyers_and_decision_makers",
+        "users_influencers_and_gatekeepers",
+        "audience_pains_and_contexts",
+    ),
+    "customer_jobs": (
+        "discovery_and_problem_definition_jobs",
+        "comparison_purchase_and_migration_jobs",
+        "implementation_operation_and_growth_jobs",
+    ),
+    "decision_criteria": (
+        "functional_and_quality_criteria",
+        "commercial_risk_and_trust_criteria",
+        "integration_service_and_operational_criteria",
+    ),
+    "terminology": (
+        "buyer_queries_and_plain_language",
+        "professional_category_vocabulary",
+        "synonyms_abbreviations_and_ambiguous_terms",
+    ),
+}
+
+
+# A provider-limited facet is re-queried through independent semantic lanes.
+# ``refinement_path`` is a request identity and a progressively narrower
+# research focus, not a text-continuation offset or a response-length cap.
+# The branch depth is bounded solely to prevent an exponential paid-call loop;
+# every received prefix remains in the durable tree.
+_MARKET_RESEARCH_REFINEMENT_AXES: tuple[tuple[str, str], ...] = (
+    ("definitions_requirements_and_constraints", "named_examples_and_outcomes"),
+    ("buyer_operator_and_user_view", "vendor_market_and_regulatory_view"),
+    ("established_current_evidence", "emerging_edge_case_evidence"),
+    ("direct_primary_sources", "independent_secondary_sources"),
+)
+
+
+def _market_research_domain_source_unit(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build one stable domain identity used by external retrieval.
+
+    Site text remains losslessly partitioned and mapped locally. External
+    seven-dimension search must not be multiplied by the number or size of
+    those local units, so its query context contains only the domain identity
+    required to find the market. No source text is truncated here.
+    """
+
+    requested_site = copy.deepcopy(payload.get("requested_site") or {})
+    profile = payload.get("site_profile") or {}
+    domain = str(requested_site.get("domain") or "").strip()
+    url = str(requested_site.get("url") or "").strip()
+    identity_profile = {
+        "brand_name": profile.get("brand_name"),
+        "site_type": profile.get("site_type"),
+        "category": profile.get("category"),
+        "customer_jobs": profile.get("customer_jobs") or [],
+    }
+    catalog_value = profile.get("offer_catalog")
+    if isinstance(catalog_value, dict):
+        catalog = OfferCatalog.from_mapping(catalog_value)
+        identity_profile["offer_catalog"] = build_domain_research_payload(
+            catalog
+        ).document
+        identity_profile["offer_clusters"] = copy.deepcopy(
+            profile.get("offer_clusters") or []
+        )
+    identity_text = json.dumps(
+        {
+            "requested_site": requested_site,
+            "site_identity": identity_profile,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    identity_sha256 = text_sha256(identity_text)
+    unit_id = f"market-domain:{domain or identity_sha256[:16]}"
+    source_unit = {
+        "url": url,
+        "title": str(profile.get("brand_name") or domain),
+        "meta_description": str(profile.get("category") or ""),
+        "main_text": identity_text,
+        "content_storage_state": "complete",
+        "absence_claims_allowed": False,
+        "_lr_unit_id": unit_id,
+        "_lr_unit_index": 0,
+        "_lr_unit_count": 1,
+        "_lr_unit_sha256": identity_sha256,
+        "_lr_context_sha256": identity_sha256,
+        "_lr_start_char": 0,
+        "_lr_end_char": len(identity_text),
+        "_lr_core_start_in_context": 0,
+        "_lr_core_end_in_context": len(identity_text),
+    }
+    return source_unit, identity_profile
+
+
+async def _market_research_model_window(*, system: str) -> dict[str, Any]:
+    """Resolve a safe provider input window without imposing a corpus cap."""
+
+    envelope = await model_output_envelope(ANALYSIS_MODEL)
+    resolved = _conservative_model_input_window(
+        envelope,
+        safety_tokens=MARKET_RESEARCH_SAFETY_TOKENS,
+        fallback_window_bytes=MARKET_RESEARCH_FALLBACK_WINDOW_BYTES,
+        minimum_input_tokens=256,
+        no_window_error=(
+            "Market-research model metadata leaves no safe input window"
+        ),
+        system=system,
+    )
+    return {
+        **resolved,
+        "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+    }
+
+
+def _market_research_source_units(
+    payload: dict[str, Any],
+    *,
+    target_chars: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    pages = [
+        copy.deepcopy(page)
+        for page in payload.get("site_evidence") or []
+        if isinstance(page, dict)
+    ]
+    units, manifests = partition_text_records(
+        pages,
+        text_key="main_text",
+        id_key="url",
+        target_chars=max(256, target_chars),
+    )
+    unit_ids = [str(item.get("_lr_unit_id") or "") for item in units]
+    if not unit_ids or any(not value for value in unit_ids):
+        raise OpenRouterError("Market research produced no source units")
+    if len(unit_ids) != len(set(unit_ids)):
+        raise OpenRouterError("Market research source unit ids are not unique")
+    return units, manifests
+
+
+def _normalize_market_evidence_packet(
+    packet: dict[str, Any],
+    *,
+    allowed_unit_ids: set[str],
+    allowed_urls: set[str],
+) -> dict[str, Any]:
+    """Validate exact lineage and prevent invented URLs or hidden absence."""
+
+    output = copy.deepcopy(packet)
+    for finding in output.get("findings") or []:
+        if not isinstance(finding, dict):
+            raise OpenRouterError("Market evidence finding is not an object")
+        unit_ids = [str(value) for value in finding.get("source_unit_ids") or []]
+        if (
+            not unit_ids
+            or len(unit_ids) != len(set(unit_ids))
+            or any(value not in allowed_unit_ids for value in unit_ids)
+        ):
+            raise OpenRouterError("Market finding has invalid source-unit lineage")
+        urls = [
+            normalized
+            for value in finding.get("source_urls") or []
+            if (normalized := _normalized_research_url(value))
+        ]
+        if len(urls) != len(finding.get("source_urls") or []) or any(
+            value not in allowed_urls for value in urls
+        ):
+            raise OpenRouterError("Market finding references an unconfirmed URL")
+        finding["source_unit_ids"] = unit_ids
+        finding["source_urls"] = list(dict.fromkeys(urls))
+
+    for uncertainty in output.get("uncertainties") or []:
+        if not isinstance(uncertainty, dict):
+            raise OpenRouterError("Market uncertainty is not an object")
+        unit_ids = [
+            str(value) for value in uncertainty.get("source_unit_ids") or []
+        ]
+        if (
+            not unit_ids
+            or len(unit_ids) != len(set(unit_ids))
+            or any(value not in allowed_unit_ids for value in unit_ids)
+        ):
+            raise OpenRouterError("Market uncertainty has invalid lineage")
+        uncertainty["source_unit_ids"] = unit_ids
+
+    coverage = output.get("unit_coverage")
+    if not isinstance(coverage, list):
+        raise OpenRouterError("Market evidence packet has no unit coverage")
+    coverage_ids = [
+        str(item.get("source_unit_id") or "")
+        for item in coverage
+        if isinstance(item, dict)
+    ]
+    if (
+        len(coverage_ids) != len(coverage)
+        or Counter(coverage_ids) != Counter(allowed_unit_ids)
+    ):
+        raise OpenRouterError(
+            "Market evidence packet must account for every source unit once"
+        )
+    output["unit_coverage"] = sorted(
+        coverage,
+        key=lambda item: str(item.get("source_unit_id") or ""),
+    )
+    return output
+
+
+def _deterministic_market_evidence_union(
+    packets: list[dict[str, Any]],
+    *,
+    allowed_unit_ids: set[str],
+    allowed_urls: set[str],
+) -> dict[str, Any]:
+    """Union complete packets without letting a reducer omit a paid finding."""
+
+    findings: list[dict[str, Any]] = []
+    uncertainties: list[dict[str, Any]] = []
+    finding_digests: set[str] = set()
+    uncertainty_digests: set[str] = set()
+    coverage_by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for packet in packets:
+        for finding in packet.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            digest = _stable_json_sha256(finding)
+            if digest not in finding_digests:
+                finding_digests.add(digest)
+                findings.append(copy.deepcopy(finding))
+        for uncertainty in packet.get("uncertainties") or []:
+            if not isinstance(uncertainty, dict):
+                continue
+            digest = _stable_json_sha256(uncertainty)
+            if digest not in uncertainty_digests:
+                uncertainty_digests.add(digest)
+                uncertainties.append(copy.deepcopy(uncertainty))
+        for item in packet.get("unit_coverage") or []:
+            if not isinstance(item, dict):
+                continue
+            unit_id = str(item.get("source_unit_id") or "")
+            if unit_id in allowed_unit_ids:
+                coverage_by_id[unit_id].append(item)
+
+    coverage: list[dict[str, Any]] = []
+    for unit_id in sorted(allowed_unit_ids):
+        candidates = coverage_by_id.get(unit_id) or []
+        if not candidates:
+            raise OpenRouterError(
+                "Deterministic market union lost source-unit coverage"
+            )
+        states = {str(item.get("state") or "") for item in candidates}
+        state = "unknown" if "unknown" in states else "evidence"
+        notes = list(
+            dict.fromkeys(
+                str(item.get("note") or "").strip()
+                for item in candidates
+                if str(item.get("note") or "").strip()
+            )
+        )
+        coverage.append(
+            {
+                "source_unit_id": unit_id,
+                "state": state,
+                "note": " ".join(notes) or "Source unit processed.",
+            }
+        )
+
+    return _normalize_market_evidence_packet(
+        {
+            "findings": findings,
+            "uncertainties": uncertainties,
+            "unit_coverage": coverage,
+        },
+        allowed_unit_ids=allowed_unit_ids,
+        allowed_urls=allowed_urls,
+    )
+
+
+def _preserve_market_evidence_reduction(
+    merged: dict[str, Any],
+    inputs: list[dict[str, Any]],
+    *,
+    allowed_unit_ids: set[str],
+    allowed_urls: set[str],
+) -> dict[str, Any]:
+    """Keep reducer synthesis and every distinct child finding/uncertainty."""
+
+    return _deterministic_market_evidence_union(
+        [merged, *inputs],
+        allowed_unit_ids=allowed_unit_ids,
+        allowed_urls=allowed_urls,
+    )
+
+
+def _pack_market_evidence_packets(
+    packets: list[dict[str, Any]],
+    *,
+    window_bytes: int,
+    level: int,
+) -> list[list[dict[str, Any]]]:
+    """Pack by the exact serialized reducer payload, including its envelope."""
+
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for packet in packets:
+        singleton_bytes = len(
+            json.dumps(
+                _market_research_reduce_payload([packet], level=level),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        # An already complete packet may be larger than one provider window.
+        # Keep it as a singleton; the caller will terminate with a deterministic
+        # union instead of truncating or repeatedly attempting an impossible
+        # reducer call.
+        if singleton_bytes > window_bytes:
+            if current:
+                groups.append(current)
+                current = []
+            groups.append([packet])
+            continue
+        candidate = [*current, packet]
+        candidate_bytes = len(
+            json.dumps(
+                _market_research_reduce_payload(candidate, level=level),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if current and (
+            len(current) >= MARKET_RESEARCH_REDUCE_FAN_IN
+            or candidate_bytes > window_bytes
+        ):
+            groups.append(current)
+            current = [packet]
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _market_research_reduce_payload(
+    group: list[dict[str, Any]],
+    *,
+    level: int,
+) -> dict[str, Any]:
+    lineage = _long_response_lineage(group)
+    allowed_urls = {
+        normalized
+        for packet in group
+        for finding in packet.get("findings") or []
+        if isinstance(finding, dict)
+        for value in finding.get("source_urls") or []
+        if (normalized := _normalized_research_url(value))
+    }
+    return {
+        "contract_version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+        "level": level,
+        "source_unit_ids": lineage,
+        "confirmed_source_urls": sorted(allowed_urls),
+        "evidence_packets": group,
+    }
+
+
+def _aggregate_market_web_attestation(
+    leaves: list[dict[str, Any]],
+) -> dict[str, Any]:
+    attestations = [
+        item.get("web_attestation")
+        for item in leaves
+        if isinstance(item.get("web_attestation"), dict)
+    ]
+    violations = list(
+        dict.fromkeys(
+            str(value)
+            for item in attestations
+            for value in item.get("violations") or []
+            if str(value)
+        )
+    )
+    verified = bool(attestations) and len(attestations) == len(leaves) and all(
+        item.get("version") == WEB_ATTESTATION_VERSION
+        and item.get("policy") == WebSearchPolicy.REQUIRED.value
+        and item.get("state") == "verified"
+        and item.get("metric_eligible") is True
+        for item in attestations
+    ) and not violations
+    return {
+        "version": WEB_ATTESTATION_VERSION,
+        "policy": WebSearchPolicy.REQUIRED.value,
+        "state": "verified" if verified else "unverified",
+        "metric_eligible": verified,
+        "web_search_requests": sum(
+            int(item.get("web_search_requests") or 0) for item in attestations
+        ),
+        "violations": violations,
+        "leaf_count": len(leaves),
+    }
+
+
+def _market_research_web_scope(
+    dimensions: Iterable[str],
+    *,
+    path: str,
+    facet: str | None = None,
+    segment_index: int = 0,
+    predecessor_raw_sha256: str | None = None,
+    predecessor_citation_urls: Iterable[str] = (),
+    refinement_path: str = "",
+) -> dict[str, Any]:
+    normalized = [str(value) for value in dimensions]
+    if not normalized or any(value not in _MARKET_RESEARCH_DIMENSIONS for value in normalized):
+        raise OpenRouterError("Market web scope has an invalid dimension")
+    if len(normalized) != len(set(normalized)):
+        raise OpenRouterError("Market web scope repeats a dimension")
+    if facet is not None:
+        if len(normalized) != 1 or facet not in _MARKET_RESEARCH_DIMENSION_FACETS[
+            normalized[0]
+        ]:
+            raise OpenRouterError("Market web scope has an invalid facet")
+    if (
+        not isinstance(refinement_path, str)
+        or (refinement_path and not re.fullmatch(r"[01]+", refinement_path))
+        or (refinement_path and facet is None)
+    ):
+        raise OpenRouterError("Market web scope has an invalid refinement path")
+    if (
+        isinstance(segment_index, bool)
+        or not isinstance(segment_index, int)
+        or segment_index != 0
+    ):
+        raise OpenRouterError("Market web segment index is invalid")
+    if predecessor_raw_sha256 is not None:
+        raise OpenRouterError(
+            "Market web semantic shards cannot masquerade as text continuation"
+        )
+    citation_urls = [
+        normalized
+        for value in predecessor_citation_urls
+        if (normalized := _normalized_research_url(value))
+    ]
+    if len(citation_urls) != len(set(citation_urls)):
+        raise OpenRouterError("Market web continuation repeats a citation URL")
+    if citation_urls:
+        raise OpenRouterError(
+            "Market web semantic shards cannot masquerade as text continuation"
+        )
+    return {
+        "path": path,
+        "dimensions": normalized,
+        "facet": facet,
+        "segment_index": segment_index,
+        "predecessor_raw_sha256": predecessor_raw_sha256,
+        "predecessor_citation_urls": citation_urls,
+        "refinement_path": refinement_path,
+    }
+
+
+def _market_research_web_children(
+    scope: dict[str, Any],
+    *,
+    predecessor_raw_sha256: str,
+    predecessor_citation_urls: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Refine a cut-off semantic cell within a bounded paid-call loop."""
+
+    dimensions = [str(value) for value in scope.get("dimensions") or []]
+    path = str(scope.get("path") or "root")
+    facet = scope.get("facet")
+    if len(dimensions) > 1:
+        midpoint = len(dimensions) // 2
+        return [
+            _market_research_web_scope(
+                dimensions[:midpoint],
+                path=f"{path}.0",
+            ),
+            _market_research_web_scope(
+                dimensions[midpoint:],
+                path=f"{path}.1",
+            ),
+        ]
+    if facet is None:
+        dimension = dimensions[0]
+        return [
+            _market_research_web_scope(
+                [dimension],
+                path=f"{path}.facet.{index}",
+                facet=value,
+            )
+            for index, value in enumerate(
+                _MARKET_RESEARCH_DIMENSION_FACETS[dimension]
+            )
+        ]
+    # A facet response can itself be physically cut off. Re-query it through
+    # two independently grounded semantic lanes instead of pretending that a
+    # digest is a continuation cursor. The path selects one side of a rotating
+    # evidence axis; arbitrary depth is allowed and every parent prefix stays
+    # in the lossless tree. There is therefore no "smallest facet" at which an
+    # unseen suffix is silently abandoned.
+    refinement_path = str(scope.get("refinement_path") or "")
+    if len(refinement_path) >= MARKET_RESEARCH_MAX_REFINEMENT_DEPTH:
+        return []
+    return [
+        _market_research_web_scope(
+            dimensions,
+            path=f"{path}.refine.{refinement_path + bit}",
+            facet=str(facet),
+            refinement_path=refinement_path + bit,
+        )
+        for bit in ("0", "1")
+    ]
+
+
+def _market_research_web_task_input(
+    *,
+    source_unit: dict[str, Any],
+    requested_site: dict[str, Any],
+    site_profile: dict[str, Any],
+    scope: dict[str, Any],
+) -> dict[str, Any]:
+    unit_id = str(source_unit.get("_lr_unit_id") or "")
+    return {
+        "contract_version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
+        "requested_site": copy.deepcopy(requested_site),
+        "site_profile": copy.deepcopy(site_profile),
+        "source_unit": {
+            key: copy.deepcopy(value)
+            for key, value in source_unit.items()
+            if not key.startswith("_")
+        },
+        "unit_contract": {
+            "source_unit_id": unit_id,
+            "unit_index": source_unit.get("_lr_unit_index"),
+            "unit_count": source_unit.get("_lr_unit_count"),
+            "core_sha256": source_unit.get("_lr_unit_sha256"),
+            "context_sha256": source_unit.get("_lr_context_sha256"),
+            "core_start_char": source_unit.get("_lr_start_char"),
+            "core_end_char": source_unit.get("_lr_end_char"),
+        },
+        "research_scope": copy.deepcopy(scope),
+        "research_contract": {
+            "mode": "adaptive_positive_evidence_tree",
+            "requested_dimensions": list(scope["dimensions"]),
+            "facet": scope.get("facet"),
+            "refinement_path": scope.get("refinement_path") or "",
+            "refinement_focus": [
+                _MARKET_RESEARCH_REFINEMENT_AXES[
+                    index % len(_MARKET_RESEARCH_REFINEMENT_AXES)
+                ][int(bit)]
+                for index, bit in enumerate(
+                    str(scope.get("refinement_path") or "")
+                )
+            ],
+            "segment_index": scope.get("segment_index"),
+            "external_absence_claims_allowed": False,
+            "internet_exhaustiveness_claimed": False,
+            "instructions": (
+                "Исследуй только перечисленные измерения и facet. Дай "
+                "положительные, проверяемые наблюдения с дословными выдержками "
+                "и полными URL. Не делай выводов об отсутствии. Каждый facet "
+                "является независимым заранее объявленным semantic shard, а "
+                "не продолжением текста другого ответа. refinement_focus "
+                "задаёт всё более узкую независимую поисковую перспективу: "
+                "проведи новый поиск именно в ней, не пытайся продолжить "
+                "оборванный текст родителя."
+            ),
+        },
+    }
+
+
+def _market_research_web_provider_payload(
+    *,
+    system: str,
+    input_json: dict[str, Any],
+    model_envelope: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the exact initial physical POST body used by ``chat``."""
+
+    payload: dict[str, Any] = {
+        "model": ANALYSIS_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(input_json, ensure_ascii=False)},
+        ],
+        "temperature": 0.1,
+    }
+    policy_fields, _policy = web_request_policy(
+        model=ANALYSIS_MODEL,
+        policy=WebSearchPolicy.REQUIRED,
+    )
+    payload.update(policy_fields)
+    avoid = _non_citing_providers(ANALYSIS_MODEL)
+    if avoid:
+        payload["provider"] = {"ignore": avoid}
+    payload["reasoning"] = {"effort": "high", "exclude": True}
+    requested_max = model_envelope.get("max_completion_tokens")
+    resolved_max, _resolved_envelope = _apply_model_output_headroom(
+        payload=payload,
+        output_envelope=model_envelope,
+        requested_max=(
+            requested_max
+            if isinstance(requested_max, int)
+            and not isinstance(requested_max, bool)
+            and requested_max > 0
+            else None
+        ),
+    )
+    if isinstance(resolved_max, int) and resolved_max > 0:
+        payload["max_completion_tokens"] = resolved_max
+    return payload
+
+
+def _market_research_web_request_utf8_bytes(
+    *,
+    system: str,
+    input_json: dict[str, Any],
+    model_envelope: dict[str, Any],
+) -> int:
+    payload = _market_research_web_provider_payload(
+        system=system,
+        input_json=input_json,
+        model_envelope=model_envelope,
+    )
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _market_research_citations_from_usage(
+    usage: dict[str, Any],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    annotations = usage.get("_aiv_response_annotations")
+    if not isinstance(annotations, list):
+        return output
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+        value = annotation.get("url_citation") or annotation
+        if not isinstance(value, dict):
+            continue
+        normalized = _normalized_research_url(value.get("url"))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(
+            {
+                "url": normalized,
+                "title": str(value.get("title") or "").strip(),
+                "content": str(value.get("content") or "").strip(),
+            }
+        )
+    return output
+
+
+def _market_research_web_receipt(
+    *,
+    task_input: dict[str, Any],
+    event: dict[str, Any],
+    expected_physical_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and bind one complete or provider-limited physical POST."""
+
+    expected_request_sha256 = _stable_json_sha256(expected_physical_payload)
+    if event.get("request_payload") != expected_physical_payload or str(
+        event.get("request_sha256") or ""
+    ) != expected_request_sha256:
+        raise OpenRouterError("Market web receipt has a physical-request mismatch")
+    if str(event.get("model") or "") != ANALYSIS_MODEL:
+        raise OpenRouterError("Market web receipt was produced by another model")
+    raw_text = event.get("raw_text")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise OpenRouterError("Market web receipt has no usable raw response")
+    usage = (
+        copy.deepcopy(event.get("usage"))
+        if isinstance(event.get("usage"), dict)
+        else {}
+    )
+    # ``chat`` already attaches a logical-call attempt list containing the
+    # same raw body.  This stage disables transport retries, so retaining that
+    # nested body would multiply an arbitrarily long response without adding
+    # evidence.  The receipt's top-level raw_text is the lossless authority.
+    usage.pop("_aiv_call_attempts", None)
+    transport = (
+        event.get("transport") if isinstance(event.get("transport"), dict) else {}
+    )
+    attestation = usage.get("_aiv_web_attestation")
+    if not isinstance(attestation, dict):
+        raise OpenRouterError("Market web receipt has no web attestation")
+    if (
+        attestation.get("version") != WEB_ATTESTATION_VERSION
+        or attestation.get("policy") != WebSearchPolicy.REQUIRED.value
+        or attestation.get("state") != "verified"
+        or attestation.get("metric_eligible") is not True
+        or bool(attestation.get("violations"))
+    ):
+        raise OpenRouterError("Market web receipt failed web attestation")
+    limited = bool(transport.get("output_limited"))
+    status = str(event.get("status") or "")
+    error = event.get("error") if isinstance(event.get("error"), dict) else {}
+    if limited:
+        if status not in {"accepted", "rejected"} or (
+            status == "rejected"
+            and str(error.get("type") or "") != "OpenRouterOutputLimitError"
+        ):
+            raise OpenRouterError("Market web limited receipt has invalid status")
+        state = "provider_limited_prefix"
+    elif status == "accepted" and transport.get("output_complete") is not False:
+        state = "complete"
+    else:
+        raise OpenRouterError("Market web receipt is not a complete/limited result")
+    citations = _market_research_citations_from_usage(usage)
+    if not citations:
+        body_json = (
+            (event.get("response") or {}).get("body_json")
+            if isinstance(event.get("response"), dict)
+            else None
+        )
+        if isinstance(body_json, dict):
+            choices = body_json.get("choices")
+            message = (
+                choices[0].get("message")
+                if isinstance(choices, list)
+                and choices
+                and isinstance(choices[0], dict)
+                else None
+            )
+            if isinstance(message, dict):
+                citations = _market_research_citations_from_usage(
+                    {"_aiv_response_annotations": message.get("annotations") or []}
+                )
+    if not citations:
+        raise OpenRouterError("Market web receipt has no URL citation")
+    task_sha256 = _stable_json_sha256(task_input)
+    core = {
+        "version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
+        "task_sha256": task_sha256,
+        "physical_request_sha256": expected_request_sha256,
+        "state": state,
+        "raw_text": raw_text,
+        "raw_text_sha256": text_sha256(raw_text),
+        "raw_text_chars": len(raw_text),
+        "raw_text_utf8_bytes": len(raw_text.encode("utf-8")),
+        "citations": citations,
+        "web_attestation": copy.deepcopy(attestation),
+        "usage": copy.deepcopy(usage),
+        "transport": copy.deepcopy(transport),
+    }
+    return {**core, "receipt_sha256": _stable_json_sha256(core)}
+
+
+def _validate_market_research_web_receipt(
+    receipt: dict[str, Any],
+    *,
+    task_input: dict[str, Any],
+    expected_physical_payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(receipt, dict):
+        raise OpenRouterError("Market web receipt is not an object")
+    copy_receipt = copy.deepcopy(receipt)
+    expected_receipt_sha256 = str(copy_receipt.pop("receipt_sha256", ""))
+    if expected_receipt_sha256 != _stable_json_sha256(copy_receipt):
+        raise OpenRouterError("Market web receipt checksum mismatch")
+    if copy_receipt.get("version") != MARKET_RESEARCH_WEB_HARNESS_VERSION:
+        raise OpenRouterError("Market web receipt version mismatch")
+    if copy_receipt.get("task_sha256") != _stable_json_sha256(task_input):
+        raise OpenRouterError("Market web receipt task coverage mismatch")
+    if copy_receipt.get("physical_request_sha256") != _stable_json_sha256(
+        expected_physical_payload
+    ):
+        raise OpenRouterError("Market web receipt physical request mismatch")
+    raw_text = copy_receipt.get("raw_text")
+    if not isinstance(raw_text, str) or text_sha256(raw_text) != copy_receipt.get(
+        "raw_text_sha256"
+    ):
+        raise OpenRouterError("Market web receipt raw response was changed")
+    if len(raw_text) != copy_receipt.get("raw_text_chars") or len(
+        raw_text.encode("utf-8")
+    ) != copy_receipt.get("raw_text_utf8_bytes"):
+        raise OpenRouterError("Market web receipt raw length mismatch")
+    # Re-run all attestation/citation/state checks through the event validator.
+    event = {
+        "model": ANALYSIS_MODEL,
+        "status": (
+            "rejected"
+            if copy_receipt.get("state") == "provider_limited_prefix"
+            else "accepted"
+        ),
+        "request_payload": expected_physical_payload,
+        "request_sha256": _stable_json_sha256(expected_physical_payload),
+        "raw_text": raw_text,
+        "usage": copy.deepcopy(copy_receipt.get("usage") or {}),
+        "transport": copy.deepcopy(copy_receipt.get("transport") or {}),
+        "error": (
+            {"type": "OpenRouterOutputLimitError", "message": "cached"}
+            if copy_receipt.get("state") == "provider_limited_prefix"
+            else None
+        ),
+    }
+    rebuilt = _market_research_web_receipt(
+        task_input=task_input,
+        event=event,
+        expected_physical_payload=expected_physical_payload,
+    )
+    if rebuilt != receipt:
+        raise OpenRouterError("Market web receipt semantic fields were changed")
+    return receipt
+
+
+def _market_research_result_event(
+    *,
+    result: Any,
+    expected_physical_payload: dict[str, Any],
+    limited: bool,
+) -> dict[str, Any]:
+    """Test/compatibility bridge when a mocked transport skips audit callback."""
+
+    citations = [
+        copy.deepcopy(item)
+        for item in getattr(result, "citations", []) or []
+        if isinstance(item, dict) and _normalized_research_url(item.get("url"))
+    ]
+    usage = copy.deepcopy(getattr(result, "usage", {}) or {})
+    usage.setdefault(
+        "_aiv_web_attestation",
+        copy.deepcopy(getattr(result, "web_attestation", {}) or {}),
+    )
+    usage.setdefault(
+        "_aiv_response_annotations",
+        [
+            {"type": "url_citation", "url_citation": item}
+            for item in citations
+        ],
+    )
+    transport = copy.deepcopy(getattr(result, "transport", {}) or {})
+    transport["output_limited"] = limited
+    transport.setdefault("output_complete", not limited)
+    return {
+        "model": ANALYSIS_MODEL,
+        "status": "rejected" if limited else "accepted",
+        "request_payload": expected_physical_payload,
+        "request_sha256": _stable_json_sha256(expected_physical_payload),
+        "raw_text": str(getattr(result, "text", "") or ""),
+        "usage": usage,
+        "transport": transport,
+        "error": (
+            {"type": "OpenRouterOutputLimitError", "message": "output limited"}
+            if limited
+            else None
+        ),
+    }
+
+
+def _compose_market_research_web_leaf(
+    *,
+    unit_id: str,
+    root_task_id: str,
+    nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not nodes:
+        raise OpenRouterError("Market web tree has no response nodes")
+    pieces: list[str] = []
+    cursor = 0
+    node_rows: list[dict[str, Any]] = []
+    citations_by_url: dict[str, dict[str, Any]] = {}
+    attestations: list[dict[str, Any]] = []
+    for index, node in enumerate(nodes):
+        receipt = node["receipt"]
+        raw_text = str(receipt["raw_text"])
+        separator = "" if index == 0 else "\n\n"
+        pieces.append(separator)
+        cursor += len(separator)
+        start = cursor
+        pieces.append(raw_text)
+        cursor += len(raw_text)
+        end = cursor
+        for citation in receipt.get("citations") or []:
+            normalized = _normalized_research_url(citation.get("url"))
+            if normalized:
+                citations_by_url.setdefault(normalized, copy.deepcopy(citation))
+        attestations.append({"web_attestation": receipt["web_attestation"]})
+        node_rows.append(
+            {
+                "task_id": node["task_id"],
+                "parent_task_id": node.get("parent_task_id"),
+                "task_sha256": receipt["task_sha256"],
+                "scope": copy.deepcopy(node["scope"]),
+                "state": receipt["state"],
+                "raw_start_char": start,
+                "raw_end_char": end,
+                "raw_text_sha256": receipt["raw_text_sha256"],
+                "raw_text_chars": receipt["raw_text_chars"],
+                "raw_text_utf8_bytes": receipt["raw_text_utf8_bytes"],
+                "citation_urls": sorted(
+                    {
+                        normalized
+                        for item in receipt.get("citations") or []
+                        if (normalized := _normalized_research_url(item.get("url")))
+                    }
+                ),
+                "web_attestation_sha256": _stable_json_sha256(
+                    receipt["web_attestation"]
+                ),
+                "child_task_ids": list(node.get("child_task_ids") or []),
+            }
+        )
+    research_notes = "".join(pieces)
+    citations = [citations_by_url[url] for url in sorted(citations_by_url)]
+    web_attestation = _aggregate_market_web_attestation(attestations)
+    observation_completeness = (
+        "scoped_composable_positive_evidence"
+        if any(row["state"] == "provider_limited_prefix" for row in node_rows)
+        else "scoped_complete_positive_evidence"
+    )
+    manifest_core = {
+        "version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
+        "semantic_contract": (
+            "scoped_positive_evidence_not_exhaustive_internet_coverage"
+        ),
+        "unit_id": unit_id,
+        "root_task_id": root_task_id,
+        "node_count": len(node_rows),
+        "node_ids_sha256": _stable_json_sha256(
+            [row["task_id"] for row in node_rows]
+        ),
+        "research_notes_sha256": text_sha256(research_notes),
+        "research_notes_chars": len(research_notes),
+        "research_notes_utf8_bytes": len(research_notes.encode("utf-8")),
+        "citations_sha256": _stable_json_sha256(citations),
+        "web_attestation_sha256": _stable_json_sha256(web_attestation),
+        "observation_completeness": observation_completeness,
+        "nodes": node_rows,
+    }
+    manifest = {
+        **manifest_core,
+        "manifest_sha256": _stable_json_sha256(manifest_core),
+    }
+    return {
+        "source_unit_ids": [unit_id],
+        "research_notes": research_notes,
+        "citations": citations,
+        "web_attestation": web_attestation,
+        "observation_completeness": observation_completeness,
+        "retrieval_manifest": manifest,
+    }
+
+
+def _validate_market_research_web_leaf(
+    output: dict[str, Any],
+    *,
+    source_unit: dict[str, Any],
+    requested_site: dict[str, Any],
+    site_profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed on missing, duplicated, or changed retrieval-tree coverage."""
+
+    unit_id = str(source_unit.get("_lr_unit_id") or "")
+    if output.get("source_unit_ids") != [unit_id]:
+        raise OpenRouterError("Market web leaf source-unit coverage mismatch")
+    notes = output.get("research_notes")
+    manifest = output.get("retrieval_manifest")
+    if not isinstance(notes, str) or not isinstance(manifest, dict):
+        raise OpenRouterError("Market web leaf has no notes/manifest")
+    manifest_core = copy.deepcopy(manifest)
+    manifest_sha256 = str(manifest_core.pop("manifest_sha256", ""))
+    if manifest_sha256 != _stable_json_sha256(manifest_core):
+        raise OpenRouterError("Market web leaf manifest checksum mismatch")
+    if (
+        manifest.get("version") != MARKET_RESEARCH_WEB_HARNESS_VERSION
+        or manifest.get("semantic_contract")
+        != "scoped_positive_evidence_not_exhaustive_internet_coverage"
+        or manifest.get("unit_id") != unit_id
+        or manifest.get("research_notes_sha256") != text_sha256(notes)
+        or manifest.get("research_notes_chars") != len(notes)
+        or manifest.get("research_notes_utf8_bytes") != len(notes.encode("utf-8"))
+    ):
+        raise OpenRouterError("Market web leaf notes coverage mismatch")
+    rows = manifest.get("nodes")
+    if not isinstance(rows, list) or len(rows) != manifest.get("node_count"):
+        raise OpenRouterError("Market web leaf node manifest is incomplete")
+    ids = [str(row.get("task_id") or "") for row in rows if isinstance(row, dict)]
+    if (
+        len(ids) != len(rows)
+        or not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in ids)
+        or len(ids) != len(set(ids))
+        or manifest.get("node_ids_sha256") != _stable_json_sha256(ids)
+    ):
+        raise OpenRouterError("Market web leaf node identities are invalid")
+    row_by_id = {str(row["task_id"]): row for row in rows}
+    root_id = str(manifest.get("root_task_id") or "")
+    expected_root_input = _market_research_web_task_input(
+        source_unit=source_unit,
+        requested_site=requested_site,
+        site_profile=site_profile,
+        scope=_market_research_web_scope(
+            _MARKET_RESEARCH_DIMENSIONS,
+            path="root",
+        ),
+    )
+    if root_id != _stable_json_sha256(expected_root_input):
+        raise OpenRouterError("Market web leaf root identity is invalid")
+    if root_id not in row_by_id:
+        raise OpenRouterError("Market web leaf root is missing")
+    previous_end = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise OpenRouterError("Market web leaf node row is invalid")
+        start = row.get("raw_start_char")
+        end = row.get("raw_end_char")
+        expected_start = 0 if index == 0 else previous_end + 2
+        if start != expected_start or (index and notes[previous_end:start] != "\n\n"):
+            raise OpenRouterError("Market web leaf raw spans are not contiguous")
+        if not isinstance(end, int) or isinstance(end, bool):
+            raise OpenRouterError("Market web leaf has an invalid raw span")
+        previous_end = end
+    if previous_end != len(notes):
+        raise OpenRouterError("Market web leaf raw spans do not cover all notes")
+    visited: set[str] = set()
+
+    def visit(task_id: str, parent_id: str | None) -> None:
+        if task_id in visited:
+            raise OpenRouterError("Market web leaf coverage contains a cycle")
+        row = row_by_id.get(task_id)
+        if row is None or row.get("parent_task_id") != parent_id:
+            raise OpenRouterError("Market web leaf parent/child coverage mismatch")
+        visited.add(task_id)
+        start = row.get("raw_start_char")
+        end = row.get("raw_end_char")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start < 0
+            or end < start
+            or end > len(notes)
+        ):
+            raise OpenRouterError("Market web leaf has an invalid raw span")
+        raw = notes[start:end]
+        if (
+            text_sha256(raw) != row.get("raw_text_sha256")
+            or len(raw) != row.get("raw_text_chars")
+            or len(raw.encode("utf-8")) != row.get("raw_text_utf8_bytes")
+        ):
+            raise OpenRouterError("Market web leaf lost a raw response character")
+        scope = row.get("scope")
+        if not isinstance(scope, dict):
+            raise OpenRouterError("Market web leaf scope is invalid")
+        task_input = _market_research_web_task_input(
+            source_unit=source_unit,
+            requested_site=requested_site,
+            site_profile=site_profile,
+            scope=scope,
+        )
+        expected_task_sha256 = _stable_json_sha256(task_input)
+        if (
+            row.get("task_sha256") != expected_task_sha256
+            or task_id != expected_task_sha256
+        ):
+            raise OpenRouterError("Market web leaf task digest mismatch")
+        citation_urls = row.get("citation_urls")
+        if (
+            not isinstance(citation_urls, list)
+            or not citation_urls
+            or any(not isinstance(value, str) for value in citation_urls)
+            or citation_urls != sorted(set(citation_urls))
+            or any(not _normalized_research_url(value) for value in citation_urls)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(row.get("web_attestation_sha256") or ""),
+            )
+        ):
+            raise OpenRouterError("Market web leaf node evidence is invalid")
+        children = row.get("child_task_ids")
+        if not isinstance(children, list) or any(
+            not isinstance(value, str) or not value for value in children
+        ):
+            raise OpenRouterError("Market web leaf children are invalid")
+        if row.get("state") == "complete":
+            if children:
+                raise OpenRouterError("Complete market web node has children")
+        elif row.get("state") == "provider_limited_prefix":
+            expected_scopes = _market_research_web_children(
+                scope,
+                predecessor_raw_sha256=str(row.get("raw_text_sha256") or ""),
+                predecessor_citation_urls=row.get("citation_urls") or [],
+            )
+            expected_ids = [
+                _stable_json_sha256(
+                    _market_research_web_task_input(
+                        source_unit=source_unit,
+                        requested_site=requested_site,
+                        site_profile=site_profile,
+                        scope=child_scope,
+                    )
+                )
+                for child_scope in expected_scopes
+            ]
+            if children != expected_ids:
+                raise OpenRouterError("Limited market web node lost child coverage")
+        else:
+            raise OpenRouterError("Market web node has an invalid state")
+        for child_id in children:
+            visit(child_id, task_id)
+
+    visit(root_id, None)
+    if visited != set(row_by_id):
+        raise OpenRouterError("Market web leaf contains unreachable nodes")
+    citation_urls = {
+        normalized
+        for item in output.get("citations") or []
+        if isinstance(item, dict)
+        and (normalized := _normalized_research_url(item.get("url")))
+    }
+    node_citation_urls = {
+        str(value)
+        for row in rows
+        for value in row.get("citation_urls") or []
+    }
+    if citation_urls != node_citation_urls:
+        raise OpenRouterError("Market web leaf citation coverage mismatch")
+    if manifest.get("citations_sha256") != _stable_json_sha256(
+        output.get("citations") or []
+    ):
+        raise OpenRouterError("Market web leaf citation evidence was changed")
+    attestation = output.get("web_attestation")
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("version") != WEB_ATTESTATION_VERSION
+        or attestation.get("policy") != WebSearchPolicy.REQUIRED.value
+        or attestation.get("state") != "verified"
+        or attestation.get("metric_eligible") is not True
+        or bool(attestation.get("violations"))
+        or int(attestation.get("leaf_count") or 0) != len(rows)
+        or manifest.get("web_attestation_sha256")
+        != _stable_json_sha256(attestation)
+    ):
+        raise OpenRouterError("Market web leaf aggregate attestation is invalid")
+    expected_completeness = (
+        "scoped_composable_positive_evidence"
+        if any(row.get("state") == "provider_limited_prefix" for row in rows)
+        else "scoped_complete_positive_evidence"
+    )
+    if (
+        output.get("observation_completeness") != expected_completeness
+        or manifest.get("observation_completeness") != expected_completeness
+    ):
+        raise OpenRouterError("Market web leaf completeness contract changed")
+    return output
+
+
+async def _market_research_web_leaf(
+    run_id: str,
+    *,
+    source_unit: dict[str, Any],
+    requested_site: dict[str, Any],
+    site_profile: dict[str, Any],
+    system: str,
+    window_bytes: int,
+    model_envelope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect one resumable, lossless tree of scoped web observations."""
+
+    unit_id = str(source_unit.get("_lr_unit_id") or "")
+    resolved_envelope = (
+        copy.deepcopy(model_envelope)
+        if isinstance(model_envelope, dict)
+        else await model_output_envelope(ANALYSIS_MODEL)
+    )
+    root_scope = _market_research_web_scope(
+        _MARKET_RESEARCH_DIMENSIONS,
+        path="root",
+    )
+    root_input = _market_research_web_task_input(
+        source_unit=source_unit,
+        requested_site=requested_site,
+        site_profile=site_profile,
+        scope=root_scope,
+    )
+    root_task_id = _stable_json_sha256(root_input)
+    root_physical_payload = _market_research_web_provider_payload(
+        system=system,
+        input_json=root_input,
+        model_envelope=resolved_envelope,
+    )
+    digest = _stable_json_sha256(
+        {
+            "unit_id": unit_id,
+            "context_sha256": source_unit.get("_lr_context_sha256"),
+            "profile": site_profile,
+            "requested_site": requested_site,
+            "root_task_id": root_task_id,
+            "harness_version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
+        }
+    )
+    artifact_key = f"market_research_web_leaf_{digest}"
+    leaf_cache_input = {
+        "contract_version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
+        "root_task_sha256": _stable_json_sha256(root_input),
+        "root_physical_request_sha256": _stable_json_sha256(
+            root_physical_payload
+        ),
+        "window_bytes": window_bytes,
+    }
+    cached = await _artifact_output(
+        run_id,
+        artifact_key,
+        input_json=leaf_cache_input,
+        model=ANALYSIS_MODEL,
+        prompt_version=MARKET_RESEARCH_VERSION,
+    )
+    if isinstance(cached, dict):
+        return _validate_market_research_web_leaf(
+            cached,
+            source_unit=source_unit,
+            requested_site=requested_site,
+            site_profile=site_profile,
+        )
+
+    nodes: list[dict[str, Any]] = []
+
+    async def execute_scope(
+        scope: dict[str, Any],
+        *,
+        parent_task_id: str | None,
+        ancestor_raw_sha256: frozenset[str],
+    ) -> str:
+        if len(nodes) >= MARKET_RESEARCH_MAX_WEB_POSTS:
+            raise OpenRouterError(
+                "Market web semantic retry budget exhausted before a new "
+                "provider POST; every accepted prefix remains checkpointed"
+            )
+        task_input = _market_research_web_task_input(
+            source_unit=source_unit,
+            requested_site=requested_site,
+            site_profile=site_profile,
+            scope=scope,
+        )
+        task_sha256 = _stable_json_sha256(task_input)
+        task_id = task_sha256
+        physical_payload = _market_research_web_provider_payload(
+            system=system,
+            input_json=task_input,
+            model_envelope=resolved_envelope,
+        )
+        physical_request_sha256 = _stable_json_sha256(physical_payload)
+        physical_bytes = len(
+            json.dumps(
+                physical_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if physical_bytes > window_bytes:
+            raise OpenRouterError(
+                "One market-research semantic shard exceeds the provider "
+                "window after exact physical-POST preflight"
+            )
+        # A task can legitimately acquire a different physical envelope after
+        # provider metadata or routing changes.  Keying the receipt by both
+        # logical task and exact wire body preserves the earlier paid POST
+        # instead of overwriting it or accidentally promoting it under a new
+        # request contract.  28 + 64 + 1 + 64 = 157 characters, within the
+        # RunArtifact.artifact_key(160) storage contract.
+        attempt_key = (
+            "market_research_web_attempt_"
+            f"{task_id}_{physical_request_sha256}"
+        )
+        cached_receipt = await _artifact_output(
+            run_id,
+            attempt_key,
+            input_json=physical_payload,
+            model=ANALYSIS_MODEL,
+            prompt_version=MARKET_RESEARCH_VERSION,
+        )
+        if isinstance(cached_receipt, dict):
+            receipt = _validate_market_research_web_receipt(
+                cached_receipt,
+                task_input=task_input,
+                expected_physical_payload=physical_payload,
+            )
+        else:
+            await _save_artifact(
+                run_id,
+                stage_key="scenario_design",
+                artifact_key=attempt_key,
+                status="running",
+                model=ANALYSIS_MODEL,
+                input_json=physical_payload,
+                prompt_version=MARKET_RESEARCH_VERSION,
+                preserve_existing_evidence=True,
+            )
+            captured_receipt: dict[str, Any] | None = None
+
+            async def audit_checkpoint(event: dict[str, Any]) -> None:
+                nonlocal captured_receipt
+                captured_receipt = _market_research_web_receipt(
+                    task_input=task_input,
+                    event=event,
+                    expected_physical_payload=physical_payload,
+                )
+                await _save_artifact(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key=attempt_key,
+                    status="completed",
+                    model=ANALYSIS_MODEL,
+                    input_json=physical_payload,
+                    output_json=captured_receipt,
+                    raw_text=captured_receipt["raw_text"],
+                    usage_json=captured_receipt["usage"],
+                    prompt_version=MARKET_RESEARCH_VERSION,
+                )
+
+            limited = False
+            result: Any | None = None
+            try:
+                result = await chat(
+                    model=ANALYSIS_MODEL,
+                    messages=copy.deepcopy(physical_payload["messages"]),
+                    web_policy=WebSearchPolicy.REQUIRED,
+                    reasoning_effort="high",
+                    output_token_policy=OutputTokenPolicy.MODEL_MAX,
+                    temperature=0.1,
+                    accept_output_limited=False,
+                    retry_response_contract_errors=False,
+                    retry_transport_errors=False,
+                    audit_checkpoint=audit_checkpoint,
+                    audit_context={
+                        "document_id": (
+                            f"market-web:{run_id}:{unit_id}:{task_id}"
+                        ),
+                        "sequence": int(scope.get("segment_index") or 0),
+                    },
+                )
+            except OpenRouterOutputLimitError as exc:
+                limited = True
+                result = exc.result
+            except Exception as exc:
+                failed_result = getattr(exc, "result", None)
+                if captured_receipt is None:
+                    await _save_artifact(
+                        run_id,
+                        stage_key="scenario_design",
+                        artifact_key=attempt_key,
+                        status="failed",
+                        model=ANALYSIS_MODEL,
+                        input_json=physical_payload,
+                        raw_text=(
+                            str(getattr(failed_result, "text", "") or "") or None
+                        ),
+                        usage_json=(
+                            copy.deepcopy(getattr(failed_result, "usage", {}) or {})
+                            if failed_result is not None
+                            else None
+                        ),
+                        error_message=str(exc),
+                        prompt_version=MARKET_RESEARCH_VERSION,
+                        preserve_existing_evidence=True,
+                    )
+                raise
+            if captured_receipt is None:
+                if result is None:
+                    raise OpenRouterError("Market web call returned no result")
+                synthetic_event = _market_research_result_event(
+                    result=result,
+                    expected_physical_payload=physical_payload,
+                    limited=limited,
+                )
+                captured_receipt = _market_research_web_receipt(
+                    task_input=task_input,
+                    event=synthetic_event,
+                    expected_physical_payload=physical_payload,
+                )
+                await _save_artifact(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key=attempt_key,
+                    status="completed",
+                    model=ANALYSIS_MODEL,
+                    input_json=physical_payload,
+                    output_json=captured_receipt,
+                    raw_text=captured_receipt["raw_text"],
+                    usage_json=captured_receipt["usage"],
+                    prompt_version=MARKET_RESEARCH_VERSION,
+                )
+            receipt = _validate_market_research_web_receipt(
+                captured_receipt,
+                task_input=task_input,
+                expected_physical_payload=physical_payload,
+            )
+
+        raw_sha256 = str(receipt["raw_text_sha256"])
+        if raw_sha256 in ancestor_raw_sha256:
+            raise OpenRouterError(
+                "Market web refinement repeated an identical provider fragment"
+            )
+        node = {
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "scope": copy.deepcopy(scope),
+            "receipt": receipt,
+            "child_task_ids": [],
+        }
+        nodes.append(node)
+        if receipt["state"] == "provider_limited_prefix":
+            child_scopes = _market_research_web_children(
+                scope,
+                predecessor_raw_sha256=raw_sha256,
+                predecessor_citation_urls=[
+                    str(item.get("url") or "")
+                    for item in receipt.get("citations") or []
+                    if isinstance(item, dict)
+                ],
+            )
+            for child_scope in child_scopes:
+                child_id = await execute_scope(
+                    child_scope,
+                    parent_task_id=task_id,
+                    ancestor_raw_sha256=ancestor_raw_sha256 | {raw_sha256},
+                )
+                node["child_task_ids"].append(child_id)
+        return task_id
+
+    started_at = time.monotonic()
+    # Each paid POST keeps its own transport inactivity/cancellation policy and
+    # is durably checkpointed before the tree advances.  Exact task identities,
+    # finite facets, ancestor hashes and the branch/call budgets prevent an
+    # exponential loop without imposing a character limit on any response.
+    executed_root_id = await execute_scope(
+        root_scope,
+        parent_task_id=None,
+        ancestor_raw_sha256=frozenset(),
+    )
+    if executed_root_id != root_task_id:
+        raise OpenRouterError("Market web retrieval root identity changed")
+    output = _compose_market_research_web_leaf(
+        unit_id=unit_id,
+        root_task_id=root_task_id,
+        nodes=nodes,
+    )
+    output["retrieval_manifest"]["elapsed_seconds"] = max(
+        0.0,
+        time.monotonic() - started_at,
+    )
+    # Elapsed time is operational metadata, not semantic coverage, so bind it
+    # into the checksum only after the tree itself has been assembled.
+    manifest = output["retrieval_manifest"]
+    manifest_core = copy.deepcopy(manifest)
+    manifest_core.pop("manifest_sha256", None)
+    manifest["manifest_sha256"] = _stable_json_sha256(manifest_core)
+    output = _validate_market_research_web_leaf(
+        output,
+        source_unit=source_unit,
+        requested_site=requested_site,
+        site_profile=site_profile,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key=artifact_key,
+        status="completed",
+        model=ANALYSIS_MODEL,
+        input_json=leaf_cache_input,
+        output_json=output,
+        raw_text=output["research_notes"],
+        usage_json={
+            "_aiv_market_web_manifest": output["retrieval_manifest"],
+            "_aiv_web_attestation": output["web_attestation"],
+        },
+        prompt_version=MARKET_RESEARCH_VERSION,
+    )
+    return output
+
+
+async def _market_research_evidence_tree(
+    run_id: str,
+    *,
+    payload: dict[str, Any],
+    research_system: str,
+) -> dict[str, Any]:
+    """Map every site unit, then reduce only bounded, lineage-bearing packets."""
+
+    map_system = f"""
+Ты evidence-mapper исследования рынка. Передан один lossless source unit сайта,
+связанный с ним lossless unit web-research notes и точный список URL,
+подтверждённых transport цитатами. Верни строгий evidence packet. Каждый
+finding обязан ссылаться на source_unit_id. Для внешнего finding используй
+только confirmed_external_urls; для site_confirmed допустим URL страницы
+source unit. Семантический overlap в research_notes нужен только для
+понимания границы: засчитывай наблюдение только если его первый
+решающий символ пересекает core из research_notes_contract. Если фрагмент
+ничего не подтверждает, пометь unit_coverage как unknown. Web notes являются
+набором независимо аттестованных положительных наблюдений в явно ограниченной
+области исследования, а не исчерпывающим индексом интернета. Даже если каждый
+смысловой shard завершён, отсутствие факта в notes не доказывает отсутствие на
+сайте или рынке. Сохрани буквально подтверждённые положительные findings,
+unknown и uncertainties; не повышай уверенность и не выдумывай URL.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    window = await _market_research_model_window(system=research_system)
+    window_bytes = int(window["input_utf8_window"])
+    map_window = await _analyzer_model_input_window(
+        PROCESSING_MODEL,
+        system=map_system,
+    )
+    leaf_window = min(
+        window_bytes,
+        int(map_window["input_utf8_window"]),
+    )
+    target_chars = min(
+        MARKET_RESEARCH_MAP_UNIT_CHARS,
+        max(256, leaf_window // 6),
+    )
+    source_units, manifests = _market_research_source_units(
+        payload,
+        target_chars=target_chars,
+    )
+    root_scope = _market_research_web_scope(
+        _MARKET_RESEARCH_DIMENSIONS,
+        path="root",
+    )
+    domain_source_unit, domain_identity_profile = (
+        _market_research_domain_source_unit(payload)
+    )
+    domain_root_input = _market_research_web_task_input(
+        source_unit=domain_source_unit,
+        requested_site=payload.get("requested_site") or {},
+        site_profile=domain_identity_profile,
+        scope=root_scope,
+    )
+    domain_request_bytes = _market_research_web_request_utf8_bytes(
+        system=research_system,
+        input_json=domain_root_input,
+        model_envelope=window["model_envelope"],
+    )
+    if domain_request_bytes > leaf_window:
+        raise OpenRouterError(
+            "Domain identity cannot fit the exact physical market-research "
+            "web-search POST without truncation"
+        )
+    expected_unit_ids = [
+        str(item.get("_lr_unit_id") or "") for item in source_units
+    ]
+    manifest = {
+        "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+        "mode": "hierarchical_evidence_tree",
+        "window": window,
+        "mapper_window": map_window,
+        "source_manifest_count": len(manifests),
+        "source_manifests": manifests,
+        "source_unit_count": len(source_units),
+        "source_unit_ids": expected_unit_ids,
+        "source_unit_ids_sha256": _stable_json_sha256(expected_unit_ids),
+        "web_retrieval_contract": {
+            "version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
+            "mode": "adaptive_positive_evidence_tree",
+            "exact_physical_post_preflight": True,
+            "retrieval_granularity": "one_domain_identity_tree",
+            "domain_source_unit_id": domain_source_unit["_lr_unit_id"],
+            "domain_source_sha256": domain_source_unit["_lr_unit_sha256"],
+            "maximum_planned_root_request_utf8_bytes": domain_request_bytes,
+            "input_utf8_window": leaf_window,
+            "local_output_or_part_count_cap": None,
+            "semantic_retry_post_cap": MARKET_RESEARCH_MAX_WEB_POSTS,
+            "facet_refinement_depth_cap": (
+                MARKET_RESEARCH_MAX_REFINEMENT_DEPTH
+            ),
+            "internet_exhaustiveness_claimed": False,
+            "external_absence_claims_allowed": False,
+            "aggregate_liveness_deadline_seconds": None,
+            "liveness_policy": (
+                "per_post_inactivity_and_cancellation_with_durable_resume"
+            ),
+            "progress_guards": [
+                "exact_task_identity",
+                "finite_predeclared_facets",
+                "ancestor_raw_sha256_no_repeat",
+                "bounded_semantic_retry_tree",
+            ],
+        },
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="market_research_source_manifest",
+        status="completed",
+        input_json={
+            "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+            "payload_sha256": _stable_json_sha256(payload),
+        },
+        output_json=manifest,
+        prompt_version=MARKET_RESEARCH_VERSION,
+    )
+
+    semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
+    # External search is domain-scoped and paid exactly once (apart from
+    # semantic output-limit refinement inside this one durable tree). Site
+    # units are joined locally below and never trigger another web search.
+    domain_retrieval = await _market_research_web_leaf(
+        run_id,
+        source_unit=domain_source_unit,
+        requested_site=payload.get("requested_site") or {},
+        site_profile=domain_identity_profile,
+        system=research_system,
+        window_bytes=leaf_window,
+        model_envelope=window["model_envelope"],
+    )
+    retrievals = [domain_retrieval]
+
+    citation_by_url: dict[str, dict[str, Any]] = {}
+    for retrieval in retrievals:
+        for item in retrieval.get("citations") or []:
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalized_research_url(item.get("url"))
+            if normalized:
+                citation_by_url.setdefault(normalized, copy.deepcopy(item))
+
+    async def map_leaf(
+        source_unit: dict[str, Any],
+        retrieval: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        unit_id = str(source_unit.get("_lr_unit_id") or "")
+        page_url = _normalized_research_url(source_unit.get("url"))
+        external_urls = {
+            normalized
+            for item in retrieval.get("citations") or []
+            if isinstance(item, dict)
+            and (normalized := _normalized_research_url(item.get("url")))
+        }
+        allowed_urls = external_urls | ({page_url} if page_url else set())
+        notes_text = str(retrieval.get("research_notes") or "")
+        notes_target_chars = max(
+            256,
+            min(max(256, len(notes_text)), max(256, leaf_window // 3)),
+        )
+
+        def note_payload(note_unit: Any, note_manifest: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "contract_version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+                "source_unit": {
+                    "source_unit_id": unit_id,
+                    "page_url": page_url,
+                    "content_storage_state": source_unit.get(
+                        "content_storage_state"
+                    ),
+                    "absence_claims_allowed": source_unit.get(
+                        "absence_claims_allowed"
+                    ),
+                    "core_sha256": source_unit.get("_lr_unit_sha256"),
+                    "context_sha256": source_unit.get("_lr_context_sha256"),
+                    "core_start_in_context": source_unit.get(
+                        "_lr_core_start_in_context"
+                    ),
+                    "core_end_in_context": source_unit.get(
+                        "_lr_core_end_in_context"
+                    ),
+                },
+                "source_context": {
+                    "title": source_unit.get("title"),
+                    "meta_description": source_unit.get("meta_description"),
+                    "main_text": source_unit.get("main_text"),
+                },
+                "research_notes": note_unit.context_text,
+                "research_notes_contract": {
+                    "document_id": note_manifest["document_id"],
+                    "source_sha256": note_manifest["source_sha256"],
+                    "source_chars": note_manifest["source_chars"],
+                    "unit_id": note_unit.unit_id,
+                    "unit_index": note_unit.index,
+                    "unit_count": note_manifest["unit_count"],
+                    "core_start_in_context": note_unit.core_start_in_context,
+                    "core_end_in_context": note_unit.core_end_in_context,
+                    "core_sha256": note_unit.sha256,
+                    "context_sha256": note_unit.context_sha256,
+                    "ownership_rule": (
+                        "first_decisive_evidence_character_in_core"
+                    ),
+                    "overlap_counts_toward_coverage": False,
+                    "observation_completeness": retrieval.get(
+                        "observation_completeness",
+                        "complete",
+                    ),
+                    "absence_claims_allowed": (
+                        retrieval.get("observation_completeness", "complete")
+                        == "complete"
+                    ),
+                },
+                "confirmed_external_urls": sorted(external_urls),
+            }
+
+        while True:
+            note_units, text_manifest = split_lossless_text(
+                notes_text,
+                document_id=(
+                    f"market-research-notes:{unit_id}:"
+                    f"{text_sha256(notes_text)[:16]}"
+                ),
+                target_chars=notes_target_chars,
+                context_overlap_chars=min(
+                    1_024,
+                    max(64, notes_target_chars // 4),
+                ),
+            )
+            note_manifest = text_manifest.as_dict()
+            note_manifest["observation_completeness"] = retrieval.get(
+                "observation_completeness",
+                "complete",
+            )
+            map_payloads = [
+                note_payload(note_unit, note_manifest)
+                for note_unit in note_units
+            ]
+            request_sizes = [
+                _structured_provider_request_utf8_bytes(
+                    model=PROCESSING_MODEL,
+                    model_envelope=map_window["model_envelope"],
+                    system=map_system,
+                    user_payload=map_payload,
+                    schema=MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA,
+                    schema_name="aiv_market_research_map_probe",
+                    reasoning_effort="high",
+                    temperature=0.15,
+                )
+                for map_payload in map_payloads
+            ]
+            if max(request_sizes, default=0) <= leaf_window:
+                break
+            if notes_target_chars == 256:
+                raise OpenRouterError(
+                    "One minimum market-research notes unit cannot fit the "
+                    "mapper window without truncation"
+                )
+            ratio = max(
+                0.1,
+                min(0.9, leaf_window / max(1, max(request_sizes))),
+            )
+            notes_target_chars = max(
+                256,
+                min(notes_target_chars - 1, int(notes_target_chars * ratio)),
+            )
+
+        async def map_notes_unit(map_payload: dict[str, Any]) -> dict[str, Any]:
+            digest = _stable_json_sha256(map_payload)[:20]
+            async with semaphore:
+                packet = await _structured_artifact(
+                    run_id,
+                    stage_key="scenario_design",
+                    artifact_key=f"market_research_map_{digest}",
+                    schema=MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA,
+                    schema_name=f"aiv_market_research_map_{digest}",
+                    system=map_system,
+                    user_payload=map_payload,
+                    model=PROCESSING_MODEL,
+                    reasoning_effort="high",
+                    prompt_version=MARKET_RESEARCH_VERSION,
+                    continuable=True,
+                )
+            return _normalize_market_evidence_packet(
+                packet,
+                allowed_unit_ids={unit_id},
+                allowed_urls=allowed_urls,
+            )
+
+        fragment_outcomes = await asyncio.gather(
+            *(map_notes_unit(map_payload) for map_payload in map_payloads),
+            return_exceptions=True,
+        )
+        fragment_packets: list[dict[str, Any]] = []
+        for outcome in fragment_outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            fragment_packets.append(outcome)
+        combined = _deterministic_market_evidence_union(
+            fragment_packets,
+            allowed_unit_ids={unit_id},
+            allowed_urls=allowed_urls,
+        )
+        return _long_response_leaf(combined, [unit_id]), note_manifest
+
+    local_only_retrieval = {
+        "research_notes": "",
+        "citations": [],
+        "observation_completeness": "scoped_complete_positive_evidence",
+    }
+    map_outcomes = await asyncio.gather(
+        *(
+            map_leaf(
+                source_unit,
+                domain_retrieval if index == 0 else local_only_retrieval,
+            )
+            for index, source_unit in enumerate(source_units)
+        ),
+        return_exceptions=True,
+    )
+    packets: list[dict[str, Any]] = []
+    notes_manifests: list[dict[str, Any]] = []
+    for outcome in map_outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        packet, notes_manifest = outcome
+        packets.append(packet)
+        notes_manifests.append(notes_manifest)
+    manifest["research_notes_manifest_count"] = len(notes_manifests)
+    manifest["research_notes_manifests"] = notes_manifests
+    manifest["research_notes_unit_count"] = sum(
+        int(item.get("unit_count") or 0) for item in notes_manifests
+    )
+    manifest["web_retrieval_post_count"] = sum(
+        int(
+            (
+                retrieval.get("retrieval_manifest")
+                if isinstance(retrieval.get("retrieval_manifest"), dict)
+                else {}
+            ).get("node_count")
+            or 0
+        )
+        for retrieval in retrievals
+    )
+    manifest["web_retrieval_tree_count"] = 1
+    manifest["external_notes_joined_source_unit_id"] = expected_unit_ids[0]
+    manifest["local_site_unit_join_count"] = len(source_units)
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="market_research_source_manifest",
+        status="completed",
+        input_json={
+            "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+            "payload_sha256": _stable_json_sha256(payload),
+        },
+        output_json=manifest,
+        prompt_version=MARKET_RESEARCH_VERSION,
+    )
+
+    reduce_system = f"""
+Ты иерархический reducer evidence packets исследования рынка. Объединяй
+дублирующие findings, но сохраняй подтверждённые claims, source URLs,
+uncertainties и точные source_unit_ids. unit_coverage обязан перечислить каждый
+входной source unit ровно один раз. Unknown остаётся unknown: отсутствие факта
+в одном packet не отменяет факт из другого и не превращается в отсутствие.
+Нельзя добавлять URL или source_unit_id, которых нет во входе.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    level = 0
+    while len(packets) > 1:
+        groups = _pack_market_evidence_packets(
+            packets,
+            window_bytes=leaf_window,
+            level=level,
+        )
+        if len(groups) >= len(packets):
+            lineage = _long_response_lineage(packets)
+            allowed_urls = {
+                normalized
+                for packet in packets
+                for finding in packet.get("findings") or []
+                if isinstance(finding, dict)
+                for value in finding.get("source_urls") or []
+                if (normalized := _normalized_research_url(value))
+            }
+            terminal = _deterministic_market_evidence_union(
+                packets,
+                allowed_unit_ids=set(lineage),
+                allowed_urls=allowed_urls,
+            )
+            packets = [_long_response_leaf(terminal, lineage)]
+            manifest["terminal_reducer_mode"] = "deterministic_lossless_union"
+            break
+
+        async def reduce_group(
+            group_index: int,
+            group: list[dict[str, Any]],
+            current_level: int = level,
+        ) -> dict[str, Any]:
+            lineage = _long_response_lineage(group)
+            reduce_payload = _market_research_reduce_payload(
+                group,
+                level=current_level,
+            )
+            allowed_urls = set(reduce_payload["confirmed_source_urls"])
+            reduce_payload_bytes = len(
+                json.dumps(
+                    reduce_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            if reduce_payload_bytes > leaf_window:
+                raise OpenRouterError(
+                    "One market-research reducer input exceeds the provider "
+                    "window; refusing to truncate evidence packets"
+                )
+            digest = _stable_json_sha256(reduce_payload)[:20]
+            merged = await _structured_artifact(
+                run_id,
+                stage_key="scenario_design",
+                artifact_key=(
+                    "market_research_reduce_l"
+                    f"{current_level}_{group_index}_{digest}"
+                ),
+                schema=MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA,
+                schema_name=(
+                    f"aiv_market_research_reduce_{current_level}_{group_index}"
+                ),
+                system=reduce_system,
+                user_payload=reduce_payload,
+                model=ANALYSIS_MODEL,
+                reasoning_effort="high",
+                prompt_version=MARKET_RESEARCH_VERSION,
+                continuable=True,
+            )
+            normalized = _normalize_market_evidence_packet(
+                merged,
+                allowed_unit_ids=set(lineage),
+                allowed_urls=allowed_urls,
+            )
+            normalized = _preserve_market_evidence_reduction(
+                normalized,
+                group,
+                allowed_unit_ids=set(lineage),
+                allowed_urls=allowed_urls,
+            )
+            output_urls = {
+                value
+                for finding in normalized.get("findings") or []
+                for value in finding.get("source_urls") or []
+            }
+            if output_urls != allowed_urls:
+                raise OpenRouterError(
+                    "Market reducer omitted a confirmed source URL"
+                )
+            input_states = {
+                str(item.get("source_unit_id") or ""): item.get("state")
+                for packet in group
+                for item in packet.get("unit_coverage") or []
+                if isinstance(item, dict)
+            }
+            output_states = {
+                str(item.get("source_unit_id") or ""): item.get("state")
+                for item in normalized.get("unit_coverage") or []
+                if isinstance(item, dict)
+            }
+            if output_states != input_states:
+                raise OpenRouterError(
+                    "Market reducer changed evidence/unknown source-unit state"
+                )
+            return _long_response_leaf(normalized, lineage)
+
+        reduce_outcomes = await asyncio.gather(
+            *(
+                reduce_group(group_index, group)
+                for group_index, group in enumerate(groups, start=1)
+            ),
+            return_exceptions=True,
+        )
+        packets = []
+        for outcome in reduce_outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            packets.append(outcome)
+        level += 1
+
+    lineage = _long_response_lineage(
+        packets,
+        expected_unit_ids=expected_unit_ids,
+    )
+    root_packet = copy.deepcopy(packets[0])
+    root_packet[_LONG_RESPONSE_LINEAGE_KEY] = lineage
+    return {
+        "packet": root_packet,
+        "manifest": manifest,
+        "citations": [citation_by_url[url] for url in sorted(citation_by_url)],
+        "web_attestation": _aggregate_market_web_attestation(retrievals),
+        "retrieval_leaf_count": len(retrievals),
+        "reducer_levels": level,
+    }
 
 
 def _nonempty_research_items(value: Any) -> list[Any]:
@@ -2340,6 +7009,14 @@ def _market_research_input(
     return {
         "requested_site": copy.deepcopy(site_context.get("requested_site") or {}),
         "site_profile": copy.deepcopy(profile),
+        "offer_catalog": copy.deepcopy(profile.get("offer_catalog") or {}),
+        "offer_clusters": copy.deepcopy(profile.get("offer_clusters") or []),
+        "selected_pages_manifest": copy.deepcopy(
+            site_context.get("selected_pages_manifest") or {}
+        ),
+        "crawl_admission": copy.deepcopy(
+            site_context.get("crawl_admission") or {}
+        ),
         "site_evidence": copy.deepcopy(site_context.get("pages") or []),
     }
 
@@ -2358,6 +7035,15 @@ def _site_profile_research_errors(
         errors.append("Сайт не подтвердил название основного бренда.")
     if not _nonempty_research_items(profile.get("evidence")):
         errors.append("В профиле нет доказательств, извлечённых с сайта.")
+    try:
+        catalog_value = profile.get("offer_catalog")
+        if not isinstance(catalog_value, dict):
+            raise OfferCatalogError("offer_catalog is missing")
+        OfferCatalog.from_mapping(catalog_value)
+    except OfferCatalogError as exc:
+        errors.append(
+            "Каталог предложений не прошёл проверку источников: " + str(exc)
+        )
     pages = payload.get("site_evidence")
     if not isinstance(pages, list) or not any(
         isinstance(page, dict)
@@ -2567,6 +7253,38 @@ def _market_research_with_gate(
         if isinstance(item, dict) and str(item.get("url") or "").strip()
     ]
     output = copy.deepcopy(research)
+    catalog_value = profile.get("offer_catalog")
+    if isinstance(catalog_value, dict):
+        catalog = OfferCatalog.from_mapping(catalog_value)
+        site_confirmed = output.get("site_confirmed")
+        if not isinstance(site_confirmed, dict):
+            site_confirmed = {}
+            output["site_confirmed"] = site_confirmed
+        site_confirmed["products"] = list(catalog.legacy_product_strings())
+        evidence_rows = [
+            copy.deepcopy(item)
+            for item in site_confirmed.get("evidence") or []
+            if isinstance(item, dict)
+        ]
+        seen_evidence = {
+            _stable_json_sha256(item) for item in evidence_rows
+        }
+        for offer in catalog.accepted_offers:
+            for evidence in offer.evidence_refs:
+                row = {
+                    "claim": (
+                        f"Сайт предлагает «{offer.canonical_name}» как "
+                        f"{offer.kind.value}."
+                    ),
+                    "url": evidence.source_url,
+                    "excerpt": evidence.evidence_excerpt,
+                }
+                digest = _stable_json_sha256(row)
+                if digest not in seen_evidence:
+                    evidence_rows.append(row)
+                    seen_evidence.add(digest)
+        site_confirmed["evidence"] = evidence_rows
+        output["offer_catalog_digest"] = catalog.catalog_digest
     gate = _market_research_sufficiency(
         output,
         profile,
@@ -2627,6 +7345,524 @@ def _require_market_research_usable(
             or "Исследование рынка не прошло проверку достаточности."
         )
     return research
+
+
+def _empty_market_research_document(
+    structuring_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a schema-valid exact seed before any semantic shard is merged."""
+
+    site_input = (
+        structuring_payload.get("site_input")
+        if isinstance(structuring_payload.get("site_input"), dict)
+        else {}
+    )
+    profile = (
+        site_input.get("site_profile")
+        if isinstance(site_input.get("site_profile"), dict)
+        else {}
+    )
+    return {
+        "status": "ready",
+        "site_confirmed": {
+            "primary_brand": str(profile.get("brand_name") or "").strip(),
+            "brand_aliases": _append_unique_strings(
+                [], profile.get("brand_aliases") or []
+            ),
+            "site_type": str(profile.get("site_type") or "").strip(),
+            "category": str(profile.get("category") or "").strip(),
+            "products": _append_unique_strings(
+                [], profile.get("products") or []
+            ),
+            "topics": _append_unique_strings([], profile.get("topics") or []),
+            "geography": _append_unique_strings(
+                [], profile.get("geography") or []
+            ),
+            "evidence": [],
+        },
+        "external_market_research": {
+            "market": "",
+            "topics": [],
+            "geography": [],
+            "audiences": [],
+            "customer_jobs": [],
+            "decision_criteria": [],
+            "terminology": [],
+            "evidence": [],
+        },
+        "sources": [],
+        "uncertainties": [],
+        "confidence": "low",
+    }
+
+
+def _deterministic_market_research_document(
+    structuring_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Materialize every accepted evidence row without an LLM length limit.
+
+    Semantic shard outputs may improve wording and field selection, but the
+    code-owned evidence ledger is authoritative.  Every finding, uncertainty
+    and confirmed citation therefore survives even if a model chooses a very
+    short answer for one shard.
+    """
+
+    output = _empty_market_research_document(structuring_payload)
+    packet = (
+        structuring_payload.get("evidence_tree")
+        if isinstance(structuring_payload.get("evidence_tree"), dict)
+        else {}
+    )
+    site_input = (
+        structuring_payload.get("site_input")
+        if isinstance(structuring_payload.get("site_input"), dict)
+        else {}
+    )
+    requested_site = (
+        site_input.get("requested_site")
+        if isinstance(site_input.get("requested_site"), dict)
+        else {}
+    )
+    fallback_site_url = _normalized_research_url(requested_site.get("url"))
+    external = output["external_market_research"]
+    confidence_values: list[str] = []
+
+    for finding in packet.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        dimension = str(finding.get("dimension") or "")
+        claim = str(finding.get("claim") or "").strip()
+        evidence = str(finding.get("evidence") or "").strip()
+        confidence = str(finding.get("confidence") or "low").casefold()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "low"
+        confidence_values.append(confidence)
+        source_urls = list(
+            dict.fromkeys(
+                normalized
+                for value in finding.get("source_urls") or []
+                if (normalized := _normalized_research_url(value))
+            )
+        )
+        if dimension == "site_confirmed":
+            site_urls = source_urls or ([fallback_site_url] if fallback_site_url else [])
+            for url in site_urls:
+                row = {"claim": claim, "url": url, "excerpt": evidence}
+                if row not in output["site_confirmed"]["evidence"]:
+                    output["site_confirmed"]["evidence"].append(row)
+            continue
+        if dimension not in _MARKET_RESEARCH_DIMENSIONS:
+            continue
+        evidence_row = {
+            "dimension": dimension,
+            "claim": claim,
+            "source_urls": source_urls,
+            "evidence": evidence,
+            "confidence": confidence,
+        }
+        if evidence_row not in external["evidence"]:
+            external["evidence"].append(evidence_row)
+        if dimension == "market":
+            external["market"] = "\n\n".join(
+                _append_unique_strings([external["market"]], [claim])
+            )
+        elif dimension == "terminology":
+            term_row = {"term": claim, "meaning": evidence}
+            if term_row not in external["terminology"]:
+                external["terminology"].append(term_row)
+        else:
+            external[dimension] = _append_unique_strings(
+                external.get(dimension) or [],
+                [claim],
+            )
+
+    for item in packet.get("uncertainties") or []:
+        if not isinstance(item, dict):
+            continue
+        statement = str(item.get("statement") or "").strip()
+        if statement:
+            output["uncertainties"] = _append_unique_strings(
+                output["uncertainties"], [statement]
+            )
+    unknown_units = [
+        item
+        for item in packet.get("unit_coverage") or []
+        if isinstance(item, dict) and item.get("state") == "unknown"
+    ]
+    for item in unknown_units:
+        note = str(item.get("note") or "").strip()
+        if note:
+            output["uncertainties"] = _append_unique_strings(
+                output["uncertainties"], [note]
+            )
+
+    source_rows = (
+        structuring_payload.get("confirmed_sources")
+        if isinstance(structuring_payload.get("confirmed_sources"), list)
+        else []
+    )
+    source_by_url: dict[str, dict[str, Any]] = {}
+    for item in source_rows:
+        if not isinstance(item, dict):
+            continue
+        url = _normalized_research_url(item.get("url"))
+        if not url:
+            continue
+        source_by_url.setdefault(
+            url,
+            {
+                "url": url,
+                "title": str(item.get("title") or "").strip(),
+                "publisher": _research_url_host(url),
+                "evidence": (
+                    str(item.get("content") or "").strip()
+                    or str(item.get("title") or "").strip()
+                    or "URL подтверждён transport-цитатой веб-поиска."
+                ),
+                "confidence": "medium",
+            },
+        )
+    output["sources"] = [source_by_url[url] for url in sorted(source_by_url)]
+    output["confidence"] = _confidence_floor(confidence_values)
+    if output["uncertainties"] or unknown_units:
+        output["status"] = "limited"
+    return output
+
+
+def _normalize_market_structuring_shard(
+    result: dict[str, Any],
+    *,
+    source_units: list[dict[str, Any]],
+    expected_brand: str,
+) -> dict[str, Any]:
+    """Verify exact, one-for-one coverage of a bounded structuring shard."""
+
+    if not isinstance(result, dict) or not isinstance(result.get("research"), dict):
+        raise OpenRouterError("Market structuring shard has no research object")
+    coverage = result.get("unit_coverage")
+    if not isinstance(coverage, list):
+        raise OpenRouterError("Market structuring shard has no unit coverage")
+    expected = [
+        (str(item.get("source_unit_id") or ""), str(item.get("core_sha256") or ""))
+        for item in source_units
+    ]
+    actual = [
+        (
+            str(item.get("source_unit_id") or ""),
+            str(item.get("core_sha256") or ""),
+        )
+        for item in coverage
+        if isinstance(item, dict)
+    ]
+    if len(actual) != len(coverage) or actual != expected:
+        raise OpenRouterError(
+            "Market structuring shard must cover every source core once and in order"
+        )
+    for item in coverage:
+        if (
+            item.get("disposition") not in {"structured", "uncertain"}
+            or not str(item.get("note") or "").strip()
+        ):
+            raise OpenRouterError("Market structuring shard has an invalid receipt")
+    actual_brand = str(
+        (result["research"].get("site_confirmed") or {}).get("primary_brand")
+        or ""
+    ).strip()
+    if expected_brand and actual_brand.casefold() != expected_brand.casefold():
+        raise OpenRouterError("Market structuring shard changed the primary brand")
+    return copy.deepcopy(result)
+
+
+def _merge_market_structuring_shards(
+    structuring_payload: dict[str, Any],
+    shards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Merge bounded semantic hints onto the exact deterministic document."""
+
+    output = _deterministic_market_research_document(structuring_payload)
+    source_corpus = json.dumps(
+        {
+            "site_input": structuring_payload.get("site_input"),
+            "evidence_tree": structuring_payload.get("evidence_tree"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).casefold()
+    external = output["external_market_research"]
+
+    def grounded(value: Any) -> str:
+        text = str(value or "").strip()
+        return text if text and text.casefold() in source_corpus else ""
+
+    for shard in shards:
+        research = shard.get("research") if isinstance(shard, dict) else None
+        if not isinstance(research, dict):
+            continue
+        partial_external = research.get("external_market_research")
+        if not isinstance(partial_external, dict):
+            continue
+        market_value = grounded(partial_external.get("market"))
+        if market_value:
+            external["market"] = "\n\n".join(
+                _append_unique_strings([external["market"]], [market_value])
+            )
+        for dimension in (
+            "topics",
+            "geography",
+            "audiences",
+            "customer_jobs",
+            "decision_criteria",
+        ):
+            values = [
+                value
+                for raw in partial_external.get(dimension) or []
+                if (value := grounded(raw))
+            ]
+            external[dimension] = _append_unique_strings(
+                external.get(dimension) or [], values
+            )
+        for item in partial_external.get("terminology") or []:
+            if not isinstance(item, dict):
+                continue
+            term = grounded(item.get("term"))
+            meaning = grounded(item.get("meaning"))
+            if term and meaning:
+                row = {"term": term, "meaning": meaning}
+                if row not in external["terminology"]:
+                    external["terminology"].append(row)
+    return output
+
+
+async def _market_research_structuring_shards(
+    run_id: str,
+    *,
+    structuring_payload: dict[str, Any],
+    structuring_system: str,
+) -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any]]:
+    """Structure an arbitrary corpus via bounded, independently valid shards."""
+
+    shard_system = f"""
+Ты редактор одного bounded shard исследования рынка. Source units — точные
+непересекающиеся core-фрагменты полного JSON, semantic overlap даётся только
+для понимания границы. Верни independently schema-valid research document и
+ровно по одному unit_coverage receipt на каждый source_unit_id в исходном
+порядке, сохранив core_sha256 без изменений. Не выдумывай URL, бренд, числа
+или отсутствие факта. Краткий research — допустим: точный полный evidence
+ledger объединит код, но каждый core нужно осмысленно отметить structured или
+uncertain. Не цитируй весь длинный core только ради объёма.
+
+{structuring_system}
+""".strip()
+    window = await _final_model_input_window(model=ANALYSIS_MODEL)
+    window_bytes = int(window["input_utf8_window"])
+    target_chars = min(
+        MARKET_RESEARCH_MAP_UNIT_CHARS,
+        max(256, window_bytes // 8),
+    )
+    site_input = (
+        structuring_payload.get("site_input")
+        if isinstance(structuring_payload.get("site_input"), dict)
+        else {}
+    )
+    profile = (
+        site_input.get("site_profile")
+        if isinstance(site_input.get("site_profile"), dict)
+        else {}
+    )
+    site_identity = {
+        "requested_site": copy.deepcopy(site_input.get("requested_site") or {}),
+        "primary_brand": str(profile.get("brand_name") or "").strip(),
+    }
+
+    def shard_payload(
+        units: list[dict[str, Any]],
+        *,
+        source_payload_sha256: str,
+    ) -> dict[str, Any]:
+        return {
+            "contract_version": MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+            "source_payload_sha256": source_payload_sha256,
+            "site_identity": site_identity,
+            "source_units": units,
+            "coverage_contract": [
+                {
+                    "source_unit_id": str(item.get("source_unit_id") or ""),
+                    "core_sha256": str(item.get("core_sha256") or ""),
+                }
+                for item in units
+            ],
+        }
+
+    def request_bytes(
+        index: int,
+        units: list[dict[str, Any]],
+        *,
+        source_payload_sha256: str,
+    ) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=ANALYSIS_MODEL,
+            model_envelope=window["model_envelope"],
+            system=shard_system,
+            user_payload=shard_payload(
+                units,
+                source_payload_sha256=source_payload_sha256,
+            ),
+            schema=MARKET_RESEARCH_STRUCTURING_SHARD_SCHEMA,
+            schema_name=f"aiv_market_structuring_shard_{index}",
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    while True:
+        units, manifest = _flatten_final_input_payload(
+            structuring_payload,
+            target_chars=target_chars,
+            context_overlap_chars=min(1_024, max(64, target_chars // 4)),
+        )
+        source_payload_sha256 = str(manifest["source_payload_sha256"])
+        maximum_singleton = max(
+            (
+                request_bytes(
+                    index,
+                    [unit],
+                    source_payload_sha256=source_payload_sha256,
+                )
+                for index, unit in enumerate(units, start=1)
+            ),
+            default=0,
+        )
+        if maximum_singleton <= window_bytes:
+            break
+        if target_chars <= 256:
+            raise OpenRouterError(
+                "One minimum market structuring core cannot fit the exact "
+                "physical structured POST"
+            )
+        target_chars = max(256, target_chars // 2)
+
+    packs: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for unit in units:
+        candidate = [*current, unit]
+        pack_index = len(packs) + 1
+        if current and request_bytes(
+            pack_index,
+            candidate,
+            source_payload_sha256=source_payload_sha256,
+        ) > window_bytes:
+            packs.append(current)
+            current = [unit]
+        else:
+            current = candidate
+    if current:
+        packs.append(current)
+    request_sizes = [
+        request_bytes(
+            index,
+            pack,
+            source_payload_sha256=source_payload_sha256,
+        )
+        for index, pack in enumerate(packs, start=1)
+    ]
+    if any(value > window_bytes for value in request_sizes):
+        raise OpenRouterError("Market structuring pack exceeded exact input window")
+
+    semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
+
+    async def structure_pack(
+        index: int,
+        pack: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload = shard_payload(
+            pack,
+            source_payload_sha256=source_payload_sha256,
+        )
+        digest = _stable_json_sha256(payload)[:20]
+        async with semaphore:
+            result = await _structured_artifact(
+                run_id,
+                stage_key="scenario_design",
+                artifact_key=f"market_research_structuring_shard_{index}_{digest}",
+                schema=MARKET_RESEARCH_STRUCTURING_SHARD_SCHEMA,
+                schema_name=f"aiv_market_structuring_shard_{index}",
+                system=shard_system,
+                user_payload=payload,
+                model=ANALYSIS_MODEL,
+                reasoning_effort="high",
+                prompt_version=MARKET_RESEARCH_VERSION,
+                continuable=True,
+            )
+        return _normalize_market_structuring_shard(
+            result,
+            source_units=pack,
+            expected_brand=site_identity["primary_brand"],
+        )
+
+    outcomes = await asyncio.gather(
+        *(structure_pack(index, pack) for index, pack in enumerate(packs, start=1)),
+        return_exceptions=True,
+    )
+    shards: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        shards.append(outcome)
+    covered_ids = [
+        str(item.get("source_unit_id") or "")
+        for shard in shards
+        for item in shard.get("unit_coverage") or []
+        if isinstance(item, dict)
+    ]
+    expected_ids = [str(item.get("source_unit_id") or "") for item in units]
+    if covered_ids != expected_ids:
+        raise OpenRouterError("Market structuring shards lost global source order")
+
+    output = _merge_market_structuring_shards(structuring_payload, shards)
+    plan = {
+        **window,
+        "version": MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+        "mode": "bounded_schema_valid_shards",
+        "source_payload_sha256": source_payload_sha256,
+        "source_payload_utf8_bytes": manifest["source_payload_utf8_bytes"],
+        "source_unit_count": len(units),
+        "shard_count": len(packs),
+        "covered_unit_count": len(covered_ids),
+        "coverage_complete": covered_ids == expected_ids,
+        "maximum_request_utf8_bytes": max(request_sizes, default=0),
+        "local_corpus_or_shard_count_cap": None,
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="market_research_structuring_shard_manifest",
+        status="completed",
+        model=ANALYSIS_MODEL,
+        input_json={
+            "version": MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+            "source_payload_sha256": source_payload_sha256,
+        },
+        output_json={
+            **plan,
+            "source_manifest": manifest,
+            "shard_unit_ids": [
+                [str(item.get("source_unit_id") or "") for item in pack]
+                for pack in packs
+            ],
+        },
+        prompt_version=MARKET_RESEARCH_VERSION,
+    )
+    return (
+        output,
+        plan,
+        json.dumps(output, ensure_ascii=False, separators=(",", ":")),
+        {
+            "_aiv_market_structuring_shards": plan,
+            "_aiv_market_structuring_shard_outputs_sha256": _stable_json_sha256(
+                shards
+            ),
+        },
+    )
 
 
 async def _cached_market_research(
@@ -2728,15 +7964,10 @@ async def _market_research(
         input_json=payload,
         prompt_version=MARKET_RESEARCH_VERSION,
     )
-    # Шаг разделён на два вызова, потому что строгая JSON-схема и
-    # URL-цитаты в агентском цикле веб-поиска взаимоисключаются (замер
-    # 2026-08-21 на anthropic/claude-opus-5): эндпоинты, соблюдающие
-    # response_format, не отдают url_citation-аннотаций, а эндпоинты и
-    # engine=exa, отдающие цитаты, игнорируют схему и пишут повествование.
-    # Поэтому retrieval и структурирование аттестуются раздельно:
-    # 1) исследование со свободным текстом и обязательным веб-поиском —
-    #    отсюда берутся аттестация и подтверждённые цитаты;
-    # 2) структурирование в MARKET_RESEARCH_SCHEMA без доступа к вебу.
+    # Web retrieval and strict JSON structuring remain separate because the
+    # provider does not reliably combine response_format with URL citations.
+    # Unlike the legacy two-call flow, retrieval is losslessly partitioned by
+    # site source unit and its notes are mapped/reduced with exact lineage.
     research_system = f"""
 Ты старший исследователь рынка. Перед проектированием поисковых сценариев
 изучи сайт, который указал пользователь, и внешний рыночный контекст.
@@ -2752,6 +7983,10 @@ async def _market_research(
 
 Основной бренд определяет только сайт. Никогда не заменяй primary_brand
 названием группы, конкурента, отрасли или бренда из внешнего поиска.
+offer_catalog — code-owned каталог предложений с дословными фрагментами и
+хешами сохранённых страниц. Сохрани все его предложения и user_jobs; внешний
+поиск может дополнить рыночный контекст, но не вправе добавить клиенту новый
+продукт или удалить подтверждённый. Общая тема запроса не является продуктом.
 
 Пиши структурированные исследовательские заметки: для каждого измерения —
 отдельный раздел с выводами, дословными выдержками и полными URL. Используй
@@ -2761,44 +7996,11 @@ async def _market_research(
 {LIVE_RUSSIAN_RULES}
 """.strip()
     try:
-        research = await chat(
-            model=ANALYSIS_MODEL,
-            messages=[
-                {"role": "system", "content": research_system},
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            web_policy=WebSearchPolicy.REQUIRED,
-            reasoning_effort="high",
-            max_tokens=12_000,
-            temperature=0.1,
-        )
-    except OpenRouterPolicyError as exc:
-        output = _market_research_with_gate(
-            {},
-            profile,
-            payload=payload,
-            web_attestation=exc.result.web_attestation,
-            citations=exc.result.citations,
-        )
-        await _save_artifact(
+        evidence_tree = await _market_research_evidence_tree(
             run_id,
-            stage_key="scenario_design",
-            artifact_key="market_research",
-            status="failed",
-            model=ANALYSIS_MODEL,
-            input_json=payload,
-            output_json=output,
-            raw_text=exc.result.text,
-            usage_json=exc.result.usage,
-            error_message=str(exc),
-            prompt_version=MARKET_RESEARCH_VERSION,
+            payload=payload,
+            research_system=research_system,
         )
-        raise MarketResearchGateError(
-            "Исследование рынка не подтвердило обязательный веб-поиск."
-        ) from exc
     except Exception as exc:
         await _save_artifact(
             run_id,
@@ -2815,7 +8017,7 @@ async def _market_research(
     confirmed_urls = sorted(
         {
             str(item.get("url") or "").strip()
-            for item in research.citations or []
+            for item in evidence_tree.get("citations") or []
             if isinstance(item, dict) and str(item.get("url") or "").strip()
         }
     )
@@ -2825,44 +8027,214 @@ async def _market_research(
 
 Правила:
 1. site_confirmed заполняй только фактами, подтверждёнными site_profile и
-страницами site_evidence из входных данных; в evidence указывай URL страницы
-сайта, точный claim и дословный excerpt.
-2. external_market_research заполняй только сведениями из заметок. В
+finding dimension=site_confirmed из evidence_tree; в evidence указывай URL
+страницы сайта, точный claim и дословный excerpt.
+2. external_market_research заполняй только сведениями из evidence_tree. В
 source_urls каждого доказательства используй только URL из списка
 confirmed_source_urls; источник, которого нет в списке, перечисли в
 uncertainties, а не в source_urls.
 3. Никогда не меняй primary_brand: его определяет сайт.
+3а. products перенеси из offer_catalog без добавлений и потерь. Evidence для
+этих предложений бери из offer_catalog.evidence_refs, а не из внешнего поиска.
 4. Не заполняй пробелы догадками: неизвестность запиши в uncertainties и
 поставь limited или blocked. ready допустим только при полном покрытии
 измерений подтверждёнными источниками.
+5. source_unit_ids и unit_coverage — точная code-owned lineage. Unit со state
+unknown не доказывает отсутствие факта. Нельзя игнорировать uncertainty или
+делать отрицательный вывод из неполного/prefix-only source unit.
+6. Если вход содержит long_input_contract, evidence_digest и
+deterministic_passthrough, это lossless-представление всего исходного payload:
+все source units учтены, точные scalar values имеют приоритет над пересказом.
+Не требуй отсутствующие верхнеуровневые ключи повторно и не считай evidence
+tree неполным только из-за иерархической формы входа.
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
+    structuring_payload = {
+        "site_input": {
+            "requested_site": payload.get("requested_site"),
+            "site_profile": payload.get("site_profile"),
+        },
+        "evidence_tree": evidence_tree["packet"],
+        "evidence_tree_contract": {
+            "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
+            "source_unit_count": evidence_tree["manifest"]["source_unit_count"],
+            "source_unit_ids_sha256": evidence_tree["manifest"][
+                "source_unit_ids_sha256"
+            ],
+            "source_unit_ids": evidence_tree["manifest"]["source_unit_ids"],
+            "reducer_levels": evidence_tree["reducer_levels"],
+        },
+        "confirmed_source_urls": confirmed_urls,
+        "confirmed_sources": [
+            copy.deepcopy(item)
+            for item in evidence_tree.get("citations") or []
+            if isinstance(item, dict)
+        ],
+    }
+    structuring_input_plan: dict[str, Any] | None = None
     try:
-        structured = await chat(
+        def market_structuring_request_bytes(
+            candidate: dict[str, Any],
+            envelope: dict[str, Any],
+        ) -> int:
+            return _structured_provider_request_utf8_bytes(
+                model=ANALYSIS_MODEL,
+                model_envelope=envelope,
+                system=structuring_system,
+                user_payload=candidate,
+                schema=MARKET_RESEARCH_SCHEMA,
+                schema_name="aiv_market_research",
+                reasoning_effort="high",
+                temperature=0.1,
+            )
+
+        structuring_window = await _final_model_input_window(
+            model=ANALYSIS_MODEL
+        )
+        direct_request_bytes = market_structuring_request_bytes(
+            structuring_payload,
+            structuring_window["model_envelope"],
+        )
+        direct_fits = direct_request_bytes <= int(
+            structuring_window["input_utf8_window"]
+        )
+        model_structuring_payload = structuring_payload
+        structuring_input_plan = {
+            **structuring_window,
+            "version": MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
+            "mode": "direct" if direct_fits else "bounded_schema_valid_shards",
+            "source_payload_sha256": _stable_json_sha256(
+                structuring_payload
+            ),
+            "source_payload_utf8_bytes": len(
+                json.dumps(
+                    structuring_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ),
+            "model_request_utf8_bytes": direct_request_bytes,
+            "coverage_complete": True,
+        }
+        await _save_artifact(
+            run_id,
+            stage_key="scenario_design",
+            artifact_key="market_research_structuring_preflight",
+            status="completed",
             model=ANALYSIS_MODEL,
-            messages=[
+            input_json={
+                "source_payload_sha256": _stable_json_sha256(
+                    structuring_payload
+                ),
+            },
+            output_json=structuring_input_plan,
+            prompt_version=MARKET_RESEARCH_VERSION,
+        )
+        if direct_fits:
+            messages = [
                 {"role": "system", "content": structuring_system},
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {
-                            "site_input": payload,
-                            "research_notes": research.text,
-                            "confirmed_source_urls": confirmed_urls,
-                        },
+                        model_structuring_payload,
                         ensure_ascii=False,
                     ),
                 },
-            ],
-            response_schema=MARKET_RESEARCH_SCHEMA,
-            schema_name="aiv_market_research",
-            web_policy=WebSearchPolicy.FORBIDDEN,
-            reasoning_effort="high",
-            max_tokens=12_000,
-            temperature=0.1,
-        )
+            ]
+            document_id = (
+                f"{run_id}:market-research:"
+                f"{_stable_json_sha256(model_structuring_payload)[:20]}"
+            )
+            audit_checkpoint, resume_checkpoint = (
+                await _durable_structured_transport(
+                    run_id,
+                    stage_key="scenario_design",
+                    owner_artifact_key="market_research",
+                    source_input=model_structuring_payload,
+                    model=ANALYSIS_MODEL,
+                    owner_prompt_version=MARKET_RESEARCH_VERSION,
+                    messages=messages,
+                    schema_name="aiv_market_research",
+                    response_schema=MARKET_RESEARCH_SCHEMA,
+                    document_id=document_id,
+                    reasoning_effort="high",
+                    temperature=0.1,
+                )
+            )
+            try:
+                structured = await chat_continuable_structured(
+                    model=ANALYSIS_MODEL,
+                    messages=messages,
+                    response_schema=MARKET_RESEARCH_SCHEMA,
+                    schema_name="aiv_market_research",
+                    reasoning_effort="high",
+                    temperature=0.1,
+                    document_id=document_id,
+                    audit_checkpoint=audit_checkpoint,
+                    resume_checkpoint=resume_checkpoint,
+                )
+            except (
+                OpenRouterStructuredContinuationError,
+                OpenRouterOutputLimitError,
+                OpenRouterResponseContractError,
+            ) as length_exc:
+                failed_result = getattr(length_exc, "result", None)
+                failed_transport = getattr(failed_result, "transport", None)
+                if (
+                    isinstance(length_exc, OpenRouterResponseContractError)
+                    and not (
+                        isinstance(failed_transport, dict)
+                        and failed_transport.get("output_limited") is True
+                    )
+                ):
+                    raise
+                (
+                    sharded_output,
+                    sharded_plan,
+                    sharded_raw,
+                    sharded_usage,
+                ) = await _market_research_structuring_shards(
+                    run_id,
+                    structuring_payload=structuring_payload,
+                    structuring_system=structuring_system,
+                )
+                structuring_input_plan = {
+                    **sharded_plan,
+                    "direct_attempt_preserved": True,
+                    "direct_failure_type": type(length_exc).__name__,
+                }
+                structured = SimpleNamespace(
+                    parsed=sharded_output,
+                    text=sharded_raw,
+                    usage=sharded_usage,
+                )
+        else:
+            (
+                sharded_output,
+                sharded_plan,
+                sharded_raw,
+                sharded_usage,
+            ) = await _market_research_structuring_shards(
+                run_id,
+                structuring_payload=structuring_payload,
+                structuring_system=structuring_system,
+            )
+            structuring_input_plan = {
+                **sharded_plan,
+                "direct_request_utf8_bytes": direct_request_bytes,
+                "direct_input_window_utf8_bytes": int(
+                    structuring_window["input_utf8_window"]
+                ),
+            }
+            structured = SimpleNamespace(
+                parsed=sharded_output,
+                text=sharded_raw,
+                usage=sharded_usage,
+            )
     except Exception as exc:
+        failed_result = getattr(exc, "result", None)
         await _save_artifact(
             run_id,
             stage_key="scenario_design",
@@ -2870,18 +8242,41 @@ uncertainties, а не в source_urls.
             status="failed",
             model=ANALYSIS_MODEL,
             input_json=payload,
-            raw_text=research.text,
-            usage_json=research.usage,
+            usage_json={
+                "_aiv_web_attestation": evidence_tree["web_attestation"],
+                "_aiv_market_research_tree": evidence_tree["manifest"],
+                "_aiv_market_research_structuring_input": (
+                    structuring_input_plan
+                ),
+                "_aiv_structuring_failure": (
+                    dict(getattr(failed_result, "usage", {}) or {})
+                    if failed_result is not None
+                    else {}
+                ),
+            },
+            raw_text=(
+                str(getattr(failed_result, "text", "") or "") or None
+            ),
             error_message=str(exc),
             prompt_version=MARKET_RESEARCH_VERSION,
         )
         raise
 
-    combined_usage = dict(research.usage)
+    combined_usage = {
+        "_aiv_web_attestation": evidence_tree["web_attestation"],
+        "_aiv_response_annotations": [
+            {"type": "url_citation", "url_citation": copy.deepcopy(item)}
+            for item in evidence_tree.get("citations") or []
+        ],
+        "_aiv_market_research_tree": evidence_tree["manifest"],
+        "_aiv_market_research_retrieval_leaf_count": evidence_tree[
+            "retrieval_leaf_count"
+        ],
+        "_aiv_market_research_reducer_levels": evidence_tree["reducer_levels"],
+        "_aiv_market_research_structuring_input": structuring_input_plan,
+    }
     combined_usage["_aiv_structuring_usage"] = structured.usage
-    combined_raw = (
-        f"{research.text}\n\n=== STRUCTURED JSON ===\n\n{structured.text}"
-    )
+    combined_raw = structured.text
     if not isinstance(structured.parsed, dict):
         error = "Market research response is not an object"
         await _save_artifact(
@@ -2897,13 +8292,13 @@ uncertainties, а не в source_urls.
             prompt_version=MARKET_RESEARCH_VERSION,
         )
         raise OpenRouterError(error)
-    # Гейт и аттестация — от исследовательского вызова: именно он ходил в веб.
+    # Гейт получает агрегат всех аттестованных retrieval leaves.
     output = _market_research_with_gate(
         structured.parsed,
         profile,
         payload=payload,
-        web_attestation=research.web_attestation,
-        citations=research.citations,
+        web_attestation=evidence_tree["web_attestation"],
+        citations=evidence_tree["citations"],
     )
     await _save_artifact(
         run_id,
@@ -2984,6 +8379,70 @@ def _validate_prompt_set(
         errors.append("Тексты сценариев должны быть непустыми и уникальными.")
     if any(not str(item.get("rationale") or "").strip() for item in prompts):
         errors.append("Каждый сценарий должен объяснять, какой сигнал он проверяет.")
+    known_clusters = {
+        str(item.get("cluster_id") or "")
+        for item in profile.get("offer_clusters") or []
+        if isinstance(item, dict) and str(item.get("cluster_id") or "")
+    }
+    covered_clusters: set[str] = set()
+    for item in prompts:
+        support = item.get("supporting_cluster_ids")
+        if not isinstance(support, list) or any(
+            not isinstance(cluster_id, str) or not cluster_id
+            for cluster_id in support or []
+        ):
+            errors.append(
+                f"Сценарий {item.get('prompt_key')} должен содержать список "
+                "supporting_cluster_ids."
+            )
+            continue
+        unknown = set(support).difference(known_clusters)
+        if unknown:
+            errors.append(
+                f"Сценарий {item.get('prompt_key')} ссылается на неизвестные "
+                f"кластеры: {', '.join(sorted(unknown))}."
+            )
+        if item.get("role") == "brand_diagnostic" and support:
+            errors.append(
+                f"Брендовый сценарий {item.get('prompt_key')} не должен "
+                "подменять покрытие шести INTENT-сценариев."
+            )
+        if item.get("role") == "unbranded_discovery":
+            covered_clusters.update(support)
+    raw_exclusions = prompt_set.get("cluster_exclusions")
+    if not isinstance(raw_exclusions, list):
+        errors.append("Нужен список cluster_exclusions, даже если он пуст.")
+        raw_exclusions = []
+    excluded_clusters: set[str] = set()
+    for item in raw_exclusions:
+        if not isinstance(item, dict):
+            errors.append("Исключение кластера должно быть объектом.")
+            continue
+        cluster_id = str(item.get("cluster_id") or "")
+        reason = str(item.get("reason") or "").strip()
+        if cluster_id not in known_clusters:
+            errors.append(f"Исключён неизвестный кластер {cluster_id or 'без id'}.")
+        if len(reason) < 12:
+            errors.append(
+                f"Исключение кластера {cluster_id or 'без id'} не объяснено."
+            )
+        if cluster_id in excluded_clusters:
+            errors.append(f"Кластер {cluster_id} исключён больше одного раза.")
+        excluded_clusters.add(cluster_id)
+    overlap = covered_clusters & excluded_clusters
+    if overlap:
+        errors.append(
+            "Кластеры одновременно покрыты и исключены: "
+            + ", ".join(sorted(overlap))
+        )
+    missing_clusters = known_clusters.difference(
+        covered_clusters | excluded_clusters
+    )
+    if missing_clusters:
+        errors.append(
+            "Безбрендовые сценарии не покрывают предложения сайта: "
+            + ", ".join(sorted(missing_clusters))
+        )
     return errors
 
 
@@ -3120,6 +8579,8 @@ async def _review_prompt_set_semantics(
                 "customer_jobs",
                 "decision_criteria",
                 "geography",
+                "offer_catalog",
+                "offer_clusters",
             )
         },
         "market_research": research,
@@ -3170,10 +8631,22 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
 исправления. В supporting_evidence укажи конкретные подтверждения и URL для
 фактических условий запроса; не требуй источника на ещё неизвестные варианты,
 которые пользователь просит назвать в ответе.
+Проверь supporting_cluster_ids: каждый ID должен существовать в
+site_profile.offer_clusters, а текст сценария и его задача должны естественно
+проверять предложение этого кластера без упоминания целевого бренда.
+cluster_exclusions допустимы только с конкретной причиной, почему кластер
+нельзя честно проверить в этом экспресс-срезе.
 Иначе поставь revise и дай короткую точную инструкцию для исправления каждого
 несовпавшего запроса. Не переписывай всю методологию.
 
 {LIVE_RUSSIAN_RULES}
+""".strip()
+    system += "\n\n" + """
+Если вход содержит long_input_contract, evidence_digest и
+deterministic_passthrough, это полное иерархическое представление исходного
+пакета. Каждый source leaf и точный scalar учтены code-owned lineage. Проверяй
+шесть сценариев по всем переданным observations и точным значениям; unknown не
+превращай в отсутствие, число, URL или сущность не пересчитывай и не изменяй.
 """.strip()
     errors: list[str] = []
     for review_attempt in range(3):
@@ -3185,6 +8658,35 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
             attempt_payload["previous_review_error"] = (
                 _REVIEW_STRUCTURALLY_INVALID
             )
+        def prompt_review_request_bytes(
+            candidate: dict[str, Any],
+            envelope: dict[str, Any],
+        ) -> int:
+            return _structured_provider_request_utf8_bytes(
+                model=PROCESSING_MODEL,
+                model_envelope=envelope,
+                system=system,
+                user_payload=candidate,
+                schema=PROMPT_SET_REVIEW_SCHEMA,
+                schema_name="aiv_prompt_set_semantic_review",
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+
+        model_attempt_payload, _review_input_plan = (
+            await _prepare_final_model_payload(
+                run_id,
+                payload=attempt_payload,
+                system=system,
+                target_model=PROCESSING_MODEL,
+                stage_key="scenario_design",
+                artifact_namespace=(
+                    f"prompt_semantic_review_input_a{review_attempt}"
+                ),
+                prompt_version=PROMPT_SET_REVIEW_VERSION,
+                final_request_utf8_bytes=prompt_review_request_bytes,
+            )
+        )
         review = await _structured_artifact(
             run_id,
             stage_key="scenario_design",
@@ -3192,8 +8694,7 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
             schema=PROMPT_SET_REVIEW_SCHEMA,
             schema_name="aiv_prompt_set_semantic_review",
             system=system,
-            user_payload=attempt_payload,
-            max_tokens=6000,
+            user_payload=model_attempt_payload,
             # Не CRITIC_MODEL: gemini-flash игнорирует minItems строгой схемы
             # и явное требование «ровно шесть проверок» — возвращал 1-2
             # проверки с verdict=pass (прогон 5ae13350, 2026-08-21).
@@ -3202,6 +8703,7 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
             model=PROCESSING_MODEL,
             reasoning_effort="high",
             prompt_version=PROMPT_SET_REVIEW_VERSION,
+            continuable=False,
         )
         errors = _prompt_review_errors(review, prompt_set, research)
         if errors != [_REVIEW_STRUCTURALLY_INVALID]:
@@ -3424,7 +8926,10 @@ def _first_research_text(
         for candidate in candidates:
             text = re.sub(r"\s+", " ", str(candidate or "")).strip(" .;:\n")
             if text:
-                return text[:180]
+                # This is a semantic fallback, not UI copy.  Cutting at an
+                # arbitrary character could change a criterion or split a
+                # negation; preserve the complete selected research value.
+                return text
     return fallback
 
 
@@ -3548,6 +9053,11 @@ def _deterministic_prompt_fallback(
             "Запрос проверяет новые подходы и их конкретных носителей.",
         ),
     ]
+    cluster_ids = [
+        str(item.get("cluster_id") or "")
+        for item in profile.get("offer_clusters") or []
+        if isinstance(item, dict) and str(item.get("cluster_id") or "")
+    ]
     prompts = [
         {
             "prompt_key": key,
@@ -3556,8 +9066,13 @@ def _deterministic_prompt_fallback(
             "text": text,
             "rationale": rationale,
             "choice_request": True,
+            "supporting_cluster_ids": [
+                cluster_id
+                for cluster_index, cluster_id in enumerate(cluster_ids)
+                if cluster_index % len(unbranded) == prompt_index
+            ],
         }
-        for key, intent, text, rationale in unbranded
+        for prompt_index, (key, intent, text, rationale) in enumerate(unbranded)
     ]
     prompts.extend(
         [
@@ -3568,6 +9083,7 @@ def _deterministic_prompt_fallback(
                 "text": f"Какие услуги предлагает {brand} и для каких задач они подходят?",
                 "rationale": "Проверяет базовое знание предложения бренда.",
                 "choice_request": False,
+                "supporting_cluster_ids": [],
             },
             {
                 "prompt_key": "b-compare",
@@ -3576,6 +9092,7 @@ def _deterministic_prompt_fallback(
                 "text": f"Чем {brand} отличается от других вариантов в категории «{category}»?",
                 "rationale": "Проверяет способность сравнить известный бренд.",
                 "choice_request": False,
+                "supporting_cluster_ids": [],
             },
             {
                 "prompt_key": "b-trust",
@@ -3584,10 +9101,11 @@ def _deterministic_prompt_fallback(
                 "text": f"Что известно о репутации {brand} и насколько ему можно доверять?",
                 "rationale": "Проверяет знание сигналов доверия к бренду.",
                 "choice_request": False,
+                "supporting_cluster_ids": [],
             },
         ]
     )
-    return {"prompts": prompts}
+    return {"prompts": prompts, "cluster_exclusions": []}
 
 
 async def _save_accepted_prompt_set(
@@ -3749,19 +9267,51 @@ async def _recover_prompt_set(
             "Это последняя ограниченная попытка. Исправь только замечания и "
             "сохрани без изменения сценарии, которых они не касаются."
         )
+        def prompt_recovery_request_bytes(
+            candidate: dict[str, Any],
+            envelope: dict[str, Any],
+        ) -> int:
+            return _structured_provider_request_utf8_bytes(
+                model=ANALYSIS_MODEL,
+                model_envelope=envelope,
+                system=system,
+                user_payload=candidate,
+                schema=PROMPT_SET_SCHEMA,
+                schema_name="aiv_prompt_set_recovery",
+                reasoning_effort="high",
+                temperature=0.1,
+            )
+
+        model_repair_payload, recovery_input_plan = (
+            await _prepare_final_model_payload(
+                run_id,
+                payload=repair_payload,
+                system=system,
+                target_model=ANALYSIS_MODEL,
+                stage_key="scenario_design",
+                artifact_namespace=(
+                    f"prompt_set_recovery_input_e{plan.epoch}"
+                ),
+                prompt_version=PROMPT_SET_VERSION,
+                final_request_utf8_bytes=prompt_recovery_request_bytes,
+            )
+        )
         result = await chat(
             model=ANALYSIS_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {
                     "role": "user",
-                    "content": json.dumps(repair_payload, ensure_ascii=False),
+                    "content": json.dumps(
+                        model_repair_payload,
+                        ensure_ascii=False,
+                    ),
                 },
             ],
             response_schema=PROMPT_SET_SCHEMA,
             schema_name="aiv_prompt_set_recovery",
             reasoning_effort="high",
-            max_tokens=7_000,
+            output_token_policy=OutputTokenPolicy.MODEL_MAX,
             temperature=0.1,
             retry_response_contract_errors=False,
             retry_transport_errors=False,
@@ -3769,6 +9319,7 @@ async def _recover_prompt_set(
         recovered = result.parsed if isinstance(result.parsed, dict) else {}
         raw_text = result.text
         usage = dict(result.usage)
+        usage["_aiv_recovery_input_harness"] = recovery_input_plan
         errors = _validate_prompt_set(recovered, profile)
         if not errors:
             errors = await _review_prompt_set_semantics(
@@ -3983,6 +9534,22 @@ choice_request поставь true только если текст действ
 В rationale объясни, какой именно признак заявленного INTENT-класса выражен
 в формулировке. Не используй код класса как формальное оправдание.
 
+site_profile.offer_clusters — обязательная карта подтверждённых предложений
+сайта. В supporting_cluster_ids каждого безбрендового сценария укажи кластеры,
+чьи пользовательские задачи реально проверяет этот запрос. Шесть сценариев
+вместе должны покрыть каждый кластер. Если конкретный кластер нельзя честно
+проверить в экспресс-наборе, внеси его один раз в cluster_exclusions и объясни
+причину предметно; формулировки «не применимо» и «прочее» запрещены.
+Брендовые сценарии всегда возвращают пустой supporting_cluster_ids: доказуемое
+покрытие портфеля относится именно к шести безбрендовым INTENT-сценариям.
+
+Если вход содержит long_input_contract, evidence_digest и
+deterministic_passthrough, это полное иерархическое представление исходного
+пакета site_profile + market_research. Code-owned lineage уже учёл каждый leaf.
+Сохраняй все подтверждённые задачи, критерии, географию, сущности, URL и
+оговорки; точные scalar values имеют приоритет над пересказом, unknown нельзя
+превращать в 0 или в отсутствие.
+
 {LIVE_RUSSIAN_RULES}
 """.strip()
     # Четыре попытки — общий durable-бюджет run_id + base_payload_digest, а не
@@ -4012,19 +9579,53 @@ choice_request поставь true только если текст действ
             budget_attempt=budget_attempt,
         )
         try:
+            def prompt_generation_request_bytes(
+                candidate: dict[str, Any],
+                envelope: dict[str, Any],
+            ) -> int:
+                return _structured_provider_request_utf8_bytes(
+                    model=ANALYSIS_MODEL,
+                    model_envelope=envelope,
+                    system=system,
+                    user_payload=candidate,
+                    schema=PROMPT_SET_SCHEMA,
+                    schema_name="aiv_prompt_set",
+                    reasoning_effort="high",
+                    temperature=0.2,
+                )
+
+            model_user_content, _generator_input_plan = (
+                await _prepare_final_model_payload(
+                    run_id,
+                    payload=user_content,
+                    system=system,
+                    target_model=ANALYSIS_MODEL,
+                    stage_key="scenario_design",
+                    artifact_namespace=(
+                        f"prompt_generator_input_a{budget_attempt}"
+                    ),
+                    prompt_version=PROMPT_SET_VERSION,
+                    final_request_utf8_bytes=(
+                        prompt_generation_request_bytes
+                    ),
+                )
+            )
             result = await chat(
                 model=ANALYSIS_MODEL,
                 messages=[
                     {"role": "system", "content": system},
                     {
                         "role": "user",
-                        "content": json.dumps(user_content, ensure_ascii=False),
+                        "content": json.dumps(
+                            model_user_content,
+                            ensure_ascii=False,
+                        ),
                     },
                 ],
                 response_schema=PROMPT_SET_SCHEMA,
                 schema_name="aiv_prompt_set",
                 reasoning_effort="high",
-                max_tokens=7000,
+                output_token_policy=OutputTokenPolicy.MODEL_MAX,
                 temperature=0.2,
                 retry_response_contract_errors=False,
                 retry_transport_errors=False,
@@ -4299,7 +9900,6 @@ async def _load_panel_resume_checkpoint(
 ) -> list[VisibilityPrompt] | None:
     """Return the immutable prompt checkpoint once panel evidence exists."""
 
-    await assert_run_lease(run_id)
     async with SessionLocal() as session:
         checkpoint = await _panel_resume_checkpoint_from_session(session, run_id)
     await assert_run_lease(run_id)
@@ -4383,6 +9983,337 @@ async def _persist_prompts(
         return list(result.scalars().all())
 
 
+def _offer_contracts_from_profile(
+    profile: dict[str, Any],
+) -> tuple[OfferCatalog, tuple[OfferCluster, ...]]:
+    catalog_value = profile.get("offer_catalog")
+    if not isinstance(catalog_value, dict):
+        raise OfferCatalogError("Profile has no proven offer catalog")
+    catalog = OfferCatalog.from_mapping(catalog_value)
+    clusters = tuple(
+        OfferCluster.from_mapping(item)
+        for item in profile.get("offer_clusters") or []
+        if isinstance(item, dict)
+    )
+    if {
+        offer_id
+        for cluster in clusters
+        for offer_id in cluster.offer_ids
+    } != {offer.offer_id for offer in catalog.accepted_offers}:
+        raise OfferCatalogError(
+            "Offer clusters do not partition the proven offer catalog"
+        )
+    return catalog, clusters
+
+
+async def _save_prompt_foundation(
+    run_id: str,
+    *,
+    profile: dict[str, Any],
+    market_research: dict[str, Any],
+    site_context: dict[str, Any],
+    prompt_set: dict[str, Any],
+) -> PromptFoundation:
+    """Bind six discovery prompts to immutable upstream evidence."""
+
+    catalog, clusters = _offer_contracts_from_profile(profile)
+    upstream = build_upstream_artifact_digests(
+        profile=profile,
+        catalog=catalog,
+        market_research=market_research,
+        selected_pages_manifest=site_context.get("selected_pages_manifest") or {},
+    )
+    intent_prompts = [
+        IntentPrompt(
+            prompt_key=str(item.get("prompt_key") or ""),
+            intent=str(item.get("intent_class") or ""),
+            text=str(item.get("text") or ""),
+            supporting_cluster_ids=tuple(
+                str(value)
+                for value in item.get("supporting_cluster_ids") or []
+            ),
+        )
+        for item in prompt_set.get("prompts") or []
+        if isinstance(item, dict)
+        and item.get("role") == "unbranded_discovery"
+    ]
+    exclusions = tuple(
+        ClusterExclusion.from_mapping(item)
+        for item in prompt_set.get("cluster_exclusions") or []
+        if isinstance(item, dict)
+    )
+    foundation = build_prompt_foundation(
+        upstream=upstream,
+        catalog=catalog,
+        clusters=clusters,
+        prompts=intent_prompts,
+        exclusions=exclusions,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="prompt_foundation",
+        status="completed",
+        model=None,
+        input_json={
+            "upstream": upstream.as_dict(),
+            "prompt_set_sha256": offer_artifact_digest(prompt_set),
+        },
+        output_json=foundation.as_dict(),
+        prompt_version=PROMPT_FOUNDATION_PIPELINE_VERSION,
+    )
+    return foundation
+
+
+async def _completed_artifact_output(
+    run_id: str,
+    artifact_key: str,
+) -> dict[str, Any] | None:
+    async with SessionLocal() as session:
+        artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact_key,
+                    RunArtifact.status == "completed",
+                )
+            )
+        ).scalar_one_or_none()
+    return (
+        copy.deepcopy(artifact.output_json)
+        if artifact is not None and isinstance(artifact.output_json, dict)
+        else None
+    )
+
+
+async def _discovery_answers_by_prompt(
+    run_id: str,
+    prompt_keys: Iterable[str],
+) -> dict[str, list[dict[str, Any]]]:
+    keys = tuple(sorted({str(value) for value in prompt_keys if str(value)}))
+    if not keys:
+        return {}
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(VisibilityPrompt.prompt_key, ModelAnswer)
+                    .join(ModelAnswer, ModelAnswer.prompt_id == VisibilityPrompt.id)
+                    .where(
+                        VisibilityPrompt.run_id == run_id,
+                        VisibilityPrompt.prompt_key.in_(keys),
+                    )
+                    .order_by(
+                        VisibilityPrompt.prompt_key,
+                        ModelAnswer.provider_key,
+                        ModelAnswer.mode,
+                        ModelAnswer.model,
+                        ModelAnswer.id,
+                    )
+                )
+            ).all()
+        )
+    answers: dict[str, list[dict[str, Any]]] = {key: [] for key in keys}
+    for prompt_key, answer in rows:
+        response_text = str(answer.response_text or "")
+        answers[str(prompt_key)].append(
+            {
+                "provider_key": str(answer.provider_key or ""),
+                "model": str(answer.model or ""),
+                "mode": str(answer.mode or ""),
+                "status": str(answer.status or ""),
+                "response_sha256": text_sha256(response_text),
+                "response_utf8_bytes": len(response_text.encode("utf-8")),
+                "citations_sha256": offer_artifact_digest(
+                    answer.citations_json or []
+                ),
+            }
+        )
+    return answers
+
+
+async def _save_answer_set_receipt(run_id: str) -> AnswerSetReceipt | None:
+    foundation_value = await _completed_artifact_output(
+        run_id, "prompt_foundation"
+    )
+    if foundation_value is None:
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key="legacy_answer_foundation_audit",
+            status="completed",
+            model=None,
+            input_json={"run_id": run_id},
+            output_json={
+                "version": LEGACY_FOUNDATION_AUDIT_VERSION,
+                "state": "legacy_unbound",
+                "reason": "saved panel predates prompt foundation",
+            },
+            prompt_version=LEGACY_FOUNDATION_AUDIT_VERSION,
+        )
+        return None
+    foundation = PromptFoundation.from_mapping(foundation_value)
+    answers = await _discovery_answers_by_prompt(
+        run_id, foundation.prompt_keys
+    )
+    incomplete = [
+        key
+        for key, cells in answers.items()
+        if not cells
+        or any(
+            cell.get("status") != "completed"
+            or int(cell.get("response_utf8_bytes") or 0) <= 0
+            for cell in cells
+        )
+    ]
+    if incomplete:
+        raise ResumeCompatibilityError(
+            "Discovery answer receipt is incomplete for: "
+            + ", ".join(sorted(incomplete))
+        )
+    receipt = build_answer_set_receipt(foundation, answers)
+    await _save_artifact(
+        run_id,
+        stage_key="knowledge_gap",
+        artifact_key="answer_set_receipt",
+        status="completed",
+        model=None,
+        input_json={
+            "prompt_foundation_digest": foundation.foundation_digest,
+            "discovery_only": True,
+            "panel_prompt_count": 9,
+            "discovery_prompt_count": 6,
+        },
+        output_json=receipt.as_dict(),
+        usage_json={
+            "cell_count": sum(len(cells) for cells in answers.values()),
+            "scope": "six_unbranded_intent_prompts_only",
+        },
+        prompt_version=ANSWER_SET_RECEIPT_PIPELINE_VERSION,
+    )
+    return receipt
+
+
+async def _validate_panel_foundation_resume(
+    run_id: str,
+    *,
+    profile: dict[str, Any],
+    site_context: dict[str, Any],
+) -> None:
+    """Fail closed for new runs; keep old panels as explicit legacy snapshots."""
+
+    foundation_value = await _completed_artifact_output(
+        run_id, "prompt_foundation"
+    )
+    if foundation_value is None:
+        await _save_artifact(
+            run_id,
+            stage_key="scenario_design",
+            artifact_key="legacy_prompt_foundation_audit",
+            status="completed",
+            model=None,
+            input_json={"run_id": run_id},
+            output_json={
+                "version": LEGACY_FOUNDATION_AUDIT_VERSION,
+                "state": "legacy_unbound",
+                "reason": (
+                    "existing panel answers predate source-bound offer coverage"
+                ),
+            },
+            prompt_version=LEGACY_FOUNDATION_AUDIT_VERSION,
+        )
+        return
+    market_research = await _completed_artifact_output(
+        run_id, "market_research"
+    )
+    if market_research is None:
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: market_research_missing"
+        )
+    catalog, _clusters = _offer_contracts_from_profile(profile)
+    current_upstream = build_upstream_artifact_digests(
+        profile=profile,
+        catalog=catalog,
+        market_research=market_research,
+        selected_pages_manifest=site_context.get("selected_pages_manifest") or {},
+    )
+    foundation = PromptFoundation.from_mapping(foundation_value)
+    prompt_set_value = await _completed_artifact_output(run_id, "prompt_set")
+    if prompt_set_value is None:
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: prompt_set_artifact_missing"
+        )
+    current_intent_prompts = [
+        IntentPrompt(
+            prompt_key=str(item.get("prompt_key") or ""),
+            intent=str(item.get("intent_class") or ""),
+            text=str(item.get("text") or ""),
+            supporting_cluster_ids=tuple(
+                str(value)
+                for value in item.get("supporting_cluster_ids") or []
+            ),
+        )
+        for item in prompt_set_value.get("prompts") or []
+        if isinstance(item, dict)
+        and item.get("role") == "unbranded_discovery"
+    ]
+    current_exclusions = tuple(
+        ClusterExclusion.from_mapping(item)
+        for item in prompt_set_value.get("cluster_exclusions") or []
+        if isinstance(item, dict)
+    )
+    reconstructed_foundation = build_prompt_foundation(
+        upstream=current_upstream,
+        catalog=catalog,
+        clusters=_clusters,
+        prompts=current_intent_prompts,
+        exclusions=current_exclusions,
+    )
+    if reconstructed_foundation.foundation_digest != foundation.foundation_digest:
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: prompt_foundation_content_changed"
+        )
+    receipt_value = await _completed_artifact_output(
+        run_id, "answer_set_receipt"
+    )
+    receipt = (
+        AnswerSetReceipt.from_mapping(receipt_value)
+        if receipt_value is not None
+        else None
+    )
+    persisted_answers = (
+        await _discovery_answers_by_prompt(run_id, foundation.prompt_keys)
+        if receipt is not None
+        else None
+    )
+    try:
+        report = validate_resume_compatibility(
+            current_upstream=current_upstream,
+            persisted_foundation=foundation,
+            answer_receipt=receipt,
+            persisted_answers_by_prompt=persisted_answers,
+        )
+    except ResumeCompatibilityError as exc:
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: analysis_foundation_changed: " + str(exc)
+        ) from exc
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="prompt_foundation_resume_audit",
+        status="completed",
+        model=None,
+        input_json={"current_upstream": current_upstream.as_dict()},
+        output_json={
+            "compatible": report.compatible,
+            "mismatches": list(report.mismatches),
+            "foundation_digest": foundation.foundation_digest,
+            "answer_receipt_checked": receipt is not None,
+        },
+        prompt_version=PROMPT_FOUNDATION_PIPELINE_VERSION,
+    )
+
+
 def _panel_system(mode: str) -> str:
     if mode == "web":
         return """
@@ -4417,7 +10348,6 @@ def _panel_request_sha256(
     mode: str,
     provider_key: str,
     model: str,
-    max_tokens: int = PANEL_DEFAULT_MAX_TOKENS,
 ) -> str:
     policy = _panel_web_policy(mode, provider_key)
     _request_fields, request_policy = web_request_policy(
@@ -4426,6 +10356,43 @@ def _panel_request_sha256(
     )
     contract = {
         "version": PANEL_CONTRACT_VERSION,
+        "model": model,
+        "mode": mode,
+        "provider_key": provider_key,
+        "system": _panel_system(mode),
+        "prompt": prompt_text,
+        "web_policy": request_policy,
+        "attestation_version": WEB_ATTESTATION_VERSION,
+        "output_policy": PANEL_OUTPUT_POLICY,
+        "temperature": 0.35,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _bounded_panel_request_sha256(
+    *,
+    prompt_text: str,
+    mode: str,
+    provider_key: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    """Rebuild the immutable 3200/6400 panel-v2 request contract."""
+
+    policy = _panel_web_policy(mode, provider_key)
+    _request_fields, request_policy = web_request_policy(
+        model=model,
+        policy=policy,
+    )
+    contract = {
+        "version": BOUNDED_PANEL_CONTRACT_VERSION,
         "model": model,
         "mode": mode,
         "provider_key": provider_key,
@@ -4500,22 +10467,76 @@ def _panel_retry_no_result_attempt_record(
     }
 
 
+def _panel_atomic_attempt_record(result: Any | None) -> dict[str, Any]:
+    if result is None:
+        return {
+            "output_policy": PANEL_OUTPUT_POLICY,
+            "max_completion_tokens": None,
+            "output_envelope": {},
+            "output_limited": None,
+            "output_complete": None,
+            "response_text_sha256": None,
+            "response_char_count": 0,
+            "citation_count": 0,
+            "token_usage": {},
+        }
+    usage = result.usage if isinstance(result.usage, dict) else {}
+    transport = usage.get("_aiv_transport")
+    if not isinstance(transport, dict):
+        transport = getattr(result, "transport", None)
+    if not isinstance(transport, dict):
+        transport = {}
+    envelope = usage.get("_aiv_output_envelope")
+    if not isinstance(envelope, dict):
+        envelope = {}
+    response_text = str(result.text or "")
+    token_usage = {
+        key: int(value)
+        for key, value in sorted(usage.items())
+        if isinstance(key, str)
+        and key.endswith("_tokens")
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value >= 0
+        and float(value).is_integer()
+    }
+    return {
+        "output_policy": PANEL_OUTPUT_POLICY,
+        "max_completion_tokens": envelope.get("max_completion_tokens"),
+        "output_envelope": copy.deepcopy(envelope),
+        "output_limited": transport.get("output_limited"),
+        "output_complete": transport.get("output_complete"),
+        "response_text_sha256": text_sha256(response_text),
+        "response_char_count": len(response_text),
+        "citation_count": len(result.citations or []),
+        "token_usage": token_usage,
+    }
+
+
 def _panel_attempt_audit_record(
     *,
     answer_id: int,
     claim_status: str,
-    max_tokens: int,
+    max_tokens: int | None,
     request_sha256: str,
     result: Any | None,
     error: Exception | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if result is None:
-        summary = _panel_retry_no_result_attempt_record(max_tokens=max_tokens)
+        summary = (
+            _panel_retry_no_result_attempt_record(max_tokens=max_tokens)
+            if max_tokens is not None
+            else _panel_atomic_attempt_record(None)
+        )
         transport: dict[str, Any] = {}
         citations: list[Any] = []
         usage: dict[str, Any] = {}
     else:
-        summary = _panel_retry_attempt_record(result, max_tokens=max_tokens)
+        summary = (
+            _panel_retry_attempt_record(result, max_tokens=max_tokens)
+            if max_tokens is not None
+            else _panel_atomic_attempt_record(result)
+        )
         usage = dict(result.usage) if isinstance(result.usage, dict) else {}
         raw_transport = usage.get("_aiv_transport")
         if not isinstance(raw_transport, dict):
@@ -4531,6 +10552,9 @@ def _panel_attempt_audit_record(
         "answer_id": answer_id,
         "claim_status": claim_status,
         "max_tokens": max_tokens,
+        "output_policy": summary.get("output_policy"),
+        "max_completion_tokens": summary.get("max_completion_tokens"),
+        "output_envelope": summary.get("output_envelope"),
         "request_sha256": request_sha256,
         "transport": transport,
         "response_text_sha256": summary["response_text_sha256"],
@@ -4552,7 +10576,7 @@ async def _reserve_panel_attempt(
     mode: str,
     provider_key: str,
     model: str,
-    max_tokens: int,
+    max_tokens: int | None,
     request_sha256: str,
 ) -> str:
     """Append a durable reservation before exactly one provider POST."""
@@ -4580,6 +10604,9 @@ async def _reserve_panel_attempt(
                     "provider_key": provider_key,
                     "model": model,
                     "max_tokens": max_tokens,
+                    "output_policy": (
+                        None if max_tokens is not None else PANEL_OUTPUT_POLICY
+                    ),
                     "request_sha256": request_sha256,
                 },
             )
@@ -4589,13 +10616,109 @@ async def _reserve_panel_attempt(
     return artifact_key
 
 
+async def _checkpoint_panel_provider_event(
+    run_id: str,
+    *,
+    artifact_key: str,
+    event: dict[str, Any],
+) -> None:
+    """Persist the physical POST receipt before ``chat`` may return.
+
+    This closes the paid-response crash window: if the worker is cancelled
+    after OpenRouter accepted a response but before the answer row is updated,
+    the next coordinator promotes this receipt instead of issuing another POST.
+    """
+
+    if event.get("event_kind") != "provider_post":
+        raise OpenRouterError("Panel checkpoint received a non-provider event")
+    async with SessionLocal() as session:
+        changed = await session.execute(
+            update(RunArtifact)
+            .where(
+                RunArtifact.run_id == run_id,
+                RunArtifact.artifact_key == artifact_key,
+                RunArtifact.status == "running",
+            )
+            .values(
+                output_json={
+                    "version": PANEL_ATTEMPT_AUDIT_VERSION,
+                    "provider_event": copy.deepcopy(event),
+                },
+                raw_text=str(event.get("raw_text") or "") or None,
+                usage_json=(
+                    copy.deepcopy(event.get("usage"))
+                    if isinstance(event.get("usage"), dict)
+                    else None
+                ),
+            )
+        )
+        await session.commit()
+    if changed.rowcount != 1:
+        raise RuntimeError("Panel provider checkpoint reservation disappeared")
+
+
+async def _restore_panel_provider_receipt(
+    run_id: str,
+    *,
+    answer_id: int,
+    request_sha256: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    web_policy: WebSearchPolicy,
+    temperature: float,
+) -> tuple[str, str, ChatResult] | None:
+    """Find and validate a previously paid accepted panel response."""
+
+    async with SessionLocal() as session:
+        artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.like(
+                            f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}{answer_id}_%"
+                        ),
+                        RunArtifact.prompt_version
+                        == PANEL_ATTEMPT_AUDIT_VERSION,
+                    )
+                    .order_by(RunArtifact.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for artifact in artifacts:
+        inputs = artifact.input_json
+        output = artifact.output_json
+        if not isinstance(inputs, dict) or (
+            inputs.get("answer_id") != answer_id
+            or inputs.get("request_sha256") != request_sha256
+            or inputs.get("model") != model
+            or inputs.get("max_tokens") is not None
+        ):
+            continue
+        event = output.get("provider_event") if isinstance(output, dict) else None
+        if not isinstance(event, dict) or event.get("status") != "accepted":
+            continue
+        result = restore_completed_chat_provider_event(
+            event,
+            model=model,
+            messages=messages,
+            web_policy=web_policy,
+            temperature=temperature,
+        )
+        return artifact.artifact_key, artifact.status, result
+    return None
+
+
 async def _finalize_panel_attempt(
     run_id: str,
     *,
     artifact_key: str,
     answer_id: int,
     claim_status: str,
-    max_tokens: int,
+    max_tokens: int | None,
     request_sha256: str,
     result: Any | None,
     error: Exception | None,
@@ -4611,6 +10734,21 @@ async def _finalize_panel_attempt(
         error=error,
     )
     async with SessionLocal() as session:
+        current_output = (
+            await session.execute(
+                select(RunArtifact.output_json).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact_key,
+                    RunArtifact.status == "running",
+                )
+            )
+        ).scalar_one_or_none()
+        if isinstance(current_output, dict) and isinstance(
+            current_output.get("provider_event"), dict
+        ):
+            output["provider_event"] = copy.deepcopy(
+                current_output["provider_event"]
+            )
         changed = await session.execute(
             update(RunArtifact)
             .where(
@@ -4908,35 +11046,58 @@ def _panel_answer_attestation(
         answer.mode,
         answer.provider_key,
     ).value
-    persisted_max_tokens = provenance.get(
-        "max_tokens",
-        PANEL_DEFAULT_MAX_TOKENS,
-    )
-    if (
-        not isinstance(persisted_max_tokens, int)
-        or isinstance(persisted_max_tokens, bool)
-        or persisted_max_tokens not in PANEL_MAX_TOKENS_ALLOWLIST
-    ):
-        return False, "unapproved_panel_max_tokens"
     try:
         _expected_fields, expected_request_policy = web_request_policy(
             model=answer.model,
             policy=expected_policy,
         )
-        expected_request_sha256 = _panel_request_sha256(
-            prompt_text=prompt_text,
-            mode=answer.mode,
-            provider_key=answer.provider_key,
-            model=answer.model,
-            max_tokens=persisted_max_tokens,
-        )
+        contract_version = provenance.get("version")
+        if contract_version == PANEL_CONTRACT_VERSION:
+            if provenance.get("output_policy") != PANEL_OUTPUT_POLICY:
+                return False, "panel_output_policy_mismatch"
+            output_envelope = usage.get("_aiv_output_envelope")
+            if not isinstance(output_envelope, dict):
+                return False, "missing_output_envelope"
+            if (
+                output_envelope.get("policy")
+                != OutputTokenPolicy.MODEL_MAX.value
+                or output_envelope.get("requested_model") != answer.model
+            ):
+                return False, "output_envelope_mismatch"
+            if usage.get("_aiv_panel_retry") is not None:
+                return False, "unexpected_panel_retry"
+            expected_request_sha256 = _panel_request_sha256(
+                prompt_text=prompt_text,
+                mode=answer.mode,
+                provider_key=answer.provider_key,
+                model=answer.model,
+            )
+        elif contract_version == BOUNDED_PANEL_CONTRACT_VERSION:
+            persisted_max_tokens = provenance.get(
+                "max_tokens",
+                LEGACY_PANEL_DEFAULT_MAX_TOKENS,
+            )
+            if (
+                not isinstance(persisted_max_tokens, int)
+                or isinstance(persisted_max_tokens, bool)
+                or persisted_max_tokens
+                not in LEGACY_PANEL_MAX_TOKENS_ALLOWLIST
+            ):
+                return False, "unapproved_panel_max_tokens"
+            expected_request_sha256 = _bounded_panel_request_sha256(
+                prompt_text=prompt_text,
+                mode=answer.mode,
+                provider_key=answer.provider_key,
+                model=answer.model,
+                max_tokens=persisted_max_tokens,
+            )
+        else:
+            return False, "stale_panel_contract"
     except OpenRouterError:
         # Legacy evidence may contain deprecated ``:online`` slugs or a
         # non-Sonar Perplexity model. It must remain stored and visible, but
         # cannot abort a rebuild or enter current metrics.
         return False, "unsupported_legacy_web_contract"
-    if provenance.get("version") != PANEL_CONTRACT_VERSION:
-        return False, "stale_panel_contract"
     if provenance.get("request_sha256") != expected_request_sha256:
         return False, "request_hash_mismatch"
     if provenance.get("attestation_version") != WEB_ATTESTATION_VERSION:
@@ -5038,11 +11199,16 @@ def _panel_metric_access(
     transport_attested: bool,
     attestation_reason: str,
     legacy_memory_observation_allowed: bool,
+    observation_state: str = "complete",
 ) -> dict[str, Any]:
     """Separate aggregate eligibility from raw-context eligibility.
 
-    Current panel calls prove their requested transport policy and may be used
-    both in metrics and as full-text narrative evidence.  Historical memory
+    Current *complete* panel calls prove their requested transport policy and
+    may be used both in metrics and as full-text narrative evidence.  A
+    provider-limited prefix is preserved and may inform explicitly qualified
+    narrative context, but it is excluded from denominators: absence in a
+    prefix is not evidence that the complete answer omitted the target.
+    Historical memory
     calls predate the persisted request-policy bundle.  A validated legacy
     run can still provide a bounded observation when the exact configured
     offline model was used and no citation, web-search, fetch or tool signal
@@ -5056,7 +11222,12 @@ def _panel_metric_access(
         and answer.mode == "memory"
         and attestation_reason == LEGACY_MEMORY_OBSERVATION_REASON
     )
-    if transport_attested:
+    provider_limited_prefix = bool(
+        transport_attested and observation_state == "provider_limited_prefix"
+    )
+    if provider_limited_prefix:
+        evidence_state = "provider_limited_prefix"
+    elif transport_attested:
         evidence_state = (
             "strict_verified"
             if attestation_reason == "verified"
@@ -5068,16 +11239,49 @@ def _panel_metric_access(
         evidence_state = "excluded"
     return {
         "metric_eligible": bool(
-            transport_attested or legacy_memory_observation
+            (transport_attested and not provider_limited_prefix)
+            or legacy_memory_observation
         ),
         "context_eligible": bool(transport_attested),
         "metric_evidence_state": evidence_state,
         "metric_limitation": (
-            LEGACY_MEMORY_OBSERVATION_REASON
+            "provider_output_limit"
+            if provider_limited_prefix
+            else LEGACY_MEMORY_OBSERVATION_REASON
             if legacy_memory_observation
             else None
         ),
     }
+
+
+def _panel_observation_state(answer: ModelAnswer) -> tuple[bool, str]:
+    """Validate whether saved raw is a complete turn or an attested prefix."""
+
+    usage = answer.usage_json if isinstance(answer.usage_json, dict) else {}
+    contract = usage.get("_aiv_panel_contract")
+    transport = usage.get("_aiv_transport")
+    if not isinstance(contract, dict):
+        return True, "legacy_unknown"
+    if contract.get("version") != PANEL_CONTRACT_VERSION:
+        # panel-v1/v2 completed rows were only persisted after a complete turn.
+        return True, "complete"
+    if not isinstance(transport, dict):
+        return False, "missing_transport_completion"
+    raw = str(answer.response_text or "")
+    if contract.get("raw_response_sha256") != text_sha256(raw):
+        return False, "raw_response_hash_mismatch"
+    if contract.get("raw_response_chars") != len(raw):
+        return False, "raw_response_length_mismatch"
+    state = str(contract.get("observation_completeness") or "")
+    if state == "complete" and transport.get("output_complete") is True:
+        return True, state
+    if (
+        state == "provider_limited_prefix"
+        and transport.get("output_limited") is True
+        and bool(raw.strip())
+    ):
+        return True, state
+    return False, "inconsistent_transport_completion"
 
 
 async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
@@ -5363,7 +11567,6 @@ async def _ensure_answer_rows(
                     mode=mode,
                     provider_key=panel.key,
                     model=selected_model,
-                    max_tokens=PANEL_DEFAULT_MAX_TOKENS,
                 )
                 row = existing.get((prompt.id, panel.key))
                 if row is None:
@@ -5574,15 +11777,39 @@ async def _wait_for_panel_claims(
     *,
     mode: str,
 ) -> list[str]:
-    """Do not let a concurrent analyzer pass cells owned by another worker."""
+    """Wait while the exact generation has a fresh durable run heartbeat.
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(
-        30.0,
-        float(settings.OPENROUTER_TIMEOUT_SECONDS) * 2 + 30.0,
+    A paid provider POST may remain active far longer than the historical
+    390-second waiter. Wall-clock age is therefore not a failure signal. The
+    authoritative liveness proof is the coordinator lease: same generation,
+    same owner, a fresh heartbeat and an unexpired lease. If that proof
+    disappears, the coordinator can reclaim the durable panel checkpoint.
+    """
+
+    def utc_value(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+    bound_owner = lease_owner_for(run_id)
+    poll_seconds = max(
+        0.1,
+        min(1.0, float(settings.RUN_COORDINATOR_POLL_SECONDS) / 3.0),
     )
     while True:
         async with SessionLocal() as session:
+            run_liveness = (
+                await session.execute(
+                    select(
+                        Run.status,
+                        Run.execution_slot,
+                        Run.lease_owner,
+                        Run.lease_expires_at,
+                        Run.heartbeat_at,
+                        Run.attempt_count,
+                    ).where(Run.id == run_id)
+                )
+            ).one_or_none()
             statuses = list(
                 (
                     await session.execute(
@@ -5597,12 +11824,67 @@ async def _wait_for_panel_claims(
             _panel_running_generation(status) is not None for status in statuses
         ):
             return statuses
-        await assert_run_lease(run_id)
-        if loop.time() >= deadline:
-            raise OpenRouterError(
-                f"Timed out waiting for claimed {mode} panel cells"
+
+        if run_liveness is None:
+            raise RunLeaseLostError(f"Run lease lost for {run_id}")
+        (
+            run_status,
+            execution_slot,
+            persisted_owner,
+            lease_expires_at,
+            heartbeat_at,
+            attempt_count,
+        ) = run_liveness
+        active_generation = max(0, int(attempt_count or 0)) & 0xFFFFFFFF
+        running_generations = {
+            generation
+            for status in statuses
+            if (generation := _panel_running_generation(status)) is not None
+        }
+        if running_generations != {active_generation}:
+            raise PanelCheckpointMismatchError(
+                "Panel running claim belongs to a stale generation: "
+                f"active={active_generation}, claims={sorted(running_generations)}"
             )
-        await asyncio.sleep(0.1)
+
+        # Unit/admin callers may intentionally execute the exact panel
+        # transaction without binding the coordinator context.  In that
+        # mode another coroutine in this process owns the claimed row, and
+        # there is no lease identity that this waiter is allowed to verify.
+        # Keep polling the durable cell; production coordinator workers always
+        # have ``bound_owner`` and therefore still take the strict branch
+        # below.  This also prevents a second concurrent caller from turning a
+        # legitimate in-flight paid POST into a false stale-heartbeat failure.
+        if bound_owner is None:
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        now = datetime.now(timezone.utc)
+        heartbeat = utc_value(heartbeat_at)
+        expires = utc_value(lease_expires_at)
+        heartbeat_fresh_until = (
+            heartbeat
+            + timedelta(seconds=max(15, int(settings.RUN_LEASE_SECONDS)))
+            if heartbeat is not None
+            else None
+        )
+        lease_is_fresh = bool(
+            execution_slot == 1
+            and persisted_owner
+            and run_status
+            in {RunStatus.pending, RunStatus.crawling, RunStatus.analyzing}
+            and expires is not None
+            and expires > now
+            and heartbeat_fresh_until is not None
+            and heartbeat_fresh_until > now
+            and (bound_owner is None or persisted_owner == bound_owner)
+        )
+        if not lease_is_fresh:
+            raise RunLeaseLostError(
+                f"Panel owner heartbeat is stale for run {run_id}"
+            )
+        await assert_run_lease(run_id)
+        await asyncio.sleep(poll_seconds)
 
 
 async def _run_panel(
@@ -5613,6 +11895,19 @@ async def _run_panel(
     start_percent: int,
     end_percent: int,
 ) -> None:
+    async with SessionLocal() as session:
+        config_json = (
+            await session.execute(
+                select(Run.config_json).where(Run.id == run_id)
+            )
+        ).scalar_one_or_none()
+    if (
+        isinstance(config_json, dict)
+        and SAVED_ANSWERS_ONLY_MARKER_KEY in config_json
+    ):
+        raise OpenRouterError(
+            "Panel mutation is forbidden during saved-answers-only reprocess"
+        )
     jobs = await _ensure_answer_rows(run_id, prompts, mode)
     async with SessionLocal() as session:
         existing_completed = len(
@@ -5685,13 +11980,11 @@ async def _run_panel(
                 )
             return conditions
 
-        def usage_with_provenance(
-            result: Any,
-            *,
-            max_tokens: int,
-            retry_attempts: list[dict[str, Any]] | None = None,
-        ) -> dict[str, Any]:
+        def usage_with_provenance(result: Any) -> dict[str, Any]:
             usage = dict(result.usage or {})
+            transport = usage.get("_aiv_transport")
+            if not isinstance(transport, dict):
+                transport = {}
             usage["_aiv_panel_contract"] = {
                 "version": PANEL_CONTRACT_VERSION,
                 "request_sha256": _panel_request_sha256(
@@ -5699,39 +11992,23 @@ async def _run_panel(
                     mode=mode,
                     provider_key=provider_key,
                     model=model,
-                    max_tokens=max_tokens,
                 ),
-                "max_tokens": max_tokens,
+                "output_policy": PANEL_OUTPUT_POLICY,
                 "request_policy_sha256": result.request_policy.get("sha256"),
                 "web_policy": result.request_policy.get("policy"),
                 "attestation_version": WEB_ATTESTATION_VERSION,
                 "web_attestation": result.web_attestation,
+                "observation_completeness": (
+                    "provider_limited_prefix"
+                    if transport.get("output_limited") is True
+                    else "complete"
+                ),
+                "raw_response_sha256": text_sha256(str(result.text or "")),
+                "raw_response_chars": len(str(result.text or "")),
             }
-            if retry_attempts is not None:
-                if (
-                    len(retry_attempts) != 2
-                    or [
-                        attempt.get("max_tokens")
-                        for attempt in retry_attempts
-                    ]
-                    != [PANEL_DEFAULT_MAX_TOKENS, PANEL_RETRY_MAX_TOKENS]
-                ):
-                    raise RuntimeError(
-                        "Adaptive panel retry provenance requires exactly "
-                        "the 3200 and 6400 attempts"
-                    )
-                usage["_aiv_panel_retry"] = {
-                    "version": PANEL_RETRY_PROVENANCE_VERSION,
-                    "attempts": copy.deepcopy(retry_attempts),
-                }
             return usage
 
-        async def persist_success(
-            result: Any,
-            *,
-            max_tokens: int,
-            retry_attempts: list[dict[str, Any]] | None,
-        ) -> bool:
+        async def persist_success(result: Any) -> bool:
             await assert_run_lease(run_id)
             async with SessionLocal() as session:
                 claimed = await session.execute(
@@ -5741,11 +12018,7 @@ async def _run_panel(
                         status="completed",
                         response_text=result.text,
                         citations_json=result.citations or None,
-                        usage_json=usage_with_provenance(
-                            result,
-                            max_tokens=max_tokens,
-                            retry_attempts=retry_attempts,
-                        ),
+                        usage_json=usage_with_provenance(result),
                         error_message=None,
                     )
                 )
@@ -5757,8 +12030,6 @@ async def _run_panel(
             exc: Exception,
             *,
             evidence_result: Any | None = None,
-            evidence_max_tokens: int | None = None,
-            retry_attempts: list[dict[str, Any]] | None = None,
         ) -> bool:
             await assert_run_lease(run_id)
             values: dict[str, Any] = {
@@ -5766,19 +12037,11 @@ async def _run_panel(
                 "error_message": str(exc)[:1000],
             }
             if evidence_result is not None:
-                if evidence_max_tokens is None:
-                    raise RuntimeError(
-                        "Panel failure evidence requires its token budget"
-                    )
                 values.update(
                     {
                         "response_text": evidence_result.text,
                         "citations_json": evidence_result.citations or None,
-                        "usage_json": usage_with_provenance(
-                            evidence_result,
-                            max_tokens=evidence_max_tokens,
-                            retry_attempts=retry_attempts,
-                        ),
+                        "usage_json": usage_with_provenance(evidence_result),
                     }
                 )
             async with SessionLocal() as session:
@@ -5791,7 +12054,7 @@ async def _run_panel(
             await assert_run_lease(run_id)
             return claimed.rowcount == 1
 
-        async def request_once(max_tokens: int) -> Any:
+        async def request_once() -> Any:
             """Execute one provider POST backed by one append-only artifact."""
 
             request_sha256 = _panel_request_sha256(
@@ -5799,8 +12062,38 @@ async def _run_panel(
                 mode=mode,
                 provider_key=provider_key,
                 model=model,
-                max_tokens=max_tokens,
             )
+            messages = [
+                {
+                    "role": "system",
+                    "content": _panel_system(mode),
+                },
+                {"role": "user", "content": prompt_text},
+            ]
+            web_policy = _panel_web_policy(mode, provider_key)
+            restored = await _restore_panel_provider_receipt(
+                run_id,
+                answer_id=answer_id,
+                request_sha256=request_sha256,
+                model=model,
+                messages=messages,
+                web_policy=web_policy,
+                temperature=0.35,
+            )
+            if restored is not None:
+                restored_key, restored_status, restored_result = restored
+                if restored_status == "running":
+                    await _finalize_panel_attempt(
+                        run_id,
+                        artifact_key=restored_key,
+                        answer_id=answer_id,
+                        claim_status=claim_status,
+                        max_tokens=None,
+                        request_sha256=request_sha256,
+                        result=restored_result,
+                        error=None,
+                    )
+                return restored_result
             artifact_key = await _reserve_panel_attempt(
                 run_id,
                 answer_id=answer_id,
@@ -5808,25 +12101,31 @@ async def _run_panel(
                 mode=mode,
                 provider_key=provider_key,
                 model=model,
-                max_tokens=max_tokens,
+                max_tokens=None,
                 request_sha256=request_sha256,
             )
             await assert_run_lease(run_id)
             try:
                 result = await chat(
                     model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": _panel_system(mode),
-                        },
-                        {"role": "user", "content": prompt_text},
-                    ],
-                    web_policy=_panel_web_policy(mode, provider_key),
-                    max_tokens=max_tokens,
+                    messages=messages,
+                    web_policy=web_policy,
+                    output_token_policy=OutputTokenPolicy.MODEL_MAX,
                     temperature=0.35,
+                    # A panel answer is one atomic observation.  If the model
+                    # itself exhausts its advertised physical window, keep the
+                    # complete emitted prefix as limited-but-real evidence;
+                    # never buy a second generation and splice/restart it.
+                    accept_output_limited=True,
                     retry_response_contract_errors=False,
                     retry_transport_errors=False,
+                    audit_checkpoint=lambda event: (
+                        _checkpoint_panel_provider_event(
+                            run_id,
+                            artifact_key=artifact_key,
+                            event=event,
+                        )
+                    ),
                 )
             except asyncio.CancelledError:
                 # The durable reservation remains ``running``.  A later run
@@ -5838,7 +12137,7 @@ async def _run_panel(
                     artifact_key=artifact_key,
                     answer_id=answer_id,
                     claim_status=claim_status,
-                    max_tokens=max_tokens,
+                    max_tokens=None,
                     request_sha256=request_sha256,
                     result=getattr(exc, "result", None),
                     error=exc,
@@ -5849,118 +12148,41 @@ async def _run_panel(
                 artifact_key=artifact_key,
                 answer_id=answer_id,
                 claim_status=claim_status,
-                max_tokens=max_tokens,
+                max_tokens=None,
                 request_sha256=request_sha256,
                 result=result,
                 error=None,
             )
             return result
 
-        request_max_tokens = PANEL_DEFAULT_MAX_TOKENS
-        retry_attempts: list[dict[str, Any]] | None = None
-        first_limit_result: Any | None = None
         try:
             async with semaphore:
-                try:
-                    result = await request_once(request_max_tokens)
-                except OpenRouterOutputLimitError as first_limit:
-                    first_limit_result = first_limit.result
-                    retry_attempts = [
-                        _panel_retry_attempt_record(
-                            first_limit.result,
-                            max_tokens=PANEL_DEFAULT_MAX_TOKENS,
-                        )
-                    ]
-                    request_max_tokens = PANEL_RETRY_MAX_TOKENS
-                    try:
-                        result = await request_once(request_max_tokens)
-                    except OpenRouterOutputLimitError as second_limit:
-                        retry_attempts.append(
-                            _panel_retry_attempt_record(
-                                second_limit.result,
-                                max_tokens=PANEL_RETRY_MAX_TOKENS,
-                            )
-                        )
-                        raise
-                    except (
-                        OpenRouterPolicyError,
-                        OpenRouterResponseContractError,
-                    ) as second_result_error:
-                        retry_attempts.append(
-                            _panel_retry_attempt_record(
-                                second_result_error.result,
-                                max_tokens=PANEL_RETRY_MAX_TOKENS,
-                            )
-                        )
-                        raise
-                    except Exception:
-                        retry_attempts.append(
-                            _panel_retry_no_result_attempt_record(
-                                max_tokens=PANEL_RETRY_MAX_TOKENS,
-                            )
-                        )
-                        raise
-                    retry_attempts.append(
-                        _panel_retry_attempt_record(
-                            result,
-                            max_tokens=PANEL_RETRY_MAX_TOKENS,
-                        )
-                    )
-            await persist_success(
-                result,
-                max_tokens=request_max_tokens,
-                retry_attempts=retry_attempts,
-            )
+                result = await request_once()
+            await persist_success(result)
         except asyncio.CancelledError:
             raise
-        except OpenRouterOutputLimitError as exc:
-            logger.warning(
-                "Panel response hit the output limit twice for answer %s",
-                answer_id,
-            )
-            await persist_failure(
-                exc,
-                evidence_result=exc.result,
-                evidence_max_tokens=request_max_tokens,
-                retry_attempts=retry_attempts,
-            )
         except OpenRouterPolicyError as exc:
             logger.warning(
                 "Panel web-policy attestation failed for answer %s",
                 answer_id,
             )
-            await persist_failure(
-                exc,
-                evidence_result=exc.result,
-                evidence_max_tokens=request_max_tokens,
-                retry_attempts=retry_attempts,
-            )
+            await persist_failure(exc, evidence_result=exc.result)
         except OpenRouterResponseContractError as exc:
             logger.warning(
                 "Panel response contract failed for answer %s",
                 answer_id,
             )
-            await persist_failure(
-                exc,
-                evidence_result=exc.result,
-                evidence_max_tokens=request_max_tokens,
-                retry_attempts=retry_attempts,
-            )
+            await persist_failure(exc, evidence_result=exc.result)
         except Exception as exc:
             logger.warning(
                 "Panel response failed for answer %s: %s",
                 answer_id,
                 type(exc).__name__,
             )
-            if first_limit_result is not None and retry_attempts is not None:
-                await persist_failure(
-                    exc,
-                    evidence_result=first_limit_result,
-                    evidence_max_tokens=PANEL_DEFAULT_MAX_TOKENS,
-                    retry_attempts=retry_attempts,
-                )
-            else:
-                await persist_failure(exc)
+            await persist_failure(
+                exc,
+                evidence_result=getattr(exc, "result", None),
+            )
         finally:
             async with progress_lock:
                 completed_now += 1
@@ -6015,38 +12237,10 @@ async def _answers_for_catalog(run_id: str) -> list[dict[str, Any]]:
             "scenario_role": prompt.role,
             "system": labels.get(answer.provider_key, answer.provider_key),
             "mode": answer.mode,
-            "answer": (answer.response_text or "")[:ANSWER_ANALYSIS_CHAR_LIMIT],
+            "answer": answer.response_text or "",
         }
         for answer, prompt in rows
     ]
-
-
-def _volume_bounded_chunks(
-    items: list[dict[str, Any]],
-    *,
-    text_key: str,
-    max_items: int,
-    max_chars: int,
-) -> list[list[dict[str, Any]]]:
-    """Keep LLM batches bounded without truncating every long answer too early."""
-
-    chunks: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_chars = 0
-    for item in items:
-        item_chars = len(str(item.get(text_key) or ""))
-        if current and (
-            len(current) >= max_items
-            or current_chars + item_chars > max_chars
-        ):
-            chunks.append(current)
-            current = []
-            current_chars = 0
-        current.append(item)
-        current_chars += item_chars
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 async def _entity_catalog(
@@ -6059,6 +12253,7 @@ async def _entity_catalog(
         "aliases": profile.get("brand_aliases") or [],
         "products": profile.get("products") or [],
         "entity_scope": profile.get("entity_scope") or [],
+        "offer_catalog": profile.get("offer_catalog") or {},
     }
     merge_target = {
         **target,
@@ -6085,6 +12280,9 @@ Atlas One, Northline Hub или Orion Suite. requires_target_attribution обя�
 означает, что модель назвала продукт целевого бренда: рядом должно быть явное
 имя цели.
 Не превращай общую тему пользовательского вопроса в продукт цели.
+Для membership портфеля code-owned target.offer_catalog имеет приоритет над
+entity_scope и текстом ответа. Сущность вне accepted_offers нельзя повышать до
+target/portfolio_entity, даже если модель ответа назвала её рядом с брендом.
 Обычные строковые aliases наследуют mention_policy сущности. Если у отличимого
 имени есть общий короткий алиас с другой политикой, верни такой alias объектом
 {{"value": "...", "match_policy": "requires_target_attribution"}}. Например,
@@ -6092,22 +12290,116 @@ Orion Suite может быть standalone, но общий alias suite треб
 
 В evidence коротко укажи, откуда следует классификация.
 Не вычисляй метрики.
+Каждый answer может быть semantic-overlap окном длинного исходного ответа.
+Границы непересекающегося core заданы в unit_contract. Учитывай сущность в
+этом окне, только если буквальное имя пересекает core; текст слева и справа
+нужен для понимания связи и не является вторым независимым свидетельством.
+Верни catalog и core_dispositions: ровно одно решение в исходном порядке для
+каждого answers[].core_claim. Если core содержит имя сущности, выбери
+grounded_fact, дословно скопируй пересекающую core цитату в evidence_quote и
+включи ту же цитату в evidence записи catalog. Если имени сущности в core нет,
+выбери explicit_no_fact, оставь evidence_quote пустым и конкретно опиши, что
+именно находится в core. Общие фразы «факты не найдены» запрещены. claim_id,
+unit_id и core_sha256 скопируй без изменений.
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    chunk_jobs: list[dict[str, Any]] = []
-    chunks = _volume_bounded_chunks(
-        answers,
-        text_key="answer",
-        max_items=8,
-        max_chars=ENTITY_CATALOG_CHUNK_CHAR_LIMIT,
+    def model_answer(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **{
+                key: value
+                for key, value in item.items()
+                if not key.startswith("_lr_")
+            },
+            "unit_contract": {
+                "unit_id": item.get("_lr_unit_id"),
+                "unit_index": item.get("_lr_unit_index"),
+                "unit_count": item.get("_lr_unit_count"),
+                "core_start_in_context": item.get(
+                    "_lr_core_start_in_context"
+                ),
+                "core_end_in_context": item.get(
+                    "_lr_core_end_in_context"
+                ),
+                "core_sha256": item.get("_lr_unit_sha256"),
+                "context_sha256": item.get("_lr_context_sha256"),
+            },
+            "core_claim": _core_unit_claim(item),
+        }
+
+    extraction_window = await _analyzer_model_input_window(
+        PROCESSING_MODEL,
+        system=extraction_system,
     )
+    extraction_window_bytes = int(extraction_window["input_utf8_window"])
+
+    def extraction_request_bytes(
+        items: list[dict[str, Any]],
+        *,
+        schema_name: str = "aiv_entity_catalog_chunk_000000000000",
+    ) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=extraction_window["model_envelope"],
+            system=extraction_system,
+            user_payload={
+                "target": target,
+                "answers": [model_answer(item) for item in items],
+            },
+            schema=ENTITY_CATALOG_LEAF_SCHEMA,
+            schema_name=schema_name,
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    target_chars = ANSWER_ANALYSIS_PARTITION_CHARS
+    while True:
+        answer_units, partition_manifests = partition_text_records(
+            answers,
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=target_chars,
+        )
+        if all(
+            extraction_request_bytes([item]) <= extraction_window_bytes
+            for item in answer_units
+        ):
+            break
+        if target_chars <= 256:
+            raise OpenRouterError(
+                "Entity catalog leaf cannot fit the physical model input "
+                "window even at the minimum lossless answer unit"
+            )
+        target_chars = max(256, target_chars // 2)
+
+    if not answer_units:
+        raise OpenRouterError("Entity catalog input has no answer core units")
+
+    # Pack by the exact complete provider body.  ``extraction_window_bytes``
+    # bounds one call, never the corpus: an arbitrarily large answer set simply
+    # creates more independently persisted leaves.
+    chunks: list[list[dict[str, Any]]] = []
+    current_chunk: list[dict[str, Any]] = []
+    for item in answer_units:
+        candidate = [*current_chunk, item]
+        if current_chunk and (
+            extraction_request_bytes(candidate) > extraction_window_bytes
+        ):
+            chunks.append(current_chunk)
+            current_chunk = [item]
+        else:
+            current_chunk = candidate
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    chunk_jobs: list[dict[str, Any]] = []
     for chunk_index, chunk in enumerate(chunks, start=1):
         digest = hashlib.sha1(
             json.dumps(
                 [
                     {
                         "answer_id": item.get("answer_id"),
+                        "unit_id": item.get("_lr_unit_id"),
                         "answer": item.get("answer"),
                     }
                     for item in chunk
@@ -6120,29 +12412,57 @@ Orion Suite может быть standalone, но общий alias suite треб
             {
                 "chunk_index": chunk_index,
                 "artifact_key": f"entity_catalog_chunk_{chunk_index}_{digest}",
-                "schema_name": f"aiv_entity_catalog_chunk_{chunk_index}",
+                "schema_name": f"aiv_entity_catalog_chunk_{digest}",
                 "answers": chunk,
+                "model_answers": [model_answer(item) for item in chunk],
             }
         )
 
     semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
 
     async def extract_chunk(job: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "target": target,
+            "answers": job["model_answers"],
+        }
         async with semaphore:
-            return await _processing_artifact(
+            wrapped = await _processing_artifact(
                 run_id,
                 stage_key="knowledge_gap",
                 artifact_key=str(job["artifact_key"]),
-                schema=ENTITY_CATALOG_SCHEMA,
+                schema=ENTITY_CATALOG_LEAF_SCHEMA,
                 schema_name=str(job["schema_name"]),
                 system=extraction_system,
-                user_payload={
-                    "target": target,
-                    "answers": job["answers"],
-                },
-                max_tokens=10_000,
+                user_payload=payload,
                 prompt_version=ENTITY_CATALOG_CHUNK_VERSION,
             )
+        try:
+            catalog = wrapped.get("catalog")
+            if not isinstance(catalog, dict):
+                raise OpenRouterError("Entity-catalog leaf has no catalog")
+            claims = _core_unit_claims(job["answers"])
+            receipts = _normalize_core_dispositions(
+                wrapped.get("core_dispositions"),
+                expected_claims=claims,
+                analytic_output=catalog,
+                output_kind="entity_catalog",
+            )
+            return _attach_core_decisions(
+                catalog,
+                receipts,
+                [str(item.get("_lr_unit_id") or "") for item in job["answers"]],
+            )
+        except Exception as exc:
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=str(job["artifact_key"]),
+                model=PROCESSING_MODEL,
+                input_json=payload,
+                prompt_version=ENTITY_CATALOG_CHUNK_VERSION,
+                error=exc,
+            )
+            raise
 
     # asyncio.gather returns values in input order even when later chunks
     # finish first. The merge input and cache keys therefore stay stable.
@@ -6151,7 +12471,7 @@ Orion Suite может быть standalone, но общий alias suite треб
         return_exceptions=True,
     )
     chunk_catalogs: list[dict[str, Any]] = []
-    for outcome in chunk_outcomes:
+    for _job, outcome in zip(chunk_jobs, chunk_outcomes, strict=True):
         if isinstance(outcome, BaseException):
             raise outcome
         chunk_catalogs.append(outcome)
@@ -6188,25 +12508,240 @@ target/portfolio_entity, а конфликтующую дублирующую з
 буквально встречается в исходном материале. Все такие общие варианты верни
 только как alias-объекты с match_policy=requires_target_attribution. Это
 помогает не терять явную связь с брендом, но не разрешает считать тему запроса
-его продуктом.
+его продуктом. Каталог-лист содержит bounded
+_aiv_core_unit_decision_shards, а каталог-предок — их фиксированный
+_aiv_core_unit_decision_head. Не удаляй точные evidence из частичных каталогов
+и не подменяй подтверждённые факты общей сводкой.
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    merged = await _processing_artifact(
-        run_id,
-        stage_key="knowledge_gap",
-        artifact_key="entity_catalog",
-        schema=ENTITY_CATALOG_SCHEMA,
-        schema_name="aiv_entity_catalog",
-        system=merge_system,
-        user_payload={
-            "target": merge_target,
-            "chunk_catalogs": chunk_catalogs,
-        },
-        max_tokens=24_000,
-        prompt_version=ENTITY_CATALOG_VERSION,
+    expected_unit_ids = [
+        str(item.get("_lr_unit_id") or "") for item in answer_units
+    ]
+    expected_claims = _core_unit_claims(answer_units)
+    leaf_catalogs = list(chunk_catalogs)
+    all_decisions = _core_decisions_from_inputs(
+        leaf_catalogs,
+        expected_claims=expected_claims,
     )
-    return _scope_entity_catalog_to_profile(merged, profile)
+    decision_index = _core_decision_index(all_decisions)
+    processing_window = await _analyzer_model_input_window(
+        PROCESSING_MODEL,
+        system=merge_system,
+    )
+
+    def entity_catalog_request_bytes(payload: dict[str, Any]) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=processing_window["model_envelope"],
+            system=merge_system,
+            user_payload=payload,
+            schema=ENTITY_CATALOG_SCHEMA,
+            schema_name="aiv_entity_catalog",
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    def reduction_payload(
+        group: list[dict[str, Any]],
+        *,
+        level: int,
+    ) -> dict[str, Any]:
+        lineage = _long_response_lineage(group)
+        for item in group:
+            _validate_core_decision_item(item, decision_index)
+        decisions = _core_decisions_for_unit_ids(lineage, decision_index)
+        return {
+            "target": merge_target,
+            "chunk_catalogs": [_model_payload_view(item) for item in group],
+            "reduction": {
+                "version": ANALYZER_REDUCER_HARNESS_VERSION,
+                "level": level,
+                "input_count": len(group),
+                "source_lineage": _long_response_lineage_pointer(lineage),
+                "core_decision_coverage": _core_decision_pointer(decisions),
+            },
+        }
+
+    merge_level = 0
+    merge_inputs = leaf_catalogs
+    while True:
+        complete_lineage = _long_response_lineage(
+            merge_inputs,
+            expected_unit_ids=expected_unit_ids,
+        )
+        complete_decisions = all_decisions
+        final_payload = reduction_payload(merge_inputs, level=merge_level)
+        final_payload["reduction"].update(
+            {
+                "leaf_count": len(chunk_catalogs),
+                "partition_manifest": _long_response_manifest_pointer(
+                    partition_manifests
+                ),
+                "complete_lineage": _long_response_lineage_pointer(
+                    complete_lineage
+                ),
+            }
+        )
+        if entity_catalog_request_bytes(final_payload) <= int(
+            processing_window["input_utf8_window"]
+        ):
+            try:
+                merged = await _processing_artifact(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key="entity_catalog",
+                    schema=ENTITY_CATALOG_SCHEMA,
+                    schema_name="aiv_entity_catalog",
+                    system=merge_system,
+                    user_payload=final_payload,
+                    prompt_version=ENTITY_CATALOG_VERSION,
+                )
+                _validate_reducer_core_decisions(
+                    merged,
+                    complete_decisions,
+                    output_kind="entity_catalog",
+                    source_inputs=leaf_catalogs,
+                )
+                preserved = _preserve_entity_catalog_reduction(
+                    merged,
+                    leaf_catalogs,
+                )
+                preserved = _preserve_entity_catalog_core_decisions(
+                    preserved,
+                    complete_decisions,
+                )
+                scoped = _scope_entity_catalog_to_profile(preserved, profile)
+                _validate_final_core_decisions(
+                    scoped,
+                    complete_decisions,
+                    output_kind="entity_catalog",
+                )
+                return scoped
+            except Exception as exc:
+                await _mark_completed_artifact_contract_failed(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key="entity_catalog",
+                    model=PROCESSING_MODEL,
+                    input_json=final_payload,
+                    prompt_version=ENTITY_CATALOG_VERSION,
+                    error=exc,
+                )
+                raise
+
+        groups = _byte_bounded_reducer_groups(
+            merge_inputs,
+            window_bytes=int(processing_window["input_utf8_window"]),
+            request_utf8_bytes=lambda group: entity_catalog_request_bytes(
+                reduction_payload(group, level=merge_level)
+            ),
+        )
+        if not any(len(group) > 1 for group in groups):
+            terminal = _deterministic_entity_catalog_union(leaf_catalogs)
+            terminal = _preserve_entity_catalog_core_decisions(
+                terminal,
+                complete_decisions,
+            )
+            terminal = _scope_entity_catalog_to_profile(terminal, profile)
+            _validate_final_core_decisions(
+                terminal,
+                complete_decisions,
+                output_kind="entity_catalog",
+            )
+            await _save_artifact(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key="entity_catalog",
+                status="completed",
+                model=None,
+                input_json={
+                    "reduction": final_payload["reduction"],
+                    "terminal_reason": "no_provider_group_fits_input_window",
+                },
+                output_json=terminal,
+                usage_json={
+                    "_aiv_analyzer_reducer": {
+                        "version": ANALYZER_REDUCER_HARNESS_VERSION,
+                        "mode": "deterministic_terminal_union",
+                        "processing_window": processing_window,
+                    }
+                },
+                prompt_version=ENTITY_CATALOG_VERSION,
+            )
+            return terminal
+
+        async def reduce_group(
+            group_index: int,
+            group: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            if len(group) == 1:
+                return group[0]
+            payload = reduction_payload(group, level=merge_level)
+            digest = _stable_json_sha256(payload)[:16]
+            lineage = _long_response_lineage(group)
+            decisions = _core_decisions_for_unit_ids(lineage, decision_index)
+            artifact_key = (
+                f"entity_catalog_merge_{merge_level}_{group_index}_{digest}"
+            )
+            async with semaphore:
+                merged_group = await _processing_artifact(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=artifact_key,
+                    schema=ENTITY_CATALOG_SCHEMA,
+                    schema_name=(
+                        f"aiv_entity_catalog_merge_{merge_level}_"
+                        f"{group_index}"
+                    ),
+                    system=merge_system,
+                    user_payload=payload,
+                    prompt_version=ENTITY_CATALOG_VERSION,
+                )
+            try:
+                _validate_reducer_core_decisions(
+                    merged_group,
+                    decisions,
+                    output_kind="entity_catalog",
+                    source_inputs=group,
+                )
+                preserved_group = _preserve_entity_catalog_reduction(
+                    merged_group,
+                    group,
+                )
+                return _attach_core_decision_head(
+                    preserved_group,
+                    decisions,
+                    lineage,
+                )
+            except Exception as exc:
+                await _mark_completed_artifact_contract_failed(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=artifact_key,
+                    model=PROCESSING_MODEL,
+                    input_json=payload,
+                    prompt_version=ENTITY_CATALOG_VERSION,
+                    error=exc,
+                )
+                raise
+
+        outcomes = await asyncio.gather(
+            *(
+                reduce_group(group_index, group)
+                for group_index, group in enumerate(groups)
+            ),
+            return_exceptions=True,
+        )
+        next_inputs: list[dict[str, Any]] = []
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            next_inputs.append(outcome)
+        if len(next_inputs) >= len(merge_inputs):
+            raise OpenRouterError("Entity-catalog reducer made no progress")
+        merge_inputs = next_inputs
+        merge_level += 1
 
 
 def _annotation_matches_answer(
@@ -6249,8 +12784,6 @@ async def _unannotated_answers(
     *,
     annotation_input_sha256: str,
     target_answer_ids: set[int] | None = None,
-    answer_char_limit: int = ANSWER_ANALYSIS_CHAR_LIMIT,
-    require_complete_raw: bool = False,
 ) -> list[dict[str, Any]]:
     answer_conditions: list[Any] = [
         ModelAnswer.run_id == run_id,
@@ -6279,12 +12812,6 @@ async def _unannotated_answers(
         answer_text = answer.response_text or ""
         if not answer_text.strip():
             continue
-        if require_complete_raw and len(answer_text) > answer_char_limit:
-            raise OpenRouterError(
-                "Targeted annotation recovery cannot inspect a truncated "
-                f"raw answer {answer.id} ({len(answer_text)}/"
-                f"{answer_char_limit} chars)"
-            )
         answer_sha256 = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         stored = annotation.annotation_json if annotation is not None else {}
         if _annotation_matches_answer(
@@ -6307,7 +12834,7 @@ async def _unannotated_answers(
             "scenario": prompt.text,
             "scenario_role": prompt.role,
             "intent_class": prompt.intent_class,
-            "answer": answer_text[:answer_char_limit],
+            "answer": answer_text,
         })
     return output
 
@@ -6489,7 +13016,7 @@ def _entity_alias_values(entity: dict[str, Any]) -> list[str]:
         ],
     ]
     return list(
-        dict.fromkeys(value for value in values if len(value) >= 3)
+        dict.fromkeys(value for value in values if len(value) >= 2)
     )
 
 
@@ -6717,12 +13244,12 @@ def _entity_alias_entries(
     excluded_normalized = {
         value.casefold().replace("ё", "е").strip()
         for value in excluded_aliases or []
-        if len(value.strip()) >= 3
+        if len(value.strip()) >= 2
     }
     entries: dict[str, tuple[str, str]] = {}
     for alias, policy, is_canonical in candidates:
         normalized = alias.casefold().replace("ё", "е").strip()
-        if len(normalized) < 3 or normalized in excluded_normalized:
+        if len(normalized) < 2 or normalized in excluded_normalized:
             continue
         lexical_tokens = re.findall(r"[a-zа-я0-9]+", normalized, re.UNICODE)
         profile_confirms_contextual_alias = bool(
@@ -6819,7 +13346,7 @@ def _target_aliases(
         dict.fromkeys(
             alias.strip()
             for alias in aliases
-            if len(alias.strip()) >= 3
+            if len(alias.strip()) >= 2
         )
     )
 
@@ -6864,7 +13391,7 @@ def _attribution_owner_aliases(
         dict.fromkeys(
             alias.strip()
             for alias in aliases
-            if len(alias.strip()) >= 3
+            if len(alias.strip()) >= 2
         )
     )
 
@@ -7024,6 +13551,20 @@ def _profile_confirmed_names_for_entity(
         )
 
     confirmed: list[str] = []
+    catalog_value = profile.get("offer_catalog")
+    if isinstance(catalog_value, dict):
+        try:
+            offer_catalog = OfferCatalog.from_mapping(catalog_value)
+        except OfferCatalogError:
+            return []
+        for offer in offer_catalog.accepted_offers:
+            offer_names = [offer.canonical_name, *offer.aliases]
+            if any(canonical_matches(value) for value in offer_names if value):
+                confirmed.extend(offer_names)
+        return list(dict.fromkeys(value for value in confirmed if value))
+
+    # Compatibility only for historical unit fixtures. Production profiles
+    # always carry the source-bound offer catalog above.
     for scoped in profile.get("entity_scope") or []:
         if not isinstance(scoped, dict):
             continue
@@ -7166,7 +13707,7 @@ def _alias_spans(answer_text: str, aliases: list[str]) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for alias in aliases:
         normalized_alias = alias.casefold().replace("ё", "е").strip()
-        if len(normalized_alias) < 3:
+        if len(normalized_alias) < 2:
             continue
         for match in re.finditer(
             rf"(?<![\w]){re.escape(normalized_alias)}(?![\w])",
@@ -7456,7 +13997,7 @@ def _evidence_is_literal(answer_text: str, evidence: str) -> bool:
     """Require the persisted quote to be an exact contiguous raw substring."""
 
     candidate = evidence.strip()
-    return len(candidate) >= 3 and candidate in answer_text
+    return len(candidate) >= 2 and candidate in answer_text
 
 
 def _literal_alias_evidence(
@@ -7544,6 +14085,32 @@ def _structured_label_starts_field(value: str) -> bool:
     )
 
 
+def _attribution_claim_bounds(
+    value: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Return the complete sentence/Markdown-line containing one entity.
+
+    Ownership is a structural relation. Fixed character vicinities silently
+    changed its meaning when a legitimate qualification happened to be long.
+    The first sentence/line boundary is stable regardless of prose length and
+    prevents a following competitor card from leaking into the current claim.
+    """
+
+    bounded_start = max(0, min(len(value), int(start)))
+    bounded_end = max(bounded_start, min(len(value), int(end)))
+    prior = [value.rfind(mark, 0, bounded_start) for mark in ".!?;\n"]
+    claim_start = max(prior, default=-1) + 1
+    following = [
+        position
+        for mark in ".!?;\n"
+        if (position := value.find(mark, bounded_end)) >= 0
+    ]
+    claim_end = min(following) if following else len(value)
+    return claim_start, claim_end
+
+
 def _structured_field_has_competing_owner(
     value: str,
     entity_aliases: list[str],
@@ -7566,12 +14133,16 @@ def _structured_field_has_competing_owner(
         normalized,
         entity_aliases,
     ):
-        prefix = normalized[:entity_start]
-        line_start = prefix.rfind("\n") + 1
+        claim_start, claim_end = _attribution_claim_bounds(
+            normalized,
+            entity_start,
+            _entity_end,
+        )
+        prefix = normalized[claim_start:entity_start]
         line_prefix = re.sub(
             r"[*_`]+",
             "",
-            value[line_start:entity_start],
+            value[claim_start:entity_start],
         )
         normalized_line_prefix = line_prefix.casefold().replace("ё", "е")
         owner_label = (
@@ -7605,11 +14176,11 @@ def _structured_field_has_competing_owner(
                 # ``- ПИК: White Box доступен`` is a competitor-owned claim,
                 # even when it sits directly below a ``### JOIS`` heading.
                 return True
-        suffix = normalized[_entity_end : _entity_end + 180]
+        suffix = normalized[_entity_end:claim_end]
         postfix_owner = re.search(
             r"(?:"
             r"(?:доступ\w*|предлага\w*|предоставля\w*|"
-            r"представлен\w*|оказыва\w*)[^.!?;\n]{0,96}"
+            r"представлен\w*|оказыва\w*)[^.!?;\n]*?"
             r"(?:\bот\b|\bу\b|компани(?:ей|и)|бренд(?:ом|а)|"
             r"застройщик(?:ом|а))|"
             r"(?:предлага\w*|предоставля\w*|представля\w*)\s+"
@@ -7633,7 +14204,12 @@ def _structured_field_has_competing_owner(
                 _alias_is_present(owner, alias) for alias in target_aliases
             ):
                 return True
-        raw_suffix = value[_entity_end : _entity_end + 160]
+        _raw_start, raw_end = _attribution_claim_bounds(
+            value,
+            entity_start,
+            _entity_end,
+        )
+        raw_suffix = value[_entity_end:raw_end]
         parenthetical_owner = re.match(
             r"^\s*\(\s*"
             r"([A-ZА-ЯЁ][\w.-]*(?:\s+[A-ZА-ЯЁ][\w.-]*){0,2})"
@@ -7769,7 +14345,7 @@ def _structured_owned_line_mentions_entity(
         entity_aliases,
     ):
         prefix = line[:alias_start]
-        suffix = line[alias_end : alias_end + 80]
+        suffix = line[alias_end:]
         if (
             _structured_separator_only(prefix)
             and _entity_tail_has_attribution_cue(suffix)
@@ -7915,7 +14491,7 @@ def _gap_has_attribution_cue(gap: str, *, target_first: bool) -> bool:
                 r"закуп\w*|"
                 r"специализиру\w*\s+на|работа\w*\s+(?:с|в)|"
                 r"сил[её]н\w*\s+в|"
-                r"агентств\w*[^.!?;\n]{0,96}\b(?:с|по)\b|"
+                r"агентств\w*[^.!?;\n]*?\b(?:с|по)\b|"
                 r"хорошо\s+сочета\w*|"
                 r"экспертиз\w*\s+(?:в|по)|"
                 r"компетенц\w*\s+(?:в|по)|"
@@ -8135,7 +14711,7 @@ def _relation_has_competing_owner(
     for match in re.finditer(
         r"(?:\bу\b|\bот\b|\bby\b|\bfrom\b)\s+"
         r"([\w.-]{3,}(?:\s+[\w.-]{3,}){0,2}?)"
-        r"[^.!?;]{0,80}(?:\bесть\b|предлага\w*|оказыва\w*|"
+        r"[^.!?;]*?(?:\bесть\b|предлага\w*|оказыва\w*|"
         r"доступ\w*|представлен\w*|име(?:ет|ют|ла|ли))",
         normalized,
         re.UNICODE,
@@ -8229,8 +14805,7 @@ def _has_markdown_scoped_target_attribution(
                     if target_end <= entity_start:
                         relation = normalized_line[target_end:entity_start]
                         if (
-                            len(relation) <= 320
-                            and not _relation_has_competing_owner(
+                            not _relation_has_competing_owner(
                                 relation,
                                 target_aliases,
                             )
@@ -8251,9 +14826,7 @@ def _has_markdown_scoped_target_attribution(
                                         r"(?:в\s+продаже|есть|доступ\w*|"
                                         r"представлен\w*|предлага\w*|"
                                         r"включа\w*|сда(?:е|ю)тся)",
-                                        normalized_line[
-                                            entity_end : entity_end + 96
-                                        ],
+                                        normalized_line[entity_end:],
                                         re.UNICODE,
                                     )
                                     is not None
@@ -8277,8 +14850,7 @@ def _has_markdown_scoped_target_attribution(
                     elif entity_end <= target_start:
                         relation = normalized_line[entity_end:target_start]
                         if (
-                            len(relation) <= 240
-                            and not _relation_has_competing_owner(
+                            not _relation_has_competing_owner(
                                 relation,
                                 target_aliases,
                             )
@@ -8324,7 +14896,6 @@ def _has_markdown_scoped_target_attribution(
                 ).strip()
                 if (
                     candidate
-                    and len(candidate) <= 1200
                     and not _structured_field_has_competing_owner(
                         claim_line,
                         claim_entity_aliases,
@@ -8425,7 +14996,6 @@ def _has_markdown_scoped_target_attribution(
                 continue
             if (
                 not candidate
-                or len(candidate) > 1200
                 or _structured_field_has_competing_owner(
                     claim_line,
                     claim_entity_aliases,
@@ -8542,8 +15112,7 @@ def _has_explicit_target_attribution(
                     if target_end <= entity_start:
                         gap = normalized[target_end:entity_start]
                         if (
-                            len(gap) <= 160
-                            and not _relation_has_competing_owner(
+                            not _relation_has_competing_owner(
                                 gap,
                                 target_aliases,
                             )
@@ -8561,7 +15130,7 @@ def _has_explicit_target_attribution(
                                 or (
                                     _structured_separator_only(gap)
                                     and _entity_tail_has_attribution_cue(
-                                        normalized[entity_end : entity_end + 48]
+                                        normalized[entity_end:]
                                     )
                                 )
                             )
@@ -8570,8 +15139,7 @@ def _has_explicit_target_attribution(
                     elif entity_end <= target_start:
                         gap = normalized[entity_end:target_start]
                         if (
-                            len(gap) <= 160
-                            and not _relation_has_competing_owner(
+                            not _relation_has_competing_owner(
                                 gap,
                                 target_aliases,
                             )
@@ -8594,8 +15162,13 @@ def _evidence_excludes_direct_target(
     normalized = _normalized_evidence_text(evidence)
     for alias in direct_target_aliases:
         for start, end in _alias_spans(normalized, [alias]):
-            prefix = normalized[max(0, start - 64) : start]
-            suffix = normalized[end : end + 96]
+            claim_start, claim_end = _attribution_claim_bounds(
+                normalized,
+                start,
+                end,
+            )
+            prefix = normalized[claim_start:start]
+            suffix = normalized[end:claim_end]
             if re.search(
                 r"(?:\b(?:но|однако|тогда\s+как)\s+)?"
                 r"\bне\b(?:\s+(?:для|у|в|на|про|о))?\s*$|"
@@ -8621,8 +15194,8 @@ def _evidence_excludes_direct_target(
             ):
                 return True
             if re.match(
-                r"^[^.!?;\n]{0,36}\b(?:не|недоступ\w*|отсутств\w*)\b"
-                r"[^.!?;\n]{0,48}(?:предлага\w*|предоставля\w*|"
+                r"^[^.!?;\n]*?\b(?:не|недоступ\w*|отсутств\w*)\b"
+                r"[^.!?;\n]*?(?:предлага\w*|предоставля\w*|"
                 r"доступ\w*|поддержива\w*|сервис\w*|услуг\w*|"
                 r"решени\w*|продукт\w*)",
                 suffix,
@@ -8630,17 +15203,17 @@ def _evidence_excludes_direct_target(
             ):
                 return True
             if re.match(
-                r"^[^.!?;\n]{0,36}(?:сервис\w*|услуг\w*|"
-                r"решени\w*|продукт\w*)[^.!?;\n]{0,36}"
+                r"^[^.!?;\n]*?(?:сервис\w*|услуг\w*|"
+                r"решени\w*|продукт\w*)[^.!?;\n]*?"
                 r"(?:не\s+доступ\w*|недоступ\w*|отсутств\w*)",
                 suffix,
                 re.UNICODE,
             ):
                 return True
             if re.match(
-                r"^[^.!?;\n]{0,48}(?:он[аио]?|е[её]|его|их|"
+                r"^[^.!?;\n]*?(?:он[аио]?|е[её]|его|их|"
                 r"сервис\w*|услуг\w*|решени\w*|продукт\w*)?"
-                r"[^.!?;\n]{0,24}(?:нет\b|не\s+доступ\w*|"
+                r"[^.!?;\n]*?(?:нет\b|не\s+доступ\w*|"
                 r"недоступ\w*|отсутств\w*|не\s+предусмотр\w*|"
                 r"не\s+реализован\w*|не\s+внедрен\w*|"
                 r"не\s+применя\w*|не\s+распространя\w*)",
@@ -8662,8 +15235,13 @@ def _evidence_negates_entity(
         normalized,
         entity_aliases,
     ):
-        prefix = normalized[max(0, start - 72) : start]
-        suffix = normalized[end : end + 96]
+        claim_start, claim_end = _attribution_claim_bounds(
+            normalized,
+            start,
+            end,
+        )
+        prefix = normalized[claim_start:start]
+        suffix = normalized[end:claim_end]
         if re.search(
             r"(?:^|[.:;—–\-])\s*"
             r"(?:не|нельзя|невозмож\w*|без(?:\s+возможности)?)\s*$",
@@ -8694,7 +15272,7 @@ def _scope_qualification_targets_other(
         r"(?:у|в|для|на)\s+"
         r"(?:(?:проект|жк|жил\w*\s+(?:комплекс|квартал)|"
         r"комплекс|бренд|сайт|компани)\w*\s+)?"
-        r"([^.!?;,\n]{2,120})",
+        r"([^.!?;,\n]{2,})",
         normalized,
         re.UNICODE,
     ):
@@ -8733,9 +15311,26 @@ def _evidence_binds_entity_to_direct_target(
                     return True
             elif target_end <= entity_start:
                 relation = normalized[target_end:entity_start]
+                if (
+                    not re.search(r"[.!?;\n]", relation)
+                    and not _relation_has_competing_owner(
+                        relation,
+                        direct_target_aliases,
+                    )
+                    and not _structured_label_starts_field(relation)
+                    and _gap_has_attribution_cue(
+                        relation,
+                        target_first=True,
+                    )
+                ):
+                    # A target can own a long but structurally continuous
+                    # predicate.  Character distance is not a scope boundary:
+                    # ``Realweb <detailed qualifiers> offers programmatic``
+                    # remains one explicit same-sentence relation.
+                    return True
                 if re.fullmatch(
                     r"\s*(?:(?:,?\s*(?:и|and)\s+)"
-                    r"[^.!?;\n]{2,96}?\s+)?"
+                    r"[^.!?;\n]{2,}?\s+)?"
                     r"(?:предлага\w*|предоставля\w*|поддержива\w*|"
                     r"использу\w*|реализу\w*|име\w*)\s*",
                     relation,
@@ -8761,8 +15356,11 @@ def _evidence_restricts_claim_to_other_scope(
         normalized,
         entity_aliases,
     ):
-        vicinity_start = max(0, entity_start - 120)
-        vicinity_end = min(len(normalized), entity_end + 260)
+        vicinity_start, vicinity_end = _attribution_claim_bounds(
+            normalized,
+            entity_start,
+            entity_end,
+        )
         vicinity = normalized[vicinity_start:vicinity_end]
         if re.search(
             r"\b(?:не\s+для|не\s+в|не\s+у)\s+"
@@ -8779,7 +15377,7 @@ def _evidence_restricts_claim_to_other_scope(
             r"(?:проект\w*|жк|жил\w*\s+комплекс\w*|"
             r"жил\w*\s+квартал\w*|комплекс\w*|"
             r"бренд\w*|сайт\w*)\s+"
-            r"([^.!?;,\n]{2,100})",
+            r"([^.!?;,\n]{2,})",
             vicinity,
             re.UNICODE,
         ):
@@ -8792,7 +15390,7 @@ def _evidence_restricts_claim_to_other_scope(
 
         owner_restriction = re.search(
             r"\b(?:только|лишь|исключительно)\s+у\s+"
-            r"([^.!?;,\n]{2,100})",
+            r"([^.!?;,\n]{2,})",
             vicinity,
             re.UNICODE,
         )
@@ -8811,14 +15409,17 @@ def _evidence_restricts_claim_to_other_scope(
         # or ``только в Москве`` as a sibling-product binding.  Raw offsets
         # are computed separately because normalized text collapses Markdown
         # and whitespace and therefore cannot index the original string.
-        original_vicinity = evidence[
-            max(0, entity_start - 120) : min(len(evidence), entity_end + 260)
-        ]
-        original_prefix = evidence[max(0, entity_start - 220) : entity_start]
+        original_start, original_end = _attribution_claim_bounds(
+            evidence,
+            entity_start,
+            entity_end,
+        )
+        original_vicinity = evidence[original_start:original_end]
+        original_prefix = evidence[original_start:entity_start]
         exclusive_subject = re.search(
             r"(?:^|[.!?;\n])\s*"
             r"(?:только|лишь|исключительно)\s+"
-            r"([^.!?;\n]{2,140}?)\s+"
+            r"([^.!?;\n]{2,}?)\s+"
             r"(?:предлага\w*|предоставля\w*|поддержива\w*|"
             r"име\w*|использу\w*|реализу\w*)\s*$",
             original_prefix,
@@ -8847,7 +15448,7 @@ def _evidence_restricts_claim_to_other_scope(
         # the match conservative: the first scope must be a multi-token proper
         # name, so ordinary constraints such as ``only on weekdays`` do not
         # become product ownership rules.
-        suffix = evidence[entity_end : min(len(evidence), entity_end + 220)]
+        suffix = evidence[entity_end:original_end]
         bare_named_restriction = re.match(
             r"^[\s:—–\-,()]{0,24}"
             r"(?:доступ\w*\s+|предлага\w*\s+|предусмотр\w*\s+)?"
@@ -8949,11 +15550,13 @@ def _entity_local_claim_context(
 
     if line_end < len(answer_text):
         cursor = line_end + 1
-        # Skip blank separators and a short neutral continuation, but stop at
-        # a new card/bullet or a repeated entity claim.  This catches
-        # ``Условия уточняются`` followed by a direct qualification without
-        # borrowing an unrelated competitor block.
-        for _line_offset in range(5):
+        # Follow the current prose scope until a deterministic structural or
+        # ownership boundary.  A fixed line count made a sixth (or later)
+        # qualification invisible and therefore converted an explicitly
+        # restricted service into target attribution.  Blank and neutral
+        # continuation lines do not end ownership; headings, sibling bullets,
+        # repeated entity claims and competing owners do.
+        while cursor <= len(answer_text):
             next_line_end = answer_text.find("\n", cursor)
             if next_line_end < 0:
                 next_line_end = len(answer_text)
@@ -8967,13 +15570,25 @@ def _entity_local_claim_context(
                 claim = f"{claim}\n{next_line}".strip()
                 break
             if (
-                re.match(r"^\s*(?:#{1,6}|[-*•])", next_line)
+                _markdown_heading_signature(next_line) is not None
+                or re.match(r"^\s*[-*•]", next_line)
                 or _line_mentions_any_alias(next_line, entity_aliases)
+                or (
+                    _MARKDOWN_OWNER_FIELD.search(next_line) is not None
+                    and not _markdown_owner_field_matches(
+                        next_line,
+                        direct_target_aliases,
+                    )
+                )
+                or _relation_has_competing_owner(
+                    next_line,
+                    direct_target_aliases,
+                )
             ):
                 break
             if next_line_end >= len(answer_text):
                 break
-    return claim[:1200]
+    return claim
 
 
 def _attribution_pair_crosses_scope_boundary(
@@ -9152,8 +15767,6 @@ def _literal_target_attribution_evidence(
         for target_start, target_end in target_spans:
             pair_start = min(entity_start, target_start)
             pair_end = max(entity_end, target_end)
-            if pair_end - pair_start > 1200:
-                continue
             if _attribution_pair_is_disqualified(
                 answer_text,
                 entity_start=entity_start,
@@ -9206,10 +15819,7 @@ def _literal_target_attribution_evidence(
                     if start > pair_start or end < pair_end:
                         continue
                     candidate = answer_text[start:end].strip()
-                    if (
-                        not candidate
-                        or len(candidate) > 1200
-                    ):
+                    if not candidate:
                         continue
                     candidate_offset = answer_text.find(
                         candidate,
@@ -9851,6 +16461,673 @@ def _annotation_context_sha256(
     ).hexdigest()
 
 
+def _merge_partitioned_annotations(
+    parts: list[dict[str, Any]],
+    *,
+    answer_id: int,
+) -> dict[str, Any]:
+    """Deterministically reduce complete leaf annotations for one raw answer."""
+
+    if not parts:
+        raise OpenRouterError(
+            f"No annotation units returned for answer_id {answer_id}"
+        )
+
+    def unique_strings(values: list[Any]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                text
+                for value in values
+                if (text := str(value or "").strip())
+            )
+        )
+
+    mentioned = any(part.get("target_mentioned") is True for part in parts)
+    positions = [
+        int(part["target_position"])
+        for part in parts
+        if isinstance(part.get("target_position"), int)
+        and not isinstance(part.get("target_position"), bool)
+        and int(part["target_position"]) > 0
+    ]
+    role_priority = {
+        "absent": 0,
+        "unknown": 1,
+        "excluded": 2,
+        "mentioned": 3,
+        "conditional": 4,
+        "recommended": 5,
+    }
+    target_role = max(
+        (str(part.get("target_role") or "unknown") for part in parts),
+        key=lambda value: role_priority.get(value, 0),
+    )
+    if not mentioned and target_role not in {"excluded", "unknown"}:
+        target_role = "absent"
+
+    sentiments = unique_strings(
+        [
+            part.get("sentiment")
+            for part in parts
+            if part.get("sentiment") != "unknown"
+        ]
+    )
+    sentiment = (
+        "unknown"
+        if not sentiments
+        else sentiments[0]
+        if len(sentiments) == 1
+        else "mixed"
+    )
+
+    entity_mentions: list[dict[str, Any]] = []
+    seen_mentions: set[tuple[Any, ...]] = set()
+    for part in parts:
+        for mention in part.get("entity_mentions") or []:
+            if not isinstance(mention, dict):
+                continue
+            key = (
+                str(mention.get("canonical_name") or "").casefold(),
+                mention.get("position"),
+                str(mention.get("role") or ""),
+                bool(mention.get("attributed_to_target")),
+                str(mention.get("evidence") or ""),
+            )
+            if key in seen_mentions:
+                continue
+            seen_mentions.add(key)
+            entity_mentions.append(copy.deepcopy(mention))
+
+    brand_answers = [
+        part.get("brand_answer")
+        for part in parts
+        if isinstance(part.get("brand_answer"), dict)
+    ]
+    directness_priority = {
+        "not_applicable": 0,
+        "refusal": 1,
+        "evasive": 2,
+        "partial": 3,
+        "direct": 4,
+    }
+    specificity_priority = {
+        "not_applicable": 0,
+        "none": 1,
+        "generic": 2,
+        "specific": 3,
+        "contradictory": 4,
+    }
+    brand_answer = {
+        "directness": max(
+            (
+                str(item.get("directness") or "not_applicable")
+                for item in brand_answers
+            ),
+            key=lambda value: directness_priority.get(value, 0),
+            default="not_applicable",
+        ),
+        "specificity": max(
+            (
+                str(item.get("specificity") or "not_applicable")
+                for item in brand_answers
+            ),
+            key=lambda value: specificity_priority.get(value, 0),
+            default="not_applicable",
+        ),
+        "supported_facets": unique_strings(
+            [
+                facet
+                for item in brand_answers
+                for facet in item.get("supported_facets") or []
+            ]
+        ),
+        "contradictions": unique_strings(
+            [
+                value
+                for item in brand_answers
+                for value in item.get("contradictions") or []
+            ]
+        ),
+    }
+    return {
+        "answer_id": answer_id,
+        "valid": any(part.get("valid") is True for part in parts),
+        "target_mentioned": mentioned,
+        "target_position": min(positions) if positions else None,
+        "target_role": target_role,
+        "sentiment": sentiment,
+        "entity_mentions": entity_mentions,
+        "brand_answer": brand_answer,
+        "evidence": unique_strings(
+            [value for part in parts for value in part.get("evidence") or []]
+        ),
+        "uncertainties": unique_strings(
+            [
+                value
+                for part in parts
+                for value in part.get("uncertainties") or []
+            ]
+        ),
+    }
+
+
+def _span_intersects_core(
+    context: str,
+    value: str,
+    *,
+    core_start: int,
+    core_end: int,
+    ignore_case: bool = False,
+) -> bool:
+    """Return true when a literal occurrence owns at least one core char."""
+
+    if not value or core_end <= core_start:
+        return False
+    flags = re.IGNORECASE if ignore_case else 0
+    for match in re.finditer(re.escape(value), context, flags):
+        if match.start() < core_end and core_start < match.end():
+            return True
+    return False
+
+
+def _restrict_partition_annotation_to_core(
+    annotation: dict[str, Any],
+    unit: dict[str, Any],
+    *,
+    target_aliases: list[str],
+) -> dict[str, Any]:
+    """Use overlap for interpretation while assigning each literal fact once.
+
+    Facts that straddle a boundary intersect both adjacent cores; exact-value
+    de-duplication in ``_merge_partitioned_annotations`` collapses them. Facts
+    wholly inside overlap belong to the neighbouring core and are discarded
+    here, preventing duplicated evidence or local list positions.
+    """
+
+    output = copy.deepcopy(annotation)
+    context = str(unit.get("answer") or "")
+    core_start = int(unit.get("_lr_core_start_in_context") or 0)
+    core_end = int(unit.get("_lr_core_end_in_context") or 0)
+    kept_mentions: list[dict[str, Any]] = []
+    for mention in output.get("entity_mentions") or []:
+        if not isinstance(mention, dict):
+            continue
+        evidence = str(mention.get("evidence") or "")
+        if _span_intersects_core(
+            context,
+            evidence,
+            core_start=core_start,
+            core_end=core_end,
+        ):
+            kept_mentions.append(mention)
+    output["entity_mentions"] = kept_mentions
+    output["evidence"] = [
+        value
+        for value in output.get("evidence") or []
+        if _span_intersects_core(
+            context,
+            str(value or ""),
+            core_start=core_start,
+            core_end=core_end,
+        )
+    ]
+    owns_target = any(
+        _span_intersects_core(
+            context,
+            alias,
+            core_start=core_start,
+            core_end=core_end,
+            ignore_case=True,
+        )
+        for alias in target_aliases
+        if alias
+    )
+    if output.get("target_mentioned") is True and not owns_target:
+        output["target_mentioned"] = False
+        output["target_position"] = None
+        if output.get("target_role") not in {"excluded", "unknown"}:
+            output["target_role"] = "absent"
+
+    # List ordinals emitted for a later window are local to that window.  They
+    # cannot be promoted to a position in the complete answer because earlier
+    # windows may already contain an arbitrary number of candidates.  Keep the
+    # literal mention and role, but make the global position unknown.  The
+    # first window starts at character zero, so its ordinal remains globally
+    # anchored.
+    unit_index = int(unit.get("_lr_unit_index") or 0)
+    local_position_seen = False
+    if unit_index > 0:
+        if isinstance(output.get("target_position"), int) and not isinstance(
+            output.get("target_position"), bool
+        ):
+            local_position_seen = True
+        output["target_position"] = None
+        normalized_mentions: list[dict[str, Any]] = []
+        for mention in output.get("entity_mentions") or []:
+            if not isinstance(mention, dict):
+                continue
+            normalized = copy.deepcopy(mention)
+            if isinstance(normalized.get("position"), int) and not isinstance(
+                normalized.get("position"), bool
+            ):
+                local_position_seen = True
+            normalized["position"] = None
+            normalized_mentions.append(normalized)
+        output["entity_mentions"] = normalized_mentions
+    if local_position_seen:
+        output["uncertainties"] = list(
+            dict.fromkeys(
+                [
+                    *(output.get("uncertainties") or []),
+                    (
+                        "Глобальная позиция в длинном ответе не доказана: "
+                        "упоминание находится после первого фрагмента."
+                    ),
+                ]
+            )
+        )
+    return output
+
+
+def _annotation_model_answer(
+    item: dict[str, Any],
+    *,
+    request_answer_id: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "answer_id": (
+            request_answer_id
+            if request_answer_id is not None
+            else int(item["answer_id"])
+        ),
+        "source_answer_id": item["_lr_original_answer_id"],
+        "source_unit_id": item.get("_lr_unit_id"),
+        "source_unit_index": item.get("_lr_unit_index"),
+        "source_unit_count": item.get("_lr_unit_count"),
+        "source_core_start_char": item.get("_lr_start_char"),
+        "source_core_end_char": item.get("_lr_end_char"),
+        "context_start_char": item.get("_lr_context_start_char"),
+        "context_end_char": item.get("_lr_context_end_char"),
+        "core_start_in_context": item.get("_lr_core_start_in_context"),
+        "core_end_in_context": item.get("_lr_core_end_in_context"),
+        "core_sha256": item.get("_lr_unit_sha256"),
+        "context_sha256": item.get("_lr_context_sha256"),
+        "mode": item.get("mode"),
+        "system": item.get("system"),
+        "scenario": item.get("scenario"),
+        "scenario_role": item.get("scenario_role"),
+        "intent_class": item.get("intent_class"),
+        "answer": item.get("answer"),
+    }
+
+
+def _annotation_context_records(
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Turn repeated analytic context into independently hashable records."""
+
+    records: list[dict[str, Any]] = []
+
+    def add(kind: str, field: str, value: Any, index: int) -> None:
+        identity = {
+            "kind": kind,
+            "field": field,
+            "index": index,
+            "value_sha256": _stable_json_sha256(value),
+        }
+        records.append(
+            {
+                **identity,
+                "record_id": (
+                    f"{kind}:{field}:{index}:"
+                    f"{_stable_json_sha256(identity)[:20]}"
+                ),
+                "value": copy.deepcopy(value),
+            }
+        )
+
+    for field in (
+        "brand_aliases",
+        "topics",
+        "products",
+        "audiences",
+        "customer_jobs",
+        "decision_criteria",
+        "geography",
+        "evidence",
+        "uncertainties",
+    ):
+        for index, value in enumerate(profile.get(field) or []):
+            add("profile_list", field, value, index)
+    for field in (
+        "site_type",
+        "category",
+        "market",
+        "business_model",
+        "language",
+        "positioning",
+        "confidence",
+    ):
+        value = profile.get(field)
+        if value not in (None, ""):
+            add("profile_scalar", field, value, 0)
+    for index, value in enumerate(profile.get("entity_scope") or []):
+        if isinstance(value, dict):
+            add("profile_entity", "entity_scope", value, index)
+    offer_catalog = profile.get("offer_catalog")
+    if isinstance(offer_catalog, dict):
+        for index, value in enumerate(offer_catalog.get("accepted_offers") or []):
+            if isinstance(value, dict):
+                add("profile_offer", "accepted_offers", value, index)
+    for index, value in enumerate(catalog.get("entities") or []):
+        if isinstance(value, dict):
+            add("catalog_entity", "entities", value, index)
+    return records
+
+
+def _annotation_record_strings(record: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if len(normalized) >= 2:
+                values.append(normalized)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(record.get("value"))
+    return values
+
+
+def _annotation_selected_context_records(
+    records: list[dict[str, Any]],
+    batch: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    """Select a provenance-bound context subset for exact raw windows.
+
+    Brand diagnostics used to attach the entire profile/catalog to every
+    answer. Once either side was partitioned this became an answer x context
+    paid cross-product. Identity scalars remain available to every diagnostic;
+    entity and narrative records are joined only when their literal aliases or
+    material lexical terms occur in the owned raw window. The full record
+    count/digest stays in ``context_provenance`` so omission cannot masquerade
+    as an absence finding.
+    """
+
+    answer_text = "\n".join(str(item.get("answer") or "") for item in batch)
+    brand_diagnostic = any(
+        item.get("scenario_role") == "brand_diagnostic" for item in batch
+    )
+
+    def material_tokens(value: str) -> set[str]:
+        return {
+            token.casefold()
+            for token in re.findall(r"[\w-]+", value, flags=re.UNICODE)
+            if len(token) >= 5
+        }
+
+    answer_tokens = material_tokens(answer_text)
+
+    def is_relevant(record: dict[str, Any]) -> bool:
+        kind = str(record.get("kind") or "")
+        field = str(record.get("field") or "")
+        if brand_diagnostic and (
+            kind == "profile_scalar"
+            or (kind == "profile_list" and field == "brand_aliases")
+        ):
+            return True
+        strings = _annotation_record_strings(record)
+        if kind in {"catalog_entity", "profile_entity", "profile_offer"} and isinstance(
+            record.get("value"), dict
+        ):
+            entity = record["value"]
+            strings = [str(entity.get("canonical_name") or "").strip()]
+            for raw_alias in entity.get("aliases") or []:
+                strings.append(
+                    str(
+                        raw_alias.get("value")
+                        if isinstance(raw_alias, dict)
+                        else raw_alias
+                    ).strip()
+                )
+            strings = [value for value in strings if len(value) >= 2]
+        if any(_alias_is_present(answer_text, value) for value in strings):
+            return True
+        if brand_diagnostic and kind.startswith("profile_"):
+            return any(
+                answer_tokens & material_tokens(value)
+                for value in strings
+            )
+        return False
+
+    selected = [
+        record
+        for record in records
+        if is_relevant(record)
+    ]
+    return selected, (
+        "identity_plus_material_relevance_for_brand_diagnostic"
+        if brand_diagnostic
+        else "literal_relevance_for_unbranded_annotation"
+    )
+
+
+def _annotation_context_payload(
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    full_alias_map: dict[str, list[str]],
+    all_records: list[dict[str, Any]],
+    selected_records: list[dict[str, Any]],
+    shard_records: list[dict[str, Any]],
+    selection_rule: str,
+    answers: list[dict[str, Any]],
+    research_guidance: str,
+    repair_mode: str,
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, Any]:
+    profile_context: dict[str, Any] = {
+        "brand_name": profile.get("brand_name"),
+    }
+    catalog_entities: list[dict[str, Any]] = []
+    context_fragments: list[dict[str, Any]] = []
+    for record in shard_records:
+        kind = str(record.get("kind") or "")
+        field = str(record.get("field") or "")
+        value = copy.deepcopy(record.get("value"))
+        if kind == "profile_scalar":
+            profile_context[field] = value
+        elif kind == "profile_list":
+            profile_context.setdefault(field, []).append(value)
+        elif kind == "profile_entity":
+            profile_context.setdefault("entity_scope", []).append(value)
+        elif kind == "profile_offer":
+            profile_context.setdefault("offer_catalog", {}).setdefault(
+                "accepted_offers", []
+            ).append(value)
+        elif kind == "catalog_entity":
+            catalog_entities.append(value)
+        elif kind == "context_json_fragment":
+            context_fragments.append(
+                {
+                    "source_record_id": record.get("source_record_id"),
+                    "source_kind": record.get("source_kind"),
+                    "source_field": record.get("source_field"),
+                    "fragment_index": record.get("fragment_index"),
+                    "fragment_count": record.get("fragment_count"),
+                    "fragment_sha256": record.get("value_sha256"),
+                    "core_start_in_context": record.get(
+                        "core_start_in_context"
+                    ),
+                    "core_end_in_context": record.get(
+                        "core_end_in_context"
+                    ),
+                    "core_sha256": record.get("core_sha256"),
+                    "context_sha256": record.get("context_sha256"),
+                    "ownership_rule": record.get("ownership_rule"),
+                    "json_fragment": value,
+                }
+            )
+
+    selected_target_aliases = [str(profile.get("brand_name") or "")]
+    for value in profile_context.get("brand_aliases") or []:
+        selected_target_aliases.append(str(value or ""))
+    selected_target_aliases = list(
+        dict.fromkeys(
+            value.strip()
+            for value in selected_target_aliases
+            if len(value.strip()) >= 2
+        )
+    )
+    selected_catalog_names: set[str] = set()
+    selected_catalog_entities = [
+        entity
+        for entity in catalog_entities
+        if isinstance(entity, dict)
+    ]
+    selected_catalog_entities.extend(
+        value
+        for record in shard_records
+        if record.get("kind") == "catalog_entity"
+        and isinstance((value := record.get("value")), dict)
+    )
+    # Oversized catalog records are represented in ``shard_records`` only by
+    # JSON text fragments.  Derive the tiny alias allow-list from the original
+    # code-owned selection without embedding that large record in the provider
+    # payload a second time.  The fragment remains the sole transmitted entity
+    # evidence; this loop only chooses which already-validated alias-map keys
+    # accompany it.
+    selected_catalog_entities.extend(
+        value
+        for record in selected_records
+        if record.get("kind") == "catalog_entity"
+        and isinstance((value := record.get("value")), dict)
+    )
+    for entity in selected_catalog_entities:
+        candidates: list[Any] = [entity.get("canonical_name")]
+        aliases = entity.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                candidates.append(
+                    alias.get("value") if isinstance(alias, dict) else alias
+                )
+        selected_catalog_names.update(
+            normalized.casefold()
+            for candidate in candidates
+            if (normalized := str(candidate or "").strip())
+        )
+    selected_ids = [str(record.get("record_id") or "") for record in selected_records]
+    shard_ids = [str(record.get("record_id") or "") for record in shard_records]
+    return {
+        "target": {
+            "brand_name": profile.get("brand_name"),
+            "aliases": selected_target_aliases,
+            "site_profile": profile_context,
+        },
+        "entity_catalog": catalog_entities,
+        "entity_attribution_aliases": {
+            key: copy.deepcopy(value)
+            for key, value in full_alias_map.items()
+            if key in selected_catalog_names
+        },
+        "context_fragments": context_fragments,
+        "context_provenance": {
+            "version": ANNOTATION_CONTEXT_HARNESS_VERSION,
+            "profile_sha256": _stable_json_sha256(profile),
+            "catalog_sha256": _stable_json_sha256(catalog),
+            "attribution_aliases_sha256": _stable_json_sha256(full_alias_map),
+            "selection_rule": selection_rule,
+            "all_record_count": len(all_records),
+            "all_record_ids_sha256": _stable_json_sha256(
+                [str(record.get("record_id") or "") for record in all_records]
+            ),
+            "selected_record_count": len(selected_records),
+            "selected_record_ids_sha256": _stable_json_sha256(selected_ids),
+            "omitted_irrelevant_record_count": len(all_records) - len(selected_records),
+            "shard_index": shard_index,
+            "shard_count": shard_count,
+            "shard_record_count": len(shard_records),
+            "shard_record_ids_sha256": _stable_json_sha256(shard_ids),
+            "answer_unit_ids_sha256": _stable_json_sha256(
+                [str(item.get("source_unit_id") or "") for item in answers]
+            ),
+        },
+        "research_guidance": research_guidance.strip(),
+        "annotation_mode": repair_mode or "standard",
+        "partition_contract": {
+            "version": LONG_RESPONSE_HARNESS_VERSION,
+            "context_version": ANNOTATION_CONTEXT_HARNESS_VERSION,
+            "rule": (
+                "Каждая запись содержит непересекающееся core-окно и "
+                "ограниченный дословный контекст слева/справа. Контекст "
+                "нужен, чтобы не разорвать имя или связь владельца с "
+                "услугой. Размечай факт в этом окне только если его "
+                "evidence пересекает core. Аналитический контекст может "
+                "быть релевантным subset или одним shard; отсутствие "
+                "сущности в shard не означает её отсутствия в полном "
+                "каталоге. answer_id кодирует конкретную пару raw-window "
+                "и context-shard, которую затем объединит код."
+            ),
+        },
+        "answers": answers,
+    }
+
+
+def _annotation_split_oversized_record(
+    record: dict[str, Any],
+    *,
+    target_chars: int = 8_000,
+) -> list[dict[str, Any]]:
+    serialized = json.dumps(
+        record.get("value"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    units, manifest = split_lossless_text(
+        serialized,
+        document_id=str(record.get("record_id") or "context-record"),
+        target_chars=target_chars,
+    )
+    if "".join(unit.text for unit in units) != serialized:
+        raise OpenRouterError(
+            "Annotation context partition changed the source record"
+        )
+    output: list[dict[str, Any]] = []
+    for unit in units:
+        # Semantic overlap keeps a name or relationship intact at a shard
+        # boundary. Core offsets remain code-owned, so overlap may inform
+        # interpretation without becoming a second independent attribution.
+        fragment = unit.context_text
+        output.append(
+            {
+                "record_id": str(unit.unit_id),
+                "kind": "context_json_fragment",
+                "field": str(record.get("field") or ""),
+                "source_record_id": record.get("record_id"),
+                "source_kind": record.get("kind"),
+                "source_field": record.get("field"),
+                "fragment_index": unit.index,
+                "fragment_count": manifest.unit_count,
+                "core_start_in_context": unit.core_start_in_context,
+                "core_end_in_context": unit.core_end_in_context,
+                "core_sha256": unit.sha256,
+                "context_sha256": unit.context_sha256,
+                "ownership_rule": "first_decisive_evidence_character_in_core",
+                "value_sha256": text_sha256(fragment),
+                "value": fragment,
+            }
+        )
+    return output
+
+
 async def _annotate_answers(
     run_id: str,
     profile: dict[str, Any],
@@ -9885,18 +17162,9 @@ async def _annotate_answers(
         run_id,
         annotation_input_sha256=annotation_input_sha256,
         target_answer_ids=normalized_target_ids,
-        answer_char_limit=(
-            CRITIC_ANSWER_CHAR_LIMIT
-            if repair_mode == "analysis_critic_targeted_v1"
-            else ANSWER_ANALYSIS_CHAR_LIMIT
-        ),
-        require_complete_raw=(
-            repair_mode == "analysis_critic_targeted_v1"
-        ),
     )
     if not pending:
         return
-    total = len(pending)
     system = f"""
 Разметь каждый ответ атомарно и только по его тексту.
 Целевая сущность: {profile.get("brand_name")}.
@@ -9920,7 +17188,7 @@ async def _annotate_answers(
   с целевым брендом. Простая близость в списке, общая тема ответа, ссылка на
   сайт или упоминание услуги у другого агентства атрибуцией не считаются.
   Для общей услуги target-портфеля evidence должен быть одним непрерывным
-  точным фрагментом до 1200 знаков и содержать одновременно разрешённого для
+  точным фрагментом необходимой длины и содержать одновременно разрешённого для
   этой сущности владельца из entity_attribution_aliases, алиас услуги и слова,
   выражающие их связь. Если связь задана заголовком Markdown и дочерним
   пунктом, не склеивай их: верни точный
@@ -9937,13 +17205,20 @@ async def _annotate_answers(
   значения directness=not_applicable и specificity=not_applicable запрещены,
   в том числе для сравнительного вопроса о названном бренде;
 - для unbranded_discovery brand_answer всегда not_applicable;
-- общий массив evidence содержит только точные непрерывные фрагменты raw до
-  15 слов, без пересказа и без изменения форматирования;
+- общий массив evidence содержит точные непрерывные фрагменты raw достаточной
+  длины, без пересказа, искусственного сокращения и изменения форматирования;
 - неизвестность записывай в uncertainties, а не превращай в негатив.
 
 Если research_guidance непустой, используй его только как дополнительное
 ужесточение правил текущего исследования. Оно не разрешает расширять каталог,
 приписывать бренду новые продукты или менять исходный текст ответа.
+
+context_provenance описывает code-owned subset/shard полного аналитического
+контекста. Из отсутствия сущности или факта в текущем shard нельзя делать
+вывод об их отсутствии в полном профиле/каталоге. context_fragments —
+дословные JSON-фрагменты одной слишком большой записи; извлекай только то,
+что явно читается в переданном фрагменте. Код объединит ответы всех shard по
+неизменному raw-окну и отклонит неполный набор.
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
@@ -9965,49 +17240,330 @@ async def _annotate_answers(
 - если непрерывного доказательного блока нет, сохрани
   attributed_to_target=false. Не синтезируй цитату.
 """.strip()
-    batch_jobs: list[dict[str, Any]] = []
-    batches = _volume_bounded_chunks(
-        pending,
-        text_key="answer",
-        max_items=10,
-        max_chars=ANNOTATION_BATCH_CHAR_LIMIT,
+    pending_by_source_id = {
+        int(item["answer_id"]): item for item in pending
+    }
+    partition_target_aliases = _target_aliases(profile, catalog)
+    all_context_records = _annotation_context_records(profile, catalog)
+    full_alias_map = _entity_attribution_alias_map(profile, catalog)
+    annotation_window = await _analyzer_model_input_window(
+        PROCESSING_MODEL,
+        system=system,
     )
-    for batch in batches:
-        answer_ids = [int(item["answer_id"]) for item in batch]
-        digest = hashlib.sha1(
-            ",".join(str(value) for value in answer_ids).encode("ascii")
-        ).hexdigest()[:12]
-        payload = {
-            "target": {
-                "brand_name": profile.get("brand_name"),
-                "aliases": _target_aliases(profile, catalog),
-                "site_profile": profile,
-            },
-            "entity_catalog": catalog.get("entities") or [],
-            "entity_attribution_aliases": _entity_attribution_alias_map(
-                profile,
-                catalog,
-            ),
-            "research_guidance": research_guidance.strip(),
-            "annotation_mode": repair_mode or "standard",
-            "answers": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if not key.startswith("_")
-                }
-                for item in batch
-            ],
+    annotation_window_bytes = int(annotation_window["input_utf8_window"])
+
+    def annotation_request_bytes(
+        payload: dict[str, Any],
+        *,
+        schema_name: str = "aiv_annotations_0000000000000000",
+    ) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=annotation_window["model_envelope"],
+            system=system,
+            user_payload=payload,
+            schema=ANNOTATION_SCHEMA,
+            schema_name=schema_name,
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    answer_target_chars = ANSWER_ANALYSIS_PARTITION_CHARS
+    while True:
+        unit_pending, partition_manifests = partition_text_records(
+            pending,
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=answer_target_chars,
+        )
+        minimum_requests_fit = True
+        for preflight_index, item in enumerate(unit_pending, start=1):
+            preflight_item = dict(item)
+            preflight_item["_lr_original_answer_id"] = int(
+                preflight_item["answer_id"]
+            )
+            preflight_item["answer_id"] = -preflight_index
+            minimal_payload = _annotation_context_payload(
+                profile=profile,
+                catalog=catalog,
+                full_alias_map=full_alias_map,
+                all_records=all_context_records,
+                selected_records=[],
+                shard_records=[],
+                selection_rule="raw_unit_physical_preflight",
+                answers=[_annotation_model_answer(preflight_item)],
+                research_guidance=research_guidance,
+                repair_mode=repair_mode,
+                shard_index=0,
+                shard_count=1,
+            )
+            if annotation_request_bytes(minimal_payload) > (
+                annotation_window_bytes
+            ):
+                minimum_requests_fit = False
+                break
+        if minimum_requests_fit:
+            break
+        if answer_target_chars <= 256:
+            raise OpenRouterError(
+                "Annotation raw-answer unit cannot fit the physical model "
+                "input window even without analytic context"
+            )
+        answer_target_chars = max(256, answer_target_chars // 2)
+
+    for synthetic_index, item in enumerate(unit_pending, start=1):
+        item["_lr_original_answer_id"] = int(item["answer_id"])
+        item["answer_id"] = -synthetic_index
+    batch_jobs: list[dict[str, Any]] = []
+    next_shard_answer_id = min(
+        (int(item["answer_id"]) for item in unit_pending),
+        default=0,
+    ) - 1
+
+    def append_job(
+        batch: list[dict[str, Any]],
+        *,
+        selected_records: list[dict[str, Any]],
+        shard_records: list[dict[str, Any]],
+        selection_rule: str,
+        shard_index: int = 0,
+        shard_count: int = 1,
+        request_answer_ids: list[int] | None = None,
+    ) -> None:
+        nonlocal next_shard_answer_id
+        if request_answer_ids is None:
+            request_answer_ids = [int(item["answer_id"]) for item in batch]
+        answers_payload = [
+            _annotation_model_answer(item, request_answer_id=request_id)
+            for item, request_id in zip(
+                batch,
+                request_answer_ids,
+                strict=True,
+            )
+        ]
+        payload = _annotation_context_payload(
+            profile=profile,
+            catalog=catalog,
+            full_alias_map=full_alias_map,
+            all_records=all_context_records,
+            selected_records=selected_records,
+            shard_records=shard_records,
+            selection_rule=selection_rule,
+            answers=answers_payload,
+            research_guidance=research_guidance,
+            repair_mode=repair_mode,
+            shard_index=shard_index,
+            shard_count=shard_count,
+        )
+        payload_bytes = annotation_request_bytes(
+            payload,
+            schema_name="aiv_annotations_" + ("0" * 16),
+        )
+        if payload_bytes > annotation_window_bytes:
+            raise OpenRouterError(
+                "Annotation request exceeds the complete byte preflight: "
+                f"{payload_bytes}>{annotation_window_bytes}"
+            )
+        digest = _stable_json_sha256(payload)[:16]
+        request_to_unit = {
+            request_id: int(item["answer_id"])
+            for item, request_id in zip(
+                batch,
+                request_answer_ids,
+                strict=True,
+            )
         }
         batch_jobs.append(
             {
                 "batch": batch,
-                "answer_ids": answer_ids,
+                "answer_ids": request_answer_ids,
+                "request_to_unit": request_to_unit,
+                "unit_ids": sorted(set(request_to_unit.values())),
+                "source_answer_ids": sorted(
+                    {
+                        int(item["_lr_original_answer_id"])
+                        for item in batch
+                    }
+                ),
                 "artifact_key": f"annotations_{digest}_{ANNOTATION_VERSION}",
                 "schema_name": f"aiv_annotations_{digest}",
                 "payload": payload,
             }
         )
+
+    def plan_batch(batch: list[dict[str, Any]]) -> None:
+        nonlocal next_shard_answer_id
+        selected_records, selection_rule = _annotation_selected_context_records(
+            all_context_records,
+            batch,
+        )
+        trial_answers = [_annotation_model_answer(item) for item in batch]
+        trial_payload = _annotation_context_payload(
+            profile=profile,
+            catalog=catalog,
+            full_alias_map=full_alias_map,
+            all_records=all_context_records,
+            selected_records=selected_records,
+            shard_records=selected_records,
+            selection_rule=selection_rule,
+            answers=trial_answers,
+            research_guidance=research_guidance,
+            repair_mode=repair_mode,
+            shard_index=0,
+            shard_count=1,
+        )
+        if annotation_request_bytes(trial_payload) <= annotation_window_bytes:
+            append_job(
+                batch,
+                selected_records=selected_records,
+                shard_records=selected_records,
+                selection_rule=selection_rule,
+            )
+            return
+        if len(batch) > 1:
+            for item in batch:
+                plan_batch([item])
+            return
+
+        # The raw window stays intact. Only the repeated analytic context is
+        # partitioned, then its annotations are hash-joined by code.
+        expanded_records: list[dict[str, Any]] = []
+        for record in selected_records:
+            single_payload = _annotation_context_payload(
+                profile=profile,
+                catalog=catalog,
+                full_alias_map=full_alias_map,
+                all_records=all_context_records,
+                selected_records=selected_records,
+                shard_records=[record],
+                selection_rule=selection_rule,
+                answers=trial_answers,
+                research_guidance=research_guidance,
+                repair_mode=repair_mode,
+                shard_index=0,
+                shard_count=max(1, len(selected_records)),
+            )
+            if annotation_request_bytes(single_payload) <= (
+                annotation_window_bytes
+            ):
+                expanded_records.append(record)
+            else:
+                fragment_target_chars = 8_000
+                while True:
+                    fragments = _annotation_split_oversized_record(
+                        record,
+                        target_chars=fragment_target_chars,
+                    )
+                    fragment_requests_fit = True
+                    for fragment in fragments:
+                        fragment_payload = _annotation_context_payload(
+                            profile=profile,
+                            catalog=catalog,
+                            full_alias_map=full_alias_map,
+                            all_records=all_context_records,
+                            selected_records=selected_records,
+                            shard_records=[fragment],
+                            selection_rule=selection_rule,
+                            answers=trial_answers,
+                            research_guidance=research_guidance,
+                            repair_mode=repair_mode,
+                            shard_index=0,
+                            shard_count=len(fragments),
+                        )
+                        if annotation_request_bytes(fragment_payload) > (
+                            annotation_window_bytes
+                        ):
+                            fragment_requests_fit = False
+                            break
+                    if fragment_requests_fit:
+                        expanded_records.extend(fragments)
+                        break
+                    if fragment_target_chars <= 256:
+                        raise OpenRouterError(
+                            "Annotation context record cannot fit the physical "
+                            "model window at minimum lossless fragment size"
+                        )
+                    fragment_target_chars = max(
+                        256,
+                        fragment_target_chars // 2,
+                    )
+
+        record_groups: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for record in expanded_records:
+            candidate = [*current, record]
+            candidate_payload = _annotation_context_payload(
+                profile=profile,
+                catalog=catalog,
+                full_alias_map=full_alias_map,
+                all_records=all_context_records,
+                selected_records=selected_records,
+                shard_records=candidate,
+                selection_rule=selection_rule,
+                answers=trial_answers,
+                research_guidance=research_guidance,
+                repair_mode=repair_mode,
+                shard_index=0,
+                shard_count=max(1, len(expanded_records)),
+            )
+            if current and annotation_request_bytes(candidate_payload) > (
+                annotation_window_bytes
+            ):
+                record_groups.append(current)
+                current = [record]
+            else:
+                current = candidate
+        if current:
+            record_groups.append(current)
+        if not record_groups:
+            # Empty relevant context still produces one complete raw request.
+            record_groups = [[]]
+
+        shard_count = len(record_groups)
+        for shard_index, records in enumerate(record_groups):
+            request_id = next_shard_answer_id
+            next_shard_answer_id -= 1
+            append_job(
+                batch,
+                selected_records=selected_records,
+                shard_records=records,
+                selection_rule=selection_rule,
+                shard_index=shard_index,
+                shard_count=shard_count,
+                request_answer_ids=[request_id],
+            )
+
+    current_batch: list[dict[str, Any]] = []
+    for item in unit_pending:
+        candidate = [*current_batch, item]
+        selected_records, selection_rule = _annotation_selected_context_records(
+            all_context_records,
+            candidate,
+        )
+        trial_payload = _annotation_context_payload(
+            profile=profile,
+            catalog=catalog,
+            full_alias_map=full_alias_map,
+            all_records=all_context_records,
+            selected_records=selected_records,
+            shard_records=selected_records,
+            selection_rule=selection_rule,
+            answers=[_annotation_model_answer(value) for value in candidate],
+            research_guidance=research_guidance,
+            repair_mode=repair_mode,
+            shard_index=0,
+            shard_count=1,
+        )
+        if current_batch and (
+            annotation_request_bytes(trial_payload)
+            > annotation_window_bytes
+        ):
+            plan_batch(current_batch)
+            current_batch = [item]
+        else:
+            current_batch = candidate
+    if current_batch:
+        plan_batch(current_batch)
 
     semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
 
@@ -10024,7 +17580,6 @@ async def _annotate_answers(
                     schema_name=str(job["schema_name"]),
                     system=system,
                     user_payload=job["payload"],
-                    max_tokens=12_000,
                     prompt_version=ANNOTATION_VERSION,
                 )
             return result, None
@@ -10040,60 +17595,64 @@ async def _annotate_answers(
         )
         for index, job in enumerate(batch_jobs, start=1)
     ]
-    processed = 0
+    context_parts_by_unit: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    expected_context_parts = Counter(
+        unit_id
+        for job in batch_jobs
+        for unit_id in job["unit_ids"]
+    )
+    remaining_context_jobs = Counter(expected_context_parts)
+    processed_units: set[int] = set()
+    failed_unit_ids: set[int] = set()
+    failed_source_ids: set[int] = set()
+    unit_by_synthetic_id = {
+        int(item["answer_id"]): item for item in unit_pending
+    }
     try:
-        # LLM requests run concurrently, but their results are reconciled,
-        # persisted and reflected in progress strictly in batch order.
+        # LLM requests run concurrently. Nothing is reduced or persisted for
+        # a source answer until every code-owned unit has returned exactly once.
         for job, task in zip(batch_jobs, tasks, strict=True):
             result, error = await task
             batch = job["batch"]
             answer_ids = job["answer_ids"]
             if error is not None:
+                failed_unit_ids.update(job["unit_ids"])
+                failed_source_ids.update(job["source_answer_ids"])
                 logger.error(
                     "Annotation batch failed for run %s",
                     run_id,
                     exc_info=(type(error), error, error.__traceback__),
                 )
             elif result is not None:
-                pending_by_id = {
-                    int(item["answer_id"]): item
-                    for item in batch
-                }
-                reconciled = [
-                    _reconcile_annotation(
-                        item,
-                        pending_by_id[int(item["answer_id"])],
-                        profile,
-                        catalog,
-                        annotation_input_sha256=annotation_input_sha256,
-                        annotation_repair_provenance=(
-                            annotation_repair_provenance
-                        ),
-                    )
+                returned = [
+                    item
                     for item in result.get("answers") or []
                     if isinstance(item, dict)
                     and isinstance(item.get("answer_id"), int)
-                    and int(item["answer_id"]) in pending_by_id
                 ]
-                if repair_mode == ANALYSIS_CRITIC_TARGETED_REPAIR_MODE:
-                    # The provider call may outlive the worker lease.  Check
-                    # once immediately after it, then persist under an atomic
-                    # raw/model/prior-annotation CAS in the same DB write
-                    # transaction.
-                    await assert_run_lease(run_id)
-                    await _save_targeted_recovery_annotations(
+                returned_ids = [int(item["answer_id"]) for item in returned]
+                if Counter(returned_ids) != Counter(answer_ids):
+                    failed_unit_ids.update(job["unit_ids"])
+                    failed_source_ids.update(job["source_answer_ids"])
+                    logger.error(
+                        "Annotation batch unit manifest mismatch for run %s: "
+                        "expected=%s returned=%s",
                         run_id,
-                        reconciled,
-                        pending_by_id,
+                        answer_ids,
+                        returned_ids,
                     )
                 else:
-                    await _save_annotations(
-                        run_id,
-                        reconciled,
-                        set(answer_ids),
-                    )
-            processed += len(batch)
-            ratio = processed / total
+                    for item in returned:
+                        request_id = int(item["answer_id"])
+                        unit_id = int(job["request_to_unit"][request_id])
+                        normalized = copy.deepcopy(item)
+                        normalized["answer_id"] = unit_id
+                        context_parts_by_unit[unit_id].append(normalized)
+            for unit_id in job["unit_ids"]:
+                remaining_context_jobs[unit_id] -= 1
+                if remaining_context_jobs[unit_id] == 0:
+                    processed_units.add(unit_id)
+            ratio = len(processed_units) / max(1, len(unit_pending))
             await update_progress(
                 run_id,
                 stage="knowledge_gap",
@@ -10109,6 +17668,121 @@ async def _annotate_answers(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    parts_by_source_id: dict[int, list[tuple[int, dict[str, Any]]]] = (
+        defaultdict(list)
+    )
+    for unit_id, unit in unit_by_synthetic_id.items():
+        source_id = int(unit["_lr_original_answer_id"])
+        context_parts = context_parts_by_unit.get(unit_id, [])
+        if (
+            unit_id in failed_unit_ids
+            or len(context_parts) != expected_context_parts[unit_id]
+        ):
+            failed_source_ids.add(source_id)
+            continue
+        # A raw unit can be repeated across byte-bounded analytic-context
+        # shards. The code-owned request map proves that every shard returned
+        # once before any fact is promoted to the source answer.
+        normalized = _merge_partitioned_annotations(
+            context_parts,
+            answer_id=source_id,
+        )
+        normalized = _restrict_partition_annotation_to_core(
+            normalized,
+            unit,
+            target_aliases=partition_target_aliases,
+        )
+        parts_by_source_id[source_id].append(
+            (int(unit.get("_lr_unit_index") or 0), normalized)
+        )
+
+    reconciled_answers: list[dict[str, Any]] = []
+    for source_id, source in pending_by_source_id.items():
+        expected_count = next(
+            (
+                int(manifest.get("unit_count") or 0)
+                for manifest in partition_manifests
+                if str(manifest.get("document_id")) == str(source_id)
+            ),
+            0,
+        )
+        parts = sorted(parts_by_source_id.get(source_id, []))
+        if source_id in failed_source_ids or len(parts) != expected_count:
+            continue
+        if [index for index, _item in parts] != list(range(expected_count)):
+            continue
+        merged = _merge_partitioned_annotations(
+            [item for _index, item in parts],
+            answer_id=source_id,
+        )
+        if expected_count > 1 and any(
+            index > 0
+            and isinstance(item.get("target_position"), int)
+            and not isinstance(item.get("target_position"), bool)
+            for index, item in parts
+        ):
+            # A leaf sees only its own fragment.  Its local list ordinal must
+            # not be promoted to a global top-3 position in the full answer.
+            merged["target_position"] = None
+            merged["uncertainties"] = list(
+                dict.fromkeys(
+                    [
+                        *(merged.get("uncertainties") or []),
+                        (
+                            "Глобальная позиция в длинном ответе не доказана: "
+                            "упоминание находится после первого фрагмента."
+                        ),
+                    ]
+                )
+            )
+        reconciled = _reconcile_annotation(
+            merged,
+            source,
+            profile,
+            catalog,
+            annotation_input_sha256=annotation_input_sha256,
+            annotation_repair_provenance=annotation_repair_provenance,
+        )
+        reconciled["_long_response_partition"] = {
+            "version": LONG_RESPONSE_HARNESS_VERSION,
+            "mode": "partitioned",
+            "complete": True,
+            "manifest": next(
+                (
+                    copy.deepcopy(manifest)
+                    for manifest in partition_manifests
+                    if str(manifest.get("document_id")) == str(source_id)
+                ),
+                None,
+            ),
+            "unit_ids": [
+                unit.get("_lr_unit_id")
+                for unit in unit_pending
+                if int(unit["_lr_original_answer_id"]) == source_id
+            ],
+        }
+        reconciled_answers.append(reconciled)
+
+    if reconciled_answers:
+        if repair_mode == ANALYSIS_CRITIC_TARGETED_REPAIR_MODE:
+            await assert_run_lease(run_id)
+            await _save_targeted_recovery_annotations(
+                run_id,
+                reconciled_answers,
+                {
+                    answer_id: pending_by_source_id[answer_id]
+                    for answer_id in {
+                        int(item["answer_id"]) for item in reconciled_answers
+                    }
+                },
+            )
+        else:
+            await _save_annotations(
+                run_id,
+                reconciled_answers,
+                {int(item["answer_id"]) for item in reconciled_answers},
+            )
 
     async with SessionLocal() as session:
         completion_conditions: list[Any] = [
@@ -10194,6 +17868,8 @@ def _row_has_completed_raw(row: dict[str, Any]) -> bool:
 
 def _slice_evidence_state(
     valid_rows: list[dict[str, Any]],
+    *,
+    source_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     observational = sum(
         row.get("metric_evidence_state") == "legacy_observational"
@@ -10208,12 +17884,17 @@ def _slice_evidence_state(
         row.get("metric_evidence_state") == "legacy_retrieval_confirmed"
         for row in valid_rows
     )
+    provider_limited = sum(
+        row.get("metric_evidence_state") == "provider_limited_prefix"
+        for row in (source_rows if source_rows is not None else valid_rows)
+    )
     other = max(
         0,
         len(valid_rows)
         - observational
         - strictly_attested
-        - legacy_retrieval_confirmed,
+        - legacy_retrieval_confirmed
+        - provider_limited,
     )
     evidence_kinds = sum(
         bool(count)
@@ -10221,6 +17902,7 @@ def _slice_evidence_state(
             observational,
             strictly_attested,
             legacy_retrieval_confirmed,
+            provider_limited,
             other,
         )
     )
@@ -10228,6 +17910,7 @@ def _slice_evidence_state(
         "strictly_attested_answers": strictly_attested,
         "legacy_retrieval_confirmed_answers": legacy_retrieval_confirmed,
         "observational_answers": observational,
+        "provider_limited_answers": provider_limited,
         "evidence_state": (
             "mixed"
             if evidence_kinds > 1
@@ -10235,14 +17918,22 @@ def _slice_evidence_state(
             if observational
             else "legacy_retrieval_confirmed"
             if legacy_retrieval_confirmed
+            else "provider_limited_prefix"
+            if provider_limited
             else "attested"
             if valid_rows
             else "unavailable"
         ),
         "limitation_reason": (
-            LEGACY_MEMORY_OBSERVATION_REASON if observational else None
+            LEGACY_MEMORY_OBSERVATION_REASON
+            if observational
+            else "provider_output_limit"
+            if provider_limited
+            else None
         ),
     }
+
+
 def _visibility_slice(
     rows: list[dict[str, Any]],
     *,
@@ -10278,7 +17969,7 @@ def _visibility_slice(
         if row["annotation"].get("valid") is True
     ]
     valid = len(valid_rows)
-    evidence_state = _slice_evidence_state(valid_rows)
+    evidence_state = _slice_evidence_state(valid_rows, source_rows=selected)
     evidence_state["strict_no_web_verified"] = bool(
         mode == "memory"
         and valid
@@ -10366,6 +18057,10 @@ def _visibility_slice(
     outcomes = [outcome(row) for row in valid_rows]
     denominator = valid
     mentions = sum(mentioned for mentioned, _position, _role in outcomes)
+    top3_denominator = sum(
+        not mentioned or isinstance(position, int)
+        for mentioned, position, _role in outcomes
+    )
     top3 = sum(
         mentioned and isinstance(position, int) and position <= 3
         for mentioned, position, _role in outcomes
@@ -10377,7 +18072,9 @@ def _visibility_slice(
         role == "conditional" for _mentioned, _position, role in outcomes
     )
     mention_rate = _rate(mentions, denominator)
-    top3_rate = _rate(top3, denominator)
+    # A known absence is a valid non-top-3 outcome. A literal mention whose
+    # global ordinal became unknowable after long-answer partitioning is not.
+    top3_rate = _rate(top3, top3_denominator)
     recommendation_rate = _rate(recommended, denominator)
     score = (
         round(
@@ -10421,7 +18118,8 @@ def _visibility_slice(
         "mention_rate": mention_rate,
         "mention_count": mentions if denominator else None,
         "top3_rate": top3_rate,
-        "top3_count": top3 if denominator else None,
+        "top3_count": top3 if top3_denominator else None,
+        "top3_denominator": top3_denominator,
         "recommendation_rate": recommendation_rate,
         "recommendation_count": recommended if denominator else None,
         "conditional_rate": _rate(conditional, denominator),
@@ -10441,6 +18139,7 @@ def _visibility_slice(
             and completed == expected
             and valid == expected
             and not evidence_state["observational_answers"]
+            and not evidence_state["provider_limited_answers"]
             else "limited"
             if completed or annotated
             else "unavailable"
@@ -10505,6 +18204,9 @@ async def _metric_rows(
             prompt_text=prompt.text,
             legacy_allowed=legacy_contract["eligible"],
         )
+        observation_attested, observation_state = _panel_observation_state(
+            answer
+        )
         annotation_is_current = bool(
             answer.status == "completed"
             and answer_text.strip()
@@ -10523,15 +18225,18 @@ async def _metric_rows(
                 "memory_observation_eligible",
                 False,
             ),
+            observation_state=observation_state,
         )
         metric_eligible = bool(
             answer.status == "completed"
             and answer_text.strip()
+            and observation_attested
             and metric_access["metric_eligible"]
         )
         context_eligible = bool(
             answer.status == "completed"
             and answer_text.strip()
+            and observation_attested
             and metric_access["context_eligible"]
         )
         output.append({
@@ -10549,6 +18254,7 @@ async def _metric_rows(
             "answer_text": answer_text,
             "web_attested": web_attested,
             "web_attestation_reason": web_attestation_reason,
+            "observation_state": observation_state,
             "panel_evidence_version": (
                 LEGACY_PANEL_EVIDENCE_VERSION
                 if web_attestation_reason.startswith("legacy_")
@@ -10716,7 +18422,7 @@ def _brand_knowledge_slice(
         if row["annotation"].get("valid") is True
     ]
     valid = len(valid_rows)
-    evidence_state = _slice_evidence_state(valid_rows)
+    evidence_state = _slice_evidence_state(valid_rows, source_rows=selected)
     evidence_state["strict_no_web_verified"] = bool(
         mode == "memory"
         and valid
@@ -11014,7 +18720,10 @@ def _compute_metrics(
                     "is_target": True,
                     "relationship": "portfolio",
                 }
-                for name, count in portfolio_events.most_common(4)
+                for name, count in sorted(
+                    portfolio_events.items(),
+                    key=lambda item: (-item[1], item[0].casefold()),
+                )
             ],
             *[
                 {
@@ -11025,9 +18734,12 @@ def _compute_metrics(
                     "is_target": False,
                     "relationship": "competitor",
                 }
-                for name, count in events.most_common(8)
+                for name, count in sorted(
+                    events.items(),
+                    key=lambda item: (-item[1], item[0].casefold()),
+                )
             ],
-        ][:12]
+        ]
         if answer_denominator
         else []
     )
@@ -11050,6 +18762,19 @@ def _compute_metrics(
         for key, value in sentiments.items()
     }
 
+    expected_web_keys = {
+        (row["provider_key"], row["prompt_id"])
+        for row in rows
+        if row["mode"] == "web"
+        and row["role"] == "unbranded_discovery"
+    }
+    expected_memory_keys = {
+        (row["provider_key"], row["prompt_id"])
+        for row in rows
+        if row["mode"] == "memory"
+        and row["role"] == "unbranded_discovery"
+    }
+    expected_paired_keys = expected_web_keys & expected_memory_keys
     web_keys = {
         (row["provider_key"], row["prompt_id"])
         for row in rows
@@ -11069,6 +18794,12 @@ def _compute_metrics(
         and row["annotation"].get("valid") is True
     }
     paired_keys = web_keys & memory_keys
+    expected_pair_count = len(expected_paired_keys)
+    completed_pair_count = len(paired_keys)
+    paired_coverage_complete = bool(
+        expected_pair_count and completed_pair_count == expected_pair_count
+    )
+    paired_coverage_rate = _rate(completed_pair_count, expected_pair_count)
     paired_rows = [
         row
         for row in rows
@@ -11148,6 +18879,15 @@ def _compute_metrics(
     if paired_observational:
         parent_lift = None
         portfolio_lift = None
+    if not paired_coverage_complete:
+        for paired_slice in (
+            paired_parent_web,
+            paired_parent_memory,
+            paired_portfolio_web,
+            paired_portfolio_memory,
+        ):
+            if paired_slice.get("data_state") != "unavailable":
+                paired_slice["data_state"] = "limited"
     raw_completed_answers = sum(
         row.get("status", "completed") == "completed"
         and (
@@ -11169,6 +18909,12 @@ def _compute_metrics(
     observational_metric_answers = sum(
         _row_has_completed_raw(row)
         and row.get("metric_evidence_state") == "legacy_observational"
+        for row in rows
+    )
+    provider_limited_answers = sum(
+        row.get("status", "completed") == "completed"
+        and bool(str(row.get("answer_text") or "").strip())
+        and row.get("metric_evidence_state") == "provider_limited_prefix"
         for row in rows
     )
     context_eligible_answers = sum(
@@ -11241,16 +18987,24 @@ def _compute_metrics(
         },
         "paired_web_lift": {
             "n_pairs": len(paired_keys),
+            "expected_pairs": expected_pair_count,
+            "completed_pairs": completed_pair_count,
+            "missing_pairs": max(0, expected_pair_count - completed_pair_count),
+            "coverage_rate": paired_coverage_rate,
             "data_state": (
                 "limited"
-                if paired_observational
+                if paired_observational or not paired_coverage_complete
                 else "complete"
-                if paired_keys
+                if paired_coverage_complete
                 else "unavailable"
             ),
             "limitation_reason": (
                 LEGACY_MEMORY_OBSERVATION_REASON
                 if paired_observational
+                else "incomplete_paired_coverage"
+                if expected_pair_count and not paired_coverage_complete
+                else "no_planned_pairs"
+                if not expected_pair_count
                 else None
             ),
             "causal_interpretation_allowed": False,
@@ -11270,6 +19024,7 @@ def _compute_metrics(
                 "data_state": (
                     "complete"
                     if portfolio_scope_available
+                    and paired_coverage_complete
                     and paired_portfolio_web.get("data_state") == "complete"
                     and paired_portfolio_memory.get("data_state") == "complete"
                     else "limited"
@@ -11279,6 +19034,7 @@ def _compute_metrics(
                 "state": (
                     "available"
                     if portfolio_scope_available
+                    and paired_coverage_complete
                     and paired_portfolio_web.get("data_state") == "complete"
                     and paired_portfolio_memory.get("data_state") == "complete"
                     else "limited"
@@ -11319,6 +19075,17 @@ def _compute_metrics(
         "providers": providers,
         "intents": intents,
         "competitors": competitors,
+        "competitor_series_contract": {
+            "state": "complete",
+            "total_rows": len(competitors),
+            "canonical_rows_omitted": 0,
+            "presentation_initial_rows": min(12, len(competitors)),
+            "presentation_rule": (
+                "UI may collapse rows after the initial view, but canonical "
+                "metrics retain every observed target, portfolio entity and "
+                "competitor."
+            ),
+        },
         "sentiment": sentiment,
         "quality": {
             "state": quality_state,
@@ -11334,6 +19101,7 @@ def _compute_metrics(
                 expected_answers - context_eligible_answers
             ),
             "legacy_observational_answers": observational_metric_answers,
+            "provider_limited_answers": provider_limited_answers,
             "valid_answers": valid_annotations,
             "coverage_rate": _rate(valid_annotations, expected_answers),
             "panel_evidence": {
@@ -11800,7 +19568,7 @@ def _deterministic_annotation_warnings(
                 {
                     "answer_id": row.get("answer_id"),
                     "entity": entity.get("canonical_name"),
-                    "evidence": str(mention.get("evidence") or "")[:1000],
+                    "evidence": str(mention.get("evidence") or ""),
                 }
             )
 
@@ -11830,7 +19598,7 @@ def _deterministic_annotation_warnings(
                         if item.get("entity")
                     }
                 ),
-                "rejected_evidence": rejected[:24],
+                "rejected_evidence": rejected,
             }
         )
     if invalid_brand_answers:
@@ -11883,12 +19651,13 @@ def _critic_selected_raw_answer_ids(
     *,
     mandatory_raw_answer_ids: set[int] | None = None,
 ) -> tuple[set[int], dict[str, Any]]:
-    """Select diverse raw evidence under one deterministic global budget.
+    """Expose every available raw answer to the primary critic.
 
-    Warning-linked rows come first. The remaining budget is spread across
-    positive, negative and failed/unusable rows instead of systematically
-    preferring successful positive examples. Every omitted row remains in the
-    manifest with its digest and annotation.
+    This function used to sample at most 24 answers / 120k characters.  That
+    could hide the only row containing a scope or attribution defect.  Raw is
+    now all-or-nothing at corpus level: every non-empty saved answer is present,
+    while missing warning-linked or mandatory evidence fails closed.  The
+    per-answer lossless manifest remains the proof of what was supplied.
     """
 
     rows_by_id = {
@@ -11905,12 +19674,6 @@ def _critic_selected_raw_answer_ids(
             "Mandatory critic raw answer ids must be integers"
         )
     missing_mandatory_ids = sorted(mandatory_ids - rows_by_id.keys())
-    oversized_mandatory_ids = sorted(
-        answer_id
-        for answer_id in mandatory_ids & rows_by_id.keys()
-        if len(str(rows_by_id[answer_id].get("answer_text") or ""))
-        > CRITIC_ANSWER_CHAR_LIMIT
-    )
     empty_mandatory_ids = sorted(
         answer_id
         for answer_id in mandatory_ids & rows_by_id.keys()
@@ -11922,21 +19685,13 @@ def _critic_selected_raw_answer_ids(
     )
     if (
         missing_mandatory_ids
-        or oversized_mandatory_ids
         or empty_mandatory_ids
-        or len(mandatory_ids) > CRITIC_PRIMARY_MAX_RAW_ANSWERS
-        or mandatory_chars > CRITIC_PRIMARY_RAW_CHAR_BUDGET
     ):
         raise OrchestratorContractError(
-            "Mandatory final-critic raw evidence does not fit the exact "
-            "primary budget: "
+            "Mandatory final-critic raw evidence is unavailable: "
             f"missing={missing_mandatory_ids}, "
-            f"oversized={oversized_mandatory_ids}, "
             f"empty={empty_mandatory_ids}, "
-            f"count={len(mandatory_ids)}/"
-            f"{CRITIC_PRIMARY_MAX_RAW_ANSWERS}, "
-            f"chars={mandatory_chars}/"
-            f"{CRITIC_PRIMARY_RAW_CHAR_BUDGET}"
+            f"count={len(mandatory_ids)}, chars={mandatory_chars}"
         )
     referenced_warning_ids = {
         int(answer_id)
@@ -11946,11 +19701,6 @@ def _critic_selected_raw_answer_ids(
         if isinstance(answer_id, int)
     }
     warning_ids = referenced_warning_ids & rows_by_id.keys()
-    missing_warning_ids = sorted(referenced_warning_ids - rows_by_id.keys())
-    priority_ids: list[int] = [
-        *sorted(mandatory_ids),
-        *sorted(warning_ids - mandatory_ids),
-    ]
     labels_to_keys = {model.label: model.key for model in panel_models()}
     leakage_provider_keys = {
         labels_to_keys.get(str(provider))
@@ -11969,95 +19719,27 @@ def _critic_selected_raw_answer_ids(
             and row.get("role") == "unbranded_discovery"
         ):
             warning_ids.add(answer_id)
-            if answer_id not in priority_ids:
-                priority_ids.append(answer_id)
-
-    # Build deterministic provider × mode × role buckets. Each bucket offers
-    # at most one positive, one negative and one failure row. The first choice
-    # rotates by bucket so bounded requests do not systematically privilege one
-    # outcome class.
-    buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
-    for row in sorted(
-        rows,
-        key=lambda item: int(item.get("answer_id") or 0),
-    ):
-        if not isinstance(row.get("answer_id"), int):
-            continue
-        buckets[
-            (
-                str(row.get("provider_key") or ""),
-                str(row.get("mode") or ""),
-                str(row.get("role") or ""),
-            )
-        ].append(row)
     class_order = ("failure", "negative", "positive")
-    bucket_candidates: list[list[int]] = []
-    for bucket_index, bucket_key in enumerate(sorted(buckets)):
-        by_class: dict[str, int] = {}
-        bucket = buckets[bucket_key]
-        for row in bucket:
-            sample_class = _critic_raw_sample_class(row)
-            if sample_class not in by_class:
-                by_class[sample_class] = int(row["answer_id"])
-        rotated = (
-            class_order[bucket_index % len(class_order) :]
-            + class_order[: bucket_index % len(class_order)]
-        )
-        candidates = [
-            by_class[sample_class]
-            for sample_class in rotated
-            if sample_class in by_class
-        ]
-        if candidates:
-            bucket_candidates.append(candidates)
-
-    # Guarantee global outcome diversity before adding further bucket rows.
-    for sample_class in class_order:
-        representative = next(
-            (
-                int(row["answer_id"])
-                for row in sorted(
-                    rows_by_id.values(),
-                    key=lambda item: int(item.get("answer_id") or 0),
-                )
-                if _critic_raw_sample_class(row) == sample_class
-            ),
-            None,
-        )
-        if representative is not None and representative not in priority_ids:
-            priority_ids.append(representative)
-
-    # Interleave bucket rounds so the budget reaches many strata before taking
-    # a second or third outcome from the same stratum.
-    for round_index in range(3):
-        for candidates in bucket_candidates:
-            if round_index >= len(candidates):
-                continue
-            answer_id = candidates[round_index]
-            if answer_id not in priority_ids:
-                priority_ids.append(answer_id)
-
-    selected: set[int] = set()
-    selected_chars = 0
-    for answer_id in priority_ids:
-        if len(selected) >= CRITIC_PRIMARY_MAX_RAW_ANSWERS:
-            break
-        row = rows_by_id.get(answer_id)
-        if row is None:
-            continue
-        raw_chars = min(
-            len(str(row.get("answer_text") or "")),
-            CRITIC_ANSWER_CHAR_LIMIT,
-        )
-        if selected and selected_chars + raw_chars > CRITIC_PRIMARY_RAW_CHAR_BUDGET:
-            continue
-        if raw_chars > CRITIC_PRIMARY_RAW_CHAR_BUDGET:
-            continue
-        selected.add(answer_id)
-        selected_chars += raw_chars
+    selected = {
+        answer_id
+        for answer_id, row in rows_by_id.items()
+        if str(row.get("answer_text") or "").strip()
+    }
+    selected_chars = sum(
+        len(str(rows_by_id[answer_id].get("answer_text") or ""))
+        for answer_id in selected
+    )
 
     omitted_warning_ids = sorted(warning_ids - selected)
     omitted_mandatory_ids = sorted(mandatory_ids - selected)
+    missing_warning_ids = sorted(
+        (referenced_warning_ids - rows_by_id.keys())
+        | {
+            answer_id
+            for answer_id in warning_ids
+            if answer_id not in selected
+        }
+    )
     if omitted_mandatory_ids:
         raise OrchestratorContractError(
             "Mandatory final-critic raw evidence was omitted: "
@@ -12068,9 +19750,9 @@ def _critic_selected_raw_answer_ids(
         for answer_id in selected
     )
     return selected, {
-        "strategy": "warning_priority_diverse_stratified_v2",
-        "char_budget": CRITIC_PRIMARY_RAW_CHAR_BUDGET,
-        "max_raw_answers": CRITIC_PRIMARY_MAX_RAW_ANSWERS,
+        "strategy": "complete_raw_corpus_v4",
+        "optional_char_window": None,
+        "max_raw_answers": None,
         "included_raw_chars": selected_chars,
         "included_class_counts": {
             sample_class: int(selected_classes.get(sample_class, 0))
@@ -12110,9 +19792,17 @@ def _critic_payload(
         deterministic_warnings,
         mandatory_raw_answer_ids=mandatory_raw_answer_ids,
     )
-    omitted_warning_ids = set(
-        raw_selection.get("omitted_warning_answer_ids") or []
-    )
+    raw_manifests: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        answer_id = row.get("answer_id")
+        if not isinstance(answer_id, int):
+            continue
+        _units, manifest = split_lossless_text(
+            str(row.get("answer_text") or ""),
+            document_id=str(answer_id),
+            target_chars=CRITIC_EVIDENCE_PARTITION_CHARS,
+        )
+        raw_manifests[answer_id] = manifest.as_dict()
     return {
         "site_profile": profile,
         "entity_catalog": scoped_catalog,
@@ -12205,26 +19895,28 @@ def _critic_payload(
                 "raw_answer_char_count": len(
                     str(row.get("answer_text") or "")
                 ),
+                "raw_answer_manifest": raw_manifests.get(
+                    int(row.get("answer_id") or 0)
+                ),
                 "raw_answer_truncated": bool(
-                    row.get("answer_id") in raw_answer_ids
-                    and len(str(row.get("answer_text") or ""))
-                    > CRITIC_ANSWER_CHAR_LIMIT
+                    False
                 ),
                 "raw_answer_omission_reason": (
                     None
                     if row.get("answer_id") in raw_answer_ids
-                    else (
-                        "primary_raw_budget_warning_evidence"
-                        if row.get("answer_id") in omitted_warning_ids
-                        else "primary_raw_budget_manifest"
-                    )
+                    else "missing_or_empty_raw_answer"
                 ),
                 "raw_answer": (
-                    str(row.get("answer_text") or "")[
-                        :CRITIC_ANSWER_CHAR_LIMIT
-                    ]
+                    str(row.get("answer_text") or "")
                     if row.get("answer_id") in raw_answer_ids
                     else ""
+                ),
+                "raw_answer_partition": (
+                    (row.get("annotation") or {}).get(
+                        "_long_response_partition"
+                    )
+                    if isinstance(row.get("annotation"), dict)
+                    else None
                 ),
                 "annotation": row.get("annotation"),
             }
@@ -12777,7 +20469,7 @@ def _deterministic_critic_fallback_review(
             ],
             "fallback": {
                 "kind": "deterministic_safe_pass",
-                "critic_validation_errors": validation_errors[:20],
+                "critic_validation_errors": list(validation_errors),
             },
         }
     else:
@@ -12794,7 +20486,7 @@ def _deterministic_critic_fallback_review(
             "acceptance_checks": [],
             "fallback": {
                 "kind": "deterministic_block",
-                "critic_validation_errors": validation_errors[:20],
+                "critic_validation_errors": list(validation_errors),
             },
         }
     fallback_errors = _critic_review_validation_errors(
@@ -12854,6 +20546,174 @@ def _critic_review_cache_status(
     if verdict == "revise":
         return "completed"
     return "failed"
+
+
+async def _persist_critic_transport_event(
+    run_id: str,
+    *,
+    iteration: int,
+    event: dict[str, Any],
+) -> None:
+    """Append an exact physical critic receipt before the call returns."""
+
+    if (
+        event.get("version") != PHYSICAL_POST_AUDIT_VERSION
+        or event.get("event_kind") != "provider_post"
+        or event.get("model") != CRITIC_MODEL
+    ):
+        raise OpenRouterError("Invalid critic physical-post audit event")
+    transport_key = str(event.get("document_id") or "")
+    request_sha256 = str(event.get("request_sha256") or "")
+    event_id = str(event.get("event_id") or "")
+    request_payload = event.get("request_payload")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", transport_key) is None
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{32}", event_id) is None
+        or not isinstance(request_payload, dict)
+        or _stable_json_sha256(request_payload) != request_sha256
+    ):
+        raise OpenRouterError("Critic physical-post identity is invalid")
+    event_copy = copy.deepcopy(event)
+    event_sha256 = _stable_json_sha256(event_copy)
+    raw_text = event_copy.pop("raw_text", None)
+    usage = event_copy.pop("usage", None)
+    if raw_text is not None and not isinstance(raw_text, str):
+        raise OpenRouterError("Critic physical-post raw response is invalid")
+    if not isinstance(usage, dict):
+        raise OpenRouterError("Critic physical-post usage is invalid")
+    status = str(event.get("status") or "")
+    artifact_key = (
+        f"acr{iteration}_post_{transport_key[:16]}_{event_sha256[:32]}"
+    )
+    event_input = {
+        "version": PHYSICAL_POST_AUDIT_VERSION,
+        "transport_key": transport_key,
+        "request_sha256": request_sha256,
+        "event_sha256": event_sha256,
+    }
+    error = event.get("error")
+    error_message = (
+        str(error.get("message"))
+        if isinstance(error, dict) and error.get("message") is not None
+        else None
+    )
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        inserted = await session.execute(
+            sqlite_insert(RunArtifact)
+            .values(
+                run_id=run_id,
+                stage_key="knowledge_gap",
+                artifact_key=artifact_key,
+                status="completed" if status == "accepted" else "failed",
+                model=CRITIC_MODEL,
+                prompt_version=CRITIC_TRANSPORT_CONTRACT_VERSION,
+                input_json=event_input,
+                output_json=event_copy,
+                raw_text=raw_text,
+                usage_json=copy.deepcopy(usage),
+                error_message=error_message,
+            )
+            .on_conflict_do_nothing(
+                index_elements=("run_id", "artifact_key")
+            )
+        )
+        await assert_run_lease(run_id)
+        await session.commit()
+    if inserted.rowcount == 1:
+        return
+    async with SessionLocal() as session:
+        existing = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact_key,
+                )
+            )
+        ).scalar_one_or_none()
+    if (
+        existing is None
+        or existing.input_json != event_input
+        or not isinstance(existing.output_json, dict)
+        or not isinstance(existing.usage_json, dict)
+    ):
+        raise OpenRouterError("Critic physical-post conflict is corrupt")
+    existing_event = {
+        **copy.deepcopy(existing.output_json),
+        "raw_text": existing.raw_text,
+        "usage": copy.deepcopy(existing.usage_json),
+    }
+    if _stable_json_sha256(existing_event) != event_sha256:
+        raise OpenRouterError(
+            "Critic physical-post append-only key mutation detected"
+        )
+
+
+async def _load_critic_transport_event(
+    run_id: str,
+    *,
+    iteration: int,
+    transport_key: str,
+) -> dict[str, Any] | None:
+    """Load the unique accepted receipt for one exact critic request."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", transport_key) is None:
+        raise OpenRouterError("Critic transport lookup key is invalid")
+    prefix = f"acr{iteration}_post_{transport_key[:16]}_"
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key >= prefix,
+                        RunArtifact.artifact_key < prefix + "\uffff",
+                    )
+                    .order_by(RunArtifact.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    accepted: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            row.model != CRITIC_MODEL
+            or row.prompt_version != CRITIC_TRANSPORT_CONTRACT_VERSION
+            or not isinstance(row.input_json, dict)
+            or not isinstance(row.output_json, dict)
+            or not isinstance(row.usage_json, dict)
+        ):
+            raise OpenRouterError("Stored critic physical receipt is corrupt")
+        event = {
+            **copy.deepcopy(row.output_json),
+            "raw_text": row.raw_text,
+            "usage": copy.deepcopy(row.usage_json),
+        }
+        if (
+            row.input_json.get("transport_key") != transport_key
+            or row.input_json.get("event_sha256")
+            != _stable_json_sha256(event)
+        ):
+            raise OpenRouterError(
+                "Stored critic physical receipt identity is invalid"
+            )
+        if event.get("status") == "accepted":
+            if row.status != "completed" or not isinstance(row.raw_text, str):
+                raise OpenRouterError(
+                    "Accepted critic physical receipt is incomplete"
+                )
+            accepted.append(event)
+    if not accepted:
+        return None
+    if len(accepted) != 1:
+        raise OpenRouterError(
+            "Multiple accepted critic receipts exist for one exact request"
+        )
+    return accepted[0]
 
 
 async def _analysis_critic_fallback_artifact(
@@ -12958,6 +20818,21 @@ async def _analysis_critic_repair_artifact(
     repaired: dict[str, Any] | None = None
     raw_text: str | None = None
     usage: dict[str, Any] | None = None
+
+    async def persist_transport(event: dict[str, Any]) -> None:
+        await _persist_critic_transport_event(
+            run_id,
+            iteration=iteration,
+            event=event,
+        )
+
+    async def lookup_transport(key: str) -> dict[str, Any] | None:
+        return await _load_critic_transport_event(
+            run_id,
+            iteration=iteration,
+            transport_key=key,
+        )
+
     try:
         repaired, raw_text, usage = await repair_analysis_review(
             payload,
@@ -12965,6 +20840,8 @@ async def _analysis_critic_repair_artifact(
             iteration=iteration,
             validation_errors=validation_errors,
             recovery_final=recovery_final,
+            transport_audit_checkpoint=persist_transport,
+            transport_resume_lookup=lookup_transport,
         )
         errors = _critic_review_validation_errors(
             repaired,
@@ -13067,11 +20944,172 @@ async def _analysis_critic_artifact(
     review: dict[str, Any] | None = None
     raw_text: str | None = None
     usage: dict[str, Any] | None = None
+
+    async def persist_map_call(event: dict[str, Any]) -> None:
+        """Append one paid critic-call outcome before any parent reducer."""
+
+        if event.get("version") != CRITIC_CALL_AUDIT_VERSION:
+            raise OpenRouterError("Unknown critic call-audit event version")
+        attempt_id = str(event.get("attempt_id") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+            raise OpenRouterError("Critic call-audit attempt id is invalid")
+        event_input = event.get("input")
+        if not isinstance(event_input, dict):
+            raise OpenRouterError("Critic call-audit input is missing")
+        event_usage = event.get("usage")
+        if not isinstance(event_usage, dict):
+            raise OpenRouterError("Critic call-audit usage is invalid")
+        event_output = {
+            key: copy.deepcopy(value)
+            for key, value in event.items()
+            if key not in {"input", "raw_text", "usage"}
+        }
+        terminal_status = str(event.get("status") or "failed")
+        artifact_key = (
+            f"analysis_critic_r{iteration}_call_"
+            f"{str(event.get('kind') or 'leaf')}_{attempt_id}"
+        )
+        await assert_run_lease(run_id)
+        async with SessionLocal() as session:
+            inserted = await session.execute(
+                sqlite_insert(RunArtifact)
+                .values(
+                    run_id=run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=artifact_key,
+                    status=(
+                        "completed"
+                        if terminal_status == "completed"
+                        else "failed"
+                    ),
+                    model=CRITIC_MODEL,
+                    prompt_version=CRITIC_CALL_AUDIT_VERSION,
+                    input_json=copy.deepcopy(event_input),
+                    output_json=event_output,
+                    raw_text=(
+                        str(event.get("raw_text") or "")
+                        if event.get("provider_response_present") is True
+                        else None
+                    ),
+                    usage_json=copy.deepcopy(event_usage) or None,
+                    error_message=(
+                        str(event.get("error_message"))
+                        if event.get("error_message") is not None
+                        else None
+                    ),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=("run_id", "artifact_key")
+                )
+            )
+            await assert_run_lease(run_id)
+            await session.commit()
+        if inserted.rowcount != 1:
+            # A stable logical key intentionally survives worker restarts.  A
+            # replay of the *same* event is idempotent; any mutation under the
+            # same key is a contract violation.
+            async with SessionLocal() as session:
+                existing = (
+                    await session.execute(
+                        select(RunArtifact).where(
+                            RunArtifact.run_id == run_id,
+                            RunArtifact.artifact_key == artifact_key,
+                        )
+                    )
+                ).scalar_one_or_none()
+            if existing is None:
+                raise OpenRouterError(
+                    "Critic call-audit conflict has no stored record"
+                )
+            existing_event = {
+                **(
+                    copy.deepcopy(existing.output_json)
+                    if isinstance(existing.output_json, dict)
+                    else {}
+                ),
+                "input": copy.deepcopy(existing.input_json),
+                "raw_text": str(existing.raw_text or ""),
+                "usage": copy.deepcopy(existing.usage_json or {}),
+            }
+            if _stable_json_sha256(existing_event) != _stable_json_sha256(
+                event
+            ):
+                raise OpenRouterError(
+                    "Critic call-audit append-only key mutation detected"
+                )
+
+    async def lookup_completed_map_call(
+        descriptor: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return one exactly addressed paid critic result for crash resume."""
+
+        logical_key = str(descriptor.get("logical_call_key") or "")
+        kind = str(descriptor.get("kind") or "leaf")
+        if re.fullmatch(r"[0-9a-f]{64}", logical_key) is None:
+            raise OpenRouterError("Critic lookup logical key is invalid")
+        if re.fullmatch(r"[a-z0-9_]+", kind) is None:
+            raise OpenRouterError("Critic lookup kind is invalid")
+        lookup_key = (
+            f"analysis_critic_r{iteration}_call_{kind}_"
+            f"{logical_key[:32]}"
+        )
+        await assert_run_lease(run_id)
+        async with SessionLocal() as session:
+            artifact = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key == lookup_key,
+                    )
+                )
+            ).scalar_one_or_none()
+        if artifact is None or artifact.status != "completed":
+            return None
+        if not isinstance(artifact.output_json, dict):
+            raise OpenRouterError(
+                "Completed critic call-audit record has no metadata"
+            )
+        if not isinstance(artifact.input_json, dict):
+            raise OpenRouterError(
+                "Completed critic call-audit record has no input"
+            )
+        if not isinstance(artifact.usage_json, dict):
+            raise OpenRouterError(
+                "Completed critic call-audit record has no usage"
+            )
+        return {
+            **copy.deepcopy(artifact.output_json),
+            "input": copy.deepcopy(artifact.input_json),
+            "raw_text": str(artifact.raw_text or ""),
+            "usage": copy.deepcopy(artifact.usage_json),
+        }
+
+    # ``review_analysis`` keeps its public sink callable-compatible while
+    # detecting this optional read side for deterministic paid-call reuse.
+    setattr(persist_map_call, "lookup_completed", lookup_completed_map_call)
+
+    async def persist_transport(event: dict[str, Any]) -> None:
+        await _persist_critic_transport_event(
+            run_id,
+            iteration=iteration,
+            event=event,
+        )
+
+    async def lookup_transport(key: str) -> dict[str, Any] | None:
+        return await _load_critic_transport_event(
+            run_id,
+            iteration=iteration,
+            transport_key=key,
+        )
+
     try:
         review, raw_text, usage = await review_analysis(
             payload,
             iteration=iteration,
             recovery_final=recovery_final,
+            audit_sink=persist_map_call,
+            transport_audit_checkpoint=persist_transport,
+            transport_resume_lookup=lookup_transport,
         )
         errors = _critic_review_validation_errors(
             review,
@@ -13288,7 +21326,7 @@ def _apply_critic_policy(
                     "action": action,
                     "entity_name": name,
                     "alias": raw_adjustment.get("alias"),
-                    "reason": str(raw_adjustment.get("reason") or "")[:1000],
+                    "reason": str(raw_adjustment.get("reason") or ""),
                     "answer_ids": sorted(answer_ids),
                 }
             )
@@ -13380,7 +21418,7 @@ async def _save_critic_gate(
         "provenance": provenance,
         "corpus_manifest": corpus_manifest,
         "policy_history": policy_history,
-        "reason": reason[:2000],
+        "reason": reason,
     }
     await _save_artifact(
         run_id,
@@ -13402,7 +21440,6 @@ async def _save_critic_gate(
 
 ANALYSIS_CRITIC_RECOVERY_STAGE = "analysis_critic"
 ANALYSIS_CRITIC_TARGETED_REPAIR_MODE = "analysis_critic_targeted_v1"
-ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS = 10
 
 
 class _AnalysisCriticRecoveryBlocked(OpenRouterError):
@@ -14218,13 +22255,6 @@ async def _recover_analysis_critic_exhaustion(
         raise OrchestratorContractError(
             "Analysis critic recovery has no validated issue answer ids"
         )
-    if len(issue_answer_ids) > ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS:
-        raise OrchestratorContractError(
-            "Analysis critic recovery exceeds the one-batch targeted scope "
-            f"({len(issue_answer_ids)}/"
-            f"{ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS})"
-        )
-
     # A targeted annotation repair cannot safely apply a catalog-wide policy
     # change: that would invalidate every other row.  Literal-evidence and
     # brand-knowledge adjustments leave the scoped catalog unchanged and are
@@ -14263,17 +22293,6 @@ async def _recover_analysis_critic_exhaustion(
         raise OrchestratorContractError(
             "Analysis critic recovery issue rows are incomplete"
         )
-    oversized_issue_ids = sorted(
-        int(item["answer_id"])
-        for item in issue_rows
-        if len(str(item.get("raw_answer") or ""))
-        > CRITIC_ANSWER_CHAR_LIMIT
-    )
-    if oversized_issue_ids:
-        raise OrchestratorContractError(
-            "Targeted critic recovery would truncate issue raw for answer ids: "
-            + ", ".join(str(value) for value in oversized_issue_ids)
-        )
     raw_digest_before = _raw_corpus_digest(rows)
     before_digest = _critic_analysis_state_digest(rows, metrics)
     facts = {
@@ -14297,10 +22316,8 @@ async def _recover_analysis_critic_exhaustion(
                 "max_execution_attempts_for_stage": 1,
                 "max_planner_calls_for_stage": 1,
                 "max_final_critic_rounds": 1,
-                "max_targeted_answer_ids": (
-                    ANALYSIS_CRITIC_MAX_TARGETED_ANSWERS
-                ),
-                "max_targeted_raw_chars": ANNOTATION_BATCH_CHAR_LIMIT,
+                "target_scope": "all_validated_issue_answer_ids_partitioned",
+                "raw_processing": "lossless_partitioned",
             },
             ACTION_STOP: {
                 "acceptance_checks": [CHECK_CHECKPOINT_PRESERVED],
@@ -14310,7 +22327,7 @@ async def _recover_analysis_critic_exhaustion(
     diagnostics = {
         "critic_iteration": MAX_CRITIC_ITERATIONS,
         "critic_verdict": str(review.get("verdict") or "block"),
-        "critic_summary": str(review.get("summary") or "")[:2000],
+        "critic_summary": str(review.get("summary") or ""),
         "issue_answer_ids": sorted(issue_answer_ids),
         "anomaly_codes": sorted(
             {
@@ -14432,28 +22449,6 @@ async def _recover_analysis_critic_exhaustion(
         )
         raise OrchestratorContractError(
             "Analysis critic executor received an out-of-scope target set"
-        )
-    target_raw_chars = sum(
-        len(str(item.get("raw_answer") or ""))
-        for item in issue_rows
-        if item.get("answer_id") in target_answer_ids
-    )
-    if target_raw_chars > ANNOTATION_BATCH_CHAR_LIMIT:
-        await finish_recovery(
-            plan,
-            succeeded=False,
-            before_digest=before_digest,
-            after_digest=before_digest,
-            details={
-                "error": "targeted_raw_budget_exceeded",
-                "targeted_raw_chars": target_raw_chars,
-                "terminal_analysis_critic_block": True,
-                "terminal_analysis_state_digest": before_digest,
-            },
-        )
-        raise OrchestratorContractError(
-            "Analysis critic targeted repair exceeds its single-batch raw "
-            f"budget ({target_raw_chars}/{ANNOTATION_BATCH_CHAR_LIMIT})"
         )
     planner_guidance = str(plan.decision.get("guidance") or "").strip()
     if not planner_guidance:
@@ -14942,7 +22937,7 @@ async def _run_analysis_critic_loop(
 
         policy_step = {
             "iteration": iteration,
-            "summary": str(review.get("summary") or "")[:2000],
+            "summary": str(review.get("summary") or ""),
             "adjustments": applied,
             "annotation_guidance": guidance,
         }
@@ -15016,14 +23011,14 @@ async def _evidence_sample(run_id: str) -> list[dict[str, Any]]:
                 "role": prompt.role,
                 "target_role": annotation.annotation_json.get("target_role"),
                 "sentiment": annotation.annotation_json.get("sentiment"),
-                "evidence": (annotation.annotation_json.get("evidence") or [])[:2],
-                "uncertainties": (
+                "evidence": list(
+                    annotation.annotation_json.get("evidence") or []
+                ),
+                "uncertainties": list(
                     annotation.annotation_json.get("uncertainties") or []
-                )[:2],
+                ),
             }
         )
-        if len(evidence) >= 60:
-            break
     return evidence
 
 
@@ -15051,6 +23046,7 @@ def _full_answer_corpus_item(
         prompt_text=prompt.text,
         legacy_allowed=legacy_context["eligible"],
     )
+    observation_attested, observation_state = _panel_observation_state(answer)
     metric_access = _panel_metric_access(
         answer,
         transport_attested=web_attested,
@@ -15059,6 +23055,7 @@ def _full_answer_corpus_item(
             "memory_observation_eligible",
             False,
         ),
+        observation_state=observation_state,
     )
     answer_complete = bool(
         answer.status == "completed" and answer_text.strip()
@@ -15079,13 +23076,18 @@ def _full_answer_corpus_item(
         "status": answer.status,
         "citations": answer.citations_json or [],
         "metric_eligible": bool(
-            answer_complete and metric_access["metric_eligible"]
+            answer_complete
+            and observation_attested
+            and metric_access["metric_eligible"]
         ),
         "context_eligible": bool(
-            answer_complete and metric_access["context_eligible"]
+            answer_complete
+            and observation_attested
+            and metric_access["context_eligible"]
         ),
         "metric_evidence_state": metric_access["metric_evidence_state"],
         "metric_limitation": metric_access["metric_limitation"],
+        "observation_state": observation_state,
         "panel_evidence": {
             "version": (
                 LEGACY_PANEL_EVIDENCE_VERSION
@@ -15158,6 +23160,9 @@ def _rows_from_full_answer_models(
             prompt_text=prompt.text,
             legacy_allowed=legacy_context["eligible"],
         )
+        observation_attested, observation_state = _panel_observation_state(
+            answer
+        )
         metric_access = _panel_metric_access(
             answer,
             transport_attested=web_attested,
@@ -15166,6 +23171,7 @@ def _rows_from_full_answer_models(
                 "memory_observation_eligible",
                 False,
             ),
+            observation_state=observation_state,
         )
         answer_complete = bool(
             answer.status == "completed" and answer_text.strip()
@@ -15197,15 +23203,20 @@ def _rows_from_full_answer_models(
                     legacy_contract=legacy_context,
                 ),
                 "metric_eligible": bool(
-                    answer_complete and metric_access["metric_eligible"]
+                    answer_complete
+                    and observation_attested
+                    and metric_access["metric_eligible"]
                 ),
                 "context_eligible": bool(
-                    answer_complete and metric_access["context_eligible"]
+                    answer_complete
+                    and observation_attested
+                    and metric_access["context_eligible"]
                 ),
                 "metric_evidence_state": metric_access[
                     "metric_evidence_state"
                 ],
                 "metric_limitation": metric_access["metric_limitation"],
+                "observation_state": observation_state,
                 "annotation": (
                     annotation_json if annotation_is_current else {}
                 ),
@@ -15264,6 +23275,13 @@ def _selection_dimension_values(item: dict[str, Any]) -> dict[str, str]:
         "context_eligible",
         item.get("metric_eligible", True),
     ) is not False
+    context_access = (
+        "metadata_only"
+        if not context_eligible
+        else "provider_limited_prefix"
+        if item.get("metric_evidence_state") == "provider_limited_prefix"
+        else "full_text"
+    )
     dimensions = {
         "provider_mode": (
             f"{str(item.get('provider_key') or 'unknown')}|"
@@ -15272,7 +23290,7 @@ def _selection_dimension_values(item: dict[str, Any]) -> dict[str, str]:
         "intent_class": str(item.get("intent_class") or "unknown"),
         "scenario_role": str(item.get("scenario_role") or "unknown"),
         "evidence_state": str(panel_evidence.get("reason") or "unknown"),
-        "context_access": "full_text" if context_eligible else "metadata_only",
+        "context_access": context_access,
     }
     if not context_eligible:
         return dimensions
@@ -15364,7 +23382,11 @@ def _final_model_answer_context_item(item: dict[str, Any]) -> dict[str, Any]:
     context["requested_mode"] = requested_mode
     context["verified_mode"] = requested_mode if context_eligible else None
     context["context_access"] = (
-        "full_text" if context_eligible else "metadata_only"
+        "metadata_only"
+        if not context_eligible
+        else "provider_limited_prefix"
+        if context.get("metric_evidence_state") == "provider_limited_prefix"
+        else "full_text"
     )
     if context_eligible:
         return context
@@ -15386,21 +23408,25 @@ def _select_final_answer_context(
     answers: list[dict[str, Any]],
     *,
     corpus_manifest: dict[str, Any],
-    max_answers: int = FINAL_CONTEXT_MAX_ANSWERS,
+    max_answers: int | None = FINAL_CONTEXT_MAX_ANSWERS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Select the smallest exact cover of observed evidence strata.
+    """Build deterministic context from the complete observed corpus.
 
-    A rarest-feature branch-and-bound search examines the complete feasible
-    set-cover space while memoizing equivalent states. Unlike a greedy cover,
-    it cannot reject a valid selection merely because an early locally useful
-    answer consumed one of the limited slots. Eligible rows retain full raw
-    text; ineligible rows are reduced to provenance-only context after
-    selection so an unattested requested mode cannot influence the narrative.
+    The production default has no local count or length cap: every observed
+    row enters the downstream lossless evidence tree.  Eligible rows retain
+    their full stored raw text; ineligible rows remain provenance-only so an
+    unattested requested mode cannot influence the narrative.  ``max_answers``
+    exists only to read and test the historical exact-cover contract; new
+    pipeline code must leave it as ``None``.
     """
 
     if not answers:
         raise OpenRouterError("Final answer context is empty")
-    if not isinstance(max_answers, int) or max_answers < 1:
+    if max_answers is not None and (
+        not isinstance(max_answers, int)
+        or isinstance(max_answers, bool)
+        or max_answers < 1
+    ):
         raise OpenRouterError("Final answer context limit is invalid")
 
     ordered_answers = sorted(
@@ -15412,6 +23438,55 @@ def _select_final_answer_context(
             int(item.get("answer_id") or 0),
         ),
     )
+    if max_answers is None:
+        selected_context = [
+            _final_model_answer_context_item(item)
+            for item in ordered_answers
+        ]
+        observed_features = set().union(
+            *(_selection_features(item) for item in ordered_answers)
+        )
+        selected_full_text_count = sum(
+            item.get("context_access") == "full_text"
+            for item in selected_context
+        )
+        selected_limited_prefix_count = sum(
+            item.get("context_access") == "provider_limited_prefix"
+            for item in selected_context
+        )
+        manifest_core = {
+            "version": FINAL_CONTEXT_SELECTION_VERSION,
+            "policy": "complete_attested_corpus_no_local_cap_v1",
+            "full_corpus_digest": corpus_manifest.get("digest"),
+            "full_corpus_critic_rows_sha256": corpus_manifest.get(
+                "critic_rows_sha256"
+            ),
+            "max_answers": None,
+            "selected_count": len(ordered_answers),
+            "selected_full_text_count": selected_full_text_count,
+            "selected_limited_prefix_count": selected_limited_prefix_count,
+            "selected_metadata_only_count": (
+                len(selected_context)
+                - selected_full_text_count
+                - selected_limited_prefix_count
+            ),
+            "omitted_count": 0,
+            "selected_cells": [
+                _selection_item_signature(item) for item in ordered_answers
+            ],
+            "omitted_cells_sha256": _stable_json_sha256([]),
+            "observed_coverage": _selection_coverage(ordered_answers),
+            "selected_coverage": _selection_coverage(ordered_answers),
+            "coverage_complete": bool(observed_features) or bool(ordered_answers),
+            "selected_serialized_utf8_bytes": len(
+                json.dumps(selected_context, ensure_ascii=False).encode("utf-8")
+            ),
+        }
+        return selected_context, {
+            **manifest_core,
+            "digest": _stable_json_sha256(manifest_core),
+        }
+
     indexed = list(enumerate(ordered_answers))
     all_features = set().union(
         *(_selection_features(item) for _, item in indexed)
@@ -15652,6 +23727,10 @@ def _select_final_answer_context(
         item.get("context_access") == "full_text"
         for item in selected_context
     )
+    selected_limited_prefix_count = sum(
+        item.get("context_access") == "provider_limited_prefix"
+        for item in selected_context
+    )
 
     omitted = sorted(
         (
@@ -15675,8 +23754,11 @@ def _select_final_answer_context(
         "max_answers": max_answers,
         "selected_count": len(selected_answers),
         "selected_full_text_count": selected_full_text_count,
+        "selected_limited_prefix_count": selected_limited_prefix_count,
         "selected_metadata_only_count": (
-            len(selected_context) - selected_full_text_count
+            len(selected_context)
+            - selected_full_text_count
+            - selected_limited_prefix_count
         ),
         "omitted_count": len(answers) - len(selected_answers),
         "selected_cells": [
@@ -15778,6 +23860,28 @@ def _build_public_report(
     metrics: dict[str, Any],
     canonical_intent_taxonomy: bool = False,
 ) -> dict[str, Any]:
+    catalog_value = profile.get("offer_catalog")
+    offer_catalog = (
+        OfferCatalog.from_mapping(catalog_value)
+        if isinstance(catalog_value, dict)
+        else None
+    )
+    public_offers = [
+        {
+            "name": offer.canonical_name,
+            "aliases": list(offer.aliases),
+            "kind": offer.kind.value,
+            "user_jobs": list(offer.user_jobs),
+            "evidence": [
+                {
+                    "url": evidence.source_url,
+                    "excerpt": evidence.evidence_excerpt,
+                }
+                for evidence in offer.evidence_refs
+            ],
+        }
+        for offer in (offer_catalog.accepted_offers if offer_catalog else ())
+    ]
     coverage = technical.get("coverage")
     if not isinstance(coverage, dict):
         evaluated = _non_negative_int(technical.get("evaluated_pages")) or 0
@@ -15922,6 +24026,7 @@ def _build_public_report(
             "site_type": profile.get("site_type"),
             "category": profile.get("category"),
             "products": profile.get("products") or [],
+            "offers": public_offers,
             "positioning": profile.get("positioning"),
             "confidence": profile.get("confidence"),
             "entity_scope": profile.get("entity_scope") or [],
@@ -16124,11 +24229,6 @@ def _final_report_semantic_review_payload(
     selected_answer_context: list[dict[str, Any]],
     answer_selection_manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    evidence_document = {
-        "report_data": public_report,
-        "selected_answer_context": selected_answer_context,
-        "answer_selection_manifest": answer_selection_manifest,
-    }
     availability_contract = metric_availability_contract(public_report)
     for item in availability_contract:
         path = str(item.get("path") or "/")
@@ -16137,7 +24237,16 @@ def _final_report_semantic_review_payload(
             if path == "/"
             else f"/report_data{path}"
         )
-    return {
+    evidence_document = {
+        "report_data": public_report,
+        # Keep exact state/path rows inside the lossless evidence input.  A
+        # long semantic candidate must not receive only an opaque digest of
+        # the contract that distinguishes unknown/unavailable from zero.
+        "metric_availability_contract": availability_contract,
+        "selected_answer_context": selected_answer_context,
+        "answer_selection_manifest": answer_selection_manifest,
+    }
+    payload = {
         "evidence_document": evidence_document,
         "metric_availability_contract": availability_contract,
         "candidate_report": candidate_report,
@@ -16148,6 +24257,418 @@ def _final_report_semantic_review_payload(
             )
         ),
     }
+    return payload
+
+
+_SEMANTIC_AUDIT_KIND_KEYS = {
+    "semantic_part_accepted": "part",
+    "semantic_reduce_accepted": "reduce",
+    "semantic_receipt_root_accepted": "root",
+}
+
+
+async def _persist_final_semantic_physical_event(
+    run_id: str,
+    *,
+    attempt: int,
+    event: dict[str, Any],
+) -> None:
+    """Persist the provider receipt before ``chat`` returns to the gate."""
+
+    if (
+        event.get("version") != PHYSICAL_POST_AUDIT_VERSION
+        or event.get("event_kind") != "provider_post"
+        or event.get("model") != REPORT_SEMANTIC_MODEL
+    ):
+        raise OpenRouterError("Invalid semantic physical-post audit event")
+    event_id = str(event.get("event_id") or "")
+    if re.fullmatch(r"[0-9a-f]{32}", event_id) is None:
+        raise OpenRouterError("Semantic physical-post event id is invalid")
+    request_payload = event.get("request_payload")
+    request_sha256 = str(event.get("request_sha256") or "")
+    if (
+        not isinstance(request_payload, dict)
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+        or _stable_json_sha256(request_payload) != request_sha256
+    ):
+        raise OpenRouterError("Semantic physical-post request is invalid")
+    status = str(event.get("status") or "")
+    if status not in {
+        "accepted",
+        "rejected",
+        "http_error",
+        "response_error",
+        "transport_error",
+        "cancelled",
+    }:
+        raise OpenRouterError("Semantic physical-post status is invalid")
+    event_copy = copy.deepcopy(event)
+    event_sha256 = _stable_json_sha256(event_copy)
+    artifact_key = (
+        f"frsg_a{attempt}_post_{request_sha256[:16]}_"
+        f"{event_sha256[:32]}"
+    )
+    raw_text = event_copy.pop("raw_text", None)
+    usage = event_copy.pop("usage", None)
+    if raw_text is not None and not isinstance(raw_text, str):
+        raise OpenRouterError("Semantic physical-post raw response is invalid")
+    if not isinstance(usage, dict):
+        raise OpenRouterError("Semantic physical-post usage is invalid")
+    event_input = {
+        "version": PHYSICAL_POST_AUDIT_VERSION,
+        "event_id": event_id,
+        "request_sha256": request_sha256,
+        "event_sha256": event_sha256,
+    }
+    error = event.get("error")
+    error_message = (
+        str(error.get("message"))
+        if isinstance(error, dict) and error.get("message") is not None
+        else None
+    )
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        inserted = await session.execute(
+            sqlite_insert(RunArtifact)
+            .values(
+                run_id=run_id,
+                stage_key="report",
+                artifact_key=artifact_key,
+                status="completed" if status == "accepted" else "failed",
+                model=REPORT_SEMANTIC_MODEL,
+                prompt_version=REPORT_SEMANTIC_GATE_VERSION,
+                input_json=event_input,
+                output_json=event_copy,
+                raw_text=raw_text,
+                usage_json=copy.deepcopy(usage),
+                error_message=error_message,
+            )
+            .on_conflict_do_nothing(
+                index_elements=("run_id", "artifact_key")
+            )
+        )
+        await assert_run_lease(run_id)
+        await session.commit()
+    if inserted.rowcount == 1:
+        return
+    async with SessionLocal() as session:
+        existing = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact_key,
+                )
+            )
+        ).scalar_one_or_none()
+    if (
+        existing is None
+        or existing.model != REPORT_SEMANTIC_MODEL
+        or existing.prompt_version != REPORT_SEMANTIC_GATE_VERSION
+        or not isinstance(existing.input_json, dict)
+        or not isinstance(existing.output_json, dict)
+        or not isinstance(existing.usage_json, dict)
+    ):
+        raise OpenRouterError("Semantic physical-post conflict is corrupt")
+    existing_event = {
+        **copy.deepcopy(existing.output_json),
+        "raw_text": existing.raw_text,
+        "usage": copy.deepcopy(existing.usage_json),
+    }
+    if (
+        existing.input_json != event_input
+        or _stable_json_sha256(existing_event) != event_sha256
+    ):
+        raise OpenRouterError(
+            "Semantic physical-post append-only key mutation detected"
+        )
+
+
+async def _persist_final_semantic_audit_event(
+    run_id: str,
+    *,
+    attempt: int,
+    event: dict[str, Any],
+) -> None:
+    """Append one content-addressed semantic-gate checkpoint event."""
+
+    if event.get("version") == PHYSICAL_POST_AUDIT_VERSION:
+        await _persist_final_semantic_physical_event(
+            run_id,
+            attempt=attempt,
+            event=event,
+        )
+        return
+    if event.get("version") != REPORT_SEMANTIC_PARTITION_VERSION:
+        raise OpenRouterError("Unknown semantic checkpoint event version")
+    kind = str(event.get("kind") or "")
+    kind_key = _SEMANTIC_AUDIT_KIND_KEYS.get(kind)
+    if kind_key is None:
+        raise OpenRouterError("Unknown semantic checkpoint event kind")
+    candidate_sha256 = str(event.get("candidate_sha256") or "")
+    manifest_sha256 = str(
+        event.get("source_part_receipts_sha256") or ""
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", candidate_sha256) is None:
+        raise OpenRouterError("Semantic checkpoint candidate digest is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
+        raise OpenRouterError("Semantic checkpoint manifest digest is invalid")
+    event_copy = copy.deepcopy(event)
+    event_sha256 = _stable_json_sha256(event_copy)
+    artifact_key = (
+        f"frsg_a{attempt}_{kind_key}_{candidate_sha256[:12]}_"
+        f"{event_sha256[:32]}"
+    )
+    raw_text = event_copy.pop("raw_text", None)
+    usage = event_copy.pop("usage", None)
+    if not isinstance(raw_text, str):
+        raise OpenRouterError("Semantic checkpoint raw response is missing")
+    if not isinstance(usage, dict):
+        raise OpenRouterError("Semantic checkpoint usage is missing")
+    event_input = {
+        "version": REPORT_SEMANTIC_PARTITION_VERSION,
+        "kind": kind,
+        "candidate_sha256": candidate_sha256,
+        "source_part_receipts_sha256": manifest_sha256,
+        "request_sha256": event.get("request_sha256"),
+        "event_sha256": event_sha256,
+    }
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        inserted = await session.execute(
+            sqlite_insert(RunArtifact)
+            .values(
+                run_id=run_id,
+                stage_key="report",
+                artifact_key=artifact_key,
+                status="completed",
+                model=REPORT_SEMANTIC_MODEL,
+                prompt_version=REPORT_SEMANTIC_GATE_VERSION,
+                input_json=event_input,
+                output_json=event_copy,
+                raw_text=raw_text,
+                usage_json=copy.deepcopy(usage),
+            )
+            .on_conflict_do_nothing(
+                index_elements=("run_id", "artifact_key")
+            )
+        )
+        await assert_run_lease(run_id)
+        await session.commit()
+    if inserted.rowcount == 1:
+        return
+    async with SessionLocal() as session:
+        existing = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact_key,
+                )
+            )
+        ).scalar_one_or_none()
+    if (
+        existing is None
+        or existing.status != "completed"
+        or existing.model != REPORT_SEMANTIC_MODEL
+        or existing.prompt_version != REPORT_SEMANTIC_GATE_VERSION
+        or not isinstance(existing.input_json, dict)
+        or not isinstance(existing.output_json, dict)
+        or not isinstance(existing.usage_json, dict)
+    ):
+        raise OpenRouterError("Semantic checkpoint conflict is corrupt")
+    existing_event = {
+        **copy.deepcopy(existing.output_json),
+        "raw_text": str(existing.raw_text or ""),
+        "usage": copy.deepcopy(existing.usage_json),
+    }
+    if (
+        existing.input_json != event_input
+        or _stable_json_sha256(existing_event) != event_sha256
+    ):
+        raise OpenRouterError(
+            "Semantic checkpoint append-only key mutation detected"
+        )
+
+
+async def _load_final_semantic_part_checkpoint(
+    run_id: str,
+    *,
+    attempt: int,
+) -> dict[str, Any] | None:
+    """Load every immutable accepted part; the gate filters exact lineage."""
+
+    prefix = f"frsg_a{attempt}_part_"
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key >= prefix,
+                        RunArtifact.artifact_key < prefix + "\uffff",
+                    )
+                    .order_by(RunArtifact.artifact_key)
+                )
+            ).scalars()
+        )
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            row.status != "completed"
+            or row.model != REPORT_SEMANTIC_MODEL
+            or row.prompt_version != REPORT_SEMANTIC_GATE_VERSION
+            or not isinstance(row.input_json, dict)
+            or not isinstance(row.output_json, dict)
+            or not isinstance(row.usage_json, dict)
+        ):
+            raise OpenRouterError("Stored semantic part checkpoint is corrupt")
+        event = {
+            **copy.deepcopy(row.output_json),
+            "raw_text": str(row.raw_text or ""),
+            "usage": copy.deepcopy(row.usage_json),
+        }
+        if (
+            event.get("kind") != "semantic_part_accepted"
+            or row.input_json.get("event_sha256")
+            != _stable_json_sha256(event)
+        ):
+            raise OpenRouterError(
+                "Stored semantic part checkpoint digest is invalid"
+            )
+        events.append(event)
+    if not events:
+        return None
+    events.sort(
+        key=lambda event: (
+            str(event.get("candidate_sha256") or ""),
+            str(event.get("source_part_receipts_sha256") or ""),
+            int((event.get("part_receipt") or {}).get("part_index") or 0),
+        )
+    )
+    return {
+        "version": REPORT_SEMANTIC_PARTITION_VERSION,
+        "accepted_parts": events,
+    }
+
+
+async def _load_final_semantic_physical_result(
+    run_id: str,
+    *,
+    attempt: int,
+    descriptor: dict[str, Any],
+) -> SimpleNamespace | None:
+    """Promote one exact accepted POST before a recovery can issue it again."""
+
+    request_payload = descriptor.get("request_payload")
+    request_sha256 = str(descriptor.get("request_sha256") or "")
+    if (
+        descriptor.get("version") != REPORT_SEMANTIC_PARTITION_VERSION
+        or descriptor.get("model") != REPORT_SEMANTIC_MODEL
+        or not isinstance(request_payload, dict)
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+        or _stable_json_sha256(request_payload) != request_sha256
+    ):
+        raise OpenRouterError("Semantic physical-resume descriptor is invalid")
+    prefix = f"frsg_a{attempt}_post_{request_sha256[:16]}_"
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key >= prefix,
+                        RunArtifact.artifact_key < prefix + "\uffff",
+                    )
+                    .order_by(RunArtifact.created_at, RunArtifact.id)
+                )
+            ).scalars()
+        )
+    accepted: list[tuple[RunArtifact, dict[str, Any]]] = []
+    for row in rows:
+        if (
+            row.model != REPORT_SEMANTIC_MODEL
+            or row.prompt_version != REPORT_SEMANTIC_GATE_VERSION
+            or not isinstance(row.input_json, dict)
+            or not isinstance(row.output_json, dict)
+            or not isinstance(row.usage_json, dict)
+        ):
+            raise OpenRouterError("Stored semantic physical receipt is corrupt")
+        event = {
+            **copy.deepcopy(row.output_json),
+            "raw_text": row.raw_text,
+            "usage": copy.deepcopy(row.usage_json),
+        }
+        if (
+            row.input_json.get("event_sha256")
+            != _stable_json_sha256(event)
+            or event.get("request_sha256") != request_sha256
+            or event.get("request_payload") != request_payload
+        ):
+            raise OpenRouterError(
+                "Stored semantic physical receipt identity is invalid"
+            )
+        if event.get("status") == "accepted":
+            if row.status != "completed" or not isinstance(row.raw_text, str):
+                raise OpenRouterError(
+                    "Accepted semantic physical receipt is incomplete"
+                )
+            accepted.append((row, event))
+    if not accepted:
+        return None
+    if len(accepted) != 1:
+        raise OpenRouterError(
+            "Multiple accepted semantic physical receipts exist for one "
+            "exact request"
+        )
+    row, _event = accepted[0]
+    return SimpleNamespace(
+        text=str(row.raw_text),
+        usage=copy.deepcopy(row.usage_json),
+    )
+
+
+async def _bounded_semantic_model_evidence_context(
+    run_id: str,
+    *,
+    review_input: dict[str, Any],
+    attempt: int,
+    artifact_namespace: str = "final_report_semantic_gate",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prepare evidence for the reviewer without sending its full code copy."""
+
+    evidence_document = review_input.get("evidence_document")
+    if not isinstance(evidence_document, dict):
+        raise OpenRouterError(
+            "Final semantic review has no code-owned evidence document"
+        )
+
+    def request_bytes(
+        candidate_context: dict[str, Any],
+        envelope: dict[str, Any],
+    ) -> int:
+        provider_probe = copy.deepcopy(review_input)
+        provider_probe["model_evidence_context"] = candidate_context
+        return semantic_provider_request_utf8_bytes(
+            provider_probe,
+            attempt=attempt,
+            model_envelope=envelope,
+        )
+
+    context, plan = await _prepare_final_model_payload(
+        run_id,
+        payload=evidence_document,
+        system=REPORT_SEMANTIC_REVIEW_SYSTEM,
+        target_model=REPORT_SEMANTIC_MODEL,
+        artifact_namespace=(
+            f"{artifact_namespace}_semantic_input_a{attempt}"
+        ),
+        prompt_version=REPORT_SEMANTIC_GATE_VERSION,
+        final_request_utf8_bytes=request_bytes,
+    )
+    return context, plan
 
 
 async def _final_report_semantic_review_artifact(
@@ -16158,17 +24679,45 @@ async def _final_report_semantic_review_artifact(
     selected_answer_context: list[dict[str, Any]],
     answer_selection_manifest: dict[str, Any],
     attempt: int,
+    artifact_namespace: str = "final_report_semantic_gate",
 ) -> dict[str, Any]:
     """Run and persist one independent, fail-closed semantic review."""
 
     if not 1 <= attempt <= MAX_FINAL_REPORT_REPAIRS + 1:
         raise ValueError("Final report semantic review is outside the bounded loop")
-    artifact_key = f"final_report_semantic_gate_a{attempt}"
+    artifact_key = f"{artifact_namespace}_a{attempt}"
     review_input = _final_report_semantic_review_payload(
         public_report,
         candidate_report,
         selected_answer_context=selected_answer_context,
         answer_selection_manifest=answer_selection_manifest,
+    )
+    model_evidence_context, semantic_input_plan = (
+        await _bounded_semantic_model_evidence_context(
+            run_id,
+            review_input=review_input,
+            attempt=attempt,
+            artifact_namespace=artifact_namespace,
+        )
+    )
+    review_input["model_evidence_context"] = model_evidence_context
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key=(
+            f"{artifact_namespace}_input_preflight_a{attempt}"
+        ),
+        status="completed",
+        model=REPORT_SEMANTIC_MODEL,
+        input_json={
+            "semantic_gate_version": REPORT_SEMANTIC_GATE_VERSION,
+            "evidence_document_sha256": _stable_json_sha256(
+                review_input["evidence_document"]
+            ),
+            "candidate_report_sha256": _stable_json_sha256(candidate_report),
+        },
+        output_json=semantic_input_plan,
+        prompt_version=REPORT_SEMANTIC_GATE_VERSION,
     )
     cached = await _artifact_output(
         run_id,
@@ -16208,10 +24757,38 @@ async def _final_report_semantic_review_artifact(
     review: dict[str, Any] | None = None
     raw_text: str | None = None
     usage: dict[str, Any] | None = None
+
+    async def semantic_audit_checkpoint(event: dict[str, Any]) -> None:
+        await _persist_final_semantic_audit_event(
+            run_id,
+            attempt=attempt,
+            event=event,
+        )
+
+    async def lookup_semantic_physical_result(
+        descriptor: dict[str, Any],
+    ) -> SimpleNamespace | None:
+        return await _load_final_semantic_physical_result(
+            run_id,
+            attempt=attempt,
+            descriptor=descriptor,
+        )
+
+    setattr(
+        semantic_audit_checkpoint,
+        "lookup_completed",
+        lookup_semantic_physical_result,
+    )
+    semantic_resume_checkpoint = await _load_final_semantic_part_checkpoint(
+        run_id,
+        attempt=attempt,
+    )
     try:
         review, raw_text, usage = await review_final_report_semantics(
             review_input,
             attempt=attempt,
+            audit_checkpoint=semantic_audit_checkpoint,
+            resume_checkpoint=semantic_resume_checkpoint,
         )
         review = normalize_report_semantic_review(
             review,
@@ -16243,6 +24820,16 @@ async def _final_report_semantic_review_artifact(
         )
         return review
     except Exception as exc:
+        failed_result = getattr(exc, "result", None)
+        if raw_text is None:
+            raw_text = (
+                str(getattr(failed_result, "text", "") or "") or None
+            )
+        if usage is None and isinstance(
+            getattr(failed_result, "usage", None),
+            dict,
+        ):
+            usage = failed_result.usage
         await _save_artifact(
             run_id,
             stage_key="report",
@@ -16260,24 +24847,10 @@ async def _final_report_semantic_review_artifact(
 
 
 def _sanitize_headline_emphasis(report: dict[str, Any]) -> dict[str, Any]:
-    headline = str(report.get("headline") or "")
-    raw = report.get("headline_emphasis")
-    accepted: list[str] = []
-    occupied: list[tuple[int, int]] = []
-    if isinstance(raw, list):
-        for value in raw[:2]:
-            phrase = str(value or "").strip()
-            if not phrase:
-                continue
-            start = headline.find(phrase)
-            if start < 0:
-                continue
-            span = (start, start + len(phrase))
-            if any(span[0] < other[1] and other[0] < span[1] for other in occupied):
-                continue
-            occupied.append(span)
-            accepted.append(phrase)
-    report["headline_emphasis"] = accepted
+    # Product typography uses one even weight and size in the report hero.
+    # Keep the required schema field for old artifacts, but never expose
+    # model-selected typographic emphasis to the renderer.
+    report["headline_emphasis"] = []
     return report
 
 
@@ -16551,45 +25124,4470 @@ def _final_report_payload(
     }
 
 
+def _json_pointer_token(value: Any) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+_FINAL_ANSWER_SOURCE_PATH = re.compile(
+    r"^/selected_full_answers/(?P<index>\d+)(?:/(?P<field>.*))?$"
+)
+
+
+def _final_input_analysis_dimension(source_path: str) -> str:
+    """Classify one exact JSON leaf for AI Visibility/GEO/AEO synthesis.
+
+    This is deterministic routing metadata, not a model-authored conclusion.
+    It lets later bounded reducers distinguish a prompt from its response and
+    brand discovery from portfolio, recommendation, competitor, citation and
+    web-vs-memory evidence without copying the whole corpus into one call.
+    """
+
+    normalized = source_path.casefold()
+    if normalized.startswith("/report_data/technical"):
+        return "technical_access"
+    if "/paired_web_lift" in normalized or "web_memory" in normalized:
+        return "web_memory_comparison"
+    if "/brand_knowledge" in normalized or "/brand_answer" in normalized:
+        return "brand_knowledge"
+    if (
+        "/portfolio" in normalized
+        or "/offer_catalog" in normalized
+        or "/offers" in normalized
+        or "/prompt_foundation/coverage" in normalized
+        or "target_role" in normalized
+    ):
+        return "portfolio_visibility"
+    if "/competitor" in normalized or "/entity_mentions" in normalized:
+        return "competitor_presence"
+    if "recommend" in normalized or normalized.endswith("/position"):
+        return "recommendation"
+    if normalized.startswith("/report_data/providers"):
+        return "model_comparison"
+    if normalized.startswith("/report_data/intents"):
+        return "intent_performance"
+    if "/citation" in normalized or "/source_url" in normalized:
+        return "citation_evidence"
+    if normalized.startswith("/report_data/discovery") or (
+        "target_mentioned" in normalized
+    ):
+        return "brand_discovery"
+    if any(
+        token in normalized
+        for token in (
+            "/uncertaint",
+            "/limitation",
+            "/data_state",
+            "/unavailable_reason",
+            "/metric_limitation",
+        )
+    ):
+        return "uncertainty"
+    if "/actions" in normalized or normalized.endswith("/action"):
+        return "action"
+    match = _FINAL_ANSWER_SOURCE_PATH.match(source_path)
+    if match:
+        field = str(match.group("field") or "").casefold()
+        if field in {"scenario", "scenario_rationale", "intent_class"} or (
+            field.startswith("scenario_")
+        ):
+            return "prompt_context"
+        if field == "answer_text":
+            return "answer_response"
+        if field.startswith("citations"):
+            return "citation_evidence"
+    return "context"
+
+
+def _final_input_domain_context(
+    payload: dict[str, Any] | None,
+    source_path: str,
+) -> dict[str, Any]:
+    """Return a bounded, code-owned semantic join key for one source leaf.
+
+    Long prompt/answer/citation text remains in its own exact claims and is
+    never copied into this header.  The header carries only controlled routing
+    fields plus sibling JSON pointers, so all fragments of one answer can be
+    recombined semantically after independent mapping without risking a large
+    repeated context prefix in every physical request.
+    """
+
+    dimension = _final_input_analysis_dimension(source_path)
+    match = _FINAL_ANSWER_SOURCE_PATH.match(source_path)
+    if match and isinstance(payload, dict):
+        index = int(match.group("index"))
+        answers = payload.get("selected_full_answers")
+        if isinstance(answers, list) and 0 <= index < len(answers):
+            answer = answers[index]
+            if isinstance(answer, dict):
+                prefix = f"/selected_full_answers/{index}"
+                annotation = (
+                    answer.get("annotation")
+                    if isinstance(answer.get("annotation"), dict)
+                    else {}
+                )
+                provenance = (
+                    answer.get("provenance")
+                    if isinstance(answer.get("provenance"), dict)
+                    else {}
+                )
+                signature = {
+                    "answer_index": index,
+                    "answer_id": answer.get("answer_id"),
+                    "prompt_id": answer.get("prompt_id"),
+                    "raw_answer_sha256": provenance.get(
+                        "raw_answer_sha256"
+                    ),
+                }
+                context_id = "answer-" + _stable_json_sha256(signature)[:24]
+                context = {
+                    "version": "aiv-final-domain-context-v1",
+                    "context_kind": "model_answer",
+                    "domain_context_id": context_id,
+                    "analysis_dimension": dimension,
+                    "answer_index": index,
+                    "answer_id": answer.get("answer_id"),
+                    "prompt_id": answer.get("prompt_id"),
+                    "prompt_key": answer.get("prompt_key"),
+                    "provider_key": answer.get("provider_key"),
+                    "model": answer.get("model"),
+                    "requested_mode": answer.get(
+                        "requested_mode", answer.get("mode")
+                    ),
+                    "verified_mode": answer.get("verified_mode"),
+                    "context_access": answer.get("context_access"),
+                    "metric_eligible": answer.get("metric_eligible"),
+                    "context_eligible": answer.get("context_eligible"),
+                    "metric_evidence_state": answer.get(
+                        "metric_evidence_state"
+                    ),
+                    "intent_class": answer.get("intent_class"),
+                    "scenario_role": answer.get("scenario_role"),
+                    "annotation_valid": annotation.get("valid"),
+                    "target_mentioned": annotation.get("target_mentioned"),
+                    "target_role": annotation.get("target_role"),
+                    "sentiment": annotation.get("sentiment"),
+                    "citation_count": len(answer.get("citations") or [])
+                    if isinstance(answer.get("citations"), list)
+                    else None,
+                    "sibling_paths": {
+                        "prompt": f"{prefix}/scenario",
+                        "answer": f"{prefix}/answer_text",
+                        "annotation": f"{prefix}/annotation",
+                        "citations": f"{prefix}/citations",
+                    },
+                }
+                context["domain_context_sha256"] = _stable_json_sha256(
+                    context
+                )
+                return context
+
+    path_parts = [part for part in source_path.split("/") if part]
+    if path_parts[:1] == ["report_data"] and len(path_parts) >= 2:
+        # A report list can contain thousands of independent metric rows.  An
+        # array index is lineage, not a new reader-facing subject: keeping it
+        # in the join key would degenerate into one paid author call and one
+        # visible section per leaf.  Exact JSON pointers remain on every claim
+        # and receipt, while the section-level path is the bounded semantic
+        # join key used by the capsule planner.
+        group_parts = path_parts[:2]
+    else:
+        # Pipeline manifests outside report_data are supporting context.  The
+        # top-level document field is a stable semantic group; deeper indexes
+        # and object keys remain exact claim lineage rather than control-plane
+        # fan-out keys.
+        group_parts = path_parts[:1]
+    group_path = "/" + "/".join(group_parts) if group_parts else "/"
+    context = {
+        "version": "aiv-final-domain-context-v1",
+        "context_kind": (
+            "report_metric"
+            if source_path.startswith("/report_data/")
+            else "pipeline_context"
+        ),
+        "domain_context_id": "path-" + text_sha256(group_path)[:24],
+        "analysis_dimension": dimension,
+        "group_path": group_path,
+    }
+    context["domain_context_sha256"] = _stable_json_sha256(context)
+    return context
+
+
+def _flatten_final_input_payload(
+    payload: dict[str, Any],
+    *,
+    target_chars: int = FINAL_INPUT_MAP_UNIT_CHARS,
+    context_overlap_chars: int = 1_024,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Flatten every JSON leaf into code-owned, lossless semantic units."""
+
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload_sha256 = text_sha256(serialized)
+    units: list[dict[str, Any]] = []
+
+    def add_scalar(value: Any, pointer: str) -> None:
+        value_type = (
+            "null"
+            if value is None
+            else "boolean"
+            if isinstance(value, bool)
+            else "number"
+            if isinstance(value, (int, float))
+            else "string"
+        )
+        text_value = (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        )
+        pointer_digest = text_sha256(pointer or "/")[:16]
+        text_units, text_manifest = split_lossless_text(
+            text_value,
+            document_id=f"final-input:{payload_sha256[:20]}:{pointer_digest}",
+            target_chars=target_chars,
+            context_overlap_chars=context_overlap_chars,
+        )
+        for unit in text_units:
+            units.append(
+                {
+                    "source_unit_id": unit.unit_id,
+                    "source_path": pointer or "/",
+                    "value_type": value_type,
+                    "source_value_sha256": text_manifest.source_sha256,
+                    "source_value_chars": text_manifest.source_chars,
+                    "unit_index": unit.index,
+                    "unit_count": text_manifest.unit_count,
+                    "core_start_char": unit.start_char,
+                    "core_end_char": unit.end_char,
+                    "context_start_char": unit.context_start_char,
+                    "context_end_char": unit.context_end_char,
+                    "core_start_in_context": unit.core_start_in_context,
+                    "core_end_in_context": unit.core_end_in_context,
+                    "core_sha256": unit.sha256,
+                    "context_sha256": unit.context_sha256,
+                    "context_value": unit.context_text,
+                }
+            )
+
+    def visit(value: Any, pointer: str) -> None:
+        if isinstance(value, dict):
+            if not value:
+                add_scalar("{}", pointer)
+                return
+            for key in sorted(value, key=lambda item: str(item)):
+                visit(
+                    value[key],
+                    f"{pointer}/{_json_pointer_token(key)}",
+                )
+            return
+        if isinstance(value, list):
+            if not value:
+                add_scalar("[]", pointer)
+                return
+            for index, item in enumerate(value):
+                visit(item, f"{pointer}/{index}")
+            return
+        add_scalar(value, pointer)
+
+    visit(payload, "")
+    unit_ids = [str(unit["source_unit_id"]) for unit in units]
+    if len(unit_ids) != len(set(unit_ids)):
+        raise OpenRouterError("Final input source unit ids are not unique")
+    return units, {
+        "version": FINAL_INPUT_HARNESS_VERSION,
+        "source_payload_sha256": payload_sha256,
+        "source_payload_chars": len(serialized),
+        "source_payload_utf8_bytes": len(serialized.encode("utf-8")),
+        "map_target_chars": target_chars,
+        "context_overlap_chars": context_overlap_chars,
+        "source_unit_count": len(units),
+        "source_unit_ids_sha256": _stable_json_sha256(unit_ids),
+        "source_units": [
+            {
+                key: value
+                for key, value in unit.items()
+                if key != "context_value"
+            }
+            for unit in units
+        ],
+    }
+
+
+def _final_input_claim_ledger(
+    units: list[dict[str, Any]],
+    *,
+    source_payload: dict[str, Any] | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, SourceClaim],
+    dict[str, list[str]],
+    dict[str, Any],
+]:
+    """Build exact sub-unit claims without pretending they prove meaning.
+
+    ``_flatten_final_input_payload`` already proves that every scalar can be
+    reconstructed from non-overlapping cores.  This second, finer ledger makes
+    each core small enough to be explicitly acknowledged by the semantic
+    mapper.  The mapper never owns claim ids, offsets or hashes and there is no
+    total claim/document ceiling.
+    """
+
+    claim_rows: list[dict[str, Any]] = []
+    claims_by_id: dict[str, SourceClaim] = {}
+    claim_ids_by_unit: dict[str, list[str]] = {}
+    unit_manifests: list[dict[str, Any]] = []
+    for unit in units:
+        unit_id = str(unit.get("source_unit_id") or "")
+        source_path = str(unit.get("source_path") or "")
+        context_value = str(unit.get("context_value") or "")
+        core_start = unit.get("core_start_in_context")
+        core_end = unit.get("core_end_in_context")
+        if (
+            not unit_id
+            or isinstance(core_start, bool)
+            or not isinstance(core_start, int)
+            or isinstance(core_end, bool)
+            or not isinstance(core_end, int)
+            or core_start < 0
+            or core_end < core_start
+            or core_end > len(context_value)
+        ):
+            raise OpenRouterError(
+                "Final input claim ledger has invalid code-owned core bounds"
+            )
+        core_value = context_value[core_start:core_end]
+        domain_context = _final_input_domain_context(
+            source_payload,
+            source_path,
+        )
+        claims, manifest = build_claim_ledger(
+            core_value,
+            document_id=f"{unit_id}:claims",
+            target_fragment_utf8_bytes=(
+                FINAL_INPUT_CLAIM_FRAGMENT_UTF8_BYTES
+            ),
+        )
+        if reconstruct_claim_ledger(claims, manifest) != core_value:
+            raise OpenRouterError(
+                "Final input claim ledger changed a source-unit core"
+            )
+        unit_claim_ids: list[str] = []
+        for claim in claims:
+            if claim.claim_id in claims_by_id:
+                raise OpenRouterError(
+                    "Final input claim ledger generated a duplicate claim id"
+                )
+            claims_by_id[claim.claim_id] = claim
+            unit_claim_ids.append(claim.claim_id)
+            claim_rows.append(
+                {
+                    **claim.as_dict(),
+                    "source_unit_id": unit_id,
+                    "source_path": source_path,
+                    "source_core_start_char": unit.get("core_start_char"),
+                    "source_core_end_char": unit.get("core_end_char"),
+                    "analysis_dimension": domain_context[
+                        "analysis_dimension"
+                    ],
+                    "domain_context_id": domain_context[
+                        "domain_context_id"
+                    ],
+                    "domain_context": copy.deepcopy(domain_context),
+                    "domain_context_sha256": domain_context[
+                        "domain_context_sha256"
+                    ],
+                    "semantic_contract": (
+                        "exact_excerpt_and_lineage_only_not_semantic_proof"
+                    ),
+                }
+            )
+        claim_ids_by_unit[unit_id] = unit_claim_ids
+        unit_manifests.append(
+            {
+                "source_unit_id": unit_id,
+                "source_path": source_path,
+                "ledger": manifest.as_dict(),
+            }
+        )
+
+    claim_ids = [str(row["claim_id"]) for row in claim_rows]
+    if len(claim_ids) != len(set(claim_ids)):
+        raise OpenRouterError("Final input claim ids are not unique")
+    aggregate = {
+        "version": FINAL_INPUT_CLAIM_LEDGER_VERSION,
+        "semantic_contract": (
+            "byte_exact_coverage_and_lineage_not_semantic_understanding"
+        ),
+        "source_unit_count": len(units),
+        "claim_count": len(claim_rows),
+        "claim_ids_sha256": _stable_json_sha256(claim_ids),
+        "unit_ledgers": unit_manifests,
+        "claims": claim_rows,
+    }
+    aggregate["ledger_sha256"] = _stable_json_sha256(aggregate)
+    return claim_rows, claims_by_id, claim_ids_by_unit, aggregate
+
+
+def _validate_final_domain_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OpenRouterError("Final claim has no domain context")
+    context = copy.deepcopy(value)
+    expected_sha256 = context.pop("domain_context_sha256", None)
+    if (
+        not isinstance(expected_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or _stable_json_sha256(context) != expected_sha256
+        or context.get("analysis_dimension")
+        not in FINAL_ANALYSIS_DIMENSIONS
+        or not isinstance(context.get("domain_context_id"), str)
+        or not str(context.get("domain_context_id") or "")
+    ):
+        raise OpenRouterError("Final claim domain context failed integrity")
+    return copy.deepcopy(value)
+
+
+def _final_answer_accounting_manifest(
+    payload: dict[str, Any],
+    claim_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prove that every stored answer/prompt pair is processed exactly once.
+
+    The manifest contains only digests, counts and join keys.  It therefore
+    stays small even when answers are very long, while every raw byte remains
+    reconstructable from the separate exact claim ledger.
+    """
+
+    answers = payload.get("selected_full_answers")
+    if not isinstance(answers, list):
+        answers = []
+    claims_by_answer: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    non_answer_claim_ids: list[str] = []
+    seen_claim_ids: set[str] = set()
+    for row in claim_rows:
+        if not isinstance(row, dict):
+            raise OpenRouterError("Final answer accounting found a bad claim")
+        claim_id = str(row.get("claim_id") or "")
+        if not claim_id or claim_id in seen_claim_ids:
+            raise OpenRouterError(
+                "Final answer accounting found duplicate claim identity"
+            )
+        seen_claim_ids.add(claim_id)
+        _validate_final_domain_context(row.get("domain_context"))
+        match = _FINAL_ANSWER_SOURCE_PATH.match(
+            str(row.get("source_path") or "")
+        )
+        if match:
+            index = int(match.group("index"))
+            if index >= len(answers):
+                raise OpenRouterError(
+                    "Final answer claim points outside the selected corpus"
+                )
+            claims_by_answer[index].append(row)
+        else:
+            non_answer_claim_ids.append(claim_id)
+
+    def rows_for_path(
+        rows: list[dict[str, Any]],
+        source_path: str,
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                row
+                for row in rows
+                if row.get("source_path") == source_path
+            ),
+            key=lambda row: (
+                int(row.get("source_core_start_char") or 0),
+                int(row.get("source_utf8_offset") or 0),
+                int(row.get("fragment_index") or 0),
+            ),
+        )
+
+    answer_rows: list[dict[str, Any]] = []
+    answer_claim_ids: list[str] = []
+    raw_answer_claim_ids: list[str] = []
+    for index, answer in enumerate(answers):
+        if not isinstance(answer, dict):
+            raise OpenRouterError(
+                "Final selected answer corpus contains a non-object row"
+            )
+        rows = claims_by_answer.get(index, [])
+        if not rows:
+            raise OpenRouterError(
+                f"Final selected answer {index} has no exact claims"
+            )
+        context_ids = {
+            str(row.get("domain_context_id") or "") for row in rows
+        }
+        if len(context_ids) != 1 or "" in context_ids:
+            raise OpenRouterError(
+                "Final selected answer claims lost their shared join key"
+            )
+        prefix = f"/selected_full_answers/{index}"
+        raw_rows = rows_for_path(rows, f"{prefix}/answer_text")
+        prompt_rows = rows_for_path(rows, f"{prefix}/scenario")
+        raw_text_present = "answer_text" in answer
+        reconstructed_raw = "".join(
+            str(row.get("excerpt") or "") for row in raw_rows
+        )
+        reconstructed_prompt = "".join(
+            str(row.get("excerpt") or "") for row in prompt_rows
+        )
+        if raw_text_present and reconstructed_raw != str(
+            answer.get("answer_text") or ""
+        ):
+            raise OpenRouterError(
+                "Final answer accounting cannot reconstruct stored raw text"
+            )
+        if "scenario" in answer and reconstructed_prompt != str(
+            answer.get("scenario") or ""
+        ):
+            raise OpenRouterError(
+                "Final answer accounting cannot reconstruct its prompt"
+            )
+        provenance = (
+            answer.get("provenance")
+            if isinstance(answer.get("provenance"), dict)
+            else {}
+        )
+        expected_raw_sha256 = provenance.get("raw_answer_sha256")
+        if raw_text_present:
+            raw_sha256 = text_sha256(reconstructed_raw)
+            if (
+                isinstance(expected_raw_sha256, str)
+                and expected_raw_sha256
+                and raw_sha256 != expected_raw_sha256
+            ):
+                raise OpenRouterError(
+                    "Final answer accounting raw digest mismatches provenance"
+                )
+            raw_disposition = "analyzed_exactly_once"
+        else:
+            raw_sha256 = (
+                expected_raw_sha256
+                if isinstance(expected_raw_sha256, str)
+                else None
+            )
+            raw_disposition = "withheld_unattested_metadata_only"
+        row_claim_ids = [str(row["claim_id"]) for row in rows]
+        row_raw_claim_ids = [str(row["claim_id"]) for row in raw_rows]
+        answer_claim_ids.extend(row_claim_ids)
+        raw_answer_claim_ids.extend(row_raw_claim_ids)
+        answer_rows.append(
+            {
+                "answer_index": index,
+                "answer_id": answer.get("answer_id"),
+                "prompt_id": answer.get("prompt_id"),
+                "domain_context_id": next(iter(context_ids)),
+                "provider_key": answer.get("provider_key"),
+                "requested_mode": answer.get(
+                    "requested_mode", answer.get("mode")
+                ),
+                "verified_mode": answer.get("verified_mode"),
+                "intent_class": answer.get("intent_class"),
+                "scenario_role": answer.get("scenario_role"),
+                "context_access": answer.get("context_access"),
+                "raw_disposition": raw_disposition,
+                "raw_answer_sha256": raw_sha256,
+                "raw_answer_utf8_bytes": (
+                    len(reconstructed_raw.encode("utf-8"))
+                    if raw_text_present
+                    else None
+                ),
+                "raw_claim_count": len(row_raw_claim_ids),
+                "raw_claim_ids_sha256": _stable_json_sha256(
+                    row_raw_claim_ids
+                ),
+                "prompt_sha256": (
+                    text_sha256(reconstructed_prompt)
+                    if "scenario" in answer
+                    else None
+                ),
+                "prompt_claim_count": len(prompt_rows),
+                "all_claim_count": len(row_claim_ids),
+                "all_claim_ids_sha256": _stable_json_sha256(row_claim_ids),
+            }
+        )
+
+    if len(answer_claim_ids) != len(set(answer_claim_ids)):
+        raise OpenRouterError(
+            "Final answer accounting assigned a claim more than once"
+        )
+    manifest = {
+        "version": FINAL_ANSWER_ACCOUNTING_VERSION,
+        "answer_count": len(answers),
+        "accounted_answer_count": len(answer_rows),
+        "raw_text_answer_count": sum(
+            row["raw_disposition"] == "analyzed_exactly_once"
+            for row in answer_rows
+        ),
+        "metadata_only_answer_count": sum(
+            row["raw_disposition"]
+            == "withheld_unattested_metadata_only"
+            for row in answer_rows
+        ),
+        "answer_claim_count": len(answer_claim_ids),
+        "answer_claim_ids_sha256": _stable_json_sha256(answer_claim_ids),
+        "raw_answer_claim_count": len(raw_answer_claim_ids),
+        "raw_answer_claim_ids_sha256": _stable_json_sha256(
+            raw_answer_claim_ids
+        ),
+        "non_answer_claim_count": len(non_answer_claim_ids),
+        "non_answer_claim_ids_sha256": _stable_json_sha256(
+            non_answer_claim_ids
+        ),
+        "claim_assignment_complete": (
+            len(answer_claim_ids) + len(non_answer_claim_ids)
+            == len(claim_rows)
+        ),
+        "raw_reconstruction_complete": True,
+        "answer_rows": answer_rows,
+    }
+    if not manifest["claim_assignment_complete"]:
+        raise OpenRouterError(
+            "Final answer accounting did not assign every exact claim"
+        )
+    manifest["manifest_sha256"] = _stable_json_sha256(manifest)
+    return manifest
+
+
+def _final_direct_answer_accounting_manifest(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal exact-once answer request binding for the direct route.
+
+    A payload that fits the final model's physical window does not need map /
+    reduce compression.  It still needs an auditable corpus receipt: every
+    selected row is present once at its code-owned JSON pointer, its raw and
+    prompt bytes are hashed, and any provider provenance digest is verified.
+    The receipt contains no copied raw text and therefore has no corpus-size
+    ceiling of its own.
+    """
+
+    answers = payload.get("selected_full_answers")
+    if not isinstance(answers, list):
+        answers = []
+    rows: list[dict[str, Any]] = []
+    row_commitments: list[str] = []
+    for index, answer in enumerate(answers):
+        if not isinstance(answer, dict):
+            raise OpenRouterError(
+                "Final direct answer corpus contains a non-object row"
+            )
+        prefix = f"/selected_full_answers/{index}"
+        raw_present = "answer_text" in answer
+        raw_text = str(answer.get("answer_text") or "")
+        prompt_present = "scenario" in answer
+        prompt_text = str(answer.get("scenario") or "")
+        raw_sha256 = text_sha256(raw_text) if raw_present else None
+        provenance = (
+            answer.get("provenance")
+            if isinstance(answer.get("provenance"), dict)
+            else {}
+        )
+        expected_raw_sha256 = provenance.get("raw_answer_sha256")
+        if (
+            raw_present
+            and isinstance(expected_raw_sha256, str)
+            and expected_raw_sha256
+            and expected_raw_sha256 != raw_sha256
+        ):
+            raise OpenRouterError(
+                "Final direct answer digest mismatches raw provenance"
+            )
+        signature = {
+            "answer_index": index,
+            "answer_id": answer.get("answer_id"),
+            "prompt_id": answer.get("prompt_id"),
+            "raw_answer_sha256": expected_raw_sha256 or raw_sha256,
+        }
+        context_id = "answer-" + _stable_json_sha256(signature)[:24]
+        row = {
+            "answer_index": index,
+            "answer_id": answer.get("answer_id"),
+            "prompt_id": answer.get("prompt_id"),
+            "domain_context_id": context_id,
+            "provider_key": answer.get("provider_key"),
+            "requested_mode": answer.get(
+                "requested_mode", answer.get("mode")
+            ),
+            "verified_mode": answer.get("verified_mode"),
+            "intent_class": answer.get("intent_class"),
+            "scenario_role": answer.get("scenario_role"),
+            "context_access": answer.get("context_access"),
+            "raw_disposition": (
+                "present_once_in_direct_request_payload"
+                if raw_present
+                else "withheld_unattested_metadata_only"
+            ),
+            "raw_source_path": f"{prefix}/answer_text",
+            "raw_answer_sha256": raw_sha256 or expected_raw_sha256,
+            "raw_answer_utf8_bytes": (
+                len(raw_text.encode("utf-8")) if raw_present else None
+            ),
+            "prompt_source_path": f"{prefix}/scenario",
+            "prompt_sha256": (
+                text_sha256(prompt_text) if prompt_present else None
+            ),
+            "prompt_utf8_bytes": (
+                len(prompt_text.encode("utf-8"))
+                if prompt_present
+                else None
+            ),
+        }
+        row_commitment = _stable_json_sha256(row)
+        rows.append({**row, "row_sha256": row_commitment})
+        row_commitments.append(row_commitment)
+
+    manifest = {
+        "version": FINAL_ANSWER_ACCOUNTING_VERSION,
+        "route": "direct_single_provider_post",
+        "source_payload_sha256": _stable_json_sha256(payload),
+        "answer_count": len(answers),
+        "accounted_answer_count": len(rows),
+        "raw_text_answer_count": sum(
+            row["raw_disposition"]
+            == "present_once_in_direct_request_payload"
+            for row in rows
+        ),
+        "metadata_only_answer_count": sum(
+            row["raw_disposition"]
+            == "withheld_unattested_metadata_only"
+            for row in rows
+        ),
+        "request_payload_occurrences_per_raw_answer": 1,
+        "provider_submission_proof": (
+            "bound_by_the_downstream_physical_post_audit_receipt"
+        ),
+        "row_commitments_sha256": _stable_json_sha256(row_commitments),
+        "raw_reconstruction_complete": True,
+        "claim_assignment_complete": True,
+        "answer_rows": rows,
+    }
+    manifest["manifest_sha256"] = _stable_json_sha256(manifest)
+    return manifest
+
+
+def _structured_provider_request_utf8_bytes(
+    *,
+    model: str,
+    model_envelope: dict[str, Any],
+    system: str,
+    user_payload: dict[str, Any] | list[Any],
+    schema: dict[str, Any],
+    schema_name: str,
+    reasoning_effort: str,
+    temperature: float,
+) -> int:
+    """Measure the exact initial OpenRouter JSON body for a structured call."""
+
+    request: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, ensure_ascii=False),
+            },
+        ],
+        "temperature": temperature,
+    }
+    maximum = model_envelope.get("max_completion_tokens")
+    if (
+        isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and maximum > 0
+    ):
+        request["max_completion_tokens"] = maximum
+    policy_fields, _request_policy = web_request_policy(
+        model=model,
+        policy=WebSearchPolicy.FORBIDDEN,
+    )
+    request.update(policy_fields)
+    if reasoning_effort:
+        request["reasoning"] = {
+            "effort": reasoning_effort,
+            "exclude": True,
+        }
+    request["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    return len(
+        json.dumps(
+            request,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _pack_final_input_units(
+    units: list[dict[str, Any]],
+    *,
+    window_bytes: int,
+    request_utf8_bytes: Callable[[int, list[dict[str, Any]]], int],
+) -> list[list[dict[str, Any]]]:
+    packs: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for unit in units:
+        candidate = [*current, unit]
+        pack_index = len(packs) + 1
+        if current and (
+            len(candidate) > FINAL_INPUT_REDUCE_FAN_IN
+            or request_utf8_bytes(pack_index, candidate) > window_bytes
+        ):
+            packs.append(current)
+            current = [unit]
+            pack_index = len(packs) + 1
+        else:
+            current = candidate
+        if request_utf8_bytes(pack_index, current) > window_bytes:
+            raise OpenRouterError(
+                "A code-owned final-input unit exceeds its mapper request "
+                "window after exact wrapper, system and schema overhead"
+            )
+    if current:
+        packs.append(current)
+    return packs
+
+
+def _pack_final_evidence_packets(
+    packets: list[dict[str, Any]],
+    *,
+    window_bytes: int,
+    request_utf8_bytes: Callable[[int, list[dict[str, Any]]], int],
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for packet in packets:
+        candidate = [*current, packet]
+        group_index = len(groups) + 1
+        if current and (
+            len(candidate) > FINAL_INPUT_REDUCE_FAN_IN
+            or request_utf8_bytes(group_index, candidate) > window_bytes
+        ):
+            groups.append(current)
+            current = [packet]
+            group_index = len(groups) + 1
+        else:
+            current = candidate
+        # A reducer cannot make progress when one already-valid child packet
+        # is larger than its own request window.  Keep that singleton as a
+        # group so the caller can terminate with the deterministic code-owned
+        # union instead of dropping evidence or failing a resumable run.
+        if (
+            len(current) > 1
+            and request_utf8_bytes(group_index, current) > window_bytes
+        ):
+            raise OpenRouterError(
+                "A multi-packet final evidence group exceeds its reducer "
+                "request window after exact wrapper, system and schema "
+                "overhead"
+            )
+    if current:
+        groups.append(current)
+    return groups
+
+
+_FINAL_INPUT_STRUCTURAL_PATH_HINTS = frozenset(
+    {
+        "answer",
+        "average",
+        "availability",
+        "category",
+        "code",
+        "confidence",
+        "count",
+        "coverage",
+        "data_state",
+        "delta",
+        "denominator",
+        "dimension",
+        "domain",
+        "eligible",
+        "id",
+        "index",
+        "intent",
+        "key",
+        "kind",
+        "label",
+        "lift",
+        "maximum",
+        "median",
+        "method",
+        "metric",
+        "metrics",
+        "minimum",
+        "mode",
+        "model",
+        "name",
+        "n_pairs",
+        "numerator",
+        "outcome",
+        "pages",
+        "percent",
+        "policy",
+        "position",
+        "provider",
+        "rank",
+        "rate",
+        "ratio",
+        "reason",
+        "relationship",
+        "role",
+        "score",
+        "scope",
+        "share",
+        "source",
+        "state",
+        "status",
+        "total",
+        "type",
+        "unit",
+        "value",
+        "values",
+        "version",
+    }
+)
+_FINAL_INPUT_STRUCTURAL_STRING_VALUES = frozenset(
+    {
+        "{}",
+        "[]",
+        "available",
+        "blocked",
+        "complete",
+        "completed",
+        "direct",
+        "failed",
+        "false",
+        "limited",
+        "missing",
+        "n/a",
+        "none",
+        "null",
+        "partial",
+        "pass",
+        "pending",
+        "ready",
+        "revise",
+        "true",
+        "unavailable",
+        "unknown",
+        "verified",
+    }
+)
+
+
+def _final_input_string_requires_passthrough(
+    source_path: str,
+    value: str,
+) -> bool:
+    normalized_value = value.strip().casefold()
+    if normalized_value in _FINAL_INPUT_STRUCTURAL_STRING_VALUES:
+        return True
+    path_tokens = {
+        token
+        for segment in source_path.casefold().split("/")
+        for token in segment.replace("-", "_").split("_")
+        if token
+    }
+    return bool(path_tokens & _FINAL_INPUT_STRUCTURAL_PATH_HINTS)
+
+
+def _final_input_deterministic_passthrough(
+    units: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Preserve exact scalar evidence independently of any LLM mapper."""
+
+    passthrough: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for unit in units:
+        value_type = str(unit.get("value_type") or "")
+        source_path = str(unit.get("source_path") or "")
+        context_value = str(unit.get("context_value") or "")
+        core_start = unit.get("core_start_in_context")
+        core_end = unit.get("core_end_in_context")
+        if (
+            isinstance(core_start, bool)
+            or not isinstance(core_start, int)
+            or isinstance(core_end, bool)
+            or not isinstance(core_end, int)
+            or core_start < 0
+            or core_end < core_start
+            or core_end > len(context_value)
+        ):
+            raise OpenRouterError(
+                "Final input passthrough has invalid code-owned core bounds"
+            )
+        core_value = context_value[core_start:core_end]
+        protect = value_type != "string" or (
+            int(unit.get("unit_count") or 0) == 1
+            and _final_input_string_requires_passthrough(
+                source_path,
+                core_value,
+            )
+        )
+        if not protect:
+            continue
+        if (
+            int(unit.get("unit_count") or 0) != 1
+            or unit.get("unit_index") != 0
+        ):
+            raise OpenRouterError(
+                "Final input passthrough scalar was unexpectedly partitioned"
+            )
+        if source_path in seen_paths:
+            raise OpenRouterError(
+                "Final input passthrough contains a duplicate source path"
+            )
+        if text_sha256(core_value) != str(
+            unit.get("source_value_sha256") or ""
+        ):
+            raise OpenRouterError(
+                "Final input passthrough scalar failed its source digest"
+            )
+        seen_paths.add(source_path)
+        try:
+            value = (
+                core_value
+                if value_type == "string"
+                else json.loads(core_value)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise OpenRouterError(
+                "Final input passthrough scalar is not valid JSON"
+            ) from exc
+        passthrough.append(
+            {
+                "source_path": source_path,
+                "source_unit_id": str(unit.get("source_unit_id") or ""),
+                "value_type": value_type,
+                "value": value,
+                "json_literal": (
+                    json.dumps(
+                        core_value,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if value_type == "string"
+                    else core_value
+                ),
+                "source_value_sha256": str(
+                    unit.get("source_value_sha256") or ""
+                ),
+            }
+        )
+    return passthrough
+
+
+def _normalize_final_evidence_packet(
+    packet: dict[str, Any],
+    *,
+    allowed_unit_paths: dict[str, str],
+    allowed_claims: dict[str, dict[str, Any]] | None = None,
+    claim_objects: dict[str, SourceClaim] | None = None,
+) -> dict[str, Any]:
+    output = copy.deepcopy(packet)
+    allowed_unit_ids = set(allowed_unit_paths)
+    allowed_paths = set(allowed_unit_paths.values())
+    observed_unit_ids: set[str] = set()
+    observed_claim_ids: list[str] = []
+    for observation in output.get("observations") or []:
+        if not isinstance(observation, dict):
+            raise OpenRouterError("Final evidence observation is not an object")
+        paths = observation.get("source_paths")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or any(
+                not isinstance(path, str) or path not in allowed_paths
+                for path in paths
+            )
+        ):
+            raise OpenRouterError(
+                "Final evidence observation references an unknown source path"
+            )
+        if len(paths) != len(set(paths)):
+            raise OpenRouterError(
+                "Final evidence observation repeats a source path"
+            )
+        observation["source_paths"] = list(dict.fromkeys(paths))
+        unit_ids = observation.get("source_unit_ids")
+        if (
+            not isinstance(unit_ids, list)
+            or not unit_ids
+            or any(
+                not isinstance(unit_id, str)
+                or unit_id not in allowed_unit_ids
+                for unit_id in unit_ids
+            )
+        ):
+            raise OpenRouterError(
+                "Final evidence observation references an unknown source unit"
+            )
+        if len(unit_ids) != len(set(unit_ids)):
+            raise OpenRouterError(
+                "Final evidence observation repeats a source unit"
+            )
+        observation["source_unit_ids"] = list(dict.fromkeys(unit_ids))
+        expected_paths = {
+            allowed_unit_paths[unit_id]
+            for unit_id in observation["source_unit_ids"]
+        }
+        if set(observation["source_paths"]) != expected_paths:
+            raise OpenRouterError(
+                "Final evidence observation mismatches its code-owned "
+                "source unit paths"
+            )
+        observed_unit_ids.update(observation["source_unit_ids"])
+        if allowed_claims is not None:
+            statement = observation.get("statement")
+            if not isinstance(statement, str) or not statement.strip():
+                raise OpenRouterError(
+                    "Final evidence observation omitted its claim-specific "
+                    "statement"
+                )
+            claim_ids = observation.get("source_claim_ids")
+            if (
+                not isinstance(claim_ids, list)
+                or not claim_ids
+                or any(
+                    not isinstance(claim_id, str)
+                    or claim_id not in allowed_claims
+                    for claim_id in claim_ids
+                )
+            ):
+                raise OpenRouterError(
+                    "Final evidence observation references an unknown claim"
+                )
+            if len(claim_ids) != 1:
+                raise OpenRouterError(
+                    "Final evidence observation must bind exactly one source "
+                    "claim; combining claims would lose claim-specific "
+                    "statement and excerpt evidence"
+                )
+            claim_id = str(claim_ids[0])
+            claim = allowed_claims[claim_id]
+            domain_context = _validate_final_domain_context(
+                claim.get("domain_context")
+            )
+            claim_unit_id = str(claim["source_unit_id"])
+            claim_source_path = str(claim["source_path"])
+            if observation["source_unit_ids"] != [claim_unit_id]:
+                raise OpenRouterError(
+                    "Final evidence observation mismatches its code-owned "
+                    "source claim lineage"
+                )
+            if observation["source_paths"] != [claim_source_path]:
+                raise OpenRouterError(
+                    "Final evidence observation mismatches its code-owned "
+                    "source claim path"
+                )
+            evidence_excerpt = str(observation.get("evidence_excerpt") or "")
+            claim_excerpt = str(claim.get("excerpt") or "")
+            if evidence_excerpt and evidence_excerpt not in claim_excerpt:
+                raise OpenRouterError(
+                    "Final evidence observation excerpt is not an exact "
+                    "substring of its source claim"
+                )
+            if not evidence_excerpt and claim_excerpt:
+                raise OpenRouterError(
+                    "Final evidence observation omitted its exact source "
+                    "claim excerpt"
+                )
+            exact_values = observation.get("exact_values")
+            if (
+                not isinstance(exact_values, list)
+                or any(
+                    not isinstance(value, str)
+                    or value not in claim_excerpt
+                    for value in exact_values
+                )
+            ):
+                raise OpenRouterError(
+                    "Final evidence observation invented an exact value"
+                )
+            if not _final_root_tokens_are_grounded(
+                str(observation.get("statement") or ""),
+                source_texts=[claim_excerpt],
+            ):
+                raise OpenRouterError(
+                    "Final evidence observation invented an exact literal "
+                    "or state"
+                )
+            # Keep a one-to-one semantic receipt for every exact source claim.
+            # The complete excerpt remains byte-exact in the code-owned claim
+            # ledger and the bounded-root path; this packet keeps the model's
+            # concise grounded quote without allowing it to stand in for any
+            # other claim.
+            observation["source_claim_ids"] = [claim_id]
+            observation["analysis_dimension"] = domain_context[
+                "analysis_dimension"
+            ]
+            observation["domain_context_id"] = domain_context[
+                "domain_context_id"
+            ]
+            observed_claim_ids.append(claim_id)
+    coverage = output.get("unit_coverage")
+    if not isinstance(coverage, list):
+        raise OpenRouterError("Final evidence packet has no unit coverage")
+    coverage_ids: list[str] = []
+    for item in coverage:
+        if not isinstance(item, dict):
+            raise OpenRouterError(
+                "Final evidence packet has an invalid unit coverage item"
+            )
+        unit_id = item.get("source_unit_id")
+        disposition = item.get("disposition")
+        rationale = item.get("rationale")
+        if not isinstance(unit_id, str) or unit_id not in allowed_unit_ids:
+            raise OpenRouterError(
+                "Final evidence packet coverage references an unknown source unit"
+            )
+        if disposition not in {
+            "material_observation",
+            "supporting_context",
+            "explicit_uncertainty",
+        }:
+            raise OpenRouterError(
+                "Final evidence packet coverage has an invalid disposition"
+            )
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise OpenRouterError(
+                "Final evidence packet coverage has no rationale"
+            )
+        coverage_ids.append(unit_id)
+    if (
+        len(coverage_ids) != len(coverage)
+        or Counter(coverage_ids) != Counter(allowed_unit_ids)
+    ):
+        raise OpenRouterError(
+            "Final evidence packet does not account for every source unit "
+            "exactly once"
+        )
+    if observed_unit_ids != allowed_unit_ids:
+        missing = sorted(allowed_unit_ids - observed_unit_ids)
+        raise OpenRouterError(
+            "Final evidence packet has source units without an explicit "
+            "observation: " + ", ".join(missing)
+        )
+    if allowed_claims is not None:
+        if Counter(observed_claim_ids) != Counter(allowed_claims.keys()):
+            missing_claims = sorted(
+                set(allowed_claims) - set(observed_claim_ids)
+            )
+            repeated_claims = sorted(
+                claim_id
+                for claim_id, count in Counter(observed_claim_ids).items()
+                if count != 1
+            )
+            raise OpenRouterError(
+                "Final evidence packet does not map every source claim "
+                "exactly once: "
+                f"missing={missing_claims}, repeated={repeated_claims}"
+            )
+        coverage = output.get("claim_coverage")
+        if not isinstance(coverage, list):
+            raise OpenRouterError(
+                "Final evidence packet has no claim coverage"
+            )
+        for item in coverage:
+            if not isinstance(item, dict):
+                raise OpenRouterError(
+                    "Final evidence packet has an invalid claim coverage item"
+                )
+            if item.get("disposition") not in {
+                "material_observation",
+                "supporting_context",
+                "explicit_uncertainty",
+            }:
+                raise OpenRouterError(
+                    "Final evidence packet has an invalid claim disposition"
+                )
+            if not isinstance(item.get("rationale"), str) or not str(
+                item.get("rationale")
+            ).strip():
+                raise OpenRouterError(
+                    "Final evidence packet claim coverage has no rationale"
+                )
+        if claim_objects is None or set(claim_objects) != set(allowed_claims):
+            raise OpenRouterError(
+                "Final evidence packet has no exact code-owned claim objects"
+            )
+        try:
+            validate_claim_coverage(
+                [claim_objects[claim_id] for claim_id in allowed_claims],
+                coverage,
+                require_complete=True,
+            )
+        except ValueError as exc:
+            raise OpenRouterError(
+                f"Final evidence packet claim coverage failed: {exc}"
+            ) from exc
+    return output
+
+
+def _preserve_final_evidence_reduction(
+    merged: dict[str, Any],
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep every material leaf finding even if a reducer omits it."""
+
+    output = copy.deepcopy(merged)
+    input_observations: list[dict[str, Any]] = []
+    for packet in inputs:
+        for observation in packet.get("observations") or []:
+            if not isinstance(observation, dict):
+                continue
+            input_observations.append(copy.deepcopy(observation))
+
+    # Claim-bound leaf observations are the immutable semantic ledger. A
+    # reducer may rephrase them, but replacing two claim-specific rows with one
+    # aggregate row destroys the statement/excerpt association even when all
+    # ids remain listed. Preserve the validated child rows byte-for-byte and
+    # use reducer output only for non-evidence synthesis fields below.
+    claim_bound = any(
+        "source_claim_ids" in observation
+        for observation in input_observations
+    )
+    if claim_bound:
+        claim_observation_by_id: dict[str, dict[str, Any]] = {}
+        ordered_claim_ids: list[str] = []
+        for observation in input_observations:
+            claim_ids = observation.get("source_claim_ids")
+            if not isinstance(claim_ids, list) or len(claim_ids) != 1:
+                raise OpenRouterError(
+                    "Final evidence reducer input must preserve one source "
+                    "claim per observation"
+                )
+            claim_id = str(claim_ids[0])
+            if not claim_id or claim_id in claim_observation_by_id:
+                raise OpenRouterError(
+                    "Final evidence reducer input repeats a source claim"
+                )
+            ordered_claim_ids.append(claim_id)
+            claim_observation_by_id[claim_id] = observation
+
+        merged_observations = output.get("observations") or []
+        if merged_observations:
+            merged_claim_ids: list[str] = []
+            for observation in merged_observations:
+                if not isinstance(observation, dict):
+                    raise OpenRouterError(
+                        "Final evidence reducer emitted an invalid observation"
+                    )
+                claim_ids = observation.get("source_claim_ids")
+                if not isinstance(claim_ids, list) or len(claim_ids) != 1:
+                    raise OpenRouterError(
+                        "Final evidence reducer must preserve one source claim "
+                        "per observation"
+                    )
+                merged_claim_ids.append(str(claim_ids[0]))
+            if Counter(merged_claim_ids) != Counter(ordered_claim_ids):
+                raise OpenRouterError(
+                    "Final evidence reducer changed atomic source-claim "
+                    "coverage"
+                )
+        observations = [
+            claim_observation_by_id[claim_id]
+            for claim_id in ordered_claim_ids
+        ]
+    else:
+        observations = [
+            copy.deepcopy(item)
+            for item in output.get("observations") or []
+            if isinstance(item, dict)
+        ]
+        seen = {_stable_json_sha256(item) for item in observations}
+        for observation in input_observations:
+            digest = _stable_json_sha256(observation)
+            if digest not in seen:
+                seen.add(digest)
+                observations.append(observation)
+    output["observations"] = observations
+    for field in ("uncertainties", "report_focus"):
+        output[field] = list(
+            dict.fromkeys(
+                str(value).strip()
+                for packet in [output, *inputs]
+                for value in packet.get(field) or []
+                if str(value).strip()
+            )
+        )
+    coverage_by_id: dict[str, dict[str, Any]] = {}
+    for packet in inputs:
+        for item in packet.get("unit_coverage") or []:
+            if not isinstance(item, dict):
+                continue
+            unit_id = str(item.get("source_unit_id") or "")
+            if unit_id:
+                coverage_by_id[unit_id] = copy.deepcopy(item)
+    output["unit_coverage"] = [
+        coverage_by_id[unit_id] for unit_id in sorted(coverage_by_id)
+    ]
+    claim_coverage_by_id: dict[str, dict[str, Any]] = {}
+    for packet in inputs:
+        for item in packet.get("claim_coverage") or []:
+            if not isinstance(item, dict):
+                continue
+            claim_id = str(item.get("claim_id") or "")
+            if claim_id:
+                claim_coverage_by_id[claim_id] = copy.deepcopy(item)
+    output["claim_coverage"] = [
+        claim_coverage_by_id[claim_id]
+        for claim_id in sorted(claim_coverage_by_id)
+    ]
+    return output
+
+
+def _deterministic_final_evidence_union(
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Losslessly union already-validated evidence without another LLM call."""
+
+    return _preserve_final_evidence_reduction(
+        {
+            "observations": [],
+            "uncertainties": [],
+            "report_focus": [],
+            "unit_coverage": [],
+            "claim_coverage": [],
+        },
+        inputs,
+    )
+
+
+def _compact_final_evidence_model_payload(
+    model_payload: dict[str, Any],
+    *,
+    complete_lineage: list[str],
+    unit_path_by_id: dict[str, str],
+    claim_rows: list[dict[str, Any]],
+    terminal_ledger_artifact_key: str,
+    terminal_ledger_sha256: str,
+) -> dict[str, Any]:
+    """Column-pack a complete evidence ledger without dropping report facts.
+
+    Provider context does not need repeated internal hashes and UUID-like unit
+    ids.  It does need every fact, exact scalar literal and source path.  The
+    full canonical packet remains in a content-addressed artifact; this model
+    view replaces only redundant transport fields with zero-based indexes.
+    """
+
+    evidence = model_payload.get("evidence_digest")
+    passthrough_container = model_payload.get("deterministic_passthrough")
+    if not isinstance(evidence, dict) or not isinstance(
+        passthrough_container,
+        dict,
+    ):
+        raise OpenRouterError("Final evidence ledger cannot be compacted")
+    passthrough = passthrough_container.get("values")
+    if not isinstance(passthrough, list):
+        raise OpenRouterError("Final scalar passthrough cannot be compacted")
+
+    unit_index_by_id = {
+        unit_id: index for index, unit_id in enumerate(complete_lineage)
+    }
+    if len(unit_index_by_id) != len(complete_lineage) or any(
+        unit_id not in unit_path_by_id for unit_id in complete_lineage
+    ):
+        raise OpenRouterError("Final compact ledger has invalid source lineage")
+    claim_index_by_id = {
+        str(item.get("claim_id") or ""): index
+        for index, item in enumerate(claim_rows)
+        if isinstance(item, dict) and str(item.get("claim_id") or "")
+    }
+    if len(claim_index_by_id) != len(claim_rows):
+        raise OpenRouterError("Final compact ledger has invalid claim lineage")
+
+    strings: list[str] = []
+    string_index: dict[str, int] = {}
+
+    def intern(value: Any) -> int:
+        normalized = str(value or "")
+        existing = string_index.get(normalized)
+        if existing is not None:
+            return existing
+        index = len(strings)
+        strings.append(normalized)
+        string_index[normalized] = index
+        return index
+
+    source_unit_path_rows = [
+        intern(unit_path_by_id[unit_id]) for unit_id in complete_lineage
+    ]
+    observation_rows: list[list[Any]] = []
+    for observation in evidence.get("observations") or []:
+        if not isinstance(observation, dict):
+            raise OpenRouterError("Final compact ledger has invalid observation")
+        unit_ids = observation.get("source_unit_ids")
+        if not isinstance(unit_ids, list) or any(
+            unit_id not in unit_index_by_id for unit_id in unit_ids
+        ):
+            raise OpenRouterError(
+                "Final compact observation has invalid source lineage"
+            )
+        claim_ids = observation.get("source_claim_ids")
+        if not isinstance(claim_ids, list) or any(
+            claim_id not in claim_index_by_id for claim_id in claim_ids
+        ):
+            raise OpenRouterError(
+                "Final compact observation has invalid claim lineage"
+            )
+        observation_rows.append(
+            [
+                intern(observation.get("category")),
+                intern(observation.get("analysis_dimension")),
+                intern(observation.get("domain_context_id")),
+                intern(observation.get("statement")),
+                [unit_index_by_id[str(unit_id)] for unit_id in unit_ids],
+                [claim_index_by_id[str(claim_id)] for claim_id in claim_ids],
+                [intern(value) for value in observation.get("exact_values") or []],
+                intern(observation.get("evidence_excerpt")),
+                intern(observation.get("importance")),
+            ]
+        )
+
+    coverage_rows: list[list[Any]] = []
+    for item in evidence.get("unit_coverage") or []:
+        if not isinstance(item, dict):
+            raise OpenRouterError("Final compact ledger has invalid coverage")
+        unit_id = str(item.get("source_unit_id") or "")
+        if unit_id not in unit_index_by_id:
+            raise OpenRouterError(
+                "Final compact coverage has invalid source lineage"
+            )
+        coverage_rows.append(
+            [
+                unit_index_by_id[unit_id],
+                intern(item.get("disposition")),
+                intern(item.get("rationale")),
+            ]
+        )
+
+    claim_coverage_rows: list[list[Any]] = []
+    for item in evidence.get("claim_coverage") or []:
+        if not isinstance(item, dict):
+            raise OpenRouterError(
+                "Final compact ledger has invalid claim coverage"
+            )
+        claim_id = str(item.get("claim_id") or "")
+        if claim_id not in claim_index_by_id:
+            raise OpenRouterError(
+                "Final compact claim coverage has invalid lineage"
+            )
+        claim_coverage_rows.append(
+            [
+                claim_index_by_id[claim_id],
+                intern(item.get("disposition")),
+                intern(item.get("rationale")),
+            ]
+        )
+
+    passthrough_rows: list[list[Any]] = []
+    for item in passthrough:
+        if not isinstance(item, dict):
+            raise OpenRouterError("Final compact passthrough has invalid row")
+        unit_id = str(item.get("source_unit_id") or "")
+        if unit_id not in unit_index_by_id:
+            raise OpenRouterError(
+                "Final compact passthrough has invalid source lineage"
+            )
+        passthrough_rows.append(
+            [
+                unit_index_by_id[unit_id],
+                intern(item.get("value_type")),
+                intern(item.get("json_literal")),
+            ]
+        )
+
+    contract = copy.deepcopy(model_payload.get("long_input_contract") or {})
+    contract.update(
+        {
+            "mode": "hierarchical_evidence_tree_compact_ledger",
+            "terminal_ledger": {
+                "artifact_key": terminal_ledger_artifact_key,
+                "sha256": terminal_ledger_sha256,
+            },
+            "compact_ledger_contract": {
+                "version": "lossless_fact_ledger_v1",
+                "string_indexes_are_zero_based": True,
+                "source_unit_path_rows": (
+                    "row index is source_unit_index; value is a string-table "
+                    "index containing the exact JSON Pointer source path"
+                ),
+                "observation_columns": [
+                    "category_string_index",
+                    "analysis_dimension_string_index",
+                    "domain_context_id_string_index",
+                    "statement_string_index",
+                    "source_unit_indices",
+                    "source_claim_indices",
+                    "exact_value_string_indices",
+                    "evidence_excerpt_string_index",
+                    "importance_string_index",
+                ],
+                "coverage_columns": [
+                    "source_unit_index",
+                    "disposition_string_index",
+                    "rationale_string_index",
+                ],
+                "claim_coverage_columns": [
+                    "source_claim_index",
+                    "disposition_string_index",
+                    "rationale_string_index",
+                ],
+                "passthrough_columns": [
+                    "source_unit_index",
+                    "value_type_string_index",
+                    "exact_json_literal_string_index",
+                ],
+                "integrity_note": (
+                    "Every observation, uncertainty, focus item, coverage "
+                    "row and exact scalar literal is present. Only redundant "
+                    "transport ids, hashes and decoded copies were removed "
+                    "from the model view; the canonical ledger is preserved "
+                    "in terminal_ledger. Reconstruct all strings through "
+                    "shared_string_table and do not skip supporting rows."
+                ),
+            },
+            "instruction": (
+                "Используй все строки lossless compact ledger. Индексы в "
+                "observation_rows и coverage_rows ссылаются на "
+                "source_unit_path_rows; значения source_unit_path_rows и "
+                "остальные *_string_index ссылаются на shared_string_table. "
+                "Числа и состояния из deterministic_passthrough.rows "
+                "восстанавливай из exact_json_literal_string_index, не "
+                "пересчитывай и не превращай unknown в ноль."
+            ),
+        }
+    )
+    return {
+        "long_input_contract": contract,
+        "shared_string_table": strings,
+        "evidence_digest": {
+            "format": "lossless_columnar_evidence_v1",
+            "source_unit_path_rows": source_unit_path_rows,
+            "observation_rows": observation_rows,
+            "uncertainty_string_indices": [
+                intern(value) for value in evidence.get("uncertainties") or []
+            ],
+            "report_focus_string_indices": [
+                intern(value) for value in evidence.get("report_focus") or []
+            ],
+            "coverage_rows": coverage_rows,
+            "claim_coverage_rows": claim_coverage_rows,
+        },
+        "deterministic_passthrough": {
+            "contract": "code_owned_exact_scalar_columnar_v1",
+            "rows": passthrough_rows,
+        },
+    }
+
+
+_FINAL_ROOT_URL_LITERAL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_FINAL_ROOT_STATE_LITERAL = re.compile(
+    r"(?<![\w-])(?:unknown|limited|unavailable|available|failed|complete|"
+    r"completed|partial|missing|n/?a|null|true|false|неизвестно|"
+    r"недоступно|доступно|ограничено)(?![\w-])",
+    re.IGNORECASE,
+)
+_FINAL_ROOT_RARE_LITERAL = re.compile(
+    r"(?<!\w)[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9._:/+@-]{5,}(?!\w)"
+)
+
+
+def _final_root_literal_tokens(value: Any) -> list[str]:
+    text = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    )
+    ordered: list[str] = []
+    for pattern in (
+        _FINAL_ROOT_URL_LITERAL,
+        _ILLUSTRATION_NUMBER_LITERAL,
+        _FINAL_ROOT_STATE_LITERAL,
+    ):
+        ordered.extend(match.group(0) for match in pattern.finditer(text))
+    for match in _FINAL_ROOT_RARE_LITERAL.finditer(text):
+        token = match.group(0).rstrip(".,:;/+@-")
+        if (
+            len(token) >= 6
+            and (
+            any(character.isdigit() for character in token)
+            or any(character in "._:/+@-" for character in token)
+            or token.isupper()
+            )
+        ):
+            ordered.append(token)
+    return list(dict.fromkeys(ordered))
+
+
+def _final_root_tokens_are_grounded(
+    text: str,
+    *,
+    source_texts: list[str],
+) -> bool:
+    combined = "\n".join(source_texts)
+    combined_folded = combined.casefold()
+    return all(
+        token in combined or token.casefold() in combined_folded
+        for token in _final_root_literal_tokens(text)
+    )
+
+
+_FINAL_ROOT_NON_SEMANTIC_WORDS = frozenset(
+    {
+        "artifact",
+        "child",
+        "claim",
+        "context",
+        "coverage",
+        "digest",
+        "entry",
+        "evidence",
+        "excerpt",
+        "fragment",
+        "index",
+        "node",
+        "ordinal",
+        "source",
+        "summary",
+        "value",
+        "данные",
+        "единица",
+        "источник",
+        "контекст",
+        "сводка",
+        "узел",
+        "учтен",
+        "учтена",
+        "учтено",
+    }
+)
+
+_FINAL_ROOT_GENERIC_ACK = re.compile(
+    r"^\s*(?:(?:[A-Za-zА-Яа-яЁё0-9+._-]+)\s+){0,4}"
+    r"(?:учт[её]н\w*|отраж[её]н\w*|обработан\w*|сохран[её]н\w*|"
+    r"accounted|acknowledged|covered|processed|recorded)"
+    r"(?:\s+(?:в|in)\s+(?:сводк\w*|summary|observation|отч[её]т\w*|report))?"
+    r"[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _final_root_content_tokens(value: str) -> list[str]:
+    """Return exact lexical anchors, excluding transport acknowledgements."""
+
+    return list(
+        dict.fromkeys(
+            token
+            for raw in re.findall(
+                r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9._+-]{3,}",
+                value,
+            )
+            if (token := raw.casefold().strip("._+-"))
+            and token not in _FINAL_ROOT_NON_SEMANTIC_WORDS
+        )
+    )
+
+
+_FINAL_REPORT_GENERIC_VISIBILITY_TOKENS = frozenset(
+    {
+        "available",
+        "complete",
+        "completed",
+        "failed",
+        "limited",
+        "measurement",
+        "missing",
+        "null",
+        "partial",
+        "state",
+        "status",
+        "unknown",
+        "unavailable",
+        "доступно",
+        "измерение",
+        "неизвестно",
+        "недоступно",
+        "ограничено",
+        "состояние",
+        "статус",
+    }
+)
+
+
+def _final_report_claim_visibility_clauses(
+    excerpt: str,
+) -> list[dict[str, Any]]:
+    """Build bounded reader-visible anchors for every material claim clause.
+
+    The exact excerpt is retained separately.  These code-owned anchors keep
+    a generic shared tail such as ``unknown`` from standing in for the actual
+    subject of a qualitative claim.  Long prose is partitioned, never cut:
+    every sentence/paragraph fragment contributes its exact rare literals and
+    both an opening and closing material lexical anchor where available.
+    """
+
+    if not excerpt:
+        return []
+    clauses = [
+        value
+        for value in re.split(r"(?<=[.!?;:])\s+|\n+", excerpt)
+        if value.strip()
+    ] or [excerpt]
+    visibility: list[dict[str, Any]] = []
+    for clause_index, clause in enumerate(clauses):
+        fragments, _manifest = build_claim_ledger(
+            clause,
+            document_id=(
+                "final-visible-clause:"
+                + text_sha256(excerpt)[:20]
+                + f":{clause_index}"
+            ),
+            target_fragment_utf8_bytes=768,
+        )
+        for fragment_index, fragment in enumerate(fragments):
+            text = fragment.excerpt
+            anchors: list[str] = []
+            seen_folded: set[str] = set()
+
+            def add_anchor(value: str) -> None:
+                normalized = value.casefold().strip()
+                if normalized and normalized not in seen_folded:
+                    seen_folded.add(normalized)
+                    anchors.append(value)
+
+            for literal in _final_root_literal_tokens(text):
+                # Generic availability states remain meaningful only when the
+                # clause has no more specific subject/outcome anchor.  Rare
+                # ids, URLs, numbers and named markers are always retained.
+                if literal.casefold() not in (
+                    _FINAL_REPORT_GENERIC_VISIBILITY_TOKENS
+                ):
+                    add_anchor(literal)
+            material_tokens = [
+                token
+                for token in _final_root_content_tokens(text)
+                if token not in _FINAL_REPORT_GENERIC_VISIBILITY_TOKENS
+            ]
+            if material_tokens:
+                add_anchor(material_tokens[0])
+                add_anchor(material_tokens[-1])
+            if not anchors:
+                fallback_tokens = _final_root_content_tokens(text)
+                if fallback_tokens:
+                    add_anchor(fallback_tokens[0])
+                    add_anchor(fallback_tokens[-1])
+                else:
+                    for literal in _final_root_literal_tokens(text):
+                        add_anchor(literal)
+            if not anchors:
+                short_tokens = re.findall(
+                    r"[A-Za-zА-Яа-яЁё0-9]+",
+                    text,
+                )
+                if short_tokens:
+                    add_anchor(short_tokens[0])
+                    add_anchor(short_tokens[-1])
+            if not anchors:
+                continue
+            visibility.append(
+                {
+                    "clause_index": clause_index,
+                    "fragment_index": fragment_index,
+                    "fragment_sha256": fragment.excerpt_sha256,
+                    "required_anchors": anchors,
+                }
+            )
+    return visibility
+
+
+def _final_root_fact_assertion_candidates(
+    binding: dict[str, Any],
+) -> list[str]:
+    if binding.get("contract") == "typed_atomic_fact_binding":
+        fact_lexeme = binding.get("fact_lexeme")
+        return [fact_lexeme] if isinstance(fact_lexeme, str) else []
+    if binding.get("contract") == "code_owned_exact_scalar_binding":
+        literal = binding.get("json_literal")
+        if not isinstance(literal, str):
+            return []
+        candidates = [literal]
+        try:
+            decoded = json.loads(literal)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, str):
+            candidates.append(decoded)
+        return list(dict.fromkeys(candidates))
+    return []
+
+
+def _normalize_final_root_summary_packet(
+    packet: dict[str, Any],
+    *,
+    allowed_node_text: dict[str, str],
+    allowed_node_fact_bindings: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Validate exact-once coverage of one bounded set of child nodes."""
+
+    output = copy.deepcopy(packet)
+    allowed_node_ids = set(allowed_node_text)
+    fact_bindings_by_node = (
+        {
+            node_id: [] for node_id in allowed_node_ids
+        }
+        if allowed_node_fact_bindings is None
+        else allowed_node_fact_bindings
+    )
+    if set(fact_bindings_by_node) != allowed_node_ids:
+        raise OpenRouterError(
+            "Bounded root fact ledger mismatches its child-node set"
+        )
+    observed_node_ids: list[str] = []
+    observations = output.get("observations")
+    if not isinstance(observations, list):
+        raise OpenRouterError("Bounded root packet has no observations")
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise OpenRouterError(
+                "Bounded root observation is not an object"
+            )
+        statement = observation.get("statement")
+        if not isinstance(statement, str) or not statement.strip():
+            raise OpenRouterError(
+                "Bounded root observation has no factual statement"
+            )
+        node_ids = observation.get("source_node_ids")
+        if (
+            not isinstance(node_ids, list)
+            or len(node_ids) != 1
+            or any(
+                not isinstance(node_id, str)
+                or node_id not in allowed_node_ids
+                for node_id in node_ids
+            )
+            or len(node_ids) != len(set(node_ids))
+        ):
+            raise OpenRouterError(
+                "Bounded root observation must reference exactly one child "
+                "node; cross-child fact binding is forbidden"
+            )
+        referenced_text = [allowed_node_text[node_id] for node_id in node_ids]
+        expected_fact_ids = _final_root_fact_refs(
+            fact_bindings_by_node[node_ids[0]]
+        )
+        fact_binding_ids = observation.get("fact_binding_ids")
+        if (
+            not isinstance(fact_binding_ids, list)
+            or any(not isinstance(value, str) for value in fact_binding_ids)
+            or fact_binding_ids != expected_fact_ids
+        ):
+            raise OpenRouterError(
+                "Bounded root observation changed or omitted a code-owned "
+                "mandatory fact binding"
+            )
+        statement_folded = statement.casefold()
+        missing_fact_ids = [
+            fact_ref
+            for binding, fact_ref in zip(
+                fact_bindings_by_node[node_ids[0]],
+                expected_fact_ids,
+                strict=True,
+            )
+            if not any(
+                candidate
+                and candidate.casefold() in statement_folded
+                for candidate in _final_root_fact_assertion_candidates(
+                    binding
+                )
+            )
+        ]
+        if missing_fact_ids:
+            raise OpenRouterError(
+                "Bounded root observation acknowledged fact refs without "
+                "asserting every mandatory atomic fact"
+            )
+        if _FINAL_ROOT_GENERIC_ACK.fullmatch(statement) and not expected_fact_ids:
+            raise OpenRouterError(
+                "Bounded root observation is a generic acknowledgement, not "
+                "a grounded semantic summary"
+            )
+        excerpts = observation.get("evidence_excerpts")
+        if not isinstance(excerpts, list):
+            raise OpenRouterError(
+                "Bounded root observation has no per-child excerpts"
+            )
+        excerpt_by_id: dict[str, str] = {}
+        for item in excerpts:
+            if not isinstance(item, dict):
+                raise OpenRouterError(
+                    "Bounded root observation has an invalid excerpt"
+                )
+            node_id = item.get("source_node_id")
+            excerpt = item.get("excerpt")
+            if (
+                not isinstance(node_id, str)
+                or node_id not in node_ids
+                or node_id in excerpt_by_id
+                or not isinstance(excerpt, str)
+                or (allowed_node_text[node_id] and not excerpt)
+                or excerpt == node_id
+                or excerpt not in allowed_node_text[node_id]
+            ):
+                raise OpenRouterError(
+                    "Bounded root excerpt is not an exact per-child substring"
+                )
+            excerpt_by_id[node_id] = excerpt
+        if set(excerpt_by_id) != set(node_ids):
+            raise OpenRouterError(
+                "Bounded root observation omitted a child excerpt"
+            )
+        source_content_tokens = _final_root_content_tokens(
+            allowed_node_text[node_ids[0]]
+        )
+        statement_content_tokens = set(_final_root_content_tokens(statement))
+        if source_content_tokens and not (
+            statement_content_tokens & set(source_content_tokens)
+            or statement.strip() in allowed_node_text[node_ids[0]]
+        ):
+            raise OpenRouterError(
+                "Bounded root observation is a generic acknowledgement, not "
+                "a grounded semantic summary"
+            )
+        exact_values = observation.get("exact_values")
+        if (
+            not isinstance(exact_values, list)
+            or any(
+                not isinstance(value, str)
+                or not any(value in text for text in referenced_text)
+                for value in exact_values
+            )
+        ):
+            raise OpenRouterError(
+                "Bounded root exact value is not present in its children"
+            )
+        if not _final_root_tokens_are_grounded(
+            statement,
+            source_texts=referenced_text,
+        ):
+            raise OpenRouterError(
+                "Bounded root statement invented an exact literal or state"
+            )
+        observation["source_node_ids"] = list(node_ids)
+        observation["fact_binding_ids"] = list(fact_binding_ids)
+        observed_node_ids.extend(node_ids)
+
+    if Counter(observed_node_ids) != Counter(allowed_node_ids):
+        missing = sorted(allowed_node_ids - set(observed_node_ids))
+        repeated = sorted(
+            node_id
+            for node_id, count in Counter(observed_node_ids).items()
+            if count != 1
+        )
+        raise OpenRouterError(
+            "Bounded root packet does not map every child exactly once: "
+            f"missing={missing}, repeated={repeated}"
+        )
+
+    for field in ("uncertainties", "report_focus"):
+        items = output.get(field)
+        if not isinstance(items, list):
+            raise OpenRouterError(
+                f"Bounded root packet has invalid {field}"
+            )
+        for item in items:
+            if not isinstance(item, dict):
+                raise OpenRouterError(
+                    f"Bounded root {field} item has no provenance"
+                )
+            text = item.get("text")
+            node_ids = item.get("source_node_ids")
+            if (
+                not isinstance(text, str)
+                or not text.strip()
+                or not isinstance(node_ids, list)
+                or not node_ids
+                or any(
+                    not isinstance(node_id, str)
+                    or node_id not in allowed_node_ids
+                    for node_id in node_ids
+                )
+                or not _final_root_tokens_are_grounded(
+                    text,
+                    source_texts=[
+                        allowed_node_text[node_id] for node_id in node_ids
+                    ],
+                )
+            ):
+                raise OpenRouterError(
+                    f"Bounded root {field} item invented or lost provenance"
+                )
+
+    coverage = output.get("node_coverage")
+    if not isinstance(coverage, list):
+        raise OpenRouterError("Bounded root packet has no node coverage")
+    coverage_ids: list[str] = []
+    for item in coverage:
+        if not isinstance(item, dict):
+            raise OpenRouterError(
+                "Bounded root packet has invalid node coverage"
+            )
+        node_id = item.get("source_node_id")
+        if not isinstance(node_id, str) or node_id not in allowed_node_ids:
+            raise OpenRouterError(
+                "Bounded root coverage references an unknown child"
+            )
+        if item.get("disposition") not in {
+            "material_observation",
+            "supporting_context",
+            "explicit_uncertainty",
+        }:
+            raise OpenRouterError(
+                "Bounded root coverage has an invalid disposition"
+            )
+        rationale = item.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise OpenRouterError(
+                "Bounded root coverage has no rationale"
+            )
+        coverage_ids.append(node_id)
+    if Counter(coverage_ids) != Counter(allowed_node_ids):
+        raise OpenRouterError(
+            "Bounded root packet does not cover every child exactly once"
+        )
+    return output
+
+
+def _final_root_semantic_entries(
+    model_payload: dict[str, Any],
+    *,
+    source_claim_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project the canonical ledger into ordered semantic source entries.
+
+    Transport ids remain committed in the canonical artifact.  The bounded
+    tree receives every observation, uncertainty, focus item, coverage
+    rationale and exact scalar as its own ordered source entry.
+    """
+
+    evidence = model_payload.get("evidence_digest")
+    passthrough_container = model_payload.get("deterministic_passthrough")
+    if not isinstance(evidence, dict) or not isinstance(
+        passthrough_container,
+        dict,
+    ):
+        raise OpenRouterError(
+            "Canonical final evidence cannot seed a bounded root"
+        )
+    passthrough = passthrough_container.get("values")
+    if not isinstance(passthrough, list):
+        raise OpenRouterError(
+            "Canonical exact-scalar ledger cannot seed a bounded root"
+        )
+
+    entries: list[dict[str, Any]] = []
+
+    def append(kind: str, value: Any, **metadata: Any) -> None:
+        entries.append(
+            {
+                "kind": kind,
+                "ordinal": len(entries),
+                "value": copy.deepcopy(value),
+                **metadata,
+            }
+        )
+
+    claim_ids = [
+        str(row.get("claim_id") or "")
+        for row in source_claim_rows
+        if isinstance(row, dict)
+    ]
+    if (
+        len(claim_ids) != len(source_claim_rows)
+        or any(not claim_id for claim_id in claim_ids)
+        or len(claim_ids) != len(set(claim_ids))
+    ):
+        raise OpenRouterError(
+            "Bounded root source claims are missing or duplicated"
+        )
+    contract = model_payload.get("long_input_contract")
+    expected_claim_count = (
+        contract.get("source_claim_count")
+        if isinstance(contract, dict)
+        else None
+    )
+    if (
+        isinstance(expected_claim_count, int)
+        and not isinstance(expected_claim_count, bool)
+        and len(source_claim_rows) != expected_claim_count
+    ):
+        raise OpenRouterError(
+            "Bounded root source claim count mismatches the canonical ledger"
+        )
+    for claim in source_claim_rows:
+        claim_id = str(claim.get("claim_id") or "")
+        source_path = str(claim.get("source_path") or "")
+        domain_context = _validate_final_domain_context(
+            claim.get("domain_context")
+        )
+        append(
+            "exact_source_claim",
+            str(claim.get("excerpt") or ""),
+            binding_source_path=source_path,
+            binding_claim_id=claim_id,
+            fragment_index=claim.get("fragment_index"),
+            fragment_count=claim.get("fragment_count"),
+            descendant_claim_count=1,
+            descendant_claim_ids_sha256=_stable_json_sha256(
+                [claim_id]
+            ),
+            descendant_unit_count=1,
+            descendant_unit_ids_sha256=_stable_json_sha256(
+                [str(claim.get("source_unit_id") or "")]
+            ),
+            analysis_dimension=domain_context["analysis_dimension"],
+            domain_context_id=domain_context["domain_context_id"],
+        )
+
+    for observation in evidence.get("observations") or []:
+        if not isinstance(observation, dict):
+            raise OpenRouterError(
+                "Canonical evidence contains an invalid observation"
+            )
+        claim_ids = observation.get("source_claim_ids")
+        unit_ids = observation.get("source_unit_ids")
+        if not isinstance(claim_ids, list) or not isinstance(unit_ids, list):
+            raise OpenRouterError(
+                "Canonical observation has no source lineage"
+            )
+        append(
+            "observation",
+            {
+                key: copy.deepcopy(observation.get(key))
+                for key in (
+                    "category",
+                    "analysis_dimension",
+                    "domain_context_id",
+                    "statement",
+                    "source_paths",
+                    "exact_values",
+                    "evidence_excerpt",
+                    "importance",
+                )
+            },
+            descendant_claim_count=0,
+            descendant_claim_ids_sha256=_stable_json_sha256(claim_ids),
+            descendant_unit_count=len(set(str(value) for value in unit_ids)),
+            descendant_unit_ids_sha256=_stable_json_sha256(
+                sorted(set(str(value) for value in unit_ids))
+            ),
+        )
+    for field, kind in (
+        ("uncertainties", "uncertainty"),
+        ("report_focus", "report_focus"),
+        ("unit_coverage", "unit_coverage"),
+        ("claim_coverage", "claim_coverage"),
+    ):
+        for item in evidence.get(field) or []:
+            if field == "unit_coverage" and isinstance(item, dict):
+                value = {
+                    key: copy.deepcopy(item.get(key))
+                    for key in ("disposition", "rationale")
+                }
+            elif field == "claim_coverage" and isinstance(item, dict):
+                value = {
+                    key: copy.deepcopy(item.get(key))
+                    for key in ("disposition", "rationale")
+                }
+            else:
+                value = copy.deepcopy(item)
+            append(kind, value)
+    for item in passthrough:
+        append(
+            "exact_scalar",
+            item,
+            binding_source_path=str(item.get("source_path") or ""),
+            binding_claim_id=str(item.get("source_unit_id") or ""),
+        )
+    if not entries:
+        append(
+            "empty_evidence_contract",
+            "В каноническом evidence ledger нет содержательных записей.",
+        )
+    return entries
+
+
+def _final_root_leaf_fact_bindings(
+    *,
+    entry: dict[str, Any],
+    child_id: str,
+    context_text: str,
+    core_start: int,
+    core_end: int,
+) -> list[dict[str, Any]]:
+    """Create code-owned mandatory facts for one lossless semantic leaf.
+
+    Scalar JSON paths are the entity/metric identity when no safer semantic
+    registry is available.  This is enough to keep values from different
+    source cells from trading places, while typed units, sign, state, ratio and
+    order remain explicit.  The ids originate from exact source text and are
+    propagated unchanged through every reducer level.
+    """
+
+    source_path = str(
+        entry.get("binding_source_path")
+        or f"/bounded-root-entry/{int(entry.get('ordinal') or 0)}"
+    )
+    claim_id = str(entry.get("binding_claim_id") or child_id)
+    bindings: list[dict[str, Any]] = []
+    if entry.get("kind") == "exact_source_claim":
+        try:
+            extracted = extract_fact_bindings(
+                context_text,
+                child_id=child_id,
+                claim_id=claim_id,
+                entity_aliases={source_path: (source_path,)},
+                metric_aliases={source_path: (source_path,)},
+                default_entity=source_path,
+                default_metric=source_path,
+            )
+        except FactBindingError as exc:
+            raise OpenRouterError(
+                f"Bounded root fact extraction failed: {exc}"
+            ) from exc
+        for binding in extracted:
+            # Semantic overlap may expose the same fact to adjacent leaves.
+            # Ownership belongs to the leaf whose non-overlapping core contains
+            # the fact's first decisive character.
+            if not core_start <= binding.fact_char_start < core_end:
+                continue
+            bindings.append(
+                {
+                    **binding.as_dict(),
+                    "source_path": source_path,
+                    "contract": "typed_atomic_fact_binding",
+                }
+            )
+    elif entry.get("kind") == "exact_scalar" and core_start == 0:
+        value = entry.get("value")
+        if isinstance(value, dict):
+            scalar_contract = {
+                "contract": "code_owned_exact_scalar_binding",
+                "source_path": source_path,
+                "value_type": str(value.get("value_type") or ""),
+                "json_literal": str(value.get("json_literal") or ""),
+                "source_value_sha256": str(
+                    value.get("source_value_sha256") or ""
+                ),
+            }
+            bindings.append(
+                {
+                    "binding_id": "afb_scalar_"
+                    + _stable_json_sha256(scalar_contract),
+                    **scalar_contract,
+                }
+            )
+    if len({item["binding_id"] for item in bindings}) != len(bindings):
+        raise OpenRouterError(
+            "Bounded root leaf generated duplicate mandatory fact bindings"
+        )
+    return bindings
+
+
+def _validate_final_root_fact_binding(binding: dict[str, Any]) -> None:
+    """Validate one full code-owned binding before deriving a compact ref."""
+
+    contract = binding.get("contract")
+    if contract == "typed_atomic_fact_binding":
+        try:
+            parsed = AtomicFactBinding.from_dict(binding)
+        except FactBindingError as exc:
+            raise OpenRouterError(
+                f"Bounded root typed fact binding failed integrity: {exc}"
+            ) from exc
+        source_path = binding.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            raise OpenRouterError(
+                "Bounded root typed fact binding has no source path"
+            )
+        if parsed.entity != source_path or parsed.metric != source_path:
+            raise OpenRouterError(
+                "Bounded root typed fact binding changed its source identity"
+            )
+        return
+    if contract == "code_owned_exact_scalar_binding":
+        scalar_contract = {
+            "contract": contract,
+            "source_path": binding.get("source_path"),
+            "value_type": binding.get("value_type"),
+            "json_literal": binding.get("json_literal"),
+            "source_value_sha256": binding.get("source_value_sha256"),
+        }
+        if any(
+            not isinstance(value, str) or not value
+            for value in scalar_contract.values()
+        ):
+            raise OpenRouterError(
+                "Bounded root exact scalar binding is incomplete"
+            )
+        expected_id = "afb_scalar_" + _stable_json_sha256(
+            scalar_contract
+        )
+        if binding.get("binding_id") != expected_id:
+            raise OpenRouterError(
+                "Bounded root exact scalar binding identity mismatches"
+            )
+        return
+    raise OpenRouterError("Bounded root fact binding has an unknown contract")
+
+
+def _final_root_binding_ids(node: dict[str, Any]) -> list[str]:
+    bindings = node.get("mandatory_fact_bindings")
+    if not isinstance(bindings, list):
+        raise OpenRouterError("Bounded root node has no mandatory fact ledger")
+    ids: list[str] = []
+    for item in bindings:
+        if not isinstance(item, dict):
+            raise OpenRouterError(
+                "Bounded root node has an invalid mandatory fact binding"
+            )
+        _validate_final_root_fact_binding(item)
+        ids.append(str(item.get("binding_id") or ""))
+    if (
+        len(ids) != len(bindings)
+        or any(not binding_id for binding_id in ids)
+        or len(ids) != len(set(ids))
+    ):
+        raise OpenRouterError(
+            "Bounded root node has invalid mandatory fact bindings"
+        )
+    return ids
+
+
+def _final_root_fact_table(
+    bindings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return a compact model view; full bindings remain in proof artifacts."""
+
+    columns = [
+        "ref",
+        "source_ref",
+        "kind",
+        "state",
+        "value",
+        "unit",
+        "numerator",
+        "denominator",
+        "sign",
+        "direction",
+        "order_relation",
+        "order_value",
+        "lexeme",
+    ]
+    rows: list[list[Any]] = []
+    seen_refs: set[str] = set()
+    for binding in bindings:
+        binding_id = str(binding.get("binding_id") or "")
+        if not binding_id:
+            raise OpenRouterError("Mandatory fact binding has no identity")
+        fact_ref = "f_" + text_sha256(binding_id)[:16]
+        if fact_ref in seen_refs:
+            raise OpenRouterError("Mandatory fact model reference collided")
+        seen_refs.add(fact_ref)
+        source_path = str(
+            binding.get("source_path") or binding.get("entity") or ""
+        )
+        source_ref = "p_" + text_sha256(source_path)[:12]
+        if binding.get("contract") == "code_owned_exact_scalar_binding":
+            rows.append(
+                [
+                    fact_ref,
+                    source_ref,
+                    "exact_scalar",
+                    None,
+                    str(binding.get("json_literal") or ""),
+                    str(binding.get("value_type") or ""),
+                    None,
+                    None,
+                    None,
+                    "neutral",
+                    None,
+                    None,
+                    str(binding.get("json_literal") or ""),
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    fact_ref,
+                    source_ref,
+                    str(binding.get("kind") or ""),
+                    binding.get("state"),
+                    binding.get("value"),
+                    binding.get("unit"),
+                    binding.get("numerator"),
+                    binding.get("denominator"),
+                    binding.get("sign"),
+                    binding.get("direction"),
+                    binding.get("order_relation"),
+                    binding.get("order_value"),
+                    binding.get("fact_lexeme"),
+                ]
+            )
+    return {
+        "version": "aiv-mandatory-fact-table-v1",
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _final_root_fact_refs(bindings: list[dict[str, Any]]) -> list[str]:
+    return [str(row[0]) for row in _final_root_fact_table(bindings)["rows"]]
+
+
+def _final_root_source_nodes(
+    model_payload: dict[str, Any],
+    *,
+    source_claim_rows: list[dict[str, Any]],
+    target_chars: int,
+) -> list[dict[str, Any]]:
+    """Create ordered, lossless transport leaves for bounded summarization."""
+
+    nodes: list[dict[str, Any]] = []
+    for entry in _final_root_semantic_entries(
+        model_payload,
+        source_claim_rows=source_claim_rows,
+    ):
+        # Transport metadata (kind, ordinal and lineage counts) is committed in
+        # the receipt, but it must not be usable as a fake semantic excerpt.
+        # Only the actual evidence value is split and exposed as semantic text.
+        serialized = json.dumps(
+            entry.get("value"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        entry_digest = text_sha256(serialized)
+        units, manifest = split_lossless_text(
+            serialized,
+            document_id=(
+                f"final-root-entry:{int(entry['ordinal']):08d}:"
+                f"{entry_digest[:24]}"
+            ),
+            target_chars=target_chars,
+            context_overlap_chars=min(512, max(32, target_chars // 8)),
+        )
+        claim_count = int(entry.get("descendant_claim_count") or 0)
+        for fragment_index, unit in enumerate(units):
+            semantic_text = unit.context_text[
+                unit.core_start_in_context:unit.core_end_in_context
+            ]
+            if text_sha256(semantic_text) != unit.sha256:
+                raise OpenRouterError(
+                    "Bounded root semantic leaf failed its code-owned digest"
+                )
+            mandatory_fact_bindings = _final_root_leaf_fact_bindings(
+                entry=entry,
+                child_id=unit.unit_id,
+                context_text=unit.context_text,
+                core_start=unit.core_start_in_context,
+                core_end=unit.core_end_in_context,
+            )
+            mandatory_fact_ids = [
+                str(item["binding_id"]) for item in mandatory_fact_bindings
+            ]
+            mandatory_fact_table = _final_root_fact_table(
+                mandatory_fact_bindings
+            )
+            mandatory_fact_provenance_sha256 = _stable_json_sha256(
+                {
+                    "domain": "aiv-final-root-leaf-facts-v1",
+                    "mandatory_fact_bindings_sha256": _stable_json_sha256(
+                        mandatory_fact_bindings
+                    ),
+                    "mandatory_fact_ids_sha256": _stable_json_sha256(
+                        mandatory_fact_ids
+                    ),
+                    "mandatory_fact_table_sha256": _stable_json_sha256(
+                        mandatory_fact_table
+                    ),
+                }
+            )
+            source_view = {
+                "source_node_id": unit.unit_id,
+                "entry_kind": entry["kind"],
+                "entry_ordinal": entry["ordinal"],
+                "analysis_dimension": entry.get("analysis_dimension"),
+                "domain_context_id": entry.get("domain_context_id"),
+                "fragment_index": fragment_index,
+                "fragment_count": manifest.unit_count,
+                "core_start_in_context": unit.core_start_in_context,
+                "core_end_in_context": unit.core_end_in_context,
+                "core_sha256": unit.sha256,
+                "context_value": unit.context_text,
+                "mandatory_fact_count": len(mandatory_fact_ids),
+                "mandatory_fact_provenance_sha256": (
+                    mandatory_fact_provenance_sha256
+                ),
+            }
+            source_text = json.dumps(
+                source_view,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            leaf_ordinal = len(nodes)
+            leaf_commitment = _stable_json_sha256(
+                {
+                    "domain": "aiv-final-root-leaf-v1",
+                    "leaf_ordinal": leaf_ordinal,
+                    "source_node_id": unit.unit_id,
+                    "source_text_sha256": text_sha256(source_text),
+                    "semantic_text_sha256": text_sha256(semantic_text),
+                    "mandatory_fact_ids_sha256": _stable_json_sha256(
+                        mandatory_fact_ids
+                    ),
+                    "mandatory_fact_bindings_sha256": _stable_json_sha256(
+                        mandatory_fact_bindings
+                    ),
+                    "mandatory_fact_table_sha256": _stable_json_sha256(
+                        mandatory_fact_table
+                    ),
+                }
+            )
+            nodes.append(
+                {
+                    "node_id": unit.unit_id,
+                    "level": 0,
+                    "leaf_start": leaf_ordinal,
+                    "leaf_end": leaf_ordinal + 1,
+                    "descendant_source_node_count": 1,
+                    "descendant_claim_count": (
+                        claim_count if fragment_index == 0 else 0
+                    ),
+                    "tree_commitment": leaf_commitment,
+                    "model_view": source_view,
+                    "source_text": source_text,
+                    "semantic_text": semantic_text,
+                    "mandatory_fact_bindings": mandatory_fact_bindings,
+                }
+            )
+    return nodes
+
+
+def _final_root_node_receipt(node: dict[str, Any]) -> dict[str, Any]:
+    level = int(node["level"])
+    model_view = node.get("model_view")
+    if not isinstance(model_view, dict):
+        raise OpenRouterError("Bounded root node has no model view")
+    if "mandatory_fact_table" in model_view:
+        raise OpenRouterError(
+            "Bounded root model view leaked an unbounded mandatory fact table"
+        )
+    if level == 0:
+        mandatory_fact_bindings = node.get("mandatory_fact_bindings")
+        if not isinstance(mandatory_fact_bindings, list):
+            raise OpenRouterError(
+                "Bounded root leaf has no mandatory fact ledger"
+            )
+        mandatory_fact_ids = _final_root_binding_ids(node)
+        mandatory_fact_table = _final_root_fact_table(
+            mandatory_fact_bindings
+        )
+        fact_provenance_sha256 = _stable_json_sha256(
+            {
+                "domain": "aiv-final-root-leaf-facts-v1",
+                "mandatory_fact_bindings_sha256": _stable_json_sha256(
+                    mandatory_fact_bindings
+                ),
+                "mandatory_fact_ids_sha256": _stable_json_sha256(
+                    mandatory_fact_ids
+                ),
+                "mandatory_fact_table_sha256": _stable_json_sha256(
+                    mandatory_fact_table
+                ),
+            }
+        )
+        fact_count = len(mandatory_fact_ids)
+    else:
+        if "mandatory_fact_bindings" in node:
+            raise OpenRouterError(
+                "Bounded root parent duplicated its descendant fact ledger"
+            )
+        fact_count = node.get("mandatory_fact_count")
+        fact_provenance_sha256 = node.get(
+            "mandatory_fact_provenance_sha256"
+        )
+        if (
+            isinstance(fact_count, bool)
+            or not isinstance(fact_count, int)
+            or fact_count < 0
+            or not isinstance(fact_provenance_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", fact_provenance_sha256)
+        ):
+            raise OpenRouterError(
+                "Bounded root parent fact provenance is invalid"
+            )
+    if (
+        model_view.get("mandatory_fact_count") != fact_count
+        or model_view.get("mandatory_fact_provenance_sha256")
+        != fact_provenance_sha256
+    ):
+        raise OpenRouterError(
+            "Bounded root model view fact provenance mismatches"
+        )
+    return {
+        "node_id": str(node["node_id"]),
+        "level": level,
+        "leaf_start": int(node["leaf_start"]),
+        "leaf_end": int(node["leaf_end"]),
+        "descendant_source_node_count": int(
+            node["descendant_source_node_count"]
+        ),
+        "descendant_claim_count": int(node["descendant_claim_count"]),
+        "tree_commitment": str(node["tree_commitment"]),
+        "model_view_sha256": _stable_json_sha256(model_view),
+        "semantic_text_sha256": text_sha256(
+            str(node.get("semantic_text", node.get("source_text") or ""))
+        ),
+        "mandatory_fact_count": fact_count,
+        "mandatory_fact_provenance_sha256": fact_provenance_sha256,
+    }
+
+
+def _validate_final_root_forest(
+    nodes: list[dict[str, Any]],
+    *,
+    expected_leaf_count: int,
+) -> None:
+    if not nodes:
+        raise OpenRouterError("Bounded root forest is empty")
+    cursor = 0
+    seen_node_ids: set[str] = set()
+    for node in nodes:
+        node_id = str(node.get("node_id") or "")
+        start = node.get("leaf_start")
+        end = node.get("leaf_end")
+        if (
+            not node_id
+            or node_id in seen_node_ids
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start != cursor
+            or end <= start
+        ):
+            raise OpenRouterError(
+                "Bounded root forest has a gap, overlap or duplicate node"
+            )
+        seen_node_ids.add(node_id)
+        cursor = end
+    if cursor != expected_leaf_count:
+        raise OpenRouterError(
+            "Bounded root forest does not cover every source leaf"
+        )
+
+
+def _pack_final_root_nodes(
+    nodes: list[dict[str, Any]],
+    *,
+    window_bytes: int,
+    request_utf8_bytes: Callable[[int, list[dict[str, Any]]], int],
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for node in nodes:
+        candidate = [*current, node]
+        group_index = len(groups) + 1
+        if current and (
+            len(candidate) > FINAL_INPUT_REDUCE_FAN_IN
+            or request_utf8_bytes(group_index, candidate) > window_bytes
+        ):
+            groups.append(current)
+            current = [node]
+            group_index = len(groups) + 1
+        else:
+            current = candidate
+        if request_utf8_bytes(group_index, current) > window_bytes:
+            raise OpenRouterError(
+                "One bounded evidence-tree child exceeds the processing "
+                "model's physical request window; its canonical artifact "
+                "was preserved"
+            )
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _final_root_parent_node(
+    *,
+    level: int,
+    children: list[dict[str, Any]],
+    packet: dict[str, Any],
+) -> dict[str, Any]:
+    if not children:
+        raise OpenRouterError("Cannot seal an empty bounded root node")
+    cursor = int(children[0]["leaf_start"])
+    for child in children:
+        if int(child["leaf_start"]) != cursor:
+            raise OpenRouterError(
+                "Bounded root children are not a contiguous ordered span"
+            )
+        cursor = int(child["leaf_end"])
+    receipts = [_final_root_node_receipt(child) for child in children]
+    fact_provenance = [
+        {
+            "source_node_id": str(receipt["node_id"]),
+            "mandatory_fact_count": int(receipt["mandatory_fact_count"]),
+            "mandatory_fact_provenance_sha256": str(
+                receipt["mandatory_fact_provenance_sha256"]
+            ),
+        }
+        for receipt in receipts
+    ]
+    mandatory_fact_count = sum(
+        int(item["mandatory_fact_count"]) for item in fact_provenance
+    )
+    mandatory_fact_provenance_sha256 = _stable_json_sha256(
+        {
+            "domain": "aiv-final-root-parent-facts-v1",
+            "ordered_child_fact_provenance": fact_provenance,
+        }
+    )
+    tree_commitment = _stable_json_sha256(
+        {
+            "domain": "aiv-final-root-node-v1",
+            "ordered_child_receipts": receipts,
+        }
+    )
+    packet_sha256 = _stable_json_sha256(packet)
+    node_id = "final-root-node-" + _stable_json_sha256(
+        {
+            "domain": "aiv-final-root-view-v1",
+            "tree_commitment": tree_commitment,
+            "packet_sha256": packet_sha256,
+        }
+    )[:32]
+    model_view = {
+        "source_node_id": node_id,
+        "level": level,
+        "leaf_start": int(children[0]["leaf_start"]),
+        "leaf_end": int(children[-1]["leaf_end"]),
+        "summary": packet,
+        "descendant_source_node_count": sum(
+            int(child["descendant_source_node_count"])
+            for child in children
+        ),
+        "descendant_claim_count": sum(
+            int(child["descendant_claim_count"])
+            for child in children
+        ),
+        "tree_commitment": tree_commitment,
+        "mandatory_fact_count": mandatory_fact_count,
+        "mandatory_fact_provenance_sha256": (
+            mandatory_fact_provenance_sha256
+        ),
+    }
+    return {
+        "node_id": node_id,
+        "level": level,
+        "leaf_start": int(children[0]["leaf_start"]),
+        "leaf_end": int(children[-1]["leaf_end"]),
+        "descendant_source_node_count": model_view[
+            "descendant_source_node_count"
+        ],
+        "descendant_claim_count": model_view["descendant_claim_count"],
+        "tree_commitment": tree_commitment,
+        "model_view": model_view,
+        "source_text": json.dumps(
+            model_view,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "semantic_text": json.dumps(
+            packet,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "mandatory_fact_count": mandatory_fact_count,
+        "mandatory_fact_provenance_sha256": (
+            mandatory_fact_provenance_sha256
+        ),
+        "fact_provenance": fact_provenance,
+        "child_receipts": receipts,
+        "packet_sha256": packet_sha256,
+    }
+
+
+def _bounded_final_root_candidate(
+    canonical_payload: dict[str, Any],
+    *,
+    nodes: list[dict[str, Any]],
+    source_leaf_count: int,
+    source_leaf_commitment: str,
+    terminal_ledger_artifact_key: str,
+    terminal_ledger_sha256: str,
+    tree_manifest_artifact_key: str,
+) -> dict[str, Any]:
+    def author_view(node: dict[str, Any]) -> dict[str, Any]:
+        """Expose the verified summary, not the O(N) internal fact table."""
+
+        model_view = node["model_view"]
+        return {
+            key: copy.deepcopy(model_view.get(key))
+            for key in (
+                "source_node_id",
+                "level",
+                "leaf_start",
+                "leaf_end",
+                "summary",
+                "descendant_source_node_count",
+                "descendant_claim_count",
+                "tree_commitment",
+                "mandatory_fact_count",
+                "mandatory_fact_provenance_sha256",
+            )
+        }
+
+    contract = copy.deepcopy(
+        canonical_payload.get("long_input_contract") or {}
+    )
+    contract.update(
+        {
+            "mode": "bounded_transitive_evidence_tree",
+            "bounded_root": {
+                "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                "terminal_ledger_artifact_key": terminal_ledger_artifact_key,
+                "terminal_ledger_sha256": terminal_ledger_sha256,
+                "tree_manifest_artifact_key": tree_manifest_artifact_key,
+                "source_semantic_leaf_count": source_leaf_count,
+                "source_semantic_leaf_commitment": source_leaf_commitment,
+                "root_node_count": len(nodes),
+                "root_receipts_sha256": _stable_json_sha256(
+                    [_final_root_node_receipt(node) for node in nodes]
+                ),
+                "leaf_mapper_claim_coverage_complete": True,
+                "transitive_child_coverage_complete": True,
+                "transport_coverage_complete": True,
+                "mandatory_fact_coverage_complete": True,
+                "semantic_completeness_proven": False,
+                "coverage_kind": (
+                    "byte_lineage_plus_code_owned_mandatory_fact_bindings"
+                ),
+                "semantic_completeness_is_model_reviewed_not_proven": True,
+            },
+            "instruction": (
+                "evidence_digest содержит bounded root-узлы. Каждый исходный "
+                "claim предъявлен leaf-mapper, каждый внутренний reducer "
+                "покрыл все непосредственные child nodes ровно один раз. "
+                "Используй все root_nodes; сохраняй точные числа, сущности, "
+                "unknown/limited и ограничения. Полный drill-down находится "
+                "в content-addressed tree artifacts."
+            ),
+        }
+    )
+    return {
+        "long_input_contract": contract,
+        "evidence_digest": {
+            "format": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+            "root_nodes": [
+                author_view(node) for node in nodes
+            ],
+        },
+    }
+
+
+def _verify_final_root_tree(
+    *,
+    roots: list[dict[str, Any]],
+    source_leaves: list[dict[str, Any]],
+    proof_records: dict[str, dict[str, Any]],
+    expected_claim_count: int,
+) -> dict[str, Any]:
+    """Verify the persisted ordered receipt chain from roots to all leaves."""
+
+    _validate_final_root_forest(
+        roots,
+        expected_leaf_count=len(source_leaves),
+    )
+    source_receipts = {
+        str(node["node_id"]): _final_root_node_receipt(node)
+        for node in source_leaves
+    }
+    source_nodes_by_id = {
+        str(node["node_id"]): node for node in source_leaves
+    }
+    if len(source_receipts) != len(source_leaves):
+        raise OpenRouterError("Bounded root source receipts are not unique")
+    visited: set[str] = set()
+    visited_leaves: set[str] = set()
+
+    def leaf_binding_ledger_for_receipt(
+        receipt: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        node_id = str(receipt.get("node_id") or "")
+        source_node = source_nodes_by_id.get(node_id)
+        if source_node is None:
+            raise OpenRouterError(
+                "Bounded root parent cannot materialize descendant facts"
+            )
+        bindings = source_node.get("mandatory_fact_bindings")
+        model_view = source_node.get("model_view")
+        if not isinstance(bindings, list) or not isinstance(model_view, dict):
+            raise OpenRouterError(
+                "Bounded root leaf has no full persisted binding ledger"
+            )
+        if "mandatory_fact_bindings" in model_view or (
+            "mandatory_fact_table" in model_view
+        ):
+            raise OpenRouterError(
+                "Bounded root leaf model view leaked its fact ledger"
+            )
+        reconstructed = _final_root_node_receipt(source_node)
+        if reconstructed != receipt:
+            raise OpenRouterError(
+                "Bounded root leaf fact provenance mismatched"
+            )
+        return copy.deepcopy(bindings)
+
+    def semantic_text_for_receipt(receipt: dict[str, Any]) -> str:
+        node_id = str(receipt.get("node_id") or "")
+        source_node = source_nodes_by_id.get(node_id)
+        if source_node is not None:
+            return str(source_node.get("semantic_text") or "")
+        proof = proof_records.get(node_id)
+        model_view = proof.get("model_view") if isinstance(proof, dict) else None
+        if not isinstance(model_view, dict) or not isinstance(
+            model_view.get("summary"), dict
+        ):
+            raise OpenRouterError(
+                "Bounded root proof has no persisted semantic summary"
+            )
+        return json.dumps(
+            model_view["summary"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def visit(receipt: dict[str, Any]) -> None:
+        node_id = str(receipt.get("node_id") or "")
+        if not node_id or node_id in visited:
+            raise OpenRouterError(
+                "Bounded root proof reuses or omits a node id"
+            )
+        visited.add(node_id)
+        source_receipt = source_receipts.get(node_id)
+        if source_receipt is not None:
+            if receipt != source_receipt:
+                raise OpenRouterError(
+                    "Bounded root leaf receipt changed after sealing"
+                )
+            leaf_binding_ledger_for_receipt(receipt)
+            visited_leaves.add(node_id)
+            return
+
+        proof = proof_records.get(node_id)
+        if not isinstance(proof, dict) or proof.get("receipt") != receipt:
+            raise OpenRouterError(
+                "Bounded root internal receipt has no exact persisted proof"
+            )
+        child_receipts = proof.get("ordered_child_receipts")
+        if not isinstance(child_receipts, list) or not child_receipts:
+            raise OpenRouterError(
+                "Bounded root internal proof has no ordered children"
+            )
+        if _stable_json_sha256(child_receipts) != proof.get(
+            "ordered_child_receipts_sha256"
+        ):
+            raise OpenRouterError(
+                "Bounded root ordered child receipt digest mismatches"
+            )
+        cursor = int(receipt["leaf_start"])
+        claim_count = 0
+        source_count = 0
+        child_fact_provenance: list[dict[str, Any]] = []
+        for child_receipt in child_receipts:
+            if not isinstance(child_receipt, dict):
+                raise OpenRouterError(
+                    "Bounded root proof contains an invalid child receipt"
+                )
+            if int(child_receipt.get("leaf_start", -1)) != cursor:
+                raise OpenRouterError(
+                    "Bounded root proof contains a child gap or overlap"
+                )
+            cursor = int(child_receipt.get("leaf_end", -1))
+            claim_count += int(
+                child_receipt.get("descendant_claim_count", -1)
+            )
+            source_count += int(
+                child_receipt.get("descendant_source_node_count", -1)
+            )
+            child_fact_provenance.append(
+                {
+                    "source_node_id": str(child_receipt["node_id"]),
+                    "mandatory_fact_count": int(
+                        child_receipt["mandatory_fact_count"]
+                    ),
+                    "mandatory_fact_provenance_sha256": str(
+                        child_receipt[
+                            "mandatory_fact_provenance_sha256"
+                        ]
+                    ),
+                }
+            )
+        if (
+            cursor != int(receipt["leaf_end"])
+            or claim_count != int(receipt["descendant_claim_count"])
+            or source_count
+            != int(receipt["descendant_source_node_count"])
+        ):
+            raise OpenRouterError(
+                "Bounded root parent counts or span do not match children"
+            )
+        expected_tree_commitment = _stable_json_sha256(
+            {
+                "domain": "aiv-final-root-node-v1",
+                "ordered_child_receipts": child_receipts,
+            }
+        )
+        if expected_tree_commitment != receipt.get("tree_commitment"):
+            raise OpenRouterError(
+                "Bounded root parent commitment does not match children"
+            )
+        model_view = proof.get("model_view")
+        packet_sha256 = str(proof.get("packet_sha256") or "")
+        expected_fact_count = sum(
+            int(item["mandatory_fact_count"])
+            for item in child_fact_provenance
+        )
+        expected_fact_provenance_sha256 = _stable_json_sha256(
+            {
+                "domain": "aiv-final-root-parent-facts-v1",
+                "ordered_child_fact_provenance": child_fact_provenance,
+            }
+        )
+        if (
+            proof.get("fact_provenance") != child_fact_provenance
+            or proof.get("mandatory_fact_count") != expected_fact_count
+            or proof.get("mandatory_fact_provenance_sha256")
+            != expected_fact_provenance_sha256
+            or receipt.get("mandatory_fact_count") != expected_fact_count
+            or receipt.get("mandatory_fact_provenance_sha256")
+            != expected_fact_provenance_sha256
+        ):
+            raise OpenRouterError(
+                "Bounded root parent fact provenance changed child facts"
+            )
+        if (
+            not isinstance(model_view, dict)
+            or not isinstance(model_view.get("summary"), dict)
+        ):
+            raise OpenRouterError(
+                "Bounded root proof has no persisted model summary"
+            )
+        normalized_packet = _normalize_final_root_summary_packet(
+            copy.deepcopy(model_view.get("summary")),
+            allowed_node_text={
+                str(child_receipt["node_id"]): semantic_text_for_receipt(
+                    child_receipt
+                )
+                for child_receipt in child_receipts
+            },
+            allowed_node_fact_bindings={
+                str(child_receipt["node_id"]): []
+                for child_receipt in child_receipts
+            },
+        )
+        if (
+            normalized_packet != model_view.get("summary")
+            or _stable_json_sha256(model_view)
+            != receipt.get("model_view_sha256")
+            or _stable_json_sha256(model_view.get("summary"))
+            != packet_sha256
+            or text_sha256(
+                json.dumps(
+                    model_view.get("summary"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            != receipt.get("semantic_text_sha256")
+            or model_view.get("source_node_id") != node_id
+            or model_view.get("tree_commitment")
+            != receipt.get("tree_commitment")
+            or model_view.get("descendant_source_node_count")
+            != receipt.get("descendant_source_node_count")
+            or model_view.get("descendant_claim_count")
+            != receipt.get("descendant_claim_count")
+            or model_view.get("mandatory_fact_count")
+            != receipt.get("mandatory_fact_count")
+            or model_view.get("mandatory_fact_provenance_sha256")
+            != receipt.get("mandatory_fact_provenance_sha256")
+            or "mandatory_fact_table" in model_view
+            or "mandatory_fact_bindings" in model_view
+            or model_view.get("level") != receipt.get("level")
+            or model_view.get("leaf_start") != receipt.get("leaf_start")
+            or model_view.get("leaf_end") != receipt.get("leaf_end")
+        ):
+            raise OpenRouterError(
+                "Bounded root persisted model view failed its digest"
+            )
+        expected_node_id = "final-root-node-" + _stable_json_sha256(
+            {
+                "domain": "aiv-final-root-view-v1",
+                "tree_commitment": expected_tree_commitment,
+                "packet_sha256": packet_sha256,
+            }
+        )[:32]
+        if expected_node_id != node_id:
+            raise OpenRouterError(
+                "Bounded root internal node id failed reconstruction"
+            )
+        for child_receipt in child_receipts:
+            visit(child_receipt)
+
+    root_receipts = [_final_root_node_receipt(node) for node in roots]
+    for root_receipt in root_receipts:
+        visit(root_receipt)
+    if visited_leaves != set(source_receipts):
+        raise OpenRouterError(
+            "Bounded root proof does not reach every semantic source leaf"
+        )
+    if sum(
+        int(receipt["descendant_claim_count"])
+        for receipt in root_receipts
+    ) != expected_claim_count:
+        raise OpenRouterError(
+            "Bounded root proof does not account for every source claim"
+        )
+    return {
+        "root_receipts": root_receipts,
+        "root_receipts_sha256": _stable_json_sha256(root_receipts),
+        "verified_node_count": len(visited),
+        "verified_leaf_count": len(visited_leaves),
+        "verified_claim_count": expected_claim_count,
+        "verified_mandatory_fact_count": sum(
+            int(receipt.get("mandatory_fact_count") or 0)
+            for receipt in root_receipts
+        ),
+        "coverage_complete": True,
+        "transport_coverage_complete": True,
+        "mandatory_fact_coverage_complete": True,
+        "semantic_completeness_proven": False,
+    }
+
+
+async def _build_bounded_final_root_payload(
+    run_id: str,
+    *,
+    canonical_payload: dict[str, Any],
+    source_claim_rows: list[dict[str, Any]],
+    target_window: dict[str, Any],
+    target_window_bytes: int,
+    final_request_utf8_bytes: Callable[
+        [dict[str, Any], dict[str, Any]], int
+    ],
+    stage_key: str,
+    artifact_namespace: str,
+    prompt_version: str,
+    terminal_ledger_artifact_key: str,
+    terminal_ledger_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a bounded transitive root over an arbitrarily large ledger."""
+
+    summary_system = f"""
+Ты reducer проверяемого дерева evidence для итогового AI visibility / GEO / AEO
+отчёта. На каждом вызове передан ограниченный физическим окном набор
+source_nodes. Синтезируй связанные записи, но сохрани в statement все явные
+числа, проценты, URL, названия брендов, продуктов и конкурентов, data-state,
+unknown/limited, ограничения, причинные оговорки и редкие маркеры. Не
+пересчитывай метрики и не превращай отсутствие данных в ноль.
+analysis_dimension и domain_context_id в source_node — code-owned маршрутизация:
+используй её, чтобы не смешивать prompt с ответом, web с memory, бренд с
+портфелем, рекомендацию с простым упоминанием и разных провайдеров/INTENT.
+
+Для каждого child создай отдельный observation: source_node_ids должен содержать
+ровно один его source_node_id. Этот id должен встретиться ровно один раз во всём
+массиве observations и ровно один раз в node_coverage. В evidence_excerpts верни
+одну дословную непустую цитату из фактического evidence child, а не его id или
+служебный transport metadata. Statement обязан содержательно называть предмет
+этой цитаты, а не сообщать, что узел «учтён». Любое exact_values обязано дословно
+встречаться именно в этом child. uncertainties и report_focus возвращай как
+объекты text + source_node_ids; числа и состояния в них тоже должны быть в
+указанных children. Не объединяй children в один observation: это запрещено,
+чтобы значение одного бренда, метрики или состояния нельзя было приписать
+другому. Это внутренний слой: не показывай служебные ids пользователю.
+fact_binding_ids оставляй пустым: parent получает только content-addressed
+provenance фактов, но не растущую таблицу потомков. Исходные claim-фрагменты и
+атомарные факты позже предъявляются автору отдельными bounded-шардами и не
+зависят от сжатия этого навигационного synopsis.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    processing_window = await _final_model_input_window(
+        model=PROCESSING_MODEL
+    )
+    processing_window_bytes = int(processing_window["input_utf8_window"])
+    target_chars = min(
+        FINAL_INPUT_MAP_UNIT_CHARS,
+        max(256, processing_window_bytes // 10),
+    )
+
+    def provider_request_bytes(
+        group_index: int,
+        group: list[dict[str, Any]],
+        *,
+        level: int,
+    ) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=processing_window["model_envelope"],
+            system=summary_system,
+            user_payload={
+                "contract_version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                "level": level,
+                "group_index": group_index,
+                "source_nodes": [node["model_view"] for node in group],
+            },
+            schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
+            schema_name=f"aiv_final_root_l{level}_{group_index}",
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    while True:
+        source_nodes = _final_root_source_nodes(
+            canonical_payload,
+            source_claim_rows=source_claim_rows,
+            target_chars=target_chars,
+        )
+        if all(
+            provider_request_bytes(index, [node], level=1)
+            <= processing_window_bytes
+            for index, node in enumerate(source_nodes, start=1)
+        ):
+            break
+        if target_chars <= 256:
+            raise OpenRouterError(
+                "Bounded root mapper has no room for one minimum transport "
+                "leaf after exact provider-wrapper preflight"
+            )
+        target_chars = max(256, target_chars // 2)
+
+    source_leaf_count = len(source_nodes)
+    source_leaf_commitment = _stable_json_sha256(
+        [_final_root_node_receipt(node) for node in source_nodes]
+    )
+    source_manifest_key = (
+        f"{artifact_namespace}_bounded_root_sources_"
+        f"{source_leaf_commitment[:20]}"
+    )
+    await _save_artifact(
+        run_id,
+        stage_key=stage_key,
+        artifact_key=source_manifest_key,
+        status="completed",
+        input_json={
+            "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+            "terminal_ledger_sha256": terminal_ledger_sha256,
+        },
+        output_json={
+            "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+            "source_leaf_count": source_leaf_count,
+            "source_leaf_commitment": source_leaf_commitment,
+            "source_leaf_receipts": [
+                _final_root_node_receipt(node) for node in source_nodes
+            ],
+            "source_leaf_fact_ledgers": [
+                {
+                    "source_node_id": str(node["node_id"]),
+                    "mandatory_fact_bindings": copy.deepcopy(
+                        node["mandatory_fact_bindings"]
+                    ),
+                }
+                for node in source_nodes
+            ],
+        },
+        prompt_version=prompt_version,
+    )
+
+    nodes = source_nodes
+    level = 1
+    total_calls = 0
+    max_request_bytes = 0
+    previous_transport_bytes = sum(
+        len(node["source_text"].encode("utf-8")) for node in nodes
+    )
+    seen_forest_commitments: set[str] = set()
+    proof_records: dict[str, dict[str, Any]] = {}
+    tree_manifest_key = (
+        f"{artifact_namespace}_bounded_root_tree_"
+        f"{source_leaf_commitment[:20]}"
+    )
+    semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
+
+    while True:
+        if level > 1:
+            _validate_final_root_forest(
+                nodes,
+                expected_leaf_count=source_leaf_count,
+            )
+            candidate = _bounded_final_root_candidate(
+                canonical_payload,
+                nodes=nodes,
+                source_leaf_count=source_leaf_count,
+                source_leaf_commitment=source_leaf_commitment,
+                terminal_ledger_artifact_key=terminal_ledger_artifact_key,
+                terminal_ledger_sha256=terminal_ledger_sha256,
+                tree_manifest_artifact_key=tree_manifest_key,
+            )
+            candidate_bytes = final_request_utf8_bytes(
+                candidate,
+                target_window["model_envelope"],
+            )
+            if candidate_bytes <= target_window_bytes:
+                verification = _verify_final_root_tree(
+                    roots=nodes,
+                    source_leaves=source_nodes,
+                    proof_records=proof_records,
+                    expected_claim_count=len(source_claim_rows),
+                )
+                root_receipts = verification["root_receipts"]
+                await _save_artifact(
+                    run_id,
+                    stage_key=stage_key,
+                    artifact_key=tree_manifest_key,
+                    status="completed",
+                    input_json={
+                        "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                        "terminal_ledger_sha256": terminal_ledger_sha256,
+                        "source_leaf_commitment": source_leaf_commitment,
+                    },
+                    output_json={
+                        "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                        "source_manifest_artifact_key": source_manifest_key,
+                        "terminal_ledger_artifact_key": (
+                            terminal_ledger_artifact_key
+                        ),
+                        "terminal_ledger_sha256": terminal_ledger_sha256,
+                        "source_leaf_count": source_leaf_count,
+                        "source_leaf_commitment": source_leaf_commitment,
+                        "root_receipts": root_receipts,
+                        "root_receipts_sha256": _stable_json_sha256(
+                            root_receipts
+                        ),
+                        "node_proof_artifact_keys": [
+                            str(record["artifact_key"])
+                            for record in proof_records.values()
+                        ],
+                        "verification": verification,
+                        "coverage_complete": verification["coverage_complete"],
+                        "transport_coverage_complete": verification[
+                            "transport_coverage_complete"
+                        ],
+                        "mandatory_fact_coverage_complete": verification[
+                            "mandatory_fact_coverage_complete"
+                        ],
+                        "semantic_completeness_proven": False,
+                    },
+                    prompt_version=prompt_version,
+                )
+                return candidate, {
+                    "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                    "tree_manifest_artifact_key": tree_manifest_key,
+                    "source_manifest_artifact_key": source_manifest_key,
+                    "source_leaf_count": source_leaf_count,
+                    "root_node_count": len(nodes),
+                    "levels": level - 1,
+                    "provider_call_count": total_calls,
+                    "max_provider_request_utf8_bytes": max_request_bytes,
+                    "model_request_utf8_bytes": candidate_bytes,
+                    "coverage_complete": True,
+                    "transport_coverage_complete": True,
+                    "mandatory_fact_coverage_complete": True,
+                    "semantic_completeness_proven": False,
+                }
+
+        def request_bytes(
+            group_index: int,
+            group: list[dict[str, Any]],
+            current_level: int = level,
+        ) -> int:
+            return provider_request_bytes(
+                group_index,
+                group,
+                level=current_level,
+            )
+
+        groups = _pack_final_root_nodes(
+            nodes,
+            window_bytes=processing_window_bytes,
+            request_utf8_bytes=request_bytes,
+        )
+        level_request_bytes = [
+            request_bytes(index, group)
+            for index, group in enumerate(groups, start=1)
+        ]
+        max_request_bytes = max(max_request_bytes, *level_request_bytes)
+
+        async def summarize_group(
+            group_index: int,
+            group: list[dict[str, Any]],
+            current_level: int = level,
+        ) -> dict[str, Any]:
+            child_ids = [str(node["node_id"]) for node in group]
+            child_digest = _stable_json_sha256(
+                [_final_root_node_receipt(node) for node in group]
+            )
+            user_payload = {
+                "contract_version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                "level": current_level,
+                "group_index": group_index,
+                "source_nodes": [node["model_view"] for node in group],
+            }
+            async with semaphore:
+                result = await _structured_artifact(
+                    run_id,
+                    stage_key=stage_key,
+                    artifact_key=(
+                        f"{artifact_namespace}_bounded_root_l{current_level}_"
+                        f"{group_index}_{child_digest[:20]}"
+                    ),
+                    schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
+                    schema_name=(
+                        f"aiv_final_root_l{current_level}_{group_index}"
+                    ),
+                    system=summary_system,
+                    user_payload=user_payload,
+                    model=PROCESSING_MODEL,
+                    reasoning_effort="high",
+                    prompt_version=prompt_version,
+                )
+            normalized = _normalize_final_root_summary_packet(
+                result,
+                allowed_node_text={
+                    str(node["node_id"]): str(node["semantic_text"])
+                    for node in group
+                },
+                allowed_node_fact_bindings={
+                    str(node["node_id"]): []
+                    for node in group
+                },
+            )
+            parent = _final_root_parent_node(
+                level=current_level,
+                children=group,
+                packet=normalized,
+            )
+            if child_ids != [
+                str(item["node_id"])
+                for item in parent["child_receipts"]
+            ]:
+                raise OpenRouterError(
+                    "Bounded root parent receipt changed child order"
+                )
+            proof_artifact_key = (
+                f"{artifact_namespace}_bounded_root_node_"
+                f"{parent['node_id']}"
+            )
+            parent["proof_artifact_key"] = proof_artifact_key
+            proof_record = {
+                "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                "artifact_key": proof_artifact_key,
+                "receipt": _final_root_node_receipt(parent),
+                "ordered_child_receipts": parent["child_receipts"],
+                "ordered_child_receipts_sha256": _stable_json_sha256(
+                    parent["child_receipts"]
+                ),
+                "packet_sha256": parent["packet_sha256"],
+                "model_view": parent["model_view"],
+                "mandatory_fact_count": parent["mandatory_fact_count"],
+                "mandatory_fact_provenance_sha256": parent[
+                    "mandatory_fact_provenance_sha256"
+                ],
+                "fact_provenance": parent["fact_provenance"],
+            }
+            await _save_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=proof_artifact_key,
+                status="completed",
+                input_json={
+                    "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+                    "ordered_child_receipts_sha256": proof_record[
+                        "ordered_child_receipts_sha256"
+                    ],
+                },
+                output_json=proof_record,
+                prompt_version=prompt_version,
+            )
+            parent["proof_record"] = proof_record
+            return parent
+
+        outcomes = await asyncio.gather(
+            *(
+                summarize_group(index, group)
+                for index, group in enumerate(groups, start=1)
+            ),
+            return_exceptions=True,
+        )
+        parents: list[dict[str, Any]] = []
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            parents.append(outcome)
+            record = outcome.get("proof_record")
+            if not isinstance(record, dict):
+                raise OpenRouterError(
+                    "Bounded root parent has no persisted proof record"
+                )
+            node_id = str(outcome["node_id"])
+            if node_id in proof_records:
+                raise OpenRouterError(
+                    "Bounded root generated a duplicate internal node"
+                )
+            proof_records[node_id] = record
+        total_calls += len(parents)
+        _validate_final_root_forest(
+            parents,
+            expected_leaf_count=source_leaf_count,
+        )
+        forest_commitment = _stable_json_sha256(
+            [_final_root_node_receipt(node) for node in parents]
+        )
+        if forest_commitment in seen_forest_commitments:
+            raise OpenRouterError(
+                "Bounded root reducer repeated an identical forest; exact "
+                "artifacts were preserved instead of looping"
+            )
+        seen_forest_commitments.add(forest_commitment)
+        transport_bytes = sum(
+            len(node["source_text"].encode("utf-8")) for node in parents
+        )
+        if (
+            len(parents) >= len(nodes)
+            and transport_bytes >= previous_transport_bytes
+        ):
+            raise OpenRouterError(
+                "Bounded root reducer made no transport progress; exact "
+                "artifacts were preserved instead of hiding or truncating "
+                "evidence "
+                f"(children={len(nodes)}, parents={len(parents)}, "
+                f"before_bytes={previous_transport_bytes}, "
+                f"after_bytes={transport_bytes})"
+            )
+        nodes = parents
+        previous_transport_bytes = transport_bytes
+        level += 1
+
+
+async def _final_model_input_window(
+    *,
+    model: str,
+) -> dict[str, Any]:
+    envelope = await model_output_envelope(model)
+    resolved = _conservative_model_input_window(
+        envelope,
+        safety_tokens=FINAL_INPUT_SAFETY_TOKENS,
+        fallback_window_bytes=FINAL_INPUT_FALLBACK_WINDOW_BYTES,
+        minimum_input_tokens=1,
+        no_window_error=(
+            "Model output envelope leaves no safe input window after "
+            "the advertised completion maximum and safety reserve"
+        ),
+    )
+    return {
+        **resolved,
+        "version": FINAL_INPUT_HARNESS_VERSION,
+    }
+
+
+async def _prepare_final_model_payload(
+    run_id: str,
+    *,
+    payload: dict[str, Any],
+    system: str,
+    target_model: str = ANALYSIS_MODEL,
+    stage_key: str = "report",
+    artifact_namespace: str = "final_input",
+    prompt_version: str = FINAL_REPORT_VERSION,
+    force_hierarchical: bool = False,
+    final_request_utf8_bytes: (
+        Callable[[dict[str, Any], dict[str, Any]], int] | None
+    ) = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return direct input or a complete hierarchical evidence digest."""
+
+    window = await _final_model_input_window(model=target_model)
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    payload_bytes = len(serialized.encode("utf-8"))
+    window_bytes = int(window["input_utf8_window"])
+    if final_request_utf8_bytes is None:
+        final_request_utf8_bytes = lambda candidate, envelope: (
+            _structured_provider_request_utf8_bytes(
+                model=target_model,
+                model_envelope=envelope,
+                system=system,
+                user_payload=candidate,
+                schema=FINAL_REPORT_SCHEMA,
+                schema_name="aiv_final_report",
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+        )
+    direct_request_bytes = final_request_utf8_bytes(
+        payload,
+        window["model_envelope"],
+    )
+    tracks_answer_corpus = isinstance(
+        payload.get("selected_full_answers"),
+        list,
+    )
+    if not force_hierarchical and direct_request_bytes <= window_bytes:
+        direct_accounting: dict[str, Any] | None = None
+        direct_accounting_artifact_key: str | None = None
+        if tracks_answer_corpus:
+            direct_accounting = _final_direct_answer_accounting_manifest(
+                payload
+            )
+            direct_accounting_artifact_key = (
+                artifact_namespace
+                + "_answer_accounting_direct_"
+                + str(direct_accounting["manifest_sha256"])[:20]
+            )
+            await _save_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=direct_accounting_artifact_key,
+                status="completed",
+                input_json={
+                    "version": FINAL_ANSWER_ACCOUNTING_VERSION,
+                    "source_payload_sha256": direct_accounting[
+                        "source_payload_sha256"
+                    ],
+                    "route": "direct_single_provider_post",
+                },
+                output_json=direct_accounting,
+                prompt_version=prompt_version,
+            )
+        direct_plan = {
+            **window,
+            "mode": "direct",
+            "target_model": target_model,
+            "source_payload_sha256": _stable_json_sha256(payload),
+            "source_payload_utf8_bytes": payload_bytes,
+            "model_request_utf8_bytes": direct_request_bytes,
+            "source_unit_count": 1,
+            "coverage_complete": True,
+        }
+        if direct_accounting is not None:
+            direct_plan["answer_accounting"] = {
+                "artifact_key": direct_accounting_artifact_key,
+                "sha256": direct_accounting["manifest_sha256"],
+                "answer_count": direct_accounting["answer_count"],
+                "accounted_answer_count": direct_accounting[
+                    "accounted_answer_count"
+                ],
+                "raw_text_answer_count": direct_accounting[
+                    "raw_text_answer_count"
+                ],
+                "request_payload_occurrences_per_raw_answer": 1,
+                "provider_submission_proof": direct_accounting[
+                    "provider_submission_proof"
+                ],
+            }
+        return payload, direct_plan
+
+    map_system = f"""
+Ты evidence-mapper итогового отчёта AI visibility. Передан code-owned пакет
+JSON Pointer leaf-значений из полного payload. Извлеки только подтверждённые
+управленчески значимые наблюдения, точные числа, ограничения и действия.
+Нельзя додумывать пропущенный контекст или пересчитывать метрики. Поле
+source_paths должно быть точным уникальным набором source_path для всех
+перечисленных в том же observation source_unit_id. Для длинной строки
+semantic overlap нужен лишь для смысла; факт принадлежит core. Сохраняй каждое
+critical/important наблюдение. Supporting-факты можно синтезировать компактно.
+Не показывай служебные hashes пользователю. Каждый source_unit_id должен ровно
+один раз присутствовать в unit_coverage и хотя бы в одном observation; если
+значимого вывода нет, создай supporting observation с фактическим содержанием
+этого source unit. source_claims — более мелкий code-owned реестр точных
+фрагментов core. Для каждого claim_id создай отдельный observation: в массивах
+source_claim_ids, source_unit_ids и source_paths этой строки должно быть ровно
+по одному значению. Объединять несколько claims в одном observation нельзя:
+иначе теряется их индивидуальная связь statement/evidence. Каждый claim_id
+должен ровно один раз встретиться в observations и ровно один раз в
+claim_coverage вместе с неизменным excerpt_sha256. evidence_excerpt копируй
+дословно из соответствующего source_claim; пустая цитата разрешена только для
+пустого claim. В statement сохрани все явные числа, проценты, URL, сущности,
+статусы, оговорки и редкие маркеры именно этого claim. Покрытие claim доказывает
+учёт фрагмента, но само по себе не разрешает заявлять, что его смысл понят.
+У каждого source_claim есть code-owned domain_context. analysis_dimension
+различает техническую доступность, пользовательский prompt, raw-ответ,
+безбрендовое обнаружение, портфель, рекомендацию, конкурента, знание бренда,
+web/memory, INTENT и citations. domain_context_id связывает prompt, ответ,
+аннотацию и источники одной и той же проверки; не смешивай одноимённые факты
+разных моделей, режимов или сценариев. Длинный prompt/answer не копируется в
+этот header: его точные claims поступают отдельно и обязаны быть учтены.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    mapper_window = await _final_model_input_window(model=PROCESSING_MODEL)
+    mapper_window_bytes = int(mapper_window["input_utf8_window"])
+    target_chars = min(
+        FINAL_INPUT_MAP_UNIT_CHARS,
+        max(256, mapper_window_bytes // 12),
+    )
+    while True:
+        context_overlap_chars = min(1_024, max(64, target_chars // 4))
+        units, manifest = _flatten_final_input_payload(
+            payload,
+            target_chars=target_chars,
+            context_overlap_chars=context_overlap_chars,
+        )
+        (
+            claim_rows,
+            claim_objects_by_id,
+            claim_ids_by_unit,
+            claim_ledger,
+        ) = _final_input_claim_ledger(
+            units,
+            source_payload=payload,
+        )
+        claim_row_by_id = {
+            str(item["claim_id"]): item for item in claim_rows
+        }
+        source_payload_sha256 = str(manifest["source_payload_sha256"])
+
+        def claims_for_pack(
+            pack: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            claim_ids = [
+                claim_id
+                for unit in pack
+                for claim_id in claim_ids_by_unit[
+                    str(unit["source_unit_id"])
+                ]
+            ]
+            return [claim_row_by_id[claim_id] for claim_id in claim_ids]
+
+        def map_request_bytes(
+            index: int,
+            pack: list[dict[str, Any]],
+            source_digest: str = source_payload_sha256,
+        ) -> int:
+            return _structured_provider_request_utf8_bytes(
+                model=PROCESSING_MODEL,
+                model_envelope=mapper_window["model_envelope"],
+                system=map_system,
+                user_payload={
+                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
+                    "source_payload_sha256": source_digest,
+                    "source_units": pack,
+                    "source_claims": claims_for_pack(pack),
+                },
+                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
+                schema_name=f"aiv_final_input_map_{index}",
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+
+        if all(
+            map_request_bytes(index, [unit]) <= mapper_window_bytes
+            for index, unit in enumerate(units, start=1)
+        ):
+            break
+        if target_chars <= 256:
+            raise OpenRouterError(
+                "Final input mapper has no room for one minimum source unit "
+                "after exact wrapper, system and schema overhead"
+            )
+        target_chars = max(256, target_chars // 2)
+
+    deterministic_passthrough = _final_input_deterministic_passthrough(units)
+    answer_accounting = (
+        _final_answer_accounting_manifest(payload, claim_rows)
+        if tracks_answer_corpus
+        else None
+    )
+    manifest_artifact_key = (
+        artifact_namespace
+        + "_manifest_"
+        + manifest["source_payload_sha256"][:20]
+    )
+    await _save_artifact(
+        run_id,
+        stage_key=stage_key,
+        artifact_key=manifest_artifact_key,
+        status="completed",
+        input_json={
+            "version": FINAL_INPUT_HARNESS_VERSION,
+            "source_payload_sha256": manifest["source_payload_sha256"],
+        },
+        output_json=manifest,
+        prompt_version=prompt_version,
+    )
+    answer_accounting_artifact_key: str | None = None
+    if answer_accounting is not None:
+        answer_accounting_artifact_key = (
+            artifact_namespace
+            + "_answer_accounting_"
+            + str(answer_accounting["manifest_sha256"])[:20]
+        )
+        await _save_artifact(
+            run_id,
+            stage_key=stage_key,
+            artifact_key=answer_accounting_artifact_key,
+            status="completed",
+            input_json={
+                "version": FINAL_ANSWER_ACCOUNTING_VERSION,
+                "source_payload_sha256": manifest["source_payload_sha256"],
+                "claim_ledger_sha256": claim_ledger["ledger_sha256"],
+            },
+            output_json=answer_accounting,
+            prompt_version=prompt_version,
+        )
+    claim_ledger_artifact_key = (
+        artifact_namespace
+        + "_claim_ledger_"
+        + str(claim_ledger["ledger_sha256"])[:20]
+    )
+    await _save_artifact(
+        run_id,
+        stage_key=stage_key,
+        artifact_key=claim_ledger_artifact_key,
+        status="completed",
+        input_json={
+            "version": FINAL_INPUT_HARNESS_VERSION,
+            "source_payload_sha256": manifest["source_payload_sha256"],
+            "claim_ledger_sha256": claim_ledger["ledger_sha256"],
+        },
+        output_json=claim_ledger,
+        prompt_version=prompt_version,
+    )
+    packs = _pack_final_input_units(
+        units,
+        window_bytes=mapper_window_bytes,
+        request_utf8_bytes=map_request_bytes,
+    )
+    max_mapper_request_bytes = max(
+        map_request_bytes(index, pack)
+        for index, pack in enumerate(packs, start=1)
+    )
+    unit_path_by_id = {
+        str(unit["source_unit_id"]): str(unit["source_path"])
+        for unit in units
+    }
+    semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
+
+    async def map_pack(index: int, pack: list[dict[str, Any]]) -> dict[str, Any]:
+        unit_ids = [str(item["source_unit_id"]) for item in pack]
+        digest = _stable_json_sha256(unit_ids)[:20]
+        async with semaphore:
+            result = await _structured_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=f"{artifact_namespace}_map_{digest}",
+                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
+                schema_name=f"aiv_final_input_map_{index}",
+                system=map_system,
+                user_payload={
+                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
+                    "source_payload_sha256": manifest[
+                        "source_payload_sha256"
+                    ],
+                    "source_units": pack,
+                    "source_claims": claims_for_pack(pack),
+                },
+                model=PROCESSING_MODEL,
+                reasoning_effort="high",
+                prompt_version=prompt_version,
+            )
+        normalized = _normalize_final_evidence_packet(
+            result,
+            allowed_unit_paths={
+                str(item["source_unit_id"]): str(item["source_path"])
+                for item in pack
+            },
+            allowed_claims={
+                str(item["claim_id"]): item
+                for item in claims_for_pack(pack)
+            },
+            claim_objects={
+                claim_id: claim_objects_by_id[claim_id]
+                for item in pack
+                for claim_id in claim_ids_by_unit[
+                    str(item["source_unit_id"])
+                ]
+            },
+        )
+        return _long_response_leaf(normalized, unit_ids)
+
+    outcomes = await asyncio.gather(
+        *(map_pack(index, pack) for index, pack in enumerate(packs, start=1)),
+        return_exceptions=True,
+    )
+    packets: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        packets.append(outcome)
+
+    reduce_system = f"""
+Ты иерархический reducer evidence-пакетов AI visibility. Синтезируй дубли и
+связанные наблюдения, но не теряй critical/important факт, точное число,
+ограничение или действие. source_paths оставляй только из входных пакетов.
+В каждом observation поле source_paths должно быть точным уникальным набором
+путей для всех перечисленных там же source_unit_id.
+Нельзя пересчитывать метрики, повышать уверенность или превращать unknown в
+ноль. Supporting-наблюдения можно синтезировать по смыслу, но каждая выходная
+строка по-прежнему должна относиться ровно к одному claim_id, одному
+source_unit_id и одному source_path. Верни ту же строгую схему.
+Каждый входной source_unit_id сохрани ровно один раз в unit_coverage и хотя бы
+в одном observation: ни один leaf нельзя молча удалить. То же относится к
+source_claim_ids и claim_coverage: каждый входной claim_id должен сохраниться
+ровно один раз с исходным excerpt_sha256. Не объединяй claims в одной строке.
+evidence_excerpt оставляй дословной цитатой соответствующего единственного
+claim, а не пересказом. Сохраняй analysis_dimension и domain_context_id,
+которые код привязал к claim: это join key для последующего тематического
+сжатия, а не повод объединять claim receipts.
+
+{LIVE_RUSSIAN_RULES}
+""".strip()
+    reducer_window = await _final_model_input_window(model=ANALYSIS_MODEL)
+    reducer_window_bytes = int(reducer_window["input_utf8_window"])
+    level = 0
+    max_reducer_request_bytes = 0
+    terminal_reducer_mode: str | None = None
+    while len(packets) > 1:
+        def reducer_request_bytes(
+            group_index: int,
+            group: list[dict[str, Any]],
+            current_level: int = level,
+        ) -> int:
+            return _structured_provider_request_utf8_bytes(
+                model=ANALYSIS_MODEL,
+                model_envelope=reducer_window["model_envelope"],
+                system=reduce_system,
+                user_payload={
+                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
+                    "source_payload_sha256": manifest[
+                        "source_payload_sha256"
+                    ],
+                    "evidence_packets": group,
+                },
+                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
+                schema_name=(
+                    f"aiv_final_input_reduce_{current_level}_{group_index}"
+                ),
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+
+        groups = _pack_final_evidence_packets(
+            packets,
+            window_bytes=reducer_window_bytes,
+            request_utf8_bytes=reducer_request_bytes,
+        )
+        group_request_bytes = [
+            reducer_request_bytes(group_index, group)
+            for group_index, group in enumerate(groups, start=1)
+        ]
+        fitting_group_request_bytes = [
+            value for value in group_request_bytes if value <= reducer_window_bytes
+        ]
+        if fitting_group_request_bytes:
+            max_reducer_request_bytes = max(
+                max_reducer_request_bytes,
+                *fitting_group_request_bytes,
+            )
+        if len(groups) >= len(packets):
+            lineage = _long_response_lineage(packets)
+            lineage_claim_ids = [
+                claim_id
+                for unit_id in lineage
+                for claim_id in claim_ids_by_unit[unit_id]
+            ]
+            terminal = _deterministic_final_evidence_union(packets)
+            terminal = _normalize_final_evidence_packet(
+                terminal,
+                allowed_unit_paths={
+                    unit_id: unit_path_by_id[unit_id]
+                    for unit_id in lineage
+                },
+                allowed_claims={
+                    claim_id: claim_row_by_id[claim_id]
+                    for claim_id in lineage_claim_ids
+                },
+                claim_objects={
+                    claim_id: claim_objects_by_id[claim_id]
+                    for claim_id in lineage_claim_ids
+                },
+            )
+            packets = [_long_response_leaf(terminal, lineage)]
+            terminal_reducer_mode = "deterministic_lossless_union"
+            break
+
+        async def reduce_group(
+            group_index: int,
+            group: list[dict[str, Any]],
+            current_level: int = level,
+        ) -> dict[str, Any]:
+            inputs = group
+            lineage = _long_response_lineage(inputs)
+            lineage_claim_ids = [
+                claim_id
+                for unit_id in lineage
+                for claim_id in claim_ids_by_unit[unit_id]
+            ]
+            digest = _stable_json_sha256(lineage)[:20]
+            merged = await _structured_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=(
+                    f"{artifact_namespace}_reduce_l{current_level}_"
+                    f"{group_index}_{digest}"
+                ),
+                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
+                schema_name=(
+                    f"aiv_final_input_reduce_{current_level}_{group_index}"
+                ),
+                system=reduce_system,
+                user_payload={
+                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
+                    "source_payload_sha256": manifest[
+                        "source_payload_sha256"
+                    ],
+                    "evidence_packets": inputs,
+                },
+                model=ANALYSIS_MODEL,
+                reasoning_effort="high",
+                prompt_version=prompt_version,
+            )
+            normalized = _normalize_final_evidence_packet(
+                merged,
+                allowed_unit_paths={
+                    unit_id: unit_path_by_id[unit_id]
+                    for unit_id in lineage
+                },
+                allowed_claims={
+                    claim_id: claim_row_by_id[claim_id]
+                    for claim_id in lineage_claim_ids
+                },
+                claim_objects={
+                    claim_id: claim_objects_by_id[claim_id]
+                    for claim_id in lineage_claim_ids
+                },
+            )
+            normalized = _preserve_final_evidence_reduction(
+                normalized,
+                inputs,
+            )
+            return _long_response_leaf(normalized, lineage)
+
+        reduced = await asyncio.gather(
+            *(
+                reduce_group(group_index, group)
+                for group_index, group in enumerate(groups, start=1)
+            ),
+            return_exceptions=True,
+        )
+        packets = []
+        for outcome in reduced:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            packets.append(outcome)
+        level += 1
+
+    complete_lineage = _long_response_lineage(
+        packets,
+        expected_unit_ids=[str(item["source_unit_id"]) for item in units],
+    )
+    final_packet = copy.deepcopy(packets[0])
+    final_packet.pop(_LONG_RESPONSE_LINEAGE_KEY, None)
+    model_payload = {
+        "long_input_contract": {
+            "version": FINAL_INPUT_HARNESS_VERSION,
+            "mode": "hierarchical_evidence_tree",
+            "source_payload_sha256": manifest["source_payload_sha256"],
+            "source_payload_utf8_bytes": manifest[
+                "source_payload_utf8_bytes"
+            ],
+            "source_unit_count": manifest["source_unit_count"],
+            "covered_unit_count": len(complete_lineage),
+            "source_claim_count": len(claim_rows),
+            "covered_claim_count": len(
+                final_packet.get("claim_coverage") or []
+            ),
+            "coverage_complete": True,
+            "deterministic_passthrough_value_count": len(
+                deterministic_passthrough
+            ),
+            "deterministic_passthrough_sha256": _stable_json_sha256(
+                deterministic_passthrough
+            ),
+            "source_manifest": {
+                "artifact_key": manifest_artifact_key,
+                "source_unit_ids_sha256": manifest[
+                    "source_unit_ids_sha256"
+                ],
+            },
+            "claim_ledger": {
+                "artifact_key": claim_ledger_artifact_key,
+                "sha256": claim_ledger["ledger_sha256"],
+                "claim_ids_sha256": claim_ledger[
+                    "claim_ids_sha256"
+                ],
+                "contract": (
+                    "byte_exact_coverage_and_lineage_not_semantic_"
+                    "understanding"
+                ),
+            },
+            "answer_accounting": {
+                "artifact_key": answer_accounting_artifact_key,
+                "sha256": answer_accounting["manifest_sha256"],
+                "answer_count": answer_accounting["answer_count"],
+                "accounted_answer_count": answer_accounting[
+                    "accounted_answer_count"
+                ],
+                "raw_text_answer_count": answer_accounting[
+                    "raw_text_answer_count"
+                ],
+                "raw_reconstruction_complete": answer_accounting[
+                    "raw_reconstruction_complete"
+                ],
+                "claim_assignment_complete": answer_accounting[
+                    "claim_assignment_complete"
+                ],
+            }
+            if answer_accounting is not None
+            else {
+                "applicable": False,
+                "reason": "payload_has_no_selected_full_answers",
+            },
+            "instruction": (
+                "Все leaf-значения исходного payload обработаны. Evidence "
+                "digest — производная интерпретация; числа не пересчитывать, "
+                "unknown не превращать в ноль. Значения из "
+                "deterministic_passthrough.values извлечены кодом напрямую "
+                "из источника, имеют приоритет над пересказом mapper и не "
+                "должны теряться в выводах."
+            ),
+        },
+        "evidence_digest": final_packet,
+        "deterministic_passthrough": {
+            "contract": "code_owned_exact_scalar_values_v1",
+            "values": deterministic_passthrough,
+        },
+    }
+    final_model_payload_mode = "hierarchical_evidence_tree"
+    terminal_ledger_artifact_key: str | None = None
+    bounded_root_plan: dict[str, Any] | None = None
+    model_request_bytes = final_request_utf8_bytes(
+        model_payload,
+        window["model_envelope"],
+    )
+    if model_request_bytes > window_bytes:
+        canonical_model_payload = model_payload
+        terminal_ledger_sha256 = _stable_json_sha256(model_payload)
+        terminal_ledger_artifact_key = (
+            f"{artifact_namespace}_terminal_ledger_"
+            f"{terminal_ledger_sha256[:20]}"
+        )
+        await _save_artifact(
+            run_id,
+            stage_key=stage_key,
+            artifact_key=terminal_ledger_artifact_key,
+            status="completed",
+            input_json={
+                "version": FINAL_INPUT_HARNESS_VERSION,
+                "source_payload_sha256": manifest["source_payload_sha256"],
+                "terminal_ledger_sha256": terminal_ledger_sha256,
+            },
+            output_json=model_payload,
+            prompt_version=prompt_version,
+        )
+        model_payload = _compact_final_evidence_model_payload(
+            model_payload,
+            complete_lineage=complete_lineage,
+            unit_path_by_id=unit_path_by_id,
+            claim_rows=claim_rows,
+            terminal_ledger_artifact_key=terminal_ledger_artifact_key,
+            terminal_ledger_sha256=terminal_ledger_sha256,
+        )
+        final_model_payload_mode = (
+            "hierarchical_evidence_tree_compact_ledger"
+        )
+        model_request_bytes = final_request_utf8_bytes(
+            model_payload,
+            window["model_envelope"],
+        )
+        if model_request_bytes > window_bytes:
+            model_payload, bounded_root_plan = (
+                await _build_bounded_final_root_payload(
+                    run_id,
+                    canonical_payload=canonical_model_payload,
+                    source_claim_rows=claim_rows,
+                    target_window=window,
+                    target_window_bytes=window_bytes,
+                    final_request_utf8_bytes=final_request_utf8_bytes,
+                    stage_key=stage_key,
+                    artifact_namespace=artifact_namespace,
+                    prompt_version=prompt_version,
+                    terminal_ledger_artifact_key=(
+                        terminal_ledger_artifact_key
+                    ),
+                    terminal_ledger_sha256=terminal_ledger_sha256,
+                )
+            )
+            final_model_payload_mode = (
+                "bounded_transitive_evidence_tree"
+            )
+            model_request_bytes = int(
+                bounded_root_plan["model_request_utf8_bytes"]
+            )
+    return model_payload, {
+        **window,
+        "mode": final_model_payload_mode,
+        "target_model": target_model,
+        "source_payload_sha256": manifest["source_payload_sha256"],
+        "source_payload_utf8_bytes": manifest["source_payload_utf8_bytes"],
+        "source_unit_count": manifest["source_unit_count"],
+        "map_leaf_count": len(packs),
+        "reduce_levels": level,
+        "mapper_window": mapper_window,
+        "mapper_request_window_utf8_bytes": mapper_window_bytes,
+        "mapper_max_request_utf8_bytes": max_mapper_request_bytes,
+        "reducer_window": reducer_window,
+        "reducer_request_window_utf8_bytes": reducer_window_bytes,
+        "reducer_max_request_utf8_bytes": max_reducer_request_bytes,
+        "terminal_reducer_mode": terminal_reducer_mode,
+        "source_manifest_artifact_key": manifest_artifact_key,
+        "claim_ledger_artifact_key": claim_ledger_artifact_key,
+        "answer_accounting_artifact_key": answer_accounting_artifact_key,
+        "answer_count": (
+            answer_accounting["answer_count"]
+            if answer_accounting is not None
+            else None
+        ),
+        "accounted_answer_count": (
+            answer_accounting["accounted_answer_count"]
+            if answer_accounting is not None
+            else None
+        ),
+        "raw_text_answer_count": (
+            answer_accounting["raw_text_answer_count"]
+            if answer_accounting is not None
+            else None
+        ),
+        "raw_reconstruction_complete": (
+            answer_accounting["raw_reconstruction_complete"]
+            if answer_accounting is not None
+            else None
+        ),
+        "source_claim_count": len(claim_rows),
+        "covered_claim_count": len(
+            final_packet.get("claim_coverage") or []
+        ),
+        "terminal_ledger_artifact_key": terminal_ledger_artifact_key,
+        "bounded_root_plan": bounded_root_plan,
+        "coverage_complete": True,
+        "transport_coverage_complete": True,
+        "mandatory_fact_coverage_complete": (
+            True if bounded_root_plan is not None else None
+        ),
+        "semantic_completeness_proven": False,
+        "model_payload_utf8_bytes": len(
+            json.dumps(model_payload, ensure_ascii=False).encode("utf-8")
+        ),
+        "model_request_utf8_bytes": model_request_bytes,
+    }
+
+
 def _final_input_preflight(
     payload: dict[str, Any],
     *,
     token_budget: int | None = None,
     reserve_tokens: int = 0,
+    physical_input_token_window: int | None = None,
 ) -> dict[str, Any]:
     """Conservatively estimate the complete user payload before the API call."""
 
     serialized = json.dumps(payload, ensure_ascii=False)
     serialized_bytes = len(serialized.encode("utf-8"))
-    estimated_tokens = math.ceil(serialized_bytes / 3)
+    # Physical admission must not depend on a language-sensitive bytes/token
+    # average.  Treat each exact serialized UTF-8 byte as one possible token;
+    # the full provider wrapper is measured separately by the input harness.
+    estimated_tokens = serialized_bytes
     budget = (
         settings.FINAL_INPUT_TOKEN_BUDGET
         if token_budget is None
         else token_budget
     )
-    accepted = (
+    budget_enabled = bool(
         isinstance(budget, int)
+        and not isinstance(budget, bool)
         and budget > 0
-        and isinstance(reserve_tokens, int)
-        and reserve_tokens >= 0
-        and estimated_tokens + reserve_tokens <= budget
+    )
+    if (
+        isinstance(reserve_tokens, bool)
+        or not isinstance(reserve_tokens, int)
+        or reserve_tokens < 0
+    ):
+        raise ValueError("reserve_tokens must be a non-negative integer")
+    legacy_budget_would_accept = bool(
+        not budget_enabled
+        or estimated_tokens + reserve_tokens <= int(budget)
+    )
+    physical_direct_fit = bool(
+        physical_input_token_window is None
+        or estimated_tokens + reserve_tokens <= physical_input_token_window
     )
     selection_manifest = payload.get("answer_selection_manifest")
     if not isinstance(selection_manifest, dict):
         selection_manifest = {}
     return {
-        "state": "complete" if accepted else "limited",
-        "accepted": accepted,
+        # The former local budget is diagnostics-only.  It may still be set in
+        # an old environment, but it can no longer reject or truncate a
+        # meaningful document before the model sees it.
+        "state": "direct" if physical_direct_fit else "partition_required",
+        "accepted": True,
         "payload_sha256": hashlib.sha256(
             serialized.encode("utf-8")
         ).hexdigest(),
         "serialized_utf8_bytes": serialized_bytes,
         "estimated_input_tokens": estimated_tokens,
-        "input_token_budget": budget,
+        "input_token_budget": budget if budget_enabled else None,
+        "legacy_budget_would_accept": legacy_budget_would_accept,
+        "budget_enforcement": "disabled_diagnostics_only",
+        "physical_input_token_window": physical_input_token_window,
+        "physical_direct_fit": physical_direct_fit,
+        "routing_contract": (
+            "direct"
+            if physical_direct_fit
+            else "lossless_hierarchical_evidence_tree_required"
+        ),
         "repair_reserve_tokens": reserve_tokens,
         "estimated_headroom_tokens": (
             budget - estimated_tokens - reserve_tokens
-            if isinstance(budget, int) and budget > 0
+            if budget_enabled
             else None
         ),
         "selection_digest": selection_manifest.get("digest"),
@@ -16597,14 +29595,2349 @@ def _final_input_preflight(
         "selected_full_text_count": selection_manifest.get(
             "selected_full_text_count"
         ),
+        "selected_limited_prefix_count": selection_manifest.get(
+            "selected_limited_prefix_count"
+        ),
         "selected_metadata_only_count": selection_manifest.get(
             "selected_metadata_only_count"
         ),
         "selection_coverage_complete": selection_manifest.get(
             "coverage_complete"
         ),
-        "estimation_contract": "ceil(serialized_utf8_bytes / 3)",
+        "estimation_contract": (
+            "conservative_upper_bound:1_serialized_utf8_byte_per_token"
+        ),
     }
+
+
+def _final_report_shard_source_records(
+    model_payload: dict[str, Any],
+    *,
+    claim_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Project a bounded evidence payload into independent narrative records.
+
+    The first record is the only global synthesis task.  Every following
+    record owns exactly one observation, uncertainty, focus item, exact
+    scalar, source claim or atomic fact.  There is no record-count ceiling:
+    the number of report shards is a deterministic consequence of the exact
+    evidence and claim ledgers.
+    """
+
+    records: list[dict[str, Any]] = []
+
+    def append(
+        kind: str,
+        value: Any,
+        *,
+        lineage: dict[str, Any] | None = None,
+        claim_contracts: list[dict[str, Any]] | None = None,
+        fact_contracts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        ordinal = len(records)
+        source = {
+            "kind": kind,
+            "ordinal": ordinal,
+            "value": copy.deepcopy(value),
+            "lineage": copy.deepcopy(lineage or {}),
+            "claim_contracts": copy.deepcopy(claim_contracts or []),
+            "fact_contracts": copy.deepcopy(fact_contracts or []),
+        }
+        digest = _stable_json_sha256(source)
+        records.append(
+            {
+                **source,
+                "source_shard_id": (
+                    f"{kind}-{ordinal:06d}-{digest[:16]}"
+                ),
+                "source_sha256": digest,
+            }
+        )
+
+    append(
+        "executive_core",
+        model_payload,
+        lineage={"contract": "complete_bounded_model_payload"},
+    )
+    evidence = model_payload.get("evidence_digest")
+    if not isinstance(evidence, dict):
+        raise OpenRouterError(
+            "Sharded final report has no structured evidence digest"
+        )
+
+    def append_packet(
+        packet: dict[str, Any],
+        *,
+        node_id: str | None,
+        node_index: int | None,
+    ) -> None:
+        lineage_base = {
+            "root_node_id": node_id,
+            "root_node_index": node_index,
+        }
+        for field, kind in (
+            ("observations", "observation"),
+            ("uncertainties", "uncertainty"),
+            ("report_focus", "report_focus"),
+        ):
+            items = packet.get(field) or []
+            if not isinstance(items, list):
+                raise OpenRouterError(
+                    f"Sharded final evidence field {field} is invalid"
+                )
+            for item_index, item in enumerate(items):
+                append(
+                    kind,
+                    item,
+                    lineage={
+                        **lineage_base,
+                        "source_field": field,
+                        "source_index": item_index,
+                    },
+                )
+
+    root_nodes = evidence.get("root_nodes")
+    if isinstance(root_nodes, list):
+        for node_index, node in enumerate(root_nodes):
+            if not isinstance(node, dict) or not isinstance(
+                node.get("summary"),
+                dict,
+            ):
+                raise OpenRouterError(
+                    "Sharded final bounded-root node has no summary"
+                )
+            append_packet(
+                node["summary"],
+                node_id=str(node.get("source_node_id") or ""),
+                node_index=node_index,
+            )
+    else:
+        append_packet(evidence, node_id=None, node_index=None)
+        passthrough_container = model_payload.get(
+            "deterministic_passthrough"
+        )
+        passthrough = (
+            passthrough_container.get("values")
+            if isinstance(passthrough_container, dict)
+            else []
+        )
+        if not isinstance(passthrough, list):
+            raise OpenRouterError(
+                "Sharded final exact-scalar ledger is invalid"
+            )
+        for item_index, item in enumerate(passthrough):
+            append(
+                "exact_scalar",
+                item,
+                lineage={
+                    "source_field": "deterministic_passthrough.values",
+                    "source_index": item_index,
+                },
+            )
+
+    seen_claim_ids: set[str] = set()
+    seen_fact_refs: set[str] = set()
+    for claim_index, claim in enumerate(claim_rows or []):
+        if not isinstance(claim, dict):
+            raise OpenRouterError(
+                "Sharded final claim ledger contains a non-object row"
+            )
+        claim_id = str(claim.get("claim_id") or "")
+        excerpt = claim.get("excerpt")
+        excerpt_sha256 = str(claim.get("excerpt_sha256") or "")
+        source_path = str(claim.get("source_path") or "")
+        domain_context = _validate_final_domain_context(
+            claim.get("domain_context")
+        )
+        if (
+            not claim_id
+            or claim_id in seen_claim_ids
+            or not isinstance(excerpt, str)
+            or text_sha256(excerpt) != excerpt_sha256
+            or not source_path
+        ):
+            raise OpenRouterError(
+                "Sharded final claim ledger has duplicate or corrupt rows"
+            )
+        seen_claim_ids.add(claim_id)
+        bindings = _final_root_leaf_fact_bindings(
+            entry={
+                "kind": "exact_source_claim",
+                "binding_source_path": source_path,
+                "binding_claim_id": claim_id,
+            },
+            child_id=claim_id,
+            context_text=excerpt,
+            core_start=0,
+            core_end=len(excerpt),
+        )
+        fact_table = _final_root_fact_table(bindings)
+        visibility_clauses = _final_report_claim_visibility_clauses(excerpt)
+        append(
+            "exact_claim",
+            {
+                "claim_id": claim_id,
+                "source_path": source_path,
+                "source_unit_id": str(claim.get("source_unit_id") or ""),
+                "fragment_index": claim.get("fragment_index"),
+                "fragment_count": claim.get("fragment_count"),
+                "excerpt": excerpt,
+                "excerpt_sha256": excerpt_sha256,
+                "analysis_dimension": domain_context[
+                    "analysis_dimension"
+                ],
+                "domain_context": domain_context,
+            },
+            lineage={
+                "contract": "exact_claim_and_atomic_fact_author_input_v1",
+                "claim_index": claim_index,
+                "source_path": source_path,
+                "domain_context_id": domain_context[
+                    "domain_context_id"
+                ],
+            },
+            claim_contracts=[
+                {
+                    "claim_id": claim_id,
+                    "excerpt_sha256": excerpt_sha256,
+                    "excerpt": excerpt,
+                    "visibility_clauses": visibility_clauses,
+                }
+            ],
+        )
+        # A 4 KiB source claim can legitimately contain thousands of numeric
+        # atoms.  Never turn that into one oversized mandatory-fact table:
+        # every atomic fact gets its own independently receipted author shard.
+        # The number of shards is unbounded; each physical request stays
+        # bounded by one source fact and its code-owned provenance.
+        for fact_index, (binding, row) in enumerate(
+            zip(bindings, fact_table["rows"], strict=True)
+        ):
+            fact_ref = str(row[0])
+            if fact_ref in seen_fact_refs:
+                raise OpenRouterError(
+                    "Sharded final claim ledger generated a duplicate fact ref"
+                )
+            seen_fact_refs.add(fact_ref)
+            assertion_candidates = _final_root_fact_assertion_candidates(
+                binding
+            )
+            if not assertion_candidates:
+                raise OpenRouterError(
+                    "Sharded final atomic fact has no exact assertion candidate"
+                )
+            fact_contract = {
+                "fact_ref": fact_ref,
+                "binding_sha256": _stable_json_sha256(binding),
+                "assertion_candidates": assertion_candidates,
+            }
+            append(
+                "exact_fact",
+                {
+                    "claim_id": claim_id,
+                    "source_path": source_path,
+                    "excerpt_sha256": excerpt_sha256,
+                    "analysis_dimension": domain_context[
+                        "analysis_dimension"
+                    ],
+                    "domain_context": domain_context,
+                    "mandatory_fact_table": {
+                        "version": fact_table["version"],
+                        "columns": copy.deepcopy(fact_table["columns"]),
+                        "rows": [copy.deepcopy(row)],
+                    },
+                },
+                lineage={
+                    "contract": "single_atomic_fact_author_input_v1",
+                    "claim_index": claim_index,
+                    "fact_index": fact_index,
+                    "claim_id": claim_id,
+                    "source_path": source_path,
+                    "domain_context_id": domain_context[
+                        "domain_context_id"
+                    ],
+                },
+                fact_contracts=[fact_contract],
+            )
+
+    # An explicitly empty analytical digest is still represented rather than
+    # silently disappearing from coverage.
+    if len(records) == 1:
+        append(
+            "empty_evidence_contract",
+            {
+                "statement": (
+                    "В подготовленном evidence digest нет отдельных "
+                    "содержательных записей."
+                )
+            },
+        )
+    return records
+
+
+def _final_report_capsule_group_key(record: dict[str, Any]) -> tuple[str, str]:
+    """Return a deterministic semantic join key for one atomic author input."""
+
+    lineage = (
+        record.get("lineage")
+        if isinstance(record.get("lineage"), dict)
+        else {}
+    )
+    value = record.get("value") if isinstance(record.get("value"), dict) else {}
+    domain_context = (
+        value.get("domain_context")
+        if isinstance(value.get("domain_context"), dict)
+        else {}
+    )
+    context_id = str(
+        lineage.get("domain_context_id")
+        or value.get("domain_context_id")
+        or domain_context.get("domain_context_id")
+        or lineage.get("root_node_id")
+        or ""
+    )
+    dimension = str(
+        value.get("analysis_dimension")
+        or domain_context.get("analysis_dimension")
+        or "context"
+    )
+    if (
+        domain_context.get("context_kind") == "model_answer"
+        and context_id
+    ):
+        # Keep the user's prompt, the model response, annotations and
+        # citations in one semantic bundle whenever the physical envelope
+        # permits it.  Their individual AI Visibility dimensions remain on
+        # each member; this key only prevents a full prompt-answer exemplar
+        # from being needlessly split into unrelated author calls.
+        return context_id, "model_answer_bundle"
+    if dimension not in FINAL_ANALYSIS_DIMENSIONS:
+        dimension = "context"
+    if not context_id:
+        # The key is content-addressed and bounded; it never copies a growing
+        # global allowlist into each capsule.
+        context_id = "record-" + text_sha256(
+            json.dumps(
+                {
+                    "kind": record.get("kind"),
+                    "lineage": lineage,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )[:24]
+    return context_id, dimension
+
+
+def _final_report_capsule_record(
+    members: list[dict[str, Any]],
+    *,
+    ordinal: int,
+    prompt_join_context: dict[str, Any] | None = None,
+    answer_join_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal one cohesive, bounded author capsule over atomic source rows."""
+
+    if not members:
+        raise OpenRouterError("Final report capsule cannot be empty")
+    group_keys = {_final_report_capsule_group_key(item) for item in members}
+    if len(group_keys) != 1:
+        raise OpenRouterError(
+            "Final report capsule mixed unrelated semantic contexts"
+        )
+    context_id, dimension = next(iter(group_keys))
+    claim_contracts = [
+        copy.deepcopy(contract)
+        for member in members
+        for contract in member.get("claim_contracts") or []
+    ]
+    fact_contracts = [
+        copy.deepcopy(contract)
+        for member in members
+        for contract in member.get("fact_contracts") or []
+    ]
+    claim_ids = [str(item.get("claim_id") or "") for item in claim_contracts]
+    fact_refs = [str(item.get("fact_ref") or "") for item in fact_contracts]
+    if (
+        any(not value for value in claim_ids + fact_refs)
+        or len(claim_ids) != len(set(claim_ids))
+        or len(fact_refs) != len(set(fact_refs))
+    ):
+        raise OpenRouterError(
+            "Final report capsule duplicated a claim or atomic fact"
+        )
+    member_views = [
+        {
+            key: copy.deepcopy(member.get(key))
+            for key in (
+                "kind",
+                "ordinal",
+                "value",
+                "lineage",
+                "source_shard_id",
+                "source_sha256",
+            )
+        }
+        for member in members
+    ]
+    member_receipts = [
+        {
+            "source_shard_id": str(member.get("source_shard_id") or ""),
+            "source_sha256": str(member.get("source_sha256") or ""),
+        }
+        for member in members
+    ]
+    member_dimensions: list[str] = []
+    for member in members:
+        member_value = (
+            member.get("value")
+            if isinstance(member.get("value"), dict)
+            else {}
+        )
+        member_context = (
+            member_value.get("domain_context")
+            if isinstance(member_value.get("domain_context"), dict)
+            else {}
+        )
+        member_dimension = str(
+            member_value.get("analysis_dimension")
+            or member_context.get("analysis_dimension")
+            or "context"
+        )
+        if member_dimension not in member_dimensions:
+            member_dimensions.append(member_dimension)
+    source = {
+        "kind": "domain_capsule",
+        "ordinal": ordinal,
+        "value": {
+            "contract_version": "aiv-final-domain-capsule-v1",
+            "domain_context_id": context_id,
+            "analysis_dimension": dimension,
+            "analysis_dimensions": member_dimensions,
+            "members": member_views,
+            "prompt_join_context": copy.deepcopy(prompt_join_context),
+            "answer_join_context": copy.deepcopy(answer_join_context),
+        },
+        "lineage": {
+            "contract": "ordered_atomic_member_receipts_v1",
+            "domain_context_id": context_id,
+            "analysis_dimension": dimension,
+            "member_count": len(member_receipts),
+            "member_receipts_sha256": _stable_json_sha256(member_receipts),
+            # Only this capsule's members are present.  There is no O(N)
+            # corpus-wide control plane repeated in every provider request.
+            "member_receipts": member_receipts,
+        },
+        "claim_contracts": claim_contracts,
+        "fact_contracts": fact_contracts,
+    }
+    digest = _stable_json_sha256(source)
+    return {
+        **source,
+        "source_shard_id": f"domain_capsule-{ordinal:06d}-{digest[:16]}",
+        "source_sha256": digest,
+    }
+
+
+def _final_report_prompt_join_context(
+    prompt_records: list[dict[str, Any]],
+    *,
+    selected_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return exact bounded prompt text used only to interpret answer shards.
+
+    Prompt claims remain ordinary exact-once members of the global plan.  This
+    join context is a non-disposition copy: it may repeat exact prompt text in
+    later response capsules, but it cannot create a second source receipt or a
+    second reader-visible claim obligation.
+    """
+
+    if not prompt_records or not selected_records:
+        raise OpenRouterError(
+            "Final report answer capsule has no exact prompt join context"
+        )
+    all_receipts: list[dict[str, Any]] = []
+    fragments: list[dict[str, Any]] = []
+    selected_ids = {
+        str(record.get("source_shard_id") or "")
+        for record in selected_records
+    }
+    for record in prompt_records:
+        value = record.get("value") if isinstance(record.get("value"), dict) else {}
+        source_shard_id = str(record.get("source_shard_id") or "")
+        excerpt = value.get("excerpt")
+        excerpt_sha256 = str(value.get("excerpt_sha256") or "")
+        if (
+            not source_shard_id
+            or not isinstance(excerpt, str)
+            or text_sha256(excerpt) != excerpt_sha256
+            or str(value.get("source_path") or "").rsplit("/", 1)[-1]
+            != "scenario"
+        ):
+            raise OpenRouterError(
+                "Final report prompt join fragment failed exact integrity"
+            )
+        all_receipts.append(
+            {
+                "source_shard_id": source_shard_id,
+                "source_sha256": str(record.get("source_sha256") or ""),
+            }
+        )
+        if source_shard_id in selected_ids:
+            fragments.append(
+                {
+                    "source_shard_id": source_shard_id,
+                    "source_path": str(value.get("source_path") or ""),
+                    "claim_id": str(value.get("claim_id") or ""),
+                    "fragment_index": value.get("fragment_index"),
+                    "fragment_count": value.get("fragment_count"),
+                    "excerpt_sha256": excerpt_sha256,
+                    "excerpt": excerpt,
+                }
+            )
+    if not fragments:
+        raise OpenRouterError(
+            "Final report prompt join selected no grounded prompt fragment"
+        )
+    return {
+        "version": "aiv-final-prompt-join-v1",
+        "contract": "exact_non_disposition_join_context",
+        "prompt_source_path": fragments[0]["source_path"],
+        "prompt_fragment_count": len(prompt_records),
+        "selected_fragment_count": len(fragments),
+        "full_prompt_included": len(fragments) == len(prompt_records),
+        "all_prompt_receipts_sha256": _stable_json_sha256(all_receipts),
+        "selected_fragments": fragments,
+        "instruction": (
+            "Interpret every answer-response member against this exact prompt "
+            "text. These copies provide join context only; original prompt "
+            "claim dispositions remain exact-once elsewhere in the plan."
+        ),
+    }
+
+
+def _final_report_answer_join_context(
+    answer_records: list[dict[str, Any]],
+    *,
+    selected_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return exact non-disposition answer text for prompt-side join shards.
+
+    A physically long prompt is already represented by exact claim members.
+    Pairing every such member with an exact answer fragment prevents a middle
+    prompt clause from becoming a disconnected, endpoint-only observation.
+    The original answer claims still own their sole dispositions elsewhere.
+    """
+
+    if not answer_records or not selected_records:
+        raise OpenRouterError(
+            "Final report prompt capsule has no exact answer join context"
+        )
+    all_receipts: list[dict[str, Any]] = []
+    fragments: list[dict[str, Any]] = []
+    selected_ids = {
+        str(record.get("source_shard_id") or "")
+        for record in selected_records
+    }
+    for record in answer_records:
+        value = (
+            record.get("value")
+            if isinstance(record.get("value"), dict)
+            else {}
+        )
+        source_shard_id = str(record.get("source_shard_id") or "")
+        excerpt = value.get("excerpt")
+        excerpt_sha256 = str(value.get("excerpt_sha256") or "")
+        if (
+            not source_shard_id
+            or not isinstance(excerpt, str)
+            or text_sha256(excerpt) != excerpt_sha256
+            or str(value.get("source_path") or "").rsplit("/", 1)[-1]
+            != "answer_text"
+        ):
+            raise OpenRouterError(
+                "Final report answer join fragment failed exact integrity"
+            )
+        all_receipts.append(
+            {
+                "source_shard_id": source_shard_id,
+                "source_sha256": str(record.get("source_sha256") or ""),
+            }
+        )
+        if source_shard_id in selected_ids:
+            fragments.append(
+                {
+                    "source_shard_id": source_shard_id,
+                    "source_path": str(value.get("source_path") or ""),
+                    "claim_id": str(value.get("claim_id") or ""),
+                    "fragment_index": value.get("fragment_index"),
+                    "fragment_count": value.get("fragment_count"),
+                    "excerpt_sha256": excerpt_sha256,
+                    "excerpt": excerpt,
+                }
+            )
+    if not fragments:
+        raise OpenRouterError(
+            "Final report answer join selected no grounded answer fragment"
+        )
+    return {
+        "version": "aiv-final-answer-join-v1",
+        "contract": "exact_non_disposition_join_context",
+        "answer_source_path": fragments[0]["source_path"],
+        "answer_fragment_count": len(answer_records),
+        "selected_fragment_count": len(fragments),
+        "full_answer_included": len(fragments) == len(answer_records),
+        "all_answer_receipts_sha256": _stable_json_sha256(all_receipts),
+        "selected_fragments": fragments,
+        "instruction": (
+            "Interpret every prompt member against this exact observed answer "
+            "text. These copies provide join context only; original answer "
+            "claim dispositions remain exact-once elsewhere in the plan."
+        ),
+    }
+
+
+def _minimum_final_report_shard_output_utf8_bytes(
+    record: dict[str, Any],
+) -> int:
+    """Return a conservative exact JSON floor for one shard response.
+
+    Claim excerpts must be echoed in dispositions and fact assertions must be
+    visible.  This floor prevents a large capsule from fitting the input side
+    while being physically impossible to return through the model's advertised
+    completion envelope.
+    """
+
+    claim_dispositions = [
+        {
+            "claim_id": str(contract.get("claim_id") or ""),
+            "excerpt_sha256": str(contract.get("excerpt_sha256") or ""),
+            "disposition": "supporting_context",
+            "evidence_excerpt": str(contract.get("excerpt") or ""),
+        }
+        for contract in record.get("claim_contracts") or []
+    ]
+    visible_claims = [
+        str(contract.get("excerpt") or "")
+        for contract in record.get("claim_contracts") or []
+    ]
+    fact_dispositions: list[dict[str, Any]] = []
+    visible_facts: list[str] = []
+    for contract in record.get("fact_contracts") or []:
+        candidates = contract.get("assertion_candidates")
+        assertion = next(
+            (
+                str(candidate)
+                for candidate in candidates or []
+                if isinstance(candidate, str) and candidate
+            ),
+            "подтверждённый факт",
+        )
+        visible_facts.append(assertion)
+        fact_dispositions.append(
+            {
+                "fact_ref": str(contract.get("fact_ref") or ""),
+                "disposition": "supporting_context",
+                "assertion": assertion,
+            }
+        )
+    output = {
+        "source_shard_id": str(record.get("source_shard_id") or ""),
+        "source_sha256": str(record.get("source_sha256") or ""),
+        "core": (
+            {
+                "headline": "Итог",
+                "headline_emphasis": [],
+                "verdict": "Итог",
+                "executive_summary": "Итог",
+            }
+            if record.get("kind") == "executive_core"
+            else None
+        ),
+        "section": {
+            "heading": "Вывод",
+            "body": "\n".join(
+                ["Вывод", *visible_claims, *visible_facts]
+            ),
+        },
+        "actions": [],
+        "limitations": [],
+        "claim_dispositions": claim_dispositions,
+        "fact_dispositions": fact_dispositions,
+    }
+    return len(
+        json.dumps(
+            output,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _batch_final_report_source_records(
+    atomic_records: list[dict[str, Any]],
+    *,
+    input_window_utf8_bytes: int,
+    output_window_utf8_bytes: int,
+    request_utf8_bytes: Callable[[dict[str, Any]], int],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Pack atomic evidence into physically bounded semantic capsules.
+
+    Grouping is by answer/metric join key and AI Visibility dimension.  Pack
+    size is discovered from the provider's exact serialized request and output
+    envelopes, never from a local item/count/character ceiling.
+    """
+
+    if not atomic_records or atomic_records[0].get("kind") != "executive_core":
+        raise OpenRouterError("Final report capsule plan has no executive core")
+    executive = copy.deepcopy(atomic_records[0])
+    executive_input_bytes = request_utf8_bytes(executive)
+    executive_output_bytes = _minimum_final_report_shard_output_utf8_bytes(
+        executive
+    )
+    if (
+        executive_input_bytes > input_window_utf8_bytes
+        or executive_output_bytes > output_window_utf8_bytes
+    ):
+        raise OpenRouterError(
+            "Final report executive capsule exceeds the physical model "
+            "input/output envelope"
+        )
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in atomic_records[1:]:
+        grouped.setdefault(
+            _final_report_capsule_group_key(record), []
+        ).append(record)
+    answer_bundle_dimension_order = {
+        "prompt_context": 0,
+        "answer_response": 1,
+        "citation_evidence": 2,
+        "brand_discovery": 3,
+        "portfolio_visibility": 4,
+        "recommendation": 5,
+        "competitor_presence": 6,
+        "uncertainty": 7,
+        "context": 8,
+    }
+    for group_key, members in grouped.items():
+        if group_key[1] != "model_answer_bundle":
+            continue
+
+        def answer_bundle_member_order(
+            member: dict[str, Any],
+        ) -> tuple[int, int]:
+            value = (
+                member.get("value")
+                if isinstance(member.get("value"), dict)
+                else {}
+            )
+            domain_context = (
+                value.get("domain_context")
+                if isinstance(value.get("domain_context"), dict)
+                else {}
+            )
+            dimension = str(
+                value.get("analysis_dimension")
+                or domain_context.get("analysis_dimension")
+                or "context"
+            )
+            return (
+                answer_bundle_dimension_order.get(dimension, 8),
+                int(member.get("ordinal") or 0),
+            )
+
+        # The prompt precedes the corresponding response so a capsule that
+        # can hold the pair becomes a genuine full prompt-answer exemplar.
+        # Exact original ordinals remain in each immutable member receipt.
+        members.sort(key=answer_bundle_member_order)
+
+    capsules: list[dict[str, Any]] = [executive]
+    max_input_bytes = executive_input_bytes
+    max_output_bytes = executive_output_bytes
+    for members in grouped.values():
+        cursor = 0
+        is_answer_bundle = (
+            _final_report_capsule_group_key(members[0])[1]
+            == "model_answer_bundle"
+        )
+        prompt_records = (
+            [
+                member
+                for member in members
+                if member.get("kind") == "exact_claim"
+                and str(
+                    (
+                        member.get("value")
+                        if isinstance(member.get("value"), dict)
+                        else {}
+                    ).get("source_path")
+                    or ""
+                ).endswith("/scenario")
+            ]
+            if is_answer_bundle
+            else []
+        )
+        answer_records = (
+            [
+                member
+                for member in members
+                if member.get("kind") == "exact_claim"
+                and str(
+                    (
+                        member.get("value")
+                        if isinstance(member.get("value"), dict)
+                        else {}
+                    ).get("source_path")
+                    or ""
+                ).endswith("/answer_text")
+            ]
+            if is_answer_bundle
+            else []
+        )
+
+        def has_answer_response(
+            selected_members: list[dict[str, Any]],
+        ) -> bool:
+            return any(
+                member.get("kind") in {"exact_claim", "exact_fact"}
+                and str(
+                    (
+                        member.get("value")
+                        if isinstance(member.get("value"), dict)
+                        else {}
+                    ).get("source_path")
+                    or ""
+                ).endswith("/answer_text")
+                for member in selected_members
+            )
+
+        def has_prompt_context(
+            selected_members: list[dict[str, Any]],
+        ) -> bool:
+            return any(
+                member.get("kind") == "exact_claim"
+                and str(
+                    (
+                        member.get("value")
+                        if isinstance(member.get("value"), dict)
+                        else {}
+                    ).get("source_path")
+                    or ""
+                ).endswith("/scenario")
+                for member in selected_members
+            )
+
+        if is_answer_bundle and any(
+            has_answer_response([member]) for member in members
+        ) and not prompt_records:
+            raise OpenRouterError(
+                "Final report answer bundle has no exact prompt claim"
+            )
+        while cursor < len(members):
+            ordinal = len(capsules)
+
+            def candidate(end: int) -> tuple[dict[str, Any], int, int]:
+                selected_members = members[cursor:end]
+                prompt_variants: list[list[dict[str, Any]] | None] = [None]
+                answer_variants: list[list[dict[str, Any]] | None] = [None]
+                selected_has_answer = has_answer_response(selected_members)
+                selected_has_prompt = has_prompt_context(selected_members)
+                if selected_has_answer:
+                    # Prefer the complete prompt.  If an unusually long prompt
+                    # cannot share the physical request, retain exact first and
+                    # final instruction fragments, then at minimum the final
+                    # grounded fragment where the user's task normally lives.
+                    endpoints = list(
+                        dict.fromkeys(
+                            [
+                                str(prompt_records[0]["source_shard_id"]),
+                                str(prompt_records[-1]["source_shard_id"]),
+                            ]
+                        )
+                    )
+                    by_id = {
+                        str(record["source_shard_id"]): record
+                        for record in prompt_records
+                    }
+                    prompt_variants = [
+                        prompt_records,
+                        [by_id[value] for value in endpoints],
+                        [prompt_records[-1]],
+                    ]
+                if (
+                    selected_has_prompt
+                    and not selected_has_answer
+                    and answer_records
+                ):
+                    answer_endpoints = list(
+                        dict.fromkeys(
+                            [
+                                str(answer_records[0]["source_shard_id"]),
+                                str(answer_records[-1]["source_shard_id"]),
+                            ]
+                        )
+                    )
+                    answers_by_id = {
+                        str(record["source_shard_id"]): record
+                        for record in answer_records
+                    }
+                    answer_variants = [
+                        answer_records,
+                        [answers_by_id[value] for value in answer_endpoints],
+                        [answer_records[-1]],
+                    ]
+                last: tuple[dict[str, Any], int, int] | None = None
+                seen_variants: set[str] = set()
+                for prompt_variant, answer_variant in (
+                    (prompt_variant, answer_variant)
+                    for prompt_variant in prompt_variants
+                    for answer_variant in answer_variants
+                ):
+                    variant_key = _stable_json_sha256(
+                        {
+                            "prompt": [
+                                str(item.get("source_shard_id") or "")
+                                for item in prompt_variant or []
+                            ],
+                            "answer": [
+                                str(item.get("source_shard_id") or "")
+                                for item in answer_variant or []
+                            ],
+                        }
+                    )
+                    if variant_key in seen_variants:
+                        continue
+                    seen_variants.add(variant_key)
+                    prompt_join_context = (
+                        _final_report_prompt_join_context(
+                            prompt_records,
+                            selected_records=prompt_variant,
+                        )
+                        if prompt_variant is not None
+                        else None
+                    )
+                    answer_join_context = (
+                        _final_report_answer_join_context(
+                            answer_records,
+                            selected_records=answer_variant,
+                        )
+                        if answer_variant is not None
+                        else None
+                    )
+                    record = _final_report_capsule_record(
+                        selected_members,
+                        ordinal=ordinal,
+                        prompt_join_context=prompt_join_context,
+                        answer_join_context=answer_join_context,
+                    )
+                    result = (
+                        record,
+                        request_utf8_bytes(record),
+                        _minimum_final_report_shard_output_utf8_bytes(record),
+                    )
+                    last = result
+                    if result[1] <= input_window_utf8_bytes:
+                        return result
+                if last is None:
+                    raise OpenRouterError(
+                        "Final report capsule planner produced no candidate"
+                    )
+                return last
+
+            first, first_input, first_output = candidate(cursor + 1)
+            if (
+                first_input > input_window_utf8_bytes
+                or first_output > output_window_utf8_bytes
+            ):
+                raise OpenRouterError(
+                    "One atomic final-report source cannot fit a physical "
+                    "author request/response envelope"
+                )
+            best = (first, cursor + 1, first_input, first_output)
+            lower = cursor + 1
+            step = 1
+            upper = len(members) + 1
+            while lower < len(members):
+                probe = min(len(members), cursor + 1 + step)
+                record, input_bytes, output_bytes = candidate(probe)
+                if (
+                    input_bytes <= input_window_utf8_bytes
+                    and output_bytes <= output_window_utf8_bytes
+                ):
+                    best = (record, probe, input_bytes, output_bytes)
+                    lower = probe
+                    if probe == len(members):
+                        break
+                    step *= 2
+                    continue
+                upper = probe
+                break
+            lo = best[1] + 1
+            hi = upper - 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                record, input_bytes, output_bytes = candidate(mid)
+                if (
+                    input_bytes <= input_window_utf8_bytes
+                    and output_bytes <= output_window_utf8_bytes
+                ):
+                    best = (record, mid, input_bytes, output_bytes)
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            record, cursor, input_bytes, output_bytes = best
+            capsules.append(record)
+            max_input_bytes = max(max_input_bytes, input_bytes)
+            max_output_bytes = max(max_output_bytes, output_bytes)
+
+    joined_prompt_fragments = 0
+    joined_answer_fragments = 0
+    joined_bundle_count = 0
+    for group_key, members in grouped.items():
+        if group_key[1] != "model_answer_bundle":
+            continue
+        prompt_ids = {
+            str(member.get("source_shard_id") or "")
+            for member in members
+            if member.get("kind") == "exact_claim"
+            and str(
+                (
+                    member.get("value")
+                    if isinstance(member.get("value"), dict)
+                    else {}
+                ).get("source_path")
+                or ""
+            ).endswith("/scenario")
+        }
+        answer_ids = {
+            str(member.get("source_shard_id") or "")
+            for member in members
+            if member.get("kind") == "exact_claim"
+            and str(
+                (
+                    member.get("value")
+                    if isinstance(member.get("value"), dict)
+                    else {}
+                ).get("source_path")
+                or ""
+            ).endswith("/answer_text")
+        }
+        if not prompt_ids or not answer_ids:
+            continue
+        paired_prompt_ids: set[str] = set()
+        paired_answer_ids: set[str] = set()
+        for capsule in capsules[1:]:
+            value = (
+                capsule.get("value")
+                if isinstance(capsule.get("value"), dict)
+                else {}
+            )
+            if value.get("domain_context_id") != group_key[0]:
+                continue
+            capsule_member_ids = {
+                str(member.get("source_shard_id") or "")
+                for member in value.get("members") or []
+                if isinstance(member, dict)
+            }
+            member_prompt_ids = capsule_member_ids & prompt_ids
+            member_answer_ids = capsule_member_ids & answer_ids
+            prompt_join = (
+                value.get("prompt_join_context")
+                if isinstance(value.get("prompt_join_context"), dict)
+                else {}
+            )
+            answer_join = (
+                value.get("answer_join_context")
+                if isinstance(value.get("answer_join_context"), dict)
+                else {}
+            )
+            joined_prompt_ids = {
+                str(fragment.get("source_shard_id") or "")
+                for fragment in prompt_join.get("selected_fragments") or []
+                if isinstance(fragment, dict)
+            }
+            joined_answer_ids = {
+                str(fragment.get("source_shard_id") or "")
+                for fragment in answer_join.get("selected_fragments") or []
+                if isinstance(fragment, dict)
+            }
+            if member_answer_ids and (member_prompt_ids or joined_prompt_ids):
+                paired_answer_ids.update(member_answer_ids)
+            if member_prompt_ids and (member_answer_ids or joined_answer_ids):
+                paired_prompt_ids.update(member_prompt_ids)
+        if paired_prompt_ids != prompt_ids or paired_answer_ids != answer_ids:
+            raise OpenRouterError(
+                "Final report capsule plan lost exact prompt-answer join "
+                "coverage"
+            )
+        joined_bundle_count += 1
+        joined_prompt_fragments += len(prompt_ids)
+        joined_answer_fragments += len(answer_ids)
+
+    atomic_receipts = [
+        {
+            "source_shard_id": str(record.get("source_shard_id") or ""),
+            "source_sha256": str(record.get("source_sha256") or ""),
+        }
+        for record in atomic_records[1:]
+    ]
+    capsule_member_receipts = [
+        receipt
+        for capsule in capsules[1:]
+        for receipt in (capsule.get("lineage") or {}).get(
+            "member_receipts", []
+        )
+    ]
+    if capsule_member_receipts != atomic_receipts:
+        # Grouping intentionally clusters semantic keys, so compare exact
+        # multisets while still rejecting a duplicate member receipt.
+        expected = Counter(
+            _stable_json_sha256(item) for item in atomic_receipts
+        )
+        actual = Counter(
+            _stable_json_sha256(item) for item in capsule_member_receipts
+        )
+        if actual != expected or any(count != 1 for count in actual.values()):
+            raise OpenRouterError(
+                "Final report capsule plan lost or duplicated atomic evidence"
+            )
+    return capsules, {
+        "version": "aiv-final-domain-capsule-plan-v1",
+        "atomic_source_count": len(atomic_records),
+        "atomic_nonexecutive_count": len(atomic_records) - 1,
+        "capsule_count": len(capsules),
+        "domain_capsule_count": len(capsules) - 1,
+        "domain_group_count": len(grouped),
+        "max_input_request_utf8_bytes": max_input_bytes,
+        "max_minimum_output_utf8_bytes": max_output_bytes,
+        "input_window_utf8_bytes": input_window_utf8_bytes,
+        "output_window_utf8_bytes": output_window_utf8_bytes,
+        "atomic_receipts_sha256": _stable_json_sha256(atomic_receipts),
+        "coverage_complete": True,
+        "prompt_answer_join_coverage_complete": True,
+        "joined_model_answer_bundle_count": joined_bundle_count,
+        "joined_prompt_fragment_count": joined_prompt_fragments,
+        "joined_answer_fragment_count": joined_answer_fragments,
+        "local_record_or_capsule_count_cap": None,
+        "packing_rule": "exact_physical_input_and_minimum_output_envelopes",
+    }
+
+
+async def _final_report_source_claim_rows(
+    run_id: str,
+    model_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Load the exact claim ledger bound to a prepared final-model payload.
+
+    Hierarchical inputs already own an immutable claim-ledger artifact.  The
+    final author must consume that exact ledger rather than flattening the
+    model's lossy synopsis a second time.  A direct payload has no persisted
+    ledger yet, so code deterministically derives the same bounded rows before
+    the sharded route starts.  Neither path imposes a total row/document cap.
+    """
+
+    contract = model_payload.get("long_input_contract")
+    ledger_reference = (
+        contract.get("claim_ledger")
+        if isinstance(contract, dict)
+        else None
+    )
+    if isinstance(ledger_reference, dict):
+        artifact_key = ledger_reference.get("artifact_key")
+        expected_sha256 = ledger_reference.get("sha256")
+        expected_ids_sha256 = ledger_reference.get("claim_ids_sha256")
+        if (
+            not isinstance(artifact_key, str)
+            or not artifact_key
+            or not isinstance(expected_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or not isinstance(expected_ids_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_ids_sha256)
+        ):
+            raise OpenRouterError(
+                "Final report claim-ledger reference is incomplete"
+            )
+        ledger = await _artifact_output(
+            run_id,
+            artifact_key,
+            prompt_version=FINAL_REPORT_VERSION,
+        )
+        if not isinstance(ledger, dict):
+            raise OpenRouterError(
+                "Final report exact claim-ledger artifact is unavailable"
+            )
+        ledger_payload = copy.deepcopy(ledger)
+        stored_sha256 = ledger_payload.pop("ledger_sha256", None)
+        claims = ledger.get("claims")
+        if (
+            ledger.get("version") != FINAL_INPUT_CLAIM_LEDGER_VERSION
+            or stored_sha256 != expected_sha256
+            or _stable_json_sha256(ledger_payload) != expected_sha256
+            or not isinstance(claims, list)
+            or ledger.get("claim_count") != len(claims)
+        ):
+            raise OpenRouterError(
+                "Final report exact claim-ledger artifact failed integrity"
+            )
+        claim_ids: list[str] = []
+        for row in claims:
+            if not isinstance(row, dict):
+                raise OpenRouterError(
+                    "Final report exact claim ledger contains a non-object row"
+                )
+            try:
+                claim = SourceClaim.from_dict(row)
+            except ValueError as exc:
+                raise OpenRouterError(
+                    f"Final report exact claim row failed integrity: {exc}"
+                ) from exc
+            if (
+                text_sha256(claim.excerpt) != claim.excerpt_sha256
+                or not isinstance(row.get("source_path"), str)
+                or not str(row.get("source_path") or "")
+            ):
+                raise OpenRouterError(
+                    "Final report exact claim row changed its source excerpt"
+                )
+            claim_ids.append(claim.claim_id)
+        if (
+            len(claim_ids) != len(set(claim_ids))
+            or _stable_json_sha256(claim_ids) != expected_ids_sha256
+            or ledger.get("claim_ids_sha256") != expected_ids_sha256
+        ):
+            raise OpenRouterError(
+                "Final report exact claim ledger changed row identity or order"
+            )
+        return copy.deepcopy(claims)
+
+    units, _manifest = _flatten_final_input_payload(
+        model_payload,
+        target_chars=FINAL_INPUT_MAP_UNIT_CHARS,
+        context_overlap_chars=0,
+    )
+    claim_rows, _claims_by_id, _ids_by_unit, ledger = (
+        _final_input_claim_ledger(
+            units,
+            source_payload=model_payload,
+        )
+    )
+    if ledger.get("claim_count") != len(claim_rows):
+        raise OpenRouterError(
+            "Final report direct claim ledger failed deterministic coverage"
+        )
+    return claim_rows
+
+
+def _merge_final_report_shards(
+    values: tuple[Any, ...],
+    *,
+    source_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble every accepted shard in exact plan order without selection."""
+
+    if len(values) != len(source_records):
+        raise OpenRouterError(
+            "Final report shard merge has incomplete source coverage"
+        )
+    core: dict[str, Any] | None = None
+    sections: list[dict[str, str]] = []
+    actions: list[dict[str, str]] = []
+    limitations: list[str] = []
+    for index, (value, source) in enumerate(
+        zip(values, source_records, strict=True)
+    ):
+        source_core = {
+            key: copy.deepcopy(source.get(key))
+            for key in (
+                "kind",
+                "ordinal",
+                "value",
+                "lineage",
+                "claim_contracts",
+                "fact_contracts",
+            )
+        }
+        expected_source_sha256 = _stable_json_sha256(source_core)
+        expected_source_shard_id = (
+            f"{source_core['kind']}-{index:06d}-"
+            f"{expected_source_sha256[:16]}"
+        )
+        if (
+            source_core.get("ordinal") != index
+            or source.get("source_sha256") != expected_source_sha256
+            or source.get("source_shard_id") != expected_source_shard_id
+        ):
+            raise OpenRouterError(
+                f"Final report source shard {index} failed its code-owned digest"
+            )
+        if not isinstance(value, dict):
+            raise OpenRouterError(
+                f"Final report shard {index} is not an object"
+            )
+        if (
+            value.get("source_shard_id") != source["source_shard_id"]
+            or value.get("source_sha256") != source["source_sha256"]
+        ):
+            raise OpenRouterError(
+                f"Final report shard {index} changed its source binding"
+            )
+        shard_core = value.get("core")
+        if index == 0:
+            if not isinstance(shard_core, dict):
+                raise OpenRouterError(
+                    "Final report executive shard has no global core"
+                )
+            core = copy.deepcopy(shard_core)
+        elif shard_core is not None:
+            raise OpenRouterError(
+                "Only the executive shard may author the global core"
+            )
+        section = value.get("section")
+        if (
+            not isinstance(section, dict)
+            or not str(section.get("heading") or "").strip()
+            or not str(section.get("body") or "").strip()
+        ):
+            raise OpenRouterError(
+                f"Final report shard {index} has no visible narrative"
+            )
+        sections.append(copy.deepcopy(section))
+        shard_actions = value.get("actions")
+        shard_limitations = value.get("limitations")
+        if not isinstance(shard_actions, list) or not isinstance(
+            shard_limitations,
+            list,
+        ):
+            raise OpenRouterError(
+                f"Final report shard {index} has invalid arrays"
+            )
+        claim_contracts = source.get("claim_contracts")
+        fact_contracts = source.get("fact_contracts")
+        claim_dispositions = value.get("claim_dispositions")
+        fact_dispositions = value.get("fact_dispositions")
+        if (
+            not isinstance(claim_contracts, list)
+            or not isinstance(fact_contracts, list)
+            or not isinstance(claim_dispositions, list)
+            or not isinstance(fact_dispositions, list)
+            or len(claim_dispositions) != len(claim_contracts)
+            or len(fact_dispositions) != len(fact_contracts)
+        ):
+            raise OpenRouterError(
+                f"Final report shard {index} has incomplete claim/fact coverage"
+            )
+        visible_text = "\n".join(
+            [
+                str(section.get("heading") or ""),
+                str(section.get("body") or ""),
+                *(
+                    str(field)
+                    for action in shard_actions
+                    if isinstance(action, dict)
+                    for field in action.values()
+                ),
+                *(str(item) for item in shard_limitations),
+            ]
+        )
+        visible_folded = visible_text.casefold()
+        for expected, disposition in zip(
+            claim_contracts,
+            claim_dispositions,
+            strict=True,
+        ):
+            if (
+                not isinstance(disposition, dict)
+                or disposition.get("claim_id") != expected.get("claim_id")
+                or disposition.get("excerpt_sha256")
+                != expected.get("excerpt_sha256")
+                or disposition.get("evidence_excerpt")
+                != expected.get("excerpt")
+                or disposition.get("disposition")
+                not in {
+                    "material_observation",
+                    "supporting_context",
+                    "explicit_limitation",
+                }
+                or text_sha256(str(expected.get("excerpt") or ""))
+                != expected.get("excerpt_sha256")
+            ):
+                raise OpenRouterError(
+                    f"Final report shard {index} changed a claim disposition"
+                )
+            claim_excerpt = str(expected.get("excerpt") or "")
+            visibility_clauses = expected.get("visibility_clauses")
+            if not isinstance(visibility_clauses, list):
+                raise OpenRouterError(
+                    f"Final report shard {index} has no qualitative clause "
+                    "contract"
+                )
+            for clause in visibility_clauses:
+                anchors = (
+                    clause.get("required_anchors")
+                    if isinstance(clause, dict)
+                    else None
+                )
+                if (
+                    not isinstance(clause, dict)
+                    or not isinstance(clause.get("fragment_sha256"), str)
+                    or not isinstance(anchors, list)
+                    or not anchors
+                    or any(
+                        not isinstance(anchor, str)
+                        or not anchor.strip()
+                        or anchor.casefold() not in claim_excerpt.casefold()
+                        for anchor in anchors
+                    )
+                ):
+                    raise OpenRouterError(
+                        f"Final report shard {index} has a corrupt "
+                        "qualitative clause contract"
+                    )
+                missing_anchors = [
+                    anchor
+                    for anchor in anchors
+                    if anchor.casefold() not in visible_folded
+                ]
+                if missing_anchors:
+                    raise OpenRouterError(
+                        f"Final report shard {index} lost material "
+                        "qualitative anchors: "
+                        + ", ".join(missing_anchors)
+                    )
+        for expected, disposition in zip(
+            fact_contracts,
+            fact_dispositions,
+            strict=True,
+        ):
+            assertion = (
+                disposition.get("assertion")
+                if isinstance(disposition, dict)
+                else None
+            )
+            candidates = expected.get("assertion_candidates")
+            if (
+                not isinstance(disposition, dict)
+                or disposition.get("fact_ref") != expected.get("fact_ref")
+                or disposition.get("disposition")
+                not in {
+                    "asserted",
+                    "supporting_context",
+                    "explicit_limitation",
+                }
+                or not isinstance(assertion, str)
+                or not assertion.strip()
+                or not isinstance(candidates, list)
+                or not candidates
+                or not any(
+                    isinstance(candidate, str)
+                    and candidate
+                    and candidate.casefold() in assertion.casefold()
+                    and candidate.casefold() in visible_folded
+                    for candidate in candidates
+                )
+            ):
+                raise OpenRouterError(
+                    f"Final report shard {index} changed or hid an atomic fact"
+                )
+        actions.extend(copy.deepcopy(shard_actions))
+        limitations.extend(str(item) for item in shard_limitations)
+    if core is None:
+        raise OpenRouterError("Final report shard merge lost the global core")
+    # The semantic gate requires canonical limitations exactly once.  Exact
+    # duplicates remain preserved in immutable shard receipts and are only
+    # collapsed in the reader-facing projection.
+    unique_limitations = list(dict.fromkeys(limitations))
+    merged = {
+        **core,
+        "sections": sections,
+        "actions": actions,
+        "limitations": unique_limitations,
+    }
+    errors = _validate_final_report(merged)
+    if errors:
+        raise OpenRouterError("; ".join(errors))
+    return merged
+
+
+def _final_report_shard_system(system: str) -> str:
+    """Return the exact prompt shared by every independent report shard."""
+
+    return f"""
+{system}
+
+ДОПОЛНИТЕЛЬНЫЙ КОНТРАКТ НЕЗАВИСИМОГО ФРАГМЕНТА
+
+Ты пишешь не весь отчёт, а ровно один самостоятельно проверяемый фрагмент из
+code-owned плана. В пользовательском JSON есть source_shard_id, source_sha256,
+kind, value и lineage. Верни source_shard_id и source_sha256 дословно, без
+изменений. Не используй знания из других фрагментов и не достраивай отсутствующий
+контекст.
+
+Для kind=executive_core:
+- core обязателен и содержит headline, headline_emphasis, verdict и
+  executive_summary;
+- section даёт обзор главного вывода, но не повторяет executive_summary;
+- выводы ограничены только переданным bounded evidence payload.
+
+Для всех остальных kind:
+- core должен быть null;
+- section содержит один самостоятельный содержательный раздел по переданному
+  факту, оговорке, фокусу или точному значению;
+- сохрани все явно переданные сущности, числа, проценты, единицы, знаки,
+  знаменатели, состояния доступности и оговорки; unknown нельзя превращать в 0;
+- если исходная запись является технической или служебной оговоркой, объясни её
+  естественным русским языком, не показывая внутренние ID и hashes.
+- если value.output_retry_contract присутствует, предыдущий физический ответ
+  этого exact leaf оказался незавершённым. Выполни instruction: убери повторы
+  и мета-комментарии, но сохрани все claim/fact obligations и весь нужный
+  читателю смысл. Локального предела длины для section/actions/limitations нет,
+  схема и обязательные dispositions не сокращаются.
+
+Для kind=domain_capsule:
+- core должен быть null;
+- members — все и только физически поместившиеся атомарные входы одной
+  тематической капсулы. Обычно это один domain_context_id и одна
+  analysis_dimension. Для model_answer_bundle это связанные prompt, raw-ответ,
+  annotation и citations одной проверки; их исходные analysis_dimensions
+  перечислены отдельно. Синтезируй по members один связный раздел, а не
+  отдельный раздел на каждый факт;
+- если в capsule есть answer_response, prompt_join_context содержит
+  дословный prompt целиком либо его физически поместившиеся точные фрагменты.
+  Интерпретируй raw только в этой связке. Это контекст join, а не второй
+  source claim: не создавай для него повторный disposition;
+- если длинный prompt вынесен в отдельную capsule, answer_join_context
+  содержит точный наблюдавшийся фрагмент ответа. Интерпретируй prompt и answer
+  совместно. Код проверяет, что каждый prompt- и answer-фрагмент вошёл хотя бы
+  в одну такую exact-связку; endpoint-only выбор запрещён;
+- обработай каждый member и верни claim_dispositions/fact_dispositions ровно
+  в порядке верхнеуровневых claim_contracts/fact_contracts. Нельзя выбрать
+  «главные» и отбросить остальные: локальный merge проверяет exact-once;
+- если capsule является продолжением той же темы в другом физическом шарде,
+  всё равно напиши самодостаточный фрагмент. Код объединит фрагменты без
+  повторной передачи всего текста модели.
+
+Для member.kind=exact_claim внутри domain_capsule действует более строгий
+доказательный контракт:
+- верни claim_dispositions ровно в порядке claim_contracts, без пропусков и
+  дублей; claim_id, excerpt_sha256 и полный evidence_excerpt скопируй дословно;
+- visibility_clauses — code-owned проверка читательского смысла. Все
+  required_anchors каждого fragment должны дословно присутствовать в section,
+  action либо limitation. Один общий хвост вроде unknown/limited не заменяет
+  субъект, редкий маркер или результат соответствующего фрагмента;
+- section обязан передать предмет и смысл всего excerpt, включая его последний
+  содержательный маркер. Нельзя заменить качественное наблюдение одним общим
+  словом или фразой «данные учтены»;
+- domain_context — проверенный кодом join header. Интерпретируй excerpt именно
+  как часть указанного prompt/model/mode/INTENT и analysis_dimension. Не
+  называй упоминание рекомендацией, общий термин продуктом клиента, web-срез
+  памятью модели или competitor целевым брендом. sibling_paths указывают, где
+  в exact ledger лежат связанные prompt, raw, annotation и citations;
+- fact_dispositions должен быть пустым: атомарные факты этого claim предъявлены
+  отдельными exact_fact-шардами, чтобы их количество не раздувало один запрос.
+
+Для member.kind=exact_fact внутри domain_capsule:
+- core равен null, claim_dispositions пуст;
+- верни fact_dispositions ровно в порядке fact_contracts. Для каждого fact_ref
+  assertion должен явно содержать переданное точное число, состояние, единицу,
+  знаменатель или иной assertion_candidate, и тот же факт должен быть видим в
+  section, action либо limitation;
+- используй domain_context и analysis_dimension по тем же правилам: одинаковое
+  число в разных provider/mode/intent не является одним и тем же наблюдением;
+- служебные refs и hashes нужны только в disposition-массивах и не должны
+  появляться в читательском тексте.
+
+Для kind=domain_capsule состав disposition-массивов задают верхнеуровневые
+contracts. Для executive_core они должны быть пустыми. Disposition-массивы
+являются машинным доказательством exact-once покрытия, но не входят в
+читательскую версию отчёта.
+
+actions и limitations могут быть пустыми, но значимое действие или ограничение
+нельзя терять ради краткости. Не объединяй этот фрагмент с воображаемыми соседями:
+код включит каждый принятый фрагмент в итог строго в порядке плана. Ответ — один
+JSON-объект по переданной схеме, без текста до или после него.
+""".strip()
+
+
+def _final_report_shard_contracts(
+    *,
+    shard_system: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    generation_contract = {
+        "model": ANALYSIS_MODEL,
+        "system_prompt": shard_system,
+        "prompt_template": "{{payload}}",
+        "parameters": {
+            "temperature": 0.15,
+            "reasoning_effort": "high",
+            "output_token_policy": "model_max_available",
+        },
+        "web_policy": {"policy": "forbidden"},
+        "schema_name": "aiv_final_report_shard",
+    }
+    merge_contract = {
+        "version": FINAL_REPORT_SHARD_MERGE_VERSION,
+        "algorithm": "ordered_domain_capsules_exact_claim_fact_coverage_v3",
+        "coverage": "every_planned_shard_exactly_once",
+        "capsule_coverage": "every_atomic_source_member_exactly_once",
+        "claim_coverage": "every_exact_claim_disposed_exactly_once",
+        "fact_coverage": "every_atomic_fact_disposed_exactly_once",
+        "selection": "none",
+        "sections": "append_in_plan_order",
+        "actions": "append_in_plan_order_without_count_cap",
+        "limitations": (
+            "append_all_then_exact_string_dedupe_reader_projection_only"
+        ),
+        "core_owner": "shard_index_zero_only",
+    }
+    return generation_contract, merge_contract
+
+
+def _build_final_report_shard_plan(
+    *,
+    document_id: str,
+    source_records: list[dict[str, Any]],
+    generation_contract: dict[str, Any],
+    merge_contract: dict[str, Any],
+    shard_schema: dict[str, Any] = FINAL_REPORT_SHARD_SCHEMA,
+) -> Any:
+    return build_shard_plan(
+        document_id=document_id,
+        shards=(
+            ShardSpec(
+                shard_id=str(record["source_shard_id"]),
+                payload=record,
+            )
+            for record in source_records
+        ),
+        shard_schema=shard_schema,
+        document_schema=FINAL_REPORT_SCHEMA,
+        plan_version=FINAL_REPORT_SHARD_PLAN_VERSION,
+        merge_version=FINAL_REPORT_SHARD_MERGE_VERSION,
+        generation_contract=generation_contract,
+        merge_contract=merge_contract,
+        response_mode=ResponseMode.PARTITIONED,
+        composability=ShardComposability.INDEPENDENT_DISJOINT,
+    )
+
+
+def _reseal_final_report_source_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rebind an adaptive terminal plan to its exact deterministic order."""
+
+    sealed: list[dict[str, Any]] = []
+    for ordinal, record in enumerate(records):
+        source = {
+            "kind": str(record.get("kind") or ""),
+            "ordinal": ordinal,
+            "value": copy.deepcopy(record.get("value")),
+            "lineage": copy.deepcopy(record.get("lineage") or {}),
+            "claim_contracts": copy.deepcopy(
+                record.get("claim_contracts") or []
+            ),
+            "fact_contracts": copy.deepcopy(
+                record.get("fact_contracts") or []
+            ),
+        }
+        digest = _stable_json_sha256(source)
+        sealed.append(
+            {
+                **source,
+                "source_shard_id": (
+                    f"{source['kind']}-{ordinal:06d}-{digest[:16]}"
+                ),
+                "source_sha256": digest,
+            }
+        )
+    return sealed
+
+
+def _final_report_adaptive_shard_schema(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the full semantic schema for every adaptive attempt.
+
+    A previous implementation reacted to a provider output limit by adding
+    progressively smaller ``maxLength`` values (down to 128 characters) to
+    reader-facing prose.  That made transport success look like analytical
+    completeness.  Output length is now never a local acceptance criterion:
+    the exact same full schema and exact claim/fact obligations apply to every
+    replan attempt.
+    """
+
+    return FINAL_REPORT_SHARD_SCHEMA
+
+
+def _split_final_report_output_limited_record(
+    record: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return a strictly smaller schema-valid plan for one limited leaf."""
+
+    value = record.get("value") if isinstance(record.get("value"), dict) else {}
+    if record.get("kind") == "domain_capsule":
+        members = value.get("members")
+        if isinstance(members, list) and len(members) > 1:
+            claim_contracts_by_id = {
+                str(contract.get("claim_id") or ""): contract
+                for contract in record.get("claim_contracts") or []
+                if isinstance(contract, dict)
+            }
+            fact_contracts_by_ref = {
+                str(contract.get("fact_ref") or ""): contract
+                for contract in record.get("fact_contracts") or []
+                if isinstance(contract, dict)
+            }
+
+            def hydrate_member(member: dict[str, Any]) -> dict[str, Any]:
+                hydrated = copy.deepcopy(member)
+                member_value = (
+                    hydrated.get("value")
+                    if isinstance(hydrated.get("value"), dict)
+                    else {}
+                )
+                claim_contract: list[dict[str, Any]] = []
+                if hydrated.get("kind") == "exact_claim":
+                    claim_id = str(member_value.get("claim_id") or "")
+                    if claim_id in claim_contracts_by_id:
+                        claim_contract = [
+                            copy.deepcopy(claim_contracts_by_id[claim_id])
+                        ]
+                fact_contract: list[dict[str, Any]] = []
+                if hydrated.get("kind") == "exact_fact":
+                    table = member_value.get("mandatory_fact_table")
+                    rows = table.get("rows") if isinstance(table, dict) else []
+                    for row in rows or []:
+                        fact_ref = (
+                            str(row[0])
+                            if isinstance(row, list) and row
+                            else ""
+                        )
+                        if fact_ref in fact_contracts_by_ref:
+                            fact_contract.append(
+                                copy.deepcopy(fact_contracts_by_ref[fact_ref])
+                            )
+                hydrated["claim_contracts"] = claim_contract
+                hydrated["fact_contracts"] = fact_contract
+                return hydrated
+
+            hydrated_members = [
+                hydrate_member(member)
+                for member in members
+                if isinstance(member, dict)
+            ]
+            if len(hydrated_members) != len(members):
+                raise OpenRouterError(
+                    "Final report limited capsule contains a corrupt member"
+                )
+            midpoint = len(members) // 2
+            children = [
+                _final_report_capsule_record(
+                    copy.deepcopy(part),
+                    ordinal=0,
+                    prompt_join_context=copy.deepcopy(
+                        value.get("prompt_join_context")
+                    ),
+                    answer_join_context=copy.deepcopy(
+                        value.get("answer_join_context")
+                    ),
+                )
+                for part in (
+                    hydrated_members[:midpoint],
+                    hydrated_members[midpoint:],
+                )
+            ]
+            return children, {
+                "strategy": "split_domain_capsule_members",
+                "parent_source_sha256": record.get("source_sha256"),
+                "parent_member_count": len(members),
+                "child_member_counts": [midpoint, len(members) - midpoint],
+                "member_receipts_sha256": _stable_json_sha256(
+                    (record.get("lineage") or {}).get("member_receipts") or []
+                ),
+            }
+    current_contract = (
+        value.get("output_retry_contract")
+        if isinstance(value.get("output_retry_contract"), dict)
+        else {}
+    )
+    current_attempt = current_contract.get("attempt")
+    if isinstance(current_attempt, bool) or not isinstance(current_attempt, int):
+        current_attempt = 0
+    next_attempt = current_attempt + 1
+    # This is a retry-loop safety boundary, not a response-length boundary.
+    # Every rejected prefix remains durably receipted and every retry uses the
+    # unchanged full schema and unchanged semantic obligations.
+    if next_attempt > 3:
+        raise OpenRouterError(
+            "One exact final-report leaf remained provider-output-limited "
+            "after three full-schema semantic retries"
+        )
+    child = copy.deepcopy(record)
+    child_value = copy.deepcopy(value)
+    child_value["output_retry_contract"] = {
+        "version": "aiv-final-adaptive-output-retry-v1",
+        "reason": "observed_provider_output_limit",
+        "attempt": next_attempt,
+        "instruction": (
+            "Верни полный schema-valid фрагмент без вступлений, повторов и "
+            "мета-комментариев. Сохрани каждое claim/fact obligation и весь "
+            "нужный читателю смысл; локального лимита длины нет."
+        ),
+        "exact_dispositions_unmodified": True,
+        "full_schema_unmodified": True,
+    }
+    child["value"] = child_value
+    return [child], {
+        "strategy": "retry_full_schema_without_narrative_cap",
+        "parent_source_sha256": record.get("source_sha256"),
+        "previous_attempt": current_attempt,
+        "next_attempt": next_attempt,
+        "response_length_cap": None,
+    }
+
+
+def _final_report_source_obligation_manifest(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    claims = [
+        {
+            "claim_id": str(contract.get("claim_id") or ""),
+            "excerpt_sha256": str(contract.get("excerpt_sha256") or ""),
+            "excerpt": str(contract.get("excerpt") or ""),
+        }
+        for record in records
+        for contract in record.get("claim_contracts") or []
+        if isinstance(contract, dict)
+    ]
+    facts = [
+        {
+            "fact_ref": str(contract.get("fact_ref") or ""),
+            "binding_sha256": str(contract.get("binding_sha256") or ""),
+            "assertion_candidates": copy.deepcopy(
+                contract.get("assertion_candidates") or []
+            ),
+        }
+        for record in records
+        for contract in record.get("fact_contracts") or []
+        if isinstance(contract, dict)
+    ]
+    manifest = {
+        "version": "aiv-final-source-obligations-v1",
+        "claim_count": len(claims),
+        "fact_count": len(facts),
+        "claims_sha256": _stable_json_sha256(claims),
+        "facts_sha256": _stable_json_sha256(facts),
+    }
+    return {**manifest, "sha256": _stable_json_sha256(manifest)}
+
+
+async def _execute_final_report_adaptive_shards(
+    run_id: str,
+    *,
+    source_records: list[dict[str, Any]],
+    system: str,
+    generation_contract: dict[str, Any],
+    merge_contract: dict[str, Any],
+    artifact_role: str,
+    attempt: int,
+    source_digest: str,
+    input_window_utf8_bytes: int,
+    max_completion_tokens: int,
+) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
+    """Run each leaf under a stable receipt and replan only a limited leaf.
+
+    Completed prefix leaves are content-addressed independently, so splitting
+    a later verbose capsule never re-bills or invalidates them.  Every replan
+    preserves the exact claim/fact obligation union and is itself recorded in
+    the returned code-owned manifest.
+    """
+
+    records = _reseal_final_report_source_records(source_records)
+    initial_obligations = _final_report_source_obligation_manifest(records)
+    values: list[dict[str, Any]] = []
+    provider_receipts: list[dict[str, Any]] = []
+    replan_events: list[dict[str, Any]] = []
+    resumed_shards = 0
+    generated_shards = 0
+    index = 0
+    while index < len(records):
+        record = records[index]
+        shard_schema = _final_report_adaptive_shard_schema(record)
+        leaf_document_id = (
+            f"{run_id}:final-leaf:{artifact_role}:{attempt}:"
+            f"{record['source_sha256'][:24]}"
+        )
+        leaf_plan = _build_final_report_shard_plan(
+            document_id=leaf_document_id,
+            source_records=[record],
+            generation_contract=generation_contract,
+            merge_contract=merge_contract,
+            shard_schema=shard_schema,
+        )
+        leaf_owner = (
+            f"final_report_{artifact_role}_leaf_a{attempt}_"
+            f"{record['source_sha256'][:24]}"
+        )
+        leaf_store = create_sharded_artifact_store(
+            run_id=run_id,
+            stage_key="report",
+            owner_artifact_key=leaf_owner,
+            model=ANALYSIS_MODEL,
+            owner_prompt_version=FINAL_REPORT_VERSION,
+            plan=leaf_plan,
+        )
+        request = leaf_store.planned_requests()[0]
+        request_bytes = len(
+            leaf_store.provider_request_utf8_bytes(
+                request,
+                max_completion_tokens=max_completion_tokens,
+            )
+        )
+        if request_bytes > input_window_utf8_bytes:
+            raise OpenRouterError(
+                "Adaptive final-report leaf exceeds the physical input "
+                f"window before POST: {request_bytes}>"
+                f"{input_window_utf8_bytes}"
+            )
+        generated = await leaf_store.promote_accepted_provider_response(
+            request
+        )
+        if generated is not None:
+            resumed_shards += 1
+        else:
+            async def provider_call(
+                audit_checkpoint: Callable[[dict[str, Any]], Any],
+                audit_context: dict[str, Any],
+            ) -> Any:
+                return await chat(
+                    **leaf_store.provider_chat_arguments(request),
+                    retry_response_contract_errors=False,
+                    retry_transport_errors=False,
+                    audit_checkpoint=audit_checkpoint,
+                    audit_context=audit_context,
+                )
+
+            try:
+                generated = await leaf_store.generate_or_resume(
+                    request,
+                    provider_call,
+                )
+            except OpenRouterOutputLimitError as exc:
+                children, event = _split_final_report_output_limited_record(
+                    record
+                )
+                event = {
+                    **event,
+                    "version": "aiv-final-output-replan-v1",
+                    "sequence": len(replan_events),
+                    "failed_index": index,
+                    "failed_source_shard_id": record["source_shard_id"],
+                    "failed_raw_sha256": text_sha256(
+                        str(getattr(exc.result, "text", "") or "")
+                    ),
+                    "failed_transport": copy.deepcopy(
+                        getattr(exc.result, "transport", {})
+                    ),
+                }
+                records = _reseal_final_report_source_records(
+                    [*records[:index], *children, *records[index + 1 :]]
+                )
+                terminal_obligations = (
+                    _final_report_source_obligation_manifest(records)
+                )
+                if terminal_obligations != initial_obligations:
+                    raise OpenRouterError(
+                        "Adaptive final-report replan changed exact "
+                        "claim/fact obligations"
+                    )
+                event["child_source_shard_ids"] = [
+                    records[index + offset]["source_shard_id"]
+                    for offset in range(len(children))
+                ]
+                event["terminal_obligations_sha256"] = (
+                    terminal_obligations["sha256"]
+                )
+                replan_events.append(event)
+                continue
+            generated_shards += 1
+        if generated is None:
+            raise OpenRouterError(
+                "Adaptive final-report leaf returned no generated value"
+            )
+        await leaf_store.verify_provider_audit(
+            generated.provider_audit,
+            request,
+        )
+        if not isinstance(generated.value, dict):
+            raise OpenRouterError(
+                "Adaptive final-report leaf returned a non-object"
+            )
+        values.append(copy.deepcopy(generated.value))
+        provider_receipts.append(
+            {
+                "source_shard_id": record["source_shard_id"],
+                "source_sha256": record["source_sha256"],
+                "request_sha256": request.request_sha256,
+                "provider_audit": {
+                    key: copy.deepcopy(getattr(generated.provider_audit, key))
+                    for key in generated.provider_audit.__dataclass_fields__
+                },
+                "raw_text_sha256": text_sha256(generated.raw_text),
+            }
+        )
+        index += 1
+
+    terminal_obligations = _final_report_source_obligation_manifest(records)
+    if terminal_obligations != initial_obligations:
+        raise OpenRouterError(
+            "Adaptive final-report terminal plan lost exact obligations"
+        )
+    document = _merge_final_report_shards(
+        tuple(values),
+        source_records=records,
+    )
+    document_sha256 = _stable_json_sha256(document)
+    manifest = {
+        "version": "aiv-final-adaptive-sharded-document-v1",
+        "document_id": (
+            f"{run_id}:final-adaptive:{artifact_role}:{attempt}:"
+            f"{source_digest[:16]}"
+        ),
+        "document_sha256": document_sha256,
+        "response_mode": ResponseMode.PARTITIONED.value,
+        "complete": True,
+        "coverage_complete": True,
+        "initial_source_count": len(source_records),
+        "terminal_source_count": len(records),
+        "source_obligations": terminal_obligations,
+        "terminal_source_receipts_sha256": _stable_json_sha256(
+            [
+                {
+                    "source_shard_id": record["source_shard_id"],
+                    "source_sha256": record["source_sha256"],
+                }
+                for record in records
+            ]
+        ),
+        "provider_receipts_sha256": _stable_json_sha256(provider_receipts),
+        "replan_event_count": len(replan_events),
+        "replan_events": replan_events,
+        "resumed_shards": resumed_shards,
+        "generated_shards": generated_shards,
+        "deadline_seconds": None,
+    }
+    manifest["manifest_sha256"] = _stable_json_sha256(manifest)
+    return document, records, manifest
+
+
+async def _final_report_sharded_attempt(
+    run_id: str,
+    *,
+    system: str,
+    user_payload: dict[str, Any],
+    artifact_role: str,
+    attempt: int,
+) -> Any:
+    """Author an arbitrarily long report as independent durable shards.
+
+    This path is used only after literal whole-document continuation reaches a
+    physical provider context/output envelope.  It never concatenates
+    independent model completions.  Code owns the source plan, every physical
+    POST is durably receipted, and the final document is a deterministic merge
+    of exact complete coverage.
+    """
+
+    source_digest = _stable_json_sha256(user_payload)
+    shard_system = _final_report_shard_system(system)
+    generation_contract, merge_contract = _final_report_shard_contracts(
+        shard_system=shard_system,
+    )
+    preflight_document_id = (
+        f"{run_id}:final-shards-preflight:{artifact_role}:{attempt}:"
+        f"{source_digest[:16]}"
+    )
+
+    def final_request_utf8_bytes(
+        candidate: dict[str, Any],
+        envelope: dict[str, Any],
+    ) -> int:
+        records = _final_report_shard_source_records(candidate)
+        plan = _build_final_report_shard_plan(
+            document_id=preflight_document_id,
+            source_records=records,
+            generation_contract=generation_contract,
+            merge_contract=merge_contract,
+        )
+        store = create_sharded_artifact_store(
+            run_id=run_id,
+            stage_key="report",
+            owner_artifact_key="final_shard_preflight",
+            model=ANALYSIS_MODEL,
+            owner_prompt_version=FINAL_REPORT_VERSION,
+            plan=plan,
+        )
+        maximum = envelope.get("max_completion_tokens")
+        if not isinstance(maximum, int) or isinstance(maximum, bool):
+            maximum = None
+        request_sizes = [
+            len(
+                store.provider_request_utf8_bytes(
+                    request,
+                    max_completion_tokens=maximum,
+                )
+            )
+            for request in store.planned_requests()
+        ]
+        if not request_sizes:
+            raise OpenRouterError("Final report shard plan is empty")
+        return max(request_sizes)
+
+    # A payload already produced by the lossless input harness must not be
+    # summarized a second time: its exact claim ledger is the authoritative
+    # source for author shards.  Only a formerly direct payload is projected
+    # once here.  The custom admission callback measures the largest executive
+    # shard POST; exact-claim shards are measured again below from their real
+    # immutable rows before any provider call.
+    existing_contract = user_payload.get("long_input_contract")
+    prepared_modes = {
+        "hierarchical_evidence_tree",
+        "hierarchical_evidence_tree_compact_ledger",
+        "bounded_transitive_evidence_tree",
+    }
+    if (
+        isinstance(existing_contract, dict)
+        and existing_contract.get("mode") in prepared_modes
+        and isinstance(existing_contract.get("claim_ledger"), dict)
+    ):
+        model_payload = copy.deepcopy(user_payload)
+        input_plan = {
+            "version": FINAL_INPUT_HARNESS_VERSION,
+            "mode": "reuse_exact_prepared_claim_ledger",
+            "source_mode": existing_contract.get("mode"),
+            "source_payload_sha256": existing_contract.get(
+                "source_payload_sha256"
+            ),
+            "claim_ledger": copy.deepcopy(
+                existing_contract.get("claim_ledger")
+            ),
+            "coverage_complete": True,
+        }
+    else:
+        model_payload, input_plan = await _prepare_final_model_payload(
+            run_id,
+            payload=user_payload,
+            system=shard_system,
+            target_model=ANALYSIS_MODEL,
+            stage_key="report",
+            artifact_namespace=(
+                f"final_shard_input_{artifact_role}_a{attempt}"
+            ),
+            prompt_version=FINAL_REPORT_VERSION,
+            force_hierarchical=True,
+            final_request_utf8_bytes=final_request_utf8_bytes,
+        )
+    claim_rows = await _final_report_source_claim_rows(
+        run_id,
+        model_payload,
+    )
+    atomic_source_records = _final_report_shard_source_records(
+        model_payload,
+        claim_rows=claim_rows,
+    )
+    window = await _final_model_input_window(model=ANALYSIS_MODEL)
+    envelope = window["model_envelope"]
+    maximum = envelope.get("max_completion_tokens")
+    if (
+        isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum <= 0
+    ):
+        raise OpenRouterError(
+            "Final report capsule planner requires the model's advertised "
+            "completion envelope"
+        )
+    window_bytes = int(window["input_utf8_window"])
+    capsule_preflight_document_id = (
+        f"{run_id}:final-capsule-preflight:{artifact_role}:{attempt}:"
+        f"{source_digest[:16]}"
+    )
+
+    def capsule_request_utf8_bytes(record: dict[str, Any]) -> int:
+        candidate_plan = _build_final_report_shard_plan(
+            document_id=capsule_preflight_document_id,
+            source_records=[record],
+            generation_contract=generation_contract,
+            merge_contract=merge_contract,
+        )
+        candidate_store = create_sharded_artifact_store(
+            run_id=run_id,
+            stage_key="report",
+            owner_artifact_key="final_capsule_preflight",
+            model=ANALYSIS_MODEL,
+            owner_prompt_version=FINAL_REPORT_VERSION,
+            plan=candidate_plan,
+        )
+        request = candidate_store.planned_requests()[0]
+        return len(
+            candidate_store.provider_request_utf8_bytes(
+                request,
+                max_completion_tokens=maximum,
+            )
+        )
+
+    source_records, capsule_plan = _batch_final_report_source_records(
+        atomic_source_records,
+        input_window_utf8_bytes=window_bytes,
+        output_window_utf8_bytes=maximum,
+        request_utf8_bytes=capsule_request_utf8_bytes,
+    )
+    document_id = (
+        f"{run_id}:final-shards:{artifact_role}:{attempt}:"
+        f"{source_digest[:16]}"
+    )
+    plan = _build_final_report_shard_plan(
+        document_id=document_id,
+        source_records=source_records,
+        generation_contract=generation_contract,
+        merge_contract=merge_contract,
+    )
+    owner_artifact_key = (
+        f"final_report_{artifact_role}_sharded_a{attempt}_"
+        f"{source_digest[:20]}"
+    )
+    store = create_sharded_artifact_store(
+        run_id=run_id,
+        stage_key="report",
+        owner_artifact_key=owner_artifact_key,
+        model=ANALYSIS_MODEL,
+        owner_prompt_version=FINAL_REPORT_VERSION,
+        plan=plan,
+    )
+
+    request_sizes = [
+        len(
+            store.provider_request_utf8_bytes(
+                request,
+                max_completion_tokens=maximum,
+            )
+        )
+        for request in store.planned_requests()
+    ]
+    window_bytes = int(window["input_utf8_window"])
+    oversized = [
+        {
+            "index": index,
+            "request_utf8_bytes": request_bytes,
+        }
+        for index, request_bytes in enumerate(request_sizes)
+        if request_bytes > window_bytes
+    ]
+    if oversized:
+        raise OpenRouterError(
+            "Final report shard admission failed before provider POST: "
+            + json.dumps(oversized, ensure_ascii=False)
+        )
+
+    workflow_input = {
+        "version": FINAL_REPORT_SHARD_PLAN_VERSION,
+        "source_payload_sha256": source_digest,
+        "source_record_count": len(source_records),
+        "atomic_source_record_count": len(atomic_source_records),
+        "capsule_plan": capsule_plan,
+        "exact_claim_count": len(claim_rows),
+        "exact_claim_ids_sha256": _stable_json_sha256(
+            [str(row["claim_id"]) for row in claim_rows]
+        ),
+        "plan": plan.as_dict(),
+        "input_plan": input_plan,
+        "physical_input_window_utf8_bytes": window_bytes,
+        "max_physical_request_utf8_bytes": max(request_sizes),
+        "physical_request_preflight_complete": True,
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key=owner_artifact_key,
+        status="running",
+        model=ANALYSIS_MODEL,
+        input_json=workflow_input,
+        prompt_version=FINAL_REPORT_VERSION,
+    )
+
+    try:
+        document, terminal_records, adaptive_manifest = (
+            await _execute_final_report_adaptive_shards(
+                run_id,
+                source_records=source_records,
+                system=shard_system,
+                generation_contract=generation_contract,
+                merge_contract=merge_contract,
+                artifact_role=artifact_role,
+                attempt=attempt,
+                source_digest=source_digest,
+                input_window_utf8_bytes=window_bytes,
+                max_completion_tokens=maximum,
+            )
+        )
+        canonical = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        usage = {
+            "_aiv_sharded_document": adaptive_manifest,
+            "_aiv_shard_input_plan": input_plan,
+            "_aiv_terminal_source_count": len(terminal_records),
+            "resumed_shards": adaptive_manifest["resumed_shards"],
+            "generated_shards": adaptive_manifest["generated_shards"],
+        }
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=owner_artifact_key,
+            status="completed",
+            model=ANALYSIS_MODEL,
+            input_json=workflow_input,
+            output_json=document,
+            raw_text=canonical,
+            usage_json=usage,
+            prompt_version=FINAL_REPORT_VERSION,
+        )
+        return SimpleNamespace(
+            parsed=document,
+            text=canonical,
+            usage=usage,
+        )
+    except Exception as exc:
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=owner_artifact_key,
+            status="failed",
+            model=ANALYSIS_MODEL,
+            input_json=workflow_input,
+            error_message=str(exc),
+            prompt_version=FINAL_REPORT_VERSION,
+            preserve_existing_evidence=True,
+        )
+        raise
+
+
+def _final_report_attempt_artifact_key(
+    *,
+    artifact_role: str,
+    attempt: int,
+    user_payload: dict[str, Any],
+) -> str:
+    return (
+        f"final_report_{artifact_role}_attempt_a{attempt}_"
+        f"{_stable_json_sha256(user_payload)[:20]}"
+    )
 
 
 async def _final_report_author_candidate(
@@ -16655,32 +31988,25 @@ async def _final_report_author_candidate(
                     last_errors
                 )
                 user_payload["rejected_report"] = rejected_report
-                repair_preflight = _final_input_preflight(user_payload)
-                if not repair_preflight["accepted"]:
-                    raise OpenRouterError(
-                        "Final report structure repair input exceeds the "
-                        "configured context budget: "
-                        f"{repair_preflight['estimated_input_tokens']} "
-                        "estimated tokens > "
-                        f"{repair_preflight['input_token_budget']}."
-                    )
-            result = await chat(
-                model=ANALYSIS_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            user_payload,
-                            ensure_ascii=False,
+                user_payload, _repair_input_plan = (
+                    await _prepare_final_model_payload(
+                        run_id,
+                        payload=user_payload,
+                        system=system,
+                        target_model=ANALYSIS_MODEL,
+                        stage_key="report",
+                        artifact_namespace=(
+                            f"final_structure_repair_input_a{attempt}"
                         ),
-                    },
-                ],
-                response_schema=FINAL_REPORT_SCHEMA,
-                schema_name="aiv_final_report",
-                reasoning_effort="high",
-                max_tokens=30_000,
-                temperature=0.15,
+                        prompt_version=FINAL_REPORT_VERSION,
+                    )
+                )
+            result = await _final_report_structured_attempt(
+                run_id,
+                system=system,
+                user_payload=user_payload,
+                artifact_role="author",
+                attempt=attempt,
             )
             last_raw_text = result.text
             last_usage = result.usage
@@ -16726,6 +32052,166 @@ async def _final_report_author_candidate(
         raise
 
 
+async def _final_report_structured_attempt(
+    run_id: str,
+    *,
+    system: str,
+    user_payload: dict[str, Any],
+    artifact_role: str,
+    attempt: int,
+) -> Any:
+    """Execute one idempotent final-report POST with append-only evidence.
+
+    The aggregate ``final_report``/author artifacts describe workflow state and
+    may legitimately be invalidated.  This digest-addressed artifact is the
+    immutable receipt for the actual paid provider call, including malformed or
+    output-limited raw text.  A process restart therefore reuses an already
+    schema-valid result instead of buying the same call again.
+    """
+
+    input_digest = _stable_json_sha256(user_payload)
+    artifact_key = _final_report_attempt_artifact_key(
+        artifact_role=artifact_role,
+        attempt=attempt,
+        user_payload=user_payload,
+    )
+    cached = await _artifact_output(
+        run_id,
+        artifact_key,
+        input_json=user_payload,
+        model=ANALYSIS_MODEL,
+        prompt_version=FINAL_REPORT_VERSION,
+    )
+    if isinstance(cached, dict):
+        return SimpleNamespace(parsed=cached, text=None, usage=None)
+
+    input_contract = user_payload.get("long_input_contract")
+    if (
+        isinstance(input_contract, dict)
+        and input_contract.get("mode")
+        in {
+            "hierarchical_evidence_tree",
+            "hierarchical_evidence_tree_compact_ledger",
+            "bounded_transitive_evidence_tree",
+        }
+        and isinstance(input_contract.get("claim_ledger"), dict)
+    ):
+        # Hierarchical summaries are navigation, not a substitute for their
+        # exact source claims.  Route them directly to bounded author shards so
+        # every claim and atomic fact receives an explicit disposition.  A
+        # monolithic author call would only see the lossy root synopsis.
+        return await _final_report_sharded_attempt(
+            run_id,
+            system=system,
+            user_payload=user_payload,
+            artifact_role=artifact_role,
+            attempt=attempt,
+        )
+
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key=artifact_key,
+        status="running",
+        model=ANALYSIS_MODEL,
+        input_json=user_payload,
+        prompt_version=FINAL_REPORT_VERSION,
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": json.dumps(user_payload, ensure_ascii=False),
+        },
+    ]
+    document_id = (
+        f"{run_id}:final-{artifact_role}:{attempt}:"
+        f"{input_digest[:16]}"
+    )
+    audit_checkpoint, resume_checkpoint = (
+        await _durable_structured_transport(
+            run_id,
+            stage_key="report",
+            owner_artifact_key=artifact_key,
+            source_input=user_payload,
+            model=ANALYSIS_MODEL,
+            owner_prompt_version=FINAL_REPORT_VERSION,
+            messages=messages,
+            schema_name="aiv_final_report",
+            response_schema=FINAL_REPORT_SCHEMA,
+            document_id=document_id,
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+    )
+    try:
+        result = await chat_continuable_structured(
+            model=ANALYSIS_MODEL,
+            messages=messages,
+            response_schema=FINAL_REPORT_SCHEMA,
+            schema_name="aiv_final_report",
+            reasoning_effort="high",
+            temperature=0.15,
+            document_id=document_id,
+            audit_checkpoint=audit_checkpoint,
+            resume_checkpoint=resume_checkpoint,
+        )
+        if not isinstance(result.parsed, dict):
+            raise OpenRouterResponseContractError(
+                "Final report attempt returned no structured object",
+                result=result,
+            )
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=artifact_key,
+            status="completed",
+            model=ANALYSIS_MODEL,
+            input_json=user_payload,
+            output_json=result.parsed,
+            raw_text=result.text,
+            usage_json=result.usage,
+            prompt_version=FINAL_REPORT_VERSION,
+        )
+        return result
+    except Exception as exc:
+        failed_result = getattr(exc, "result", None)
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=artifact_key,
+            status="failed",
+            model=ANALYSIS_MODEL,
+            input_json=user_payload,
+            raw_text=(
+                str(getattr(failed_result, "text", "") or "") or None
+            ),
+            usage_json=(
+                getattr(failed_result, "usage", None)
+                if isinstance(getattr(failed_result, "usage", None), dict)
+                else None
+            ),
+            error_message=str(exc),
+            prompt_version=FINAL_REPORT_VERSION,
+        )
+        if isinstance(exc, OpenRouterStructuredContinuationError):
+            logger.warning(
+                "Final %s report attempt %s reached the physical "
+                "whole-document continuation envelope; switching to "
+                "independent durable shards",
+                artifact_role,
+                attempt,
+            )
+            return await _final_report_sharded_attempt(
+                run_id,
+                system=system,
+                user_payload=user_payload,
+                artifact_role=artifact_role,
+                attempt=attempt,
+            )
+        raise
+
+
 async def _invalidate_blocked_final_report_author_candidate(
     run_id: str,
     *,
@@ -16737,6 +32223,58 @@ async def _invalidate_blocked_final_report_author_candidate(
     """Make a semantically blocked author candidate non-reusable."""
 
     candidate_sha256 = _stable_json_sha256(candidate)
+    # The common author attempt (a0) is invalidated through the same artifact
+    # API so test/in-memory stores and production agree.  Preserve its raw and
+    # usage receipt: semantic rejection changes reusability, not history.
+    initial_receipt_key = _final_report_attempt_artifact_key(
+        artifact_role="author",
+        attempt=0,
+        user_payload=payload,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key=initial_receipt_key,
+        status="failed",
+        model=ANALYSIS_MODEL,
+        input_json=payload,
+        output_json=candidate,
+        error_message=(
+            "Author candidate was rejected by the semantic gate: "
+            + "; ".join(blockers)
+        ),
+        prompt_version=FINAL_REPORT_VERSION,
+        preserve_existing_evidence=True,
+    )
+    # A structurally repaired candidate may have come from a1 with a payload
+    # that includes the rejected a0 document.  Find every matching receipt by
+    # its code-owned candidate digest and invalidate only its cache status while
+    # retaining the append-only raw/usage fields.
+    async with SessionLocal() as session:
+        receipts = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key.like(
+                        "final_report_author_attempt_%"
+                    ),
+                )
+            )
+        ).scalars().all()
+        changed = False
+        for receipt in receipts:
+            if not isinstance(receipt.output_json, dict):
+                continue
+            if _stable_json_sha256(receipt.output_json) != candidate_sha256:
+                continue
+            receipt.status = "failed"
+            receipt.error_message = (
+                "Author candidate was rejected by the semantic gate: "
+                + "; ".join(blockers)
+            )
+            changed = True
+        if changed:
+            await session.commit()
     await _save_artifact(
         run_id,
         stage_key="report",
@@ -16758,6 +32296,242 @@ async def _invalidate_blocked_final_report_author_candidate(
     )
 
 
+def _final_editor_protected_terms(
+    public_report: dict[str, Any],
+) -> list[str]:
+    """Collect reader-visible names that an editorial pass may not rename."""
+
+    protected: list[str] = []
+    brand = public_report.get("brand")
+    if isinstance(brand, dict):
+        protected.append(str(brand.get("name") or "").strip())
+        for entity in brand.get("entity_scope") or []:
+            if not isinstance(entity, dict):
+                continue
+            protected.append(str(entity.get("canonical_name") or "").strip())
+            protected.extend(
+                str(value).strip() for value in entity.get("aliases") or []
+            )
+    provider_rows = (
+        (public_report.get("discovery") or {}).get("providers") or []
+        if isinstance(public_report.get("discovery"), dict)
+        else []
+    )
+    for row in provider_rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ("label", "provider", "model", "name"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                protected.append(value)
+    return list(dict.fromkeys(value for value in protected if value))
+
+
+async def _edit_final_report_language(
+    run_id: str,
+    *,
+    report: dict[str, Any],
+    public_report: dict[str, Any],
+    selected_answer_context: list[dict[str, Any]],
+    answer_selection_manifest: dict[str, Any],
+    semantic_evidence_document: dict[str, Any],
+) -> dict[str, Any]:
+    """Run a lossless, fact-preserving Russian editorial pass.
+
+    Failure is safe: the already semantically accepted author report is kept
+    byte-for-byte (apart from removing presentation-only headline emphasis),
+    while the editorial audit records the fallback reason.  A rewritten
+    candidate must pass both the unit critic and the full report semantic gate.
+    """
+
+    source = copy.deepcopy(report)
+    source["headline_emphasis"] = []
+    cache_input = {
+        "source_report_sha256": _stable_json_sha256(source),
+        "public_report_sha256": _stable_json_sha256(public_report),
+        "policy_version": REPORT_EDITOR_POLICY_VERSION,
+        "protected_terms": _final_editor_protected_terms(public_report),
+    }
+    cached = await _artifact_output(
+        run_id,
+        "final_report_editorial",
+        input_json=cache_input,
+        model=PROCESSING_MODEL,
+        prompt_version=FINAL_EDITORIAL_VERSION,
+    )
+    if isinstance(cached, dict):
+        cached_report = cached.get("report")
+        cached_audit = cached.get("audit")
+        if (
+            isinstance(cached_report, dict)
+            and isinstance(cached_audit, dict)
+            and cached_audit.get("source_report_sha256")
+            == cache_input["source_report_sha256"]
+            and cached_audit.get("policy_version")
+            == REPORT_EDITOR_POLICY_VERSION
+            and not _validate_final_report(cached_report)
+        ):
+            return copy.deepcopy(cached_report)
+
+    async def editor_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        attempt = int(value.get("attempt") or 0)
+        source_digest = str(value.get("source_sha256") or "")
+        unit_identity = _stable_json_sha256(
+            {
+                "source_unit_id": value.get("source_unit_id"),
+                "source_sha256": source_digest,
+            }
+        )[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=(
+                f"ru_editor_unit_a{attempt}_{unit_identity}"
+            ),
+            schema=EDITOR_UNIT_SCHEMA,
+            schema_name="aiv_ru_editor_unit",
+            system=EDITORIAL_POLICY,
+            user_payload=value,
+            model=PROCESSING_MODEL,
+            reasoning_effort="high",
+            prompt_version=FINAL_EDITORIAL_VERSION,
+        )
+
+    async def critic_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        unit_id = str(value.get("source_unit_id") or "")
+        digest = _stable_json_sha256(value)[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=f"ru_editor_critic_{digest}",
+            schema=EDITOR_CRITIC_SCHEMA,
+            schema_name="aiv_ru_editor_critic",
+            system=EDITOR_CRITIC_POLICY,
+            user_payload={**value, "source_unit_id": unit_id},
+            model=REPORT_SEMANTIC_MODEL,
+            reasoning_effort="high",
+            prompt_version=FINAL_EDITORIAL_VERSION,
+        )
+
+    async def arbiter_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        digest = _stable_json_sha256(value)[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=f"ru_editor_arbiter_{digest}",
+            schema=EDITOR_UNIT_SCHEMA,
+            schema_name="aiv_ru_editor_arbiter",
+            system=(
+                EDITORIAL_POLICY
+                + "\n\nТы старший арбитр. Исправь только доказанный "
+                "редакционный или смысловой дефект; факты неизменны."
+            ),
+            user_payload=value,
+            model=ANALYSIS_MODEL,
+            reasoning_effort="high",
+            prompt_version=FINAL_EDITORIAL_VERSION,
+        )
+
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key="final_report_editorial",
+        status="running",
+        model=PROCESSING_MODEL,
+        input_json=cache_input,
+        prompt_version=FINAL_EDITORIAL_VERSION,
+    )
+    try:
+        edited, audit = await edit_report(
+            source,
+            editor_call=editor_call,
+            critic_call=critic_call,
+            arbiter_call=arbiter_call,
+            protected_terms=cache_input["protected_terms"],
+            concurrency=max(1, min(4, PROCESSING_BATCH_CONCURRENCY)),
+        )
+        errors = _validate_final_report(edited)
+        semantic_review: dict[str, Any] | None = None
+        if not errors and edited != source:
+            semantic_review = await _final_report_semantic_review_artifact(
+                run_id,
+                public_report=public_report,
+                candidate_report=edited,
+                selected_answer_context=selected_answer_context,
+                answer_selection_manifest=answer_selection_manifest,
+                attempt=1,
+                artifact_namespace="final_report_editor_semantic_gate",
+            )
+            errors = report_semantic_blockers(
+                edited,
+                public_report,
+                semantic_review,
+                evidence_document=semantic_evidence_document,
+            )
+        if errors:
+            audit["semantic_fallback"] = {
+                "used": True,
+                "errors": list(errors),
+                "review": semantic_review,
+            }
+            edited = source
+            audit["result_report_sha256"] = _stable_json_sha256(edited)
+        else:
+            audit["semantic_fallback"] = {"used": False, "errors": []}
+        output = {"report": edited, "audit": audit}
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key="final_report_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=cache_input,
+            output_json=output,
+            raw_text=json.dumps(edited, ensure_ascii=False),
+            usage_json={
+                "_aiv_editorial_audit": {
+                    key: copy.deepcopy(audit.get(key))
+                    for key in (
+                        "version", "policy_version", "policy_sha256",
+                        "source_report_sha256", "result_report_sha256",
+                        "unit_count", "processed_unit_count",
+                        "coverage_complete", "audit_sha256",
+                        "semantic_fallback",
+                    )
+                }
+            },
+            prompt_version=FINAL_EDITORIAL_VERSION,
+        )
+        return edited
+    except Exception as exc:
+        fallback_audit = {
+            "version": REPORT_EDITOR_HARNESS_VERSION,
+            "policy_version": REPORT_EDITOR_POLICY_VERSION,
+            "source_report_sha256": cache_input["source_report_sha256"],
+            "result_report_sha256": _stable_json_sha256(source),
+            "coverage_complete": False,
+            "fallback_reason": f"{type(exc).__name__}: {exc}",
+        }
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key="final_report_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=cache_input,
+            output_json={"report": source, "audit": fallback_audit},
+            error_message=str(exc),
+            prompt_version=FINAL_EDITORIAL_VERSION,
+        )
+        return source
+
+
 async def _final_report(
     run_id: str,
     public_report: dict[str, Any],
@@ -16773,9 +32547,8 @@ async def _final_report(
 
 Структура:
 - первая фраза даёт управленческий вывод;
-- headline должен быть немного короче обычного газетного заголовка. В
-  headline_emphasis верни одну или две точные непересекающиеся подстроки из
-  headline, которые заслуживают более крупного кегля. Не перефразируй их;
+- headline должен быть крупным, но достаточно компактным для первого экрана.
+  Используй равномерный кегль и насыщенность; headline_emphasis верни пустым;
 - первый содержательный раздел — подробный технический аудит: доступ
   содержательных страниц, robots.txt, серверный HTML/CSR, Schema.org,
   формы входа, таблица страниц, доказательства и практические действия;
@@ -16842,20 +32615,31 @@ async def _final_report(
 содержательные страницы», «пять ответов содержат расхождения в фактах».
 Сохраняй сами числа, знаменатели и смысл доказательства.
 
-В selected_full_answers передана детерминированная выборка контекста из
-корпуса, который прошёл независимого критика. Доступ к raw определяет
+В selected_full_answers передан весь наблюдавшийся корпус, который прошёл
+независимого критика: локального лимита количества ответов или длины raw здесь
+нет. Если полный payload физически не помещается в одно окно модели, code-owned
+evidence tree предварительно обрабатывает каждый leaf и доказывает полное
+покрытие через lineage. Доступ к raw определяет
 context_eligible/context_access, а не metric_eligible. Для
 context_access=full_text связка «сценарий — raw-ответ» передана полностью и не
-обрезана. Для context_access=metadata_only переданы только метаданные и
+обрезана. context_access=provider_limited_prefix означает, что передан весь
+фактически полученный от модели текст, но сама модель остановилась на своём
+физическом пределе вывода. Такой префикс можно использовать только как
+положительное буквальное доказательство уже названного; отсутствие сущности в
+нём ничего не доказывает, и строка не входит в знаменатели метрик. Для
+context_access=metadata_only переданы только метаданные и
 provenance: answer_text, annotation evidence и citations намеренно
 отсутствуют. requested_mode показывает лишь запрошенный режим; verified_mode
 показывает транспортно подтверждённый режим и для непроверенной строки равен
-null. metric_eligible=true вместе с context_eligible=false допустимо только
+null. metric_eligible=false вместе с context_eligible=true допустимо для
+provider_limited_prefix: raw сохранён для квалифицированного контекста, но не
+для расчёта отсутствий. metric_eligible=true вместе с context_eligible=false допустимо только
 для ограниченного legacy-observational агрегата: строка участвует в
 программном числе, но не является качественным доказательством памяти модели.
 answer_corpus_manifest описывает весь корпус, а
-answer_selection_manifest доказывает покрытие выборки и связывает её с полным
-корпусом. Доли и показатели не пересчитывай: числовой источник истины —
+answer_selection_manifest доказывает, что в контекст включены все строки без
+пропусков, и связывает их с полным корпусом. Доли и показатели не пересчитывай:
+числовой источник истины —
 report_data. Строку с context_access=metadata_only разрешено использовать
 только как контекст ограничения протокола; запрещено строить по её скрытому
 содержанию вывод или причинное объяснение. Не показывай читателю внутренние
@@ -16874,28 +32658,39 @@ report_data. Строку с context_access=metadata_only разрешено и�
 {LIVE_RUSSIAN_RULES}
 """.strip()
     payload = _final_report_payload(public_report, answer_corpus)
+    model_payload, input_plan = await _prepare_final_model_payload(
+        run_id,
+        payload=payload,
+        system=system,
+    )
     semantic_evidence_document = {
         "report_data": public_report,
         "selected_answer_context": payload["selected_full_answers"],
         "answer_selection_manifest": payload["answer_selection_manifest"],
     }
+
+    async def finalize_language(value: dict[str, Any]) -> dict[str, Any]:
+        return await _edit_final_report_language(
+            run_id,
+            report=value,
+            public_report=public_report,
+            selected_answer_context=payload["selected_full_answers"],
+            answer_selection_manifest=payload["answer_selection_manifest"],
+            semantic_evidence_document=semantic_evidence_document,
+        )
     preflight = _final_input_preflight(
         payload,
-        reserve_tokens=FINAL_REPAIR_TOKEN_RESERVE,
+        physical_input_token_window=(
+            input_plan.get("input_token_window")
+            or max(1, int(input_plan["input_utf8_window"]))
+        ),
     )
-    preflight_error = None
-    if not preflight["accepted"]:
-        preflight_error = (
-            "Final Opus input exceeds the configured context budget: "
-            f"{preflight['estimated_input_tokens']} estimated tokens + "
-            f"{preflight['repair_reserve_tokens']} repair reserve > "
-            f"{preflight['input_token_budget']}."
-        )
+    preflight["long_input_harness"] = input_plan
     await _save_artifact(
         run_id,
         stage_key="report",
         artifact_key="final_report_preflight",
-        status="completed" if preflight["accepted"] else "failed",
+        status="completed",
         model=ANALYSIS_MODEL,
         input_json={
             "final_report_version": FINAL_REPORT_VERSION,
@@ -16905,11 +32700,8 @@ report_data. Строку с context_access=metadata_only разрешено и�
             ),
         },
         output_json=preflight,
-        error_message=preflight_error,
         prompt_version=FINAL_REPORT_VERSION,
     )
-    if preflight_error is not None:
-        raise OpenRouterError(preflight_error)
     cached = await _artifact_output(
         run_id,
         "final_report",
@@ -16944,7 +32736,7 @@ report_data. Строку с context_access=metadata_only разрешено и�
             ) = await _final_report_author_candidate(
                 run_id,
                 system=system,
-                payload=payload,
+                payload=model_payload,
             )
         else:
             candidate = final_cache_candidate
@@ -16966,7 +32758,7 @@ report_data. Строку с context_access=metadata_only разрешено и�
         )
         if not last_errors:
             if final_cache_candidate is not None:
-                return candidate
+                return await finalize_language(candidate)
             await _save_artifact(
                 run_id,
                 stage_key="report",
@@ -16979,11 +32771,11 @@ report_data. Строку с context_access=metadata_only разрешено и�
                 usage_json=candidate_usage,
                 prompt_version=FINAL_REPORT_VERSION,
             )
-            return candidate
+            return await finalize_language(candidate)
         if semantic_review.get("verdict") == "block":
             await _invalidate_blocked_final_report_author_candidate(
                 run_id,
-                payload=payload,
+                payload=model_payload,
                 candidate=candidate,
                 semantic_review=semantic_review,
                 blockers=last_errors,
@@ -16996,54 +32788,29 @@ report_data. Строку с context_access=metadata_only разрешено и�
         rejected_report = candidate
         last_semantic_review = semantic_review
         for _attempt in range(MAX_FINAL_REPORT_REPAIRS):
-            user_payload = dict(payload)
+            user_payload = dict(model_payload)
             user_payload["validation_errors_to_fix"] = last_errors
             user_payload["semantic_review_to_fix"] = last_semantic_review
             user_payload["rejected_report"] = rejected_report
-            retry_preflight = _final_input_preflight(user_payload)
-            if not retry_preflight["accepted"]:
-                retry_error = (
-                    "Final Opus retry input exceeds the configured context "
-                    f"budget: {retry_preflight['estimated_input_tokens']} "
-                    f"estimated tokens > "
-                    f"{retry_preflight['input_token_budget']}."
-                )
-                await _save_artifact(
+            user_payload, _repair_input_plan = (
+                await _prepare_final_model_payload(
                     run_id,
+                    payload=user_payload,
+                    system=system,
+                    target_model=ANALYSIS_MODEL,
                     stage_key="report",
-                    artifact_key="final_report_preflight",
-                    status="failed",
-                    model=ANALYSIS_MODEL,
-                    input_json={
-                        "final_report_version": FINAL_REPORT_VERSION,
-                        "corpus_manifest_digest": answer_corpus["manifest"][
-                            "digest"
-                        ],
-                        "selection_manifest_digest": (
-                            payload["answer_selection_manifest"]["digest"]
-                        ),
-                        "retry_after_validation": True,
-                        "repair_kind": "semantic",
-                    },
-                    output_json=retry_preflight,
-                    error_message=retry_error,
+                    artifact_namespace=(
+                        f"final_semantic_repair_input_a{_attempt}"
+                    ),
                     prompt_version=FINAL_REPORT_VERSION,
                 )
-                raise OpenRouterError(retry_error)
-            result = await chat(
-                model=ANALYSIS_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": json.dumps(user_payload, ensure_ascii=False),
-                    },
-                ],
-                response_schema=FINAL_REPORT_SCHEMA,
-                schema_name="aiv_final_report",
-                reasoning_effort="high",
-                max_tokens=30_000,
-                temperature=0.15,
+            )
+            result = await _final_report_structured_attempt(
+                run_id,
+                system=system,
+                user_payload=user_payload,
+                artifact_role="semantic_repair",
+                attempt=_attempt,
             )
             if not isinstance(result.parsed, dict):
                 last_errors = ["Ответ не является объектом."]
@@ -17088,7 +32855,7 @@ report_data. Строку с context_access=metadata_only разрешено и�
                 usage_json=result.usage,
                 prompt_version=FINAL_REPORT_VERSION,
             )
-            return repaired
+            return await finalize_language(repaired)
         raise OpenRouterError(
             "; ".join(last_errors) or "Final report validation failed"
         )
@@ -17108,10 +32875,8 @@ report_data. Строку с context_access=metadata_only разрешено и�
 
 def _eligible_illustration_answer_context(
     full_answers: list[dict[str, Any]] | None,
-    *,
-    limit: int = 8,
-) -> tuple[list[dict[str, Any]], dict[str, int | bool]]:
-    """Build visual context without exposing unattested panel content."""
+) -> tuple[list[dict[str, Any]], dict[str, int | bool | str]]:
+    """Build uncapped visual context without exposing unattested content."""
 
     sanitized = [
         _final_model_answer_context_item(item)
@@ -17119,20 +32884,36 @@ def _eligible_illustration_answer_context(
         if isinstance(item, dict)
     ]
     eligible = [
-        item for item in sanitized if item.get("context_access") == "full_text"
+        item
+        for item in sanitized
+        if item.get("context_access")
+        in {"full_text", "provider_limited_prefix"}
     ]
-    selected = []
-    for item in eligible[:limit]:
-        selected.append(
-            {
-                **item,
-                "answer_text": str(item.get("answer_text") or "")[:3000],
-            }
-        )
+    selected = [
+        {
+            **item,
+            "answer_text": str(item.get("answer_text") or ""),
+        }
+        for item in eligible
+    ]
     return selected, {
-        "eligible_full_text_count": len(eligible),
-        "selected_full_text_count": len(selected),
-        "withheld_metadata_only_count": len(sanitized) - len(eligible),
+        "context_policy": "all_attested_answers_no_local_cap_v1",
+        "eligible_raw_context_count": len(eligible),
+        "eligible_full_text_count": sum(
+            item.get("context_access") == "full_text" for item in eligible
+        ),
+        "selected_raw_context_count": len(selected),
+        "selected_full_text_count": sum(
+            item.get("context_access") == "full_text" for item in selected
+        ),
+        "selected_limited_prefix_count": sum(
+            item.get("context_access") == "provider_limited_prefix"
+            for item in selected
+        ),
+        "withheld_metadata_only_count": sum(
+            item.get("context_access") == "metadata_only"
+            for item in sanitized
+        ),
         "unattested_raw_content_included": False,
     }
 
@@ -17174,9 +32955,15 @@ rw.plus исследуемый бренд может совпадать с из�
   причинный эффект веб-поиска; при legacy-observational обязательно повтори
   ограничение аттестации режима;
 - evidence_sample и selected_full_answers содержат только технически
-  подтверждённые ответы. withheld_metadata_only_count в
+  подтверждённые ответы либо явно отмеченные provider_limited_prefix. Для
+  такого префикса используй только уже присутствующие положительные факты;
+  отсутствие чего-либо не интерпретируй. withheld_metadata_only_count в
   answer_context_contract — число намеренно скрытых строк, а не результат и
   не доказательство того, что модель что-либо знает или не знает;
+- если вход содержит long_input_contract, evidence_digest и
+  deterministic_passthrough, это полное иерархическое представление payload,
+  а не сокращённая выборка: используй code-owned scalar values как источник
+  точных чисел и не объявляй контекст неполным из-за изменённой формы;
 - core_claim формулирует один проверяемый главный вывод без новых расчётов;
 - evidence_paths содержит только существующие JSON Pointer пути из report_data.
   Для technical_access используй /technical/..., для competitive_visibility —
@@ -17242,20 +33029,100 @@ rw.plus исследуемый бренд может совпадать с из�
             user_payload = dict(payload)
             if last_errors:
                 user_payload["validation_errors_to_fix"] = last_errors
-            result = await chat(
+
+            def illustration_request_bytes(
+                candidate: dict[str, Any],
+                envelope: dict[str, Any],
+            ) -> int:
+                return _structured_provider_request_utf8_bytes(
+                    model=ILLUSTRATION_CONCEPT_MODEL,
+                    model_envelope=envelope,
+                    system=system,
+                    user_payload=candidate,
+                    schema=ILLUSTRATION_CONCEPTS_SCHEMA,
+                    schema_name="aiv_illustration_concepts",
+                    reasoning_effort="high",
+                    temperature=0.2,
+                )
+
+            model_payload, input_plan = await _prepare_final_model_payload(
+                run_id,
+                payload=user_payload,
+                system=system,
+                target_model=ILLUSTRATION_CONCEPT_MODEL,
+                artifact_namespace=f"illustration_input_a{_attempt + 1}",
+                prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
+                final_request_utf8_bytes=illustration_request_bytes,
+            )
+            await _save_artifact(
+                run_id,
+                stage_key="report",
+                artifact_key=f"illustration_input_preflight_a{_attempt + 1}",
+                status="completed",
                 model=ILLUSTRATION_CONCEPT_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": json.dumps(user_payload, ensure_ascii=False),
-                    },
-                ],
+                input_json={
+                    "source_payload_sha256": _stable_json_sha256(user_payload),
+                    "attempt": _attempt + 1,
+                },
+                output_json=input_plan,
+                prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
+            )
+            attempt_artifact_key = (
+                f"illustration_concepts_attempt_{_attempt + 1}"
+            )
+            messages = [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(model_payload, ensure_ascii=False),
+                },
+            ]
+            document_id = (
+                f"{run_id}:illustration-concepts:{_attempt + 1}:"
+                f"{_stable_json_sha256(model_payload)[:20]}"
+            )
+            audit_checkpoint, resume_checkpoint = (
+                await _durable_structured_transport(
+                    run_id,
+                    stage_key="report",
+                    owner_artifact_key=attempt_artifact_key,
+                    source_input=model_payload,
+                    model=ILLUSTRATION_CONCEPT_MODEL,
+                    owner_prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
+                    messages=messages,
+                    schema_name="aiv_illustration_concepts",
+                    response_schema=ILLUSTRATION_CONCEPTS_SCHEMA,
+                    document_id=document_id,
+                    reasoning_effort="high",
+                    temperature=0.2,
+                )
+            )
+            result = await chat_continuable_structured(
+                model=ILLUSTRATION_CONCEPT_MODEL,
+                messages=messages,
                 response_schema=ILLUSTRATION_CONCEPTS_SCHEMA,
                 schema_name="aiv_illustration_concepts",
                 reasoning_effort="high",
-                max_tokens=10_000,
                 temperature=0.2,
+                document_id=document_id,
+                audit_checkpoint=audit_checkpoint,
+                resume_checkpoint=resume_checkpoint,
+            )
+            await _save_artifact(
+                run_id,
+                stage_key="report",
+                artifact_key=attempt_artifact_key,
+                status="completed",
+                model=ILLUSTRATION_CONCEPT_MODEL,
+                input_json={
+                    "source_payload_sha256": _stable_json_sha256(user_payload),
+                    "model_payload_sha256": _stable_json_sha256(model_payload),
+                    "input_plan": input_plan,
+                },
+                output_json=result.parsed if isinstance(result.parsed, dict) else None,
+                raw_text=result.text,
+                usage_json=result.usage,
+                prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
             )
             if not isinstance(result.parsed, dict):
                 last_errors = ["Ответ не является объектом."]
@@ -17616,7 +33483,7 @@ retry_instruction напиши по-английски как позитивно
             response_schema=ILLUSTRATION_QA_SCHEMA,
             schema_name=f"aiv_illustration_qa_{sequence}",
             reasoning_effort="high",
-            max_tokens=4500,
+            output_token_policy=OutputTokenPolicy.MODEL_MAX,
             temperature=0.05,
         )
         if not isinstance(result.parsed, dict):
@@ -18375,20 +34242,270 @@ async def _review_technical_summary(
 {LIVE_RUSSIAN_RULES}
 """.strip(),
         user_payload=technical,
-        max_tokens=9000,
         prompt_version=TECHNICAL_REVIEW_VERSION,
     )
 
 
+def _technical_editor_protected_terms(profile: dict[str, Any]) -> list[str]:
+    protected = [str(profile.get("brand_name") or "").strip()]
+    protected.extend(
+        str(value or "").strip() for value in profile.get("brand_aliases") or []
+    )
+    protected.extend(
+        str(value or "").strip() for value in profile.get("products") or []
+    )
+    catalog = profile.get("offer_catalog")
+    if isinstance(catalog, dict):
+        for offer in catalog.get("accepted_offers") or []:
+            if not isinstance(offer, dict):
+                continue
+            protected.append(str(offer.get("canonical_name") or "").strip())
+            protected.extend(
+                str(value or "").strip() for value in offer.get("aliases") or []
+            )
+    return list(dict.fromkeys(value for value in protected if value))
+
+
+def _technical_editorial_shape_is_safe(
+    source: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    """Prove that editorial output changed prose fields and nothing else."""
+
+    if set(candidate) != set(source):
+        return False
+    source_findings = source.get("findings")
+    candidate_findings = candidate.get("findings")
+    if not isinstance(source_findings, list) or not isinstance(
+        candidate_findings, list
+    ):
+        return False
+    if len(source_findings) != len(candidate_findings):
+        return False
+    for source_row, candidate_row in zip(source_findings, candidate_findings):
+        if not isinstance(source_row, dict) or not isinstance(candidate_row, dict):
+            return False
+        if set(candidate_row) != set(source_row):
+            return False
+        for key in source_row:
+            if key in {"title", "business_effect", "action"}:
+                if not isinstance(candidate_row.get(key), str):
+                    return False
+            elif candidate_row.get(key) != source_row.get(key):
+                return False
+    source_limits = source.get("limitations")
+    candidate_limits = candidate.get("limitations")
+    if not isinstance(source_limits, list) or not isinstance(candidate_limits, list):
+        return False
+    if len(source_limits) != len(candidate_limits) or not all(
+        isinstance(value, str) for value in candidate_limits
+    ):
+        return False
+    return all(
+        isinstance(candidate.get(key), str)
+        for key in ("overall_conclusion", "render_conclusion")
+    )
+
+
+async def _edit_technical_review_language(
+    run_id: str,
+    *,
+    review: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the audited Russian editorial harness to technical prose."""
+
+    source = copy.deepcopy(review)
+    prose_paths = technical_review_narrative_paths(source)
+    protected_terms = _technical_editor_protected_terms(profile)
+    cache_input = {
+        "source_review_sha256": _stable_json_sha256(source),
+        "profile_identity_sha256": _stable_json_sha256(
+            {
+                "brand_name": profile.get("brand_name"),
+                "brand_aliases": profile.get("brand_aliases") or [],
+                "products": profile.get("products") or [],
+            }
+        ),
+        "policy_version": REPORT_EDITOR_POLICY_VERSION,
+        "prose_paths": prose_paths,
+        "protected_terms": protected_terms,
+    }
+    cached = await _artifact_output(
+        run_id,
+        "technical_review_editorial",
+        input_json=cache_input,
+        model=PROCESSING_MODEL,
+        prompt_version=TECHNICAL_EDITORIAL_VERSION,
+    )
+    if isinstance(cached, dict):
+        cached_review = cached.get("review")
+        cached_audit = cached.get("audit")
+        if (
+            isinstance(cached_review, dict)
+            and isinstance(cached_audit, dict)
+            and cached_audit.get("source_report_sha256")
+            == cache_input["source_review_sha256"]
+            and cached_audit.get("policy_version")
+            == REPORT_EDITOR_POLICY_VERSION
+            and _technical_editorial_shape_is_safe(source, cached_review)
+        ):
+            return copy.deepcopy(cached_review)
+
+    async def editor_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        attempt = int(value.get("attempt") or 0)
+        unit_identity = _stable_json_sha256(
+            {
+                "source_unit_id": value.get("source_unit_id"),
+                "source_sha256": value.get("source_sha256"),
+            }
+        )[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="technical_access",
+            artifact_key=f"technical_ru_editor_unit_a{attempt}_{unit_identity}",
+            schema=EDITOR_UNIT_SCHEMA,
+            schema_name="aiv_technical_ru_editor_unit",
+            system=EDITORIAL_POLICY,
+            user_payload=value,
+            model=PROCESSING_MODEL,
+            reasoning_effort="high",
+            prompt_version=TECHNICAL_EDITORIAL_VERSION,
+        )
+
+    async def critic_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        digest = _stable_json_sha256(value)[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="technical_access",
+            artifact_key=f"technical_ru_editor_critic_{digest}",
+            schema=EDITOR_CRITIC_SCHEMA,
+            schema_name="aiv_technical_ru_editor_critic",
+            system=EDITOR_CRITIC_POLICY,
+            user_payload=value,
+            model=REPORT_SEMANTIC_MODEL,
+            reasoning_effort="high",
+            prompt_version=TECHNICAL_EDITORIAL_VERSION,
+        )
+
+    async def arbiter_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        digest = _stable_json_sha256(value)[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="technical_access",
+            artifact_key=f"technical_ru_editor_arbiter_{digest}",
+            schema=EDITOR_UNIT_SCHEMA,
+            schema_name="aiv_technical_ru_editor_arbiter",
+            system=(
+                EDITORIAL_POLICY
+                + "\n\nТы старший арбитр. Исправь только доказанный "
+                "редакционный или смысловой дефект; факты неизменны."
+            ),
+            user_payload=value,
+            model=ANALYSIS_MODEL,
+            reasoning_effort="high",
+            prompt_version=TECHNICAL_EDITORIAL_VERSION,
+        )
+
+    await _save_artifact(
+        run_id,
+        stage_key="technical_access",
+        artifact_key="technical_review_editorial",
+        status="running",
+        model=PROCESSING_MODEL,
+        input_json=cache_input,
+        prompt_version=TECHNICAL_EDITORIAL_VERSION,
+    )
+    try:
+        edited, audit = await edit_report(
+            source,
+            editor_call=editor_call,
+            critic_call=critic_call,
+            arbiter_call=arbiter_call,
+            prose_paths=prose_paths,
+            protected_terms=protected_terms,
+            concurrency=max(1, min(4, PROCESSING_BATCH_CONCURRENCY)),
+        )
+        if not _technical_editorial_shape_is_safe(source, edited):
+            audit["semantic_fallback"] = {
+                "used": True,
+                "errors": ["technical_review_non_prose_fields_changed"],
+            }
+            edited = source
+            audit["result_report_sha256"] = _stable_json_sha256(edited)
+        else:
+            audit["semantic_fallback"] = {"used": False, "errors": []}
+        await _save_artifact(
+            run_id,
+            stage_key="technical_access",
+            artifact_key="technical_review_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=cache_input,
+            output_json={"review": edited, "audit": audit},
+            raw_text=json.dumps(edited, ensure_ascii=False),
+            prompt_version=TECHNICAL_EDITORIAL_VERSION,
+        )
+        return edited
+    except Exception as exc:
+        fallback_audit = {
+            "version": REPORT_EDITOR_HARNESS_VERSION,
+            "policy_version": REPORT_EDITOR_POLICY_VERSION,
+            "source_report_sha256": cache_input["source_review_sha256"],
+            "result_report_sha256": _stable_json_sha256(source),
+            "coverage_complete": False,
+            "fallback_reason": f"{type(exc).__name__}: {exc}",
+        }
+        await _save_artifact(
+            run_id,
+            stage_key="technical_access",
+            artifact_key="technical_review_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=cache_input,
+            output_json={"review": source, "audit": fallback_audit},
+            error_message=str(exc),
+            prompt_version=TECHNICAL_EDITORIAL_VERSION,
+        )
+        return source
+
+
 async def _prepare_analysis_foundation(
     run_id: str,
+    *,
+    allow_legacy_snapshot: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Build independent technical and semantic foundations in parallel."""
+
+    async with SessionLocal() as session:
+        domain = (
+            await session.execute(select(Run.domain).where(Run.id == run_id))
+        ).scalar_one()
+    try:
+        crawl_admission = await require_crawl_admission(
+            run_id,
+            domain=domain,
+            allow_legacy_snapshot=allow_legacy_snapshot,
+        )
+    except CrawlAdmissionIncomplete:
+        if not allow_legacy_snapshot:
+            raise
+        crawl_admission = await bootstrap_legacy_crawl_admission(
+            run_id,
+            domain=domain,
+        )
 
     technical, site_context = await asyncio.gather(
         _technical_summary(run_id),
         _site_context(run_id),
     )
+    site_context["crawl_admission"] = copy.deepcopy(crawl_admission)
     async with asyncio.TaskGroup() as task_group:
         technical_review_task = task_group.create_task(
             _review_technical_summary(run_id, technical),
@@ -18398,10 +34515,20 @@ async def _prepare_analysis_foundation(
             _classify_site(run_id, site_context),
             name=f"aiv-site-profile-{run_id}",
         )
+    profile, _catalog, _clusters = await _bind_offer_catalog(
+        run_id,
+        profile_task.result(),
+        site_context,
+    )
+    technical_review = await _edit_technical_review_language(
+        run_id,
+        review=technical_review_task.result(),
+        profile=profile,
+    )
     return (
         technical,
-        technical_review_task.result(),
-        profile_task.result(),
+        technical_review,
+        profile,
         site_context,
     )
 
@@ -18419,6 +34546,35 @@ async def _uses_canonical_intent_taxonomy(run_id: str) -> bool:
             )
         ).scalar_one_or_none()
     return version in CANONICAL_INTENT_PROMPT_SET_VERSIONS
+
+
+async def _final_analysis_foundation_context(run_id: str) -> dict[str, Any]:
+    """Load internal provenance for the author without publishing metadata."""
+
+    keys = (
+        "offer_catalog",
+        "prompt_foundation",
+        "answer_set_receipt",
+        "legacy_prompt_foundation_audit",
+        "legacy_answer_foundation_audit",
+    )
+    async with SessionLocal() as session:
+        artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.in_(keys),
+                        RunArtifact.status == "completed",
+                    )
+                )
+            ).scalars()
+        )
+    return {
+        artifact.artifact_key: copy.deepcopy(artifact.output_json)
+        for artifact in artifacts
+        if isinstance(artifact.output_json, dict)
+    }
 
 
 async def _finish_saved_answer_analysis(
@@ -18476,6 +34632,10 @@ async def _finish_saved_answer_analysis(
         metrics=metrics,
         canonical_intent_taxonomy=await _uses_canonical_intent_taxonomy(run_id),
     )
+    final_input_report = copy.deepcopy(public_report)
+    final_input_report["_analysis_foundation"] = (
+        await _final_analysis_foundation_context(run_id)
+    )
     await update_progress(
         run_id,
         stage="report",
@@ -18497,7 +34657,7 @@ async def _finish_saved_answer_analysis(
     if regenerate_illustrations:
         final, illustrations = await _run_report_branches(
             run_id,
-            public_report=public_report,
+            public_report=final_input_report,
             evidence=evidence,
             answer_corpus=answer_corpus,
             brand_name=str(profile.get("brand_name") or "бренд"),
@@ -18516,7 +34676,7 @@ async def _finish_saved_answer_analysis(
         )
         final, illustrations = await _run_reused_report_branches(
             run_id,
-            public_report=public_report,
+            public_report=final_input_report,
             evidence=evidence,
             answer_corpus=answer_corpus,
             saved_illustrations=saved_illustrations,
@@ -18598,8 +34758,12 @@ async def reprocess_saved_answers(run_id: str) -> None:
             status=RunStatus.analyzing,
         )
         technical, technical_review, profile, _site_context_value = (
-            await _prepare_analysis_foundation(run_id)
+            await _prepare_analysis_foundation(
+                run_id,
+                allow_legacy_snapshot=True,
+            )
         )
+        await _save_answer_set_receipt(run_id)
         await _finish_saved_answer_analysis(
             run_id,
             profile=profile,
@@ -18629,6 +34793,10 @@ async def analyze_run(run_id: str) -> None:
             status=RunStatus.analyzing,
         )
         await apply_ua_conditional_block(run_id)
+        # Validate the persisted nine-prompt panel checkpoint before any
+        # upstream model work or artifact writes. Provenance validation still
+        # follows below, but a DB/artifact mismatch must fail at the cheapest,
+        # read-only boundary.
         panel_checkpoint = await _load_panel_resume_checkpoint(run_id)
         technical, technical_review, profile, site_context = (
             await _prepare_analysis_foundation(run_id)
@@ -18659,8 +34827,20 @@ async def analyze_run(run_id: str) -> None:
                 site_context.get("requested_site"),
                 market_research=market_research,
             )
+            await _save_prompt_foundation(
+                run_id,
+                profile=profile,
+                market_research=market_research,
+                site_context=site_context,
+                prompt_set=prompt_set,
+            )
             prompts = await _persist_prompts(run_id, prompt_set)
         else:
+            await _validate_panel_foundation_resume(
+                run_id,
+                profile=profile,
+                site_context=site_context,
+            )
             prompts = panel_checkpoint
             await update_progress(
                 run_id,
@@ -18697,6 +34877,7 @@ async def analyze_run(run_id: str) -> None:
             start_percent=65,
             end_percent=72,
         )
+        await _save_answer_set_receipt(run_id)
         await _finish_saved_answer_analysis(
             run_id,
             profile=profile,
