@@ -322,6 +322,12 @@ async def retry_run(
     if run is None:
         await session.rollback()
         raise HTTPException(status_code=404, detail="Проверка не найдена.")
+    if run.status == RunStatus.completed:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Готовую проверку нельзя перезапустить.",
+        )
     if run.status in ACTIVE_STATUSES:
         await session.commit()
         coordinator.wake()
@@ -343,8 +349,7 @@ async def retry_run(
         update(Run)
         .where(
             Run.id == run_id,
-            Run.status == run.status,
-            Run.status.in_([RunStatus.failed, RunStatus.completed]),
+            Run.status == RunStatus.failed,
         )
         .values(
             status=RunStatus.pending,

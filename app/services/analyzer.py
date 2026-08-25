@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import settings
@@ -42,6 +43,7 @@ from app.services.openrouter import (
     WEB_ATTESTATION_VERSION,
     ImageResult,
     OpenRouterError,
+    OpenRouterOutputLimitError,
     OpenRouterPolicyError,
     OpenRouterResponseContractError,
     PanelModel,
@@ -109,6 +111,12 @@ PROMPT_GENERATOR_MAX_ATTEMPTS = 4
 PROMPT_CANDIDATE_ARTIFACT_PREFIX = "prompt_set_candidate_"
 PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
 LEGACY_PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v1"
+PANEL_DEFAULT_MAX_TOKENS = 3_200
+PANEL_RETRY_MAX_TOKENS = 6_400
+PANEL_MAX_TOKENS_ALLOWLIST = frozenset(
+    {PANEL_DEFAULT_MAX_TOKENS, PANEL_RETRY_MAX_TOKENS}
+)
+PANEL_RETRY_PROVENANCE_VERSION = "aiv-panel-retry-v1"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v8"
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v15"
@@ -4152,6 +4160,7 @@ def _panel_request_sha256(
     mode: str,
     provider_key: str,
     model: str,
+    max_tokens: int = PANEL_DEFAULT_MAX_TOKENS,
 ) -> str:
     policy = _panel_web_policy(mode, provider_key)
     _request_fields, request_policy = web_request_policy(
@@ -4167,7 +4176,7 @@ def _panel_request_sha256(
         "prompt": prompt_text,
         "web_policy": request_policy,
         "attestation_version": WEB_ATTESTATION_VERSION,
-        "max_tokens": 3200,
+        "max_tokens": max_tokens,
         "temperature": 0.35,
     }
     return hashlib.sha256(
@@ -4178,6 +4187,60 @@ def _panel_request_sha256(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _panel_retry_attempt_record(
+    result: Any,
+    *,
+    max_tokens: int,
+) -> dict[str, Any]:
+    usage = result.usage if isinstance(result.usage, dict) else {}
+    transport = usage.get("_aiv_transport")
+    if not isinstance(transport, dict):
+        transport = (
+            result.transport
+            if isinstance(getattr(result, "transport", None), dict)
+            else {}
+        )
+    response_text = str(result.text or "")
+    token_usage: dict[str, int] = {}
+    for key in sorted(usage):
+        value = usage[key]
+        if (
+            isinstance(key, str)
+            and key.endswith("_tokens")
+            and not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and value >= 0
+            and float(value).is_integer()
+        ):
+            token_usage[key] = int(value)
+    return {
+        "max_tokens": max_tokens,
+        "output_limited": transport.get("output_limited"),
+        "output_complete": transport.get("output_complete"),
+        "response_text_sha256": hashlib.sha256(
+            response_text.encode("utf-8")
+        ).hexdigest(),
+        "response_char_count": len(response_text),
+        "citation_count": len(result.citations or []),
+        "token_usage": token_usage,
+    }
+
+
+def _panel_retry_no_result_attempt_record(
+    *,
+    max_tokens: int,
+) -> dict[str, Any]:
+    return {
+        "max_tokens": max_tokens,
+        "output_limited": None,
+        "output_complete": None,
+        "response_text_sha256": None,
+        "response_char_count": 0,
+        "citation_count": 0,
+        "token_usage": {},
+    }
 
 
 def _legacy_panel_request_sha256(
@@ -4453,6 +4516,16 @@ def _panel_answer_attestation(
         answer.mode,
         answer.provider_key,
     ).value
+    persisted_max_tokens = provenance.get(
+        "max_tokens",
+        PANEL_DEFAULT_MAX_TOKENS,
+    )
+    if (
+        not isinstance(persisted_max_tokens, int)
+        or isinstance(persisted_max_tokens, bool)
+        or persisted_max_tokens not in PANEL_MAX_TOKENS_ALLOWLIST
+    ):
+        return False, "unapproved_panel_max_tokens"
     try:
         _expected_fields, expected_request_policy = web_request_policy(
             model=answer.model,
@@ -4463,6 +4536,7 @@ def _panel_answer_attestation(
             mode=answer.mode,
             provider_key=answer.provider_key,
             model=answer.model,
+            max_tokens=persisted_max_tokens,
         )
     except OpenRouterError:
         # Legacy evidence may contain deprecated ``:online`` slugs or a
@@ -4852,39 +4926,83 @@ async def _ensure_answer_rows(
                     mode=mode,
                     provider_key=panel.key,
                     model=selected_model,
+                    max_tokens=PANEL_DEFAULT_MAX_TOKENS,
                 )
                 row = existing.get((prompt.id, panel.key))
                 if row is None:
-                    row = ModelAnswer(
-                        run_id=run_id,
-                        prompt_id=prompt.id,
-                        provider_key=panel.key,
-                        model=selected_model,
-                        mode=mode,
-                        status="pending",
+                    await session.execute(
+                        sqlite_insert(ModelAnswer)
+                        .values(
+                            run_id=run_id,
+                            prompt_id=prompt.id,
+                            provider_key=panel.key,
+                            model=selected_model,
+                            mode=mode,
+                            status="pending",
+                        )
+                        .on_conflict_do_nothing(
+                            index_elements=(
+                                "run_id",
+                                "prompt_id",
+                                "provider_key",
+                                "mode",
+                            )
+                        )
                     )
-                    session.add(row)
-                    await session.flush()
-                elif (
-                    row.status == "completed"
-                    and row.response_text
-                ):
+                    row = (
+                        await session.execute(
+                            select(ModelAnswer).where(
+                                ModelAnswer.run_id == run_id,
+                                ModelAnswer.prompt_id == prompt.id,
+                                ModelAnswer.provider_key == panel.key,
+                                ModelAnswer.mode == mode,
+                            )
+                        )
+                    ).scalar_one()
+                    existing[(prompt.id, panel.key)] = row
+                if row.status == "completed" and str(
+                    row.response_text or ""
+                ).strip():
                     # Raw panel answers are append-only evidence. A legacy or
                     # stale completed cell remains visible for audit/rebuild,
                     # but _metric_rows will fail it closed unless its exact
                     # request and web policy are attested.
+                    continue
+                reset = await session.execute(
+                    update(ModelAnswer)
+                    .where(
+                        ModelAnswer.id == row.id,
+                        or_(
+                            ModelAnswer.status != "completed",
+                            ModelAnswer.response_text.is_(None),
+                            func.length(
+                                func.trim(
+                                    ModelAnswer.response_text,
+                                    " \t\r\n",
+                                )
+                            )
+                            == 0,
+                        ),
+                    )
+                    .values(
+                        model=selected_model,
+                        status="pending",
+                        response_text=None,
+                        citations_json=None,
+                        usage_json=None,
+                        error_message=None,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if reset.rowcount != 1:
+                    # Another resume completed this cell after our read.
+                    # Its raw evidence is immutable and must stay intact.
                     continue
                 await session.execute(
                     delete(AnswerAnnotation).where(
                         AnswerAnnotation.answer_id == row.id
                     )
                 )
-                row.model = selected_model
-                row.status = "pending"
-                row.response_text = None
-                row.citations_json = None
-                row.usage_json = None
-                row.error_message = None
                 jobs.append(
                     (
                         row.id,
@@ -4947,81 +5065,246 @@ async def _run_panel(
             provider_key,
             _provider_label,
             model,
-            request_sha256,
+            _request_sha256,
         ) = job
 
-        def usage_with_provenance(result: Any) -> dict[str, Any]:
+        def usage_with_provenance(
+            result: Any,
+            *,
+            max_tokens: int,
+            retry_attempts: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
             usage = dict(result.usage or {})
             usage["_aiv_panel_contract"] = {
                 "version": PANEL_CONTRACT_VERSION,
-                "request_sha256": request_sha256,
+                "request_sha256": _panel_request_sha256(
+                    prompt_text=prompt_text,
+                    mode=mode,
+                    provider_key=provider_key,
+                    model=model,
+                    max_tokens=max_tokens,
+                ),
+                "max_tokens": max_tokens,
                 "request_policy_sha256": result.request_policy.get("sha256"),
                 "web_policy": result.request_policy.get("policy"),
                 "attestation_version": WEB_ATTESTATION_VERSION,
                 "web_attestation": result.web_attestation,
             }
+            if retry_attempts is not None:
+                if (
+                    len(retry_attempts) != 2
+                    or [
+                        attempt.get("max_tokens")
+                        for attempt in retry_attempts
+                    ]
+                    != [PANEL_DEFAULT_MAX_TOKENS, PANEL_RETRY_MAX_TOKENS]
+                ):
+                    raise RuntimeError(
+                        "Adaptive panel retry provenance requires exactly "
+                        "the 3200 and 6400 attempts"
+                    )
+                usage["_aiv_panel_retry"] = {
+                    "version": PANEL_RETRY_PROVENANCE_VERSION,
+                    "attempts": copy.deepcopy(retry_attempts),
+                }
             return usage
 
-        try:
-            async with semaphore:
-                result = await chat(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": _panel_system(mode)},
-                        {"role": "user", "content": prompt_text},
-                    ],
-                    web_policy=_panel_web_policy(mode, provider_key),
-                    max_tokens=3200,
-                    temperature=0.35,
+        async def persist_success(
+            result: Any,
+            *,
+            max_tokens: int,
+            retry_attempts: list[dict[str, Any]] | None,
+        ) -> bool:
+            async with SessionLocal() as session:
+                claimed = await session.execute(
+                    update(ModelAnswer)
+                    .where(
+                        ModelAnswer.id == answer_id,
+                        ModelAnswer.status.in_(("pending", "failed")),
+                    )
+                    .values(
+                        status="completed",
+                        response_text=result.text,
+                        citations_json=result.citations or None,
+                        usage_json=usage_with_provenance(
+                            result,
+                            max_tokens=max_tokens,
+                            retry_attempts=retry_attempts,
+                        ),
+                        error_message=None,
+                    )
+                )
+                await session.commit()
+            return claimed.rowcount == 1
+
+        async def persist_failure(
+            exc: Exception,
+            *,
+            evidence_result: Any | None = None,
+            evidence_max_tokens: int | None = None,
+            retry_attempts: list[dict[str, Any]] | None = None,
+        ) -> bool:
+            values: dict[str, Any] = {
+                "status": "failed",
+                "error_message": str(exc)[:1000],
+            }
+            if evidence_result is not None:
+                if evidence_max_tokens is None:
+                    raise RuntimeError(
+                        "Panel failure evidence requires its token budget"
+                    )
+                values.update(
+                    {
+                        "response_text": evidence_result.text,
+                        "citations_json": evidence_result.citations or None,
+                        "usage_json": usage_with_provenance(
+                            evidence_result,
+                            max_tokens=evidence_max_tokens,
+                            retry_attempts=retry_attempts,
+                        ),
+                    }
                 )
             async with SessionLocal() as session:
-                row = (
-                    await session.execute(
-                        select(ModelAnswer).where(ModelAnswer.id == answer_id)
+                claimed = await session.execute(
+                    update(ModelAnswer)
+                    .where(
+                        ModelAnswer.id == answer_id,
+                        ModelAnswer.status == "pending",
                     )
-                ).scalar_one()
-                row.status = "completed"
-                row.response_text = result.text
-                row.citations_json = result.citations or None
-                row.usage_json = usage_with_provenance(result)
-                row.error_message = None
+                    .values(**values)
+                )
                 await session.commit()
+            return claimed.rowcount == 1
+
+        request_max_tokens = PANEL_DEFAULT_MAX_TOKENS
+        retry_attempts: list[dict[str, Any]] | None = None
+        first_limit_result: Any | None = None
+        try:
+            async with semaphore:
+                try:
+                    result = await chat(
+                        model=model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": _panel_system(mode),
+                            },
+                            {"role": "user", "content": prompt_text},
+                        ],
+                        web_policy=_panel_web_policy(mode, provider_key),
+                        max_tokens=request_max_tokens,
+                        temperature=0.35,
+                    )
+                except OpenRouterOutputLimitError as first_limit:
+                    first_limit_result = first_limit.result
+                    retry_attempts = [
+                        _panel_retry_attempt_record(
+                            first_limit.result,
+                            max_tokens=PANEL_DEFAULT_MAX_TOKENS,
+                        )
+                    ]
+                    request_max_tokens = PANEL_RETRY_MAX_TOKENS
+                    try:
+                        result = await chat(
+                            model=model,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": _panel_system(mode),
+                                },
+                                {"role": "user", "content": prompt_text},
+                            ],
+                            web_policy=_panel_web_policy(mode, provider_key),
+                            max_tokens=request_max_tokens,
+                            temperature=0.35,
+                        )
+                    except OpenRouterOutputLimitError as second_limit:
+                        retry_attempts.append(
+                            _panel_retry_attempt_record(
+                                second_limit.result,
+                                max_tokens=PANEL_RETRY_MAX_TOKENS,
+                            )
+                        )
+                        raise
+                    except (
+                        OpenRouterPolicyError,
+                        OpenRouterResponseContractError,
+                    ) as second_result_error:
+                        retry_attempts.append(
+                            _panel_retry_attempt_record(
+                                second_result_error.result,
+                                max_tokens=PANEL_RETRY_MAX_TOKENS,
+                            )
+                        )
+                        raise
+                    except Exception:
+                        retry_attempts.append(
+                            _panel_retry_no_result_attempt_record(
+                                max_tokens=PANEL_RETRY_MAX_TOKENS,
+                            )
+                        )
+                        raise
+                    retry_attempts.append(
+                        _panel_retry_attempt_record(
+                            result,
+                            max_tokens=PANEL_RETRY_MAX_TOKENS,
+                        )
+                    )
+            await persist_success(
+                result,
+                max_tokens=request_max_tokens,
+                retry_attempts=retry_attempts,
+            )
         except asyncio.CancelledError:
             raise
+        except OpenRouterOutputLimitError as exc:
+            logger.warning(
+                "Panel response hit the output limit twice for answer %s",
+                answer_id,
+            )
+            await persist_failure(
+                exc,
+                evidence_result=exc.result,
+                evidence_max_tokens=request_max_tokens,
+                retry_attempts=retry_attempts,
+            )
         except OpenRouterPolicyError as exc:
             logger.warning(
                 "Panel web-policy attestation failed for answer %s",
                 answer_id,
             )
-            async with SessionLocal() as session:
-                row = (
-                    await session.execute(
-                        select(ModelAnswer).where(ModelAnswer.id == answer_id)
-                    )
-                ).scalar_one_or_none()
-                if row is not None:
-                    row.status = "failed"
-                    row.response_text = exc.result.text
-                    row.citations_json = exc.result.citations or None
-                    row.usage_json = usage_with_provenance(exc.result)
-                    row.error_message = str(exc)[:1000]
-                    await session.commit()
+            await persist_failure(
+                exc,
+                evidence_result=exc.result,
+                evidence_max_tokens=request_max_tokens,
+                retry_attempts=retry_attempts,
+            )
+        except OpenRouterResponseContractError as exc:
+            logger.warning(
+                "Panel response contract failed for answer %s",
+                answer_id,
+            )
+            await persist_failure(
+                exc,
+                evidence_result=exc.result,
+                evidence_max_tokens=request_max_tokens,
+                retry_attempts=retry_attempts,
+            )
         except Exception as exc:
             logger.warning(
                 "Panel response failed for answer %s: %s",
                 answer_id,
                 type(exc).__name__,
             )
-            async with SessionLocal() as session:
-                row = (
-                    await session.execute(
-                        select(ModelAnswer).where(ModelAnswer.id == answer_id)
-                    )
-                ).scalar_one_or_none()
-                if row is not None:
-                    row.status = "failed"
-                    row.error_message = str(exc)[:1000]
-                    await session.commit()
+            if first_limit_result is not None and retry_attempts is not None:
+                await persist_failure(
+                    exc,
+                    evidence_result=first_limit_result,
+                    evidence_max_tokens=PANEL_DEFAULT_MAX_TOKENS,
+                    retry_attempts=retry_attempts,
+                )
+            else:
+                await persist_failure(exc)
         finally:
             async with progress_lock:
                 completed_now += 1

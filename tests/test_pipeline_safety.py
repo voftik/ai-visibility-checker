@@ -34,7 +34,9 @@ from app.models import (
 from app.services import crawler
 from app.services.openrouter import (
     WEB_ATTESTATION_VERSION,
+    OpenRouterOutputLimitError,
     OpenRouterError,
+    OpenRouterPolicyError,
     OpenRouterResponseContractError,
     PanelModel,
     WebSearchPolicy,
@@ -123,6 +125,7 @@ from app.services.analyzer import (
     _reconcile_annotation,
     _recover_prompt_set,
     reprocess_saved_answers,
+    _run_panel,
     _rendering_assessment,
     _review_prompt_set_semantics,
     _review_illustration,
@@ -935,6 +938,103 @@ class PanelRoutingTests(unittest.TestCase):
 
         self.assertNotEqual(web_hash, memory_hash)
         self.assertNotEqual(web_hash, changed_attestation_hash)
+
+    def test_panel_v2_missing_budget_attests_as_legacy_3200(self) -> None:
+        prompt_text = "Какие решения выбрать?"
+        usage, citations = _attested_panel_usage(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model="test/model",
+        )
+        self.assertNotIn("max_tokens", usage["_aiv_panel_contract"])
+        answer = ModelAnswer(
+            run_id="run-id",
+            prompt_id=1,
+            provider_key="openai",
+            model="test/model",
+            mode="web",
+            status="completed",
+            response_text="Ответ.",
+            citations_json=citations,
+            usage_json=usage,
+        )
+
+        verified, reason = _panel_answer_attestation(
+            answer,
+            prompt_text=prompt_text,
+        )
+
+        self.assertTrue(verified)
+        self.assertEqual(reason, "verified")
+
+    def test_panel_v2_budget_allowlist_and_hash_are_attested(self) -> None:
+        prompt_text = "Какие решения выбрать?"
+        usage, citations = _attested_panel_usage(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model="test/model",
+        )
+        provenance = dict(usage["_aiv_panel_contract"])
+        provenance["max_tokens"] = 6_400
+        provenance["request_sha256"] = _panel_request_sha256(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model="test/model",
+            max_tokens=6_400,
+        )
+        usage["_aiv_panel_contract"] = provenance
+        answer = ModelAnswer(
+            run_id="run-id",
+            prompt_id=1,
+            provider_key="openai",
+            model="test/model",
+            mode="web",
+            status="completed",
+            response_text="Ответ.",
+            citations_json=citations,
+            usage_json=usage,
+        )
+
+        verified, reason = _panel_answer_attestation(
+            answer,
+            prompt_text=prompt_text,
+        )
+        self.assertTrue(verified)
+        self.assertEqual(reason, "verified")
+
+        unapproved_usage = copy.deepcopy(usage)
+        unapproved = dict(unapproved_usage["_aiv_panel_contract"])
+        unapproved["max_tokens"] = 4_800
+        unapproved["request_sha256"] = _panel_request_sha256(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model="test/model",
+            max_tokens=4_800,
+        )
+        unapproved_usage["_aiv_panel_contract"] = unapproved
+        answer.usage_json = unapproved_usage
+        verified, reason = _panel_answer_attestation(
+            answer,
+            prompt_text=prompt_text,
+        )
+        self.assertFalse(verified)
+        self.assertEqual(reason, "unapproved_panel_max_tokens")
+
+        tampered_usage = copy.deepcopy(usage)
+        tampered = dict(tampered_usage["_aiv_panel_contract"])
+        tampered["max_tokens"] = 3_200
+        tampered_usage["_aiv_panel_contract"] = tampered
+        answer.usage_json = tampered_usage
+        verified, reason = _panel_answer_attestation(
+            answer,
+            prompt_text=prompt_text,
+        )
+        self.assertFalse(verified)
+        self.assertEqual(reason, "request_hash_mismatch")
 
     def test_strict_schemas_avoid_unsupported_array_cardinality(self) -> None:
         self.assertNotIn("minItems", str(PROMPT_SET_SCHEMA))
@@ -8183,6 +8283,80 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         await init_db()
 
+    async def _single_panel_fixture(
+        self,
+    ) -> tuple[str, VisibilityPrompt, PanelModel]:
+        run_id = f"test-panel-limit-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="example.com",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            prompt = VisibilityPrompt(
+                run_id=run_id,
+                prompt_key="u-1",
+                intent_class="I",
+                role="unbranded_discovery",
+                text="Какие решения выбрать?",
+                sequence=1,
+            )
+            session.add(prompt)
+            await session.commit()
+        return (
+            run_id,
+            prompt,
+            PanelModel(
+                key="openai",
+                label="ChatGPT",
+                model="test/model",
+                memory_model="test/model",
+            ),
+        )
+
+    @staticmethod
+    def _panel_result(
+        *,
+        prompt_text: str,
+        text_value: str,
+        limited: bool,
+        prompt_tokens: int,
+        completion_tokens: int,
+        output_complete: bool | None = None,
+    ) -> SimpleNamespace:
+        usage, citations = _attested_panel_usage(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model="test/model",
+        )
+        usage = dict(usage)
+        usage.update(
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        )
+        usage["_aiv_transport"] = {
+            "output_limited": limited,
+            "output_complete": (
+                not limited
+                if output_complete is None
+                else output_complete
+            ),
+        }
+        return SimpleNamespace(
+            text=text_value,
+            citations=citations or [],
+            usage=usage,
+            request_policy=usage["_aiv_request_policy"],
+            web_attestation=usage["_aiv_web_attestation"],
+        )
+
     async def test_legacy_memory_observation_requires_the_complete_clean_cohort(
         self,
     ) -> None:
@@ -8668,6 +8842,792 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
+    async def test_panel_output_limit_retries_once_with_6400(self) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Частичный ответ 3 200.",
+            limited=True,
+            prompt_tokens=101,
+            completion_tokens=3_200,
+        )
+        complete = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Полный ответ после повтора.",
+            limited=False,
+            prompt_tokens=101,
+            completion_tokens=4_125,
+        )
+        first_limit = OpenRouterOutputLimitError(
+            "first output limit",
+            result=partial,
+        )
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=[first_limit, complete],
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+
+            self.assertEqual(
+                [
+                    call.kwargs["max_tokens"]
+                    for call in panel_chat.await_args_list
+                ],
+                [3_200, 6_400],
+            )
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "completed")
+            self.assertEqual(answer.response_text, complete.text)
+            provenance = answer.usage_json["_aiv_panel_contract"]
+            self.assertEqual(provenance["max_tokens"], 6_400)
+            self.assertEqual(
+                provenance["request_sha256"],
+                _panel_request_sha256(
+                    prompt_text=prompt.text,
+                    mode="web",
+                    provider_key="openai",
+                    model="test/model",
+                    max_tokens=6_400,
+                ),
+            )
+            retry = answer.usage_json["_aiv_panel_retry"]
+            self.assertEqual(retry["version"], "aiv-panel-retry-v1")
+            attempts = retry["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [attempt["max_tokens"] for attempt in attempts],
+                [3_200, 6_400],
+            )
+            expected_attempt_keys = {
+                "max_tokens",
+                "output_limited",
+                "output_complete",
+                "response_text_sha256",
+                "response_char_count",
+                "citation_count",
+                "token_usage",
+            }
+            for attempt in attempts:
+                self.assertEqual(set(attempt), expected_attempt_keys)
+            self.assertTrue(attempts[0]["output_limited"])
+            self.assertFalse(attempts[0]["output_complete"])
+            self.assertFalse(attempts[1]["output_limited"])
+            self.assertTrue(attempts[1]["output_complete"])
+            self.assertEqual(
+                attempts[0]["response_text_sha256"],
+                hashlib.sha256(partial.text.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(
+                attempts[0]["response_char_count"],
+                len(partial.text),
+            )
+            self.assertEqual(
+                attempts[1]["response_text_sha256"],
+                hashlib.sha256(complete.text.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(
+                attempts[0]["token_usage"],
+                {
+                    "completion_tokens": 3_200,
+                    "prompt_tokens": 101,
+                    "total_tokens": 3_301,
+                },
+            )
+            self.assertNotIn(
+                partial.text,
+                json.dumps(retry, ensure_ascii=False),
+            )
+            self.assertNotIn(
+                complete.text,
+                json.dumps(retry, ensure_ascii=False),
+            )
+            self.assertEqual(
+                _panel_answer_attestation(
+                    answer,
+                    prompt_text=prompt.text,
+                ),
+                (True, "verified"),
+            )
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_second_panel_output_limit_persists_failed_audit_evidence(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        first_partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Частичный ответ 3 200.",
+            limited=True,
+            prompt_tokens=87,
+            completion_tokens=3_200,
+        )
+        second_partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Частичный ответ 6 400 для аудита.",
+            limited=True,
+            prompt_tokens=87,
+            completion_tokens=6_400,
+        )
+        second_partial.citations = [
+            {"url": "https://source.example/second", "title": "Second"}
+        ]
+        limits = [
+            OpenRouterOutputLimitError(
+                "first output limit",
+                result=first_partial,
+            ),
+            OpenRouterOutputLimitError(
+                "second output limit",
+                result=second_partial,
+            ),
+        ]
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=limits,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+                self.assertRaisesRegex(
+                    OpenRouterError,
+                    "Too few successful web panel responses",
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+
+            self.assertEqual(panel_chat.await_count, 2)
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "failed")
+            self.assertEqual(answer.response_text, second_partial.text)
+            self.assertEqual(
+                answer.citations_json,
+                second_partial.citations,
+            )
+            self.assertIn("second output limit", answer.error_message)
+            self.assertTrue(
+                answer.usage_json["_aiv_transport"]["output_limited"]
+            )
+            provenance = answer.usage_json["_aiv_panel_contract"]
+            self.assertEqual(provenance["max_tokens"], 6_400)
+            self.assertEqual(
+                provenance["request_sha256"],
+                _panel_request_sha256(
+                    prompt_text=prompt.text,
+                    mode="web",
+                    provider_key="openai",
+                    model="test/model",
+                    max_tokens=6_400,
+                ),
+            )
+            retry = answer.usage_json["_aiv_panel_retry"]
+            self.assertEqual(retry["version"], "aiv-panel-retry-v1")
+            attempts = retry["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [attempt["max_tokens"] for attempt in attempts],
+                [3_200, 6_400],
+            )
+            self.assertEqual(
+                attempts[0]["response_text_sha256"],
+                hashlib.sha256(
+                    first_partial.text.encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                attempts[0]["token_usage"],
+                {
+                    "completion_tokens": 3_200,
+                    "prompt_tokens": 87,
+                    "total_tokens": 3_287,
+                },
+            )
+            self.assertTrue(attempts[0]["output_limited"])
+            self.assertFalse(attempts[0]["output_complete"])
+            self.assertTrue(attempts[1]["output_limited"])
+            self.assertFalse(attempts[1]["output_complete"])
+            self.assertEqual(
+                attempts[1]["response_text_sha256"],
+                hashlib.sha256(
+                    second_partial.text.encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertNotIn(
+                first_partial.text,
+                json.dumps(retry, ensure_ascii=False),
+            )
+            self.assertNotIn(
+                second_partial.text,
+                json.dumps(retry, ensure_ascii=False),
+            )
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_panel_retry_policy_failure_persists_both_attempts(self) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        first_partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Первый частичный ответ.",
+            limited=True,
+            prompt_tokens=73,
+            completion_tokens=3_200,
+        )
+        policy_result = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Второй ответ с нарушенной web-policy.",
+            limited=False,
+            prompt_tokens=73,
+            completion_tokens=931,
+        )
+        policy_result.usage["_aiv_web_attestation"].update(
+            {
+                "state": "failed",
+                "metric_eligible": False,
+                "violations": ["web_search_requests_not_confirmed"],
+            }
+        )
+        failures = [
+            OpenRouterOutputLimitError(
+                "first output limit",
+                result=first_partial,
+            ),
+            OpenRouterPolicyError(
+                "second policy failure",
+                result=policy_result,
+            ),
+        ]
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=failures,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+                self.assertRaisesRegex(
+                    OpenRouterError,
+                    "Too few successful web panel responses",
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+
+            self.assertEqual(panel_chat.await_count, 2)
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "failed")
+            self.assertEqual(answer.response_text, policy_result.text)
+            self.assertEqual(answer.usage_json["total_tokens"], 1_004)
+            attempts = answer.usage_json["_aiv_panel_retry"]["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [attempt["max_tokens"] for attempt in attempts],
+                [3_200, 6_400],
+            )
+            self.assertEqual(
+                attempts[0]["response_text_sha256"],
+                hashlib.sha256(
+                    first_partial.text.encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                attempts[1]["response_text_sha256"],
+                hashlib.sha256(
+                    policy_result.text.encode("utf-8")
+                ).hexdigest(),
+            )
+            metric_rows = await _metric_rows(
+                run_id,
+                annotation_input_sha256="unused",
+            )
+            self.assertFalse(metric_rows[0]["metric_eligible"])
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_panel_retry_contract_failure_persists_both_attempts(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        first_partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Первый частичный ответ.",
+            limited=True,
+            prompt_tokens=79,
+            completion_tokens=3_200,
+        )
+        contract_result = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Второй незавершённый ответ.",
+            limited=False,
+            output_complete=False,
+            prompt_tokens=79,
+            completion_tokens=1_207,
+        )
+        failures = [
+            OpenRouterOutputLimitError(
+                "first output limit",
+                result=first_partial,
+            ),
+            OpenRouterResponseContractError(
+                "second response contract failure",
+                result=contract_result,
+            ),
+        ]
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=failures,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+                self.assertRaisesRegex(
+                    OpenRouterError,
+                    "Too few successful web panel responses",
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+
+            self.assertEqual(panel_chat.await_count, 2)
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "failed")
+            self.assertEqual(answer.response_text, contract_result.text)
+            self.assertEqual(answer.usage_json["total_tokens"], 1_286)
+            attempts = answer.usage_json["_aiv_panel_retry"]["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [attempt["max_tokens"] for attempt in attempts],
+                [3_200, 6_400],
+            )
+            self.assertFalse(attempts[1]["output_limited"])
+            self.assertFalse(attempts[1]["output_complete"])
+            self.assertEqual(
+                attempts[0]["response_text_sha256"],
+                hashlib.sha256(
+                    first_partial.text.encode("utf-8")
+                ).hexdigest(),
+            )
+            metric_rows = await _metric_rows(
+                run_id,
+                annotation_input_sha256="unused",
+            )
+            self.assertFalse(metric_rows[0]["metric_eligible"])
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_panel_retry_transport_failure_preserves_first_partial(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        first_partial = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Первый частичный ответ для аудита.",
+            limited=True,
+            prompt_tokens=83,
+            completion_tokens=3_200,
+        )
+        failures = [
+            OpenRouterOutputLimitError(
+                "first output limit",
+                result=first_partial,
+            ),
+            OpenRouterError("second transport failure"),
+        ]
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=failures,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+                self.assertRaisesRegex(
+                    OpenRouterError,
+                    "Too few successful web panel responses",
+                ),
+            ):
+                await _run_panel(
+                    run_id,
+                    [prompt],
+                    mode="web",
+                    start_percent=40,
+                    end_percent=60,
+                )
+
+            self.assertEqual(panel_chat.await_count, 2)
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "failed")
+            self.assertEqual(answer.response_text, first_partial.text)
+            self.assertIn("second transport failure", answer.error_message)
+            self.assertEqual(
+                answer.usage_json["_aiv_panel_contract"]["max_tokens"],
+                3_200,
+            )
+            attempts = answer.usage_json["_aiv_panel_retry"]["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [attempt["max_tokens"] for attempt in attempts],
+                [3_200, 6_400],
+            )
+            self.assertEqual(
+                attempts[0]["response_text_sha256"],
+                hashlib.sha256(
+                    first_partial.text.encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertIsNone(attempts[1]["response_text_sha256"])
+            self.assertEqual(attempts[1]["response_char_count"], 0)
+            self.assertEqual(attempts[1]["citation_count"], 0)
+            self.assertEqual(attempts[1]["token_usage"], {})
+            self.assertIsNone(attempts[1]["output_limited"])
+            self.assertIsNone(attempts[1]["output_complete"])
+            metric_rows = await _metric_rows(
+                run_id,
+                annotation_input_sha256="unused",
+            )
+            self.assertFalse(metric_rows[0]["metric_eligible"])
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_concurrent_panel_successes_preserve_first_completed_evidence(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        fast = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Первый завершённый ответ.",
+            limited=False,
+            prompt_tokens=71,
+            completion_tokens=113,
+        )
+        slow = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Запоздавший ответ не должен перезаписать первый.",
+            limited=False,
+            prompt_tokens=71,
+            completion_tokens=997,
+        )
+        fast.usage["attempt_marker"] = "fast-first"
+        slow.usage["attempt_marker"] = "slow-second"
+        both_started = asyncio.Event()
+        release_slow = asyncio.Event()
+        call_lock = asyncio.Lock()
+        call_count = 0
+        tasks: list[asyncio.Task[None]] = []
+
+        async def two_successes(**_kwargs: object) -> SimpleNamespace:
+            nonlocal call_count
+            async with call_lock:
+                call_index = call_count
+                call_count += 1
+                if call_count == 2:
+                    both_started.set()
+            await both_started.wait()
+            if call_index == 0:
+                return fast
+            await release_slow.wait()
+            return slow
+
+        async def saved_snapshot() -> str | None:
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            if answer.status != "completed":
+                return None
+            return json.dumps(
+                {
+                    "status": answer.status,
+                    "response_text": answer.response_text,
+                    "citations_json": answer.citations_json,
+                    "usage_json": answer.usage_json,
+                    "error_message": answer.error_message,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=two_successes,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                tasks = [
+                    asyncio.create_task(
+                        _run_panel(
+                            run_id,
+                            [prompt],
+                            mode="web",
+                            start_percent=40,
+                            end_percent=60,
+                        )
+                    )
+                    for _ in range(2)
+                ]
+                await asyncio.wait_for(both_started.wait(), timeout=5)
+                first_snapshot = None
+                for _ in range(200):
+                    first_snapshot = await saved_snapshot()
+                    if first_snapshot is not None:
+                        break
+                    await asyncio.sleep(0.005)
+                self.assertIsNotNone(first_snapshot)
+                release_slow.set()
+                await asyncio.gather(*tasks)
+                final_snapshot = await saved_snapshot()
+
+            self.assertEqual(panel_chat.await_count, 2)
+            self.assertEqual(final_snapshot, first_snapshot)
+            self.assertIn("Первый завершённый ответ.", final_snapshot or "")
+            self.assertNotIn("Запоздавший ответ", final_snapshot or "")
+            self.assertIn('"attempt_marker":"fast-first"', final_snapshot or "")
+        finally:
+            release_slow.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_concurrent_panel_failure_then_success_allows_complete_to_win(
+        self,
+    ) -> None:
+        run_id, prompt, panel = await self._single_panel_fixture()
+        success = self._panel_result(
+            prompt_text=prompt.text,
+            text_value="Успешный полный ответ.",
+            limited=False,
+            prompt_tokens=61,
+            completion_tokens=149,
+        )
+        success.usage["attempt_marker"] = "success-after-failure"
+        both_started = asyncio.Event()
+        release_success = asyncio.Event()
+        call_lock = asyncio.Lock()
+        call_count = 0
+        tasks: list[asyncio.Task[None]] = []
+
+        async def failure_then_success(**_kwargs: object) -> SimpleNamespace:
+            nonlocal call_count
+            async with call_lock:
+                call_index = call_count
+                call_count += 1
+                if call_count == 2:
+                    both_started.set()
+            await both_started.wait()
+            if call_index == 0:
+                raise OpenRouterError("fast transport failure")
+            await release_success.wait()
+            return success
+
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=(panel,),
+                ),
+                patch(
+                    "app.services.analyzer.chat",
+                    new_callable=AsyncMock,
+                    side_effect=failure_then_success,
+                ) as panel_chat,
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                tasks = [
+                    asyncio.create_task(
+                        _run_panel(
+                            run_id,
+                            [prompt],
+                            mode="web",
+                            start_percent=40,
+                            end_percent=60,
+                        )
+                    )
+                    for _ in range(2)
+                ]
+                try:
+                    await asyncio.wait_for(both_started.wait(), timeout=5)
+                except TimeoutError:
+                    diagnostics = [
+                        repr(task.exception()) if task.done() else "pending"
+                        for task in tasks
+                    ]
+                    self.fail(
+                        "Concurrent panel workers did not both start: "
+                        f"{diagnostics}"
+                    )
+                done, _pending = await asyncio.wait(
+                    tasks,
+                    timeout=5,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                self.assertEqual(len(done), 1)
+                release_success.set()
+                outcomes = await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+
+            self.assertEqual(panel_chat.await_count, 2)
+            self.assertTrue(
+                any(isinstance(outcome, OpenRouterError) for outcome in outcomes)
+            )
+            async with SessionLocal() as session:
+                answer = (
+                    await session.execute(
+                        select(ModelAnswer).where(
+                            ModelAnswer.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(answer.status, "completed")
+            self.assertEqual(answer.response_text, success.text)
+            self.assertIsNone(answer.error_message)
+            self.assertEqual(
+                answer.usage_json["attempt_marker"],
+                "success-after-failure",
+            )
+        finally:
+            release_success.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
     async def test_completed_panel_evidence_is_append_only(self) -> None:
         run_id = f"test-panel-contract-{uuid.uuid4()}"
         panel = PanelModel(
@@ -9065,6 +10025,198 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                 ).one()
             self.assertEqual(status, RunStatus.pending)
             self.assertEqual(resume_count, 1)
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_completed_run_retry_is_rejected_without_mutating_evidence(
+        self,
+    ) -> None:
+        run_id = f"test-completed-retry-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            run = Run(
+                id=run_id,
+                domain="completed.example.com",
+                status=RunStatus.completed,
+                config_json={"pipeline_version": "immutable-test"},
+                progress_current=100,
+                progress_total=100,
+                progress_percent=100,
+                stage_key="report",
+                stage_label="Отчёт готов",
+                state_revision=7,
+                resume_count=2,
+                analysis_markdown="# Готовый отчёт",
+                report_json={"headline": "Сохранённый отчёт"},
+            )
+            session.add(run)
+            prompt = VisibilityPrompt(
+                run_id=run_id,
+                prompt_key="u-1",
+                intent_class="I",
+                role="unbranded_discovery",
+                text="Какой сервис выбрать?",
+                rationale="Сохранённый сценарий",
+                sequence=1,
+            )
+            session.add(prompt)
+            await session.flush()
+            session.add_all(
+                [
+                    RunArtifact(
+                        run_id=run_id,
+                        stage_key="report",
+                        artifact_key="final_report",
+                        status="completed",
+                        model="test/report-model",
+                        output_json={"headline": "Сохранённый отчёт"},
+                        raw_text="{\"headline\":\"Сохранённый отчёт\"}",
+                        usage_json={"total_tokens": 321},
+                    ),
+                    ModelAnswer(
+                        run_id=run_id,
+                        prompt_id=prompt.id,
+                        provider_key="openai",
+                        model="test/model",
+                        mode="web",
+                        status="completed",
+                        response_text="Неизменяемый сырой ответ.",
+                        citations_json=[
+                            {"url": "https://source.example/evidence"}
+                        ],
+                        usage_json={"total_tokens": 123},
+                    ),
+                ]
+            )
+            await session.commit()
+
+        async def evidence_snapshot() -> bytes:
+            async with SessionLocal() as session:
+                saved_run = (
+                    await session.execute(select(Run).where(Run.id == run_id))
+                ).scalar_one()
+                artifacts = list(
+                    (
+                        await session.execute(
+                            select(RunArtifact)
+                            .where(RunArtifact.run_id == run_id)
+                            .order_by(RunArtifact.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                prompts = list(
+                    (
+                        await session.execute(
+                            select(VisibilityPrompt)
+                            .where(VisibilityPrompt.run_id == run_id)
+                            .order_by(VisibilityPrompt.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                answers = list(
+                    (
+                        await session.execute(
+                            select(ModelAnswer)
+                            .where(ModelAnswer.run_id == run_id)
+                            .order_by(ModelAnswer.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            snapshot = {
+                "run": {
+                    "status": saved_run.status.value,
+                    "config": saved_run.config_json,
+                    "progress": [
+                        saved_run.progress_current,
+                        saved_run.progress_total,
+                        saved_run.progress_percent,
+                    ],
+                    "stage": [
+                        saved_run.stage_key,
+                        saved_run.stage_label,
+                        saved_run.stage_detail,
+                    ],
+                    "state_revision": saved_run.state_revision,
+                    "resume_count": saved_run.resume_count,
+                    "resume_reason": saved_run.resume_reason,
+                    "analysis_markdown": saved_run.analysis_markdown,
+                    "report_json": saved_run.report_json,
+                },
+                "artifacts": [
+                    {
+                        "stage_key": artifact.stage_key,
+                        "artifact_key": artifact.artifact_key,
+                        "status": artifact.status,
+                        "model": artifact.model,
+                        "output_json": artifact.output_json,
+                        "raw_text": artifact.raw_text,
+                        "usage_json": artifact.usage_json,
+                    }
+                    for artifact in artifacts
+                ],
+                "prompts": [
+                    {
+                        "prompt_key": saved_prompt.prompt_key,
+                        "intent_class": saved_prompt.intent_class,
+                        "role": saved_prompt.role,
+                        "text": saved_prompt.text,
+                        "rationale": saved_prompt.rationale,
+                        "sequence": saved_prompt.sequence,
+                    }
+                    for saved_prompt in prompts
+                ],
+                "answers": [
+                    {
+                        "provider_key": answer.provider_key,
+                        "model": answer.model,
+                        "mode": answer.mode,
+                        "status": answer.status,
+                        "response_text": answer.response_text,
+                        "citations_json": answer.citations_json,
+                        "usage_json": answer.usage_json,
+                        "error_message": answer.error_message,
+                    }
+                    for answer in answers
+                ],
+            }
+            return json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+        try:
+            before = await evidence_snapshot()
+            with (
+                patch("app.routes.runs.coordinator.wake") as wake,
+                patch("app.routes.runs.bus.reset") as reset_bus,
+                patch(
+                    "app.routes.runs.pending_run_count",
+                    new_callable=AsyncMock,
+                ) as pending_count,
+            ):
+                response = await self.client.post(
+                    f"/api/runs/{run_id}/retry"
+                )
+            after = await evidence_snapshot()
+
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(
+                response.json()["detail"],
+                "Готовую проверку нельзя перезапустить.",
+            )
+            self.assertEqual(after, before)
+            wake.assert_not_called()
+            reset_bus.assert_not_called()
+            pending_count.assert_not_awaited()
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
