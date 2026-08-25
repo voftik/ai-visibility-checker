@@ -332,7 +332,7 @@ Web-режим предлагает модели серверный OpenRouter w
 
 Критик не может переписать raw answers или вручную назначить проценты. Максимум — два раунда. Первый `revise` запускает ограниченную корректировку; повторное возражение или `block` останавливает публикацию.
 
-Контекст критика ограничен 24 000 символами на ответ. Любое усечение помечается явно; при недостаточном доказательстве критик должен блокировать результат, а не одобрять его по неполному фрагменту. Некорректный structured response получает одну repair-попытку, после чего действует консервативный deterministic fallback.
+Первичный контекст критика содержит полный индекс корпуса с SHA, provenance и разметкой, но длинный raw-текст передаёт только для всех строк из детерминированных предупреждений и для воспроизводимой стратифицированной выборки по системе, режиму и роли сценария. Это уменьшает многомегабайтный запрос без потери строк из manifest. Включённый raw ограничен 24 000 символами; любое усечение помечается явно и закрывает gate. Основной critic-call использует medium reasoning и бюджет 20 000 output tokens. `finish_reason=length` и неразбираемый structured response считаются успешным HTTP transport, но не готовым решением: они не проходят gate и получают одну компактную repair-попытку с low reasoning и бюджетом 8 000 tokens. Repair получает digest полного payload, каталог, метрики, индекс корпуса и raw только затронутых ответов. После неудачного repair действует консервативный deterministic fallback.
 
 ### 10. Финальный отчёт и визуальная ветка
 
@@ -666,6 +666,10 @@ FastAPI OpenAPI и интерактивная документация откл�
 | `OPENROUTER_ANALYSIS_MODEL` | `anthropic/claude-opus-5` | Сильная аналитика и финальный автор |
 | `OPENROUTER_PROCESSING_MODEL` | `openai/gpt-5.6-terra` | Каталог, аннотации, QA; high reasoning задаёт код |
 | `OPENROUTER_CRITIC_MODEL` | `google/gemini-3.6-flash` | Prompt critic, analysis critic, semantic gate |
+| `OPENROUTER_ORCHESTRATOR_MODEL` | `anthropic/claude-fable-5` | Дорогой planner только для исключительного восстановления |
+| `PIPELINE_ORCHESTRATOR_ENABLED` | `false` | Опционально разрешает bounded recovery после исчерпания обычного контура; включается явно после канарейки |
+| `PIPELINE_ORCHESTRATOR_MAX_CALLS_PER_RUN` | `2` | Жёсткий лимит planner-вызовов на одну проверку |
+| `PIPELINE_ORCHESTRATOR_MAX_INPUT_CHARS` | `80000` | Верхняя граница сериализованного planner-контекста |
 | `OPENROUTER_ILLUSTRATION_CONCEPT_MODEL` | `anthropic/claude-opus-5` | Art direction |
 | `OPENROUTER_IMAGE_MODEL` | `google/gemini-3-pro-image` | Генерация изображений |
 | `OPENROUTER_OPENAI_MODEL` | `openai/gpt-chat-latest` | ChatGPT family в панели |
@@ -678,6 +682,12 @@ FastAPI OpenAPI и интерактивная документация откл�
 | `FINAL_INPUT_TOKEN_BUDGET` | `160000` | Бюджет user payload финального автора |
 
 Модель и версия prompt сохраняются вместе с artifacts. Простая замена default model не должна молча переиспользовать результат другой модели.
+
+Recovery-orchestrator не участвует в штатном happy path. После исчерпания локальных repair-попыток он получает сжатый incident, факты, digest и короткий allowlist действий. Модель не исполняет код, не меняет raw-ответы, SQL или метрики. Решение проходит кодовую проверку области, сохраняется в append-only `recovery_epochs`, исполняется фиксированным обработчиком и закрывается сравнением before/after digest. Одинаковое действие для того же fingerprint второй раз запрещено. `acceptance_checks` — не свободный текст модели, а enum исполняемых кодом проверок: например, контракт сценариев, semantic review, неизменность raw-корпуса и повторный critic gate. Потерявший lease воркер не может сохранить или завершить recovery epoch; повторное исполнение одного плана также ограничено отдельным бюджетом.
+
+Первый production rollout подключает этот контур только к `scenario_design`: после четырёх обычных итераций planner может назначить одну последнюю guided-попытку, проверенный детерминированный fallback или безопасную остановку с checkpoint. В `knowledge_gap` Fable пока не имеет права обходить независимый critic gate и публиковать ограниченный отчёт: сохранённые ответы переанализируются обычным детерминированным контуром. Post-critic recovery следует добавлять отдельным rollout с повторной проверкой неизменности raw-корпуса и обязательным финальным critic verdict.
+
+`chat()` сохраняет в `usage_json._aiv_transport` HTTP-статус, попытку, провайдера, фактическую модель, `finish_reason`, `native_finish_reason` и признак полноты output. Это только transport evidence: успешный HTTP-ответ или `finish_reason=stop` не означает, что critic verdict прошёл детерминированную проверку. Состояние critic до этой проверки записывается отдельно как `semantic_verdict_status=pending_deterministic_validation`.
 
 ### Сервис, crawler и очередь
 
@@ -715,7 +725,7 @@ Proxy pool необязателен. Без `WEBSHARE_API_KEY` crawler рабо�
 uv run python -m unittest discover -s tests -v
 ```
 
-На момент обновления этого README в suite 399 тестов.
+На момент обновления этого README в suite 456 тестов.
 
 Основные группы:
 

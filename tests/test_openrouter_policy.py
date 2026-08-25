@@ -6,7 +6,9 @@ from unittest.mock import patch
 from app.services.openrouter import (
     _NON_CITING_PROVIDERS,
     OpenRouterError,
+    OpenRouterOutputLimitError,
     OpenRouterPolicyError,
+    OpenRouterResponseContractError,
     WebSearchPolicy,
     chat,
 )
@@ -95,6 +97,8 @@ def _body(
         "provider": provider,
         "choices": [
             {
+                "finish_reason": "stop",
+                "native_finish_reason": "stop",
                 "message": {
                     "role": "assistant",
                     "content": "Непустой ответ.",
@@ -148,6 +152,12 @@ class OpenRouterPolicyRequestTests(unittest.IsolatedAsyncioTestCase):
             "enabled",
         )
         self.assertTrue(result.web_attestation["metric_eligible"])
+        self.assertEqual(result.transport["status"], "succeeded")
+        self.assertTrue(result.transport["output_complete"])
+        self.assertEqual(
+            result.usage["_aiv_transport"],
+            result.transport,
+        )
 
     async def test_required_policy_offers_the_only_server_tool(self) -> None:
         client = _FakeClient(
@@ -297,6 +307,140 @@ class OpenRouterPolicyRequestTests(unittest.IsolatedAsyncioTestCase):
         message = str(raised.exception)
         self.assertIn("pause_turn", message)
         self.assertIn("finish_reason=stop", message)
+
+    async def test_output_limit_is_not_accepted_or_retried(self) -> None:
+        body = _body()
+        body["id"] = "generation-123"
+        body["choices"][0]["finish_reason"] = "length"
+        body["choices"][0]["native_finish_reason"] = "MAX_TOKENS"
+        body["choices"][0]["message"]["content"] = '{"verdict":"pass"}'
+        client = _FakeClient(body)
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            self.assertRaises(OpenRouterOutputLimitError) as raised,
+        ):
+            await chat(
+                model="google/gemini-3.6-flash",
+                messages=[{"role": "user", "content": "Проверь расчёт."}],
+                response_schema={"type": "object"},
+                max_tokens=20_000,
+                retry_response_contract_errors=False,
+            )
+
+        self.assertEqual(len(client.requests), 1)
+        transport = raised.exception.result.transport
+        self.assertEqual(transport["status"], "succeeded")
+        self.assertFalse(transport["output_complete"])
+        self.assertTrue(transport["output_limited"])
+        self.assertEqual(transport["finish_reason"], "length")
+        self.assertEqual(transport["native_finish_reason"], "MAX_TOKENS")
+        self.assertEqual(transport["response_id"], "generation-123")
+        self.assertIn("max_tokens=20000", str(raised.exception))
+
+    async def test_nonfinal_finish_reasons_fail_closed_with_evidence(
+        self,
+    ) -> None:
+        for finish_reason in ("content_filter", "error", ""):
+            with self.subTest(finish_reason=finish_reason):
+                body = _body()
+                body["choices"][0]["finish_reason"] = finish_reason
+                client = _FakeClient(body)
+                with (
+                    patch(
+                        "app.services.openrouter.httpx.AsyncClient",
+                        return_value=client,
+                    ),
+                    patch(
+                        "app.services.openrouter._headers",
+                        return_value={"Authorization": "Bearer test"},
+                    ),
+                    self.assertRaises(
+                        OpenRouterResponseContractError
+                    ) as raised,
+                ):
+                    await chat(
+                        model="google/gemini-3.6-flash",
+                        messages=[
+                            {"role": "user", "content": "Верни JSON."}
+                        ],
+                        response_schema={"type": "object"},
+                        retry_response_contract_errors=False,
+                    )
+
+                self.assertEqual(len(client.requests), 1)
+                transport = raised.exception.result.transport
+                self.assertFalse(transport["output_complete"])
+                self.assertFalse(transport["output_limited"])
+                self.assertTrue(transport["output_incomplete_reason"])
+
+    async def test_invalid_structured_output_preserves_transport_evidence(
+        self,
+    ) -> None:
+        body = _body()
+        body["choices"][0]["message"]["content"] = "{unfinished"
+        client = _FakeClient(body)
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            self.assertRaises(OpenRouterResponseContractError) as raised,
+        ):
+            await chat(
+                model="google/gemini-3.6-flash",
+                messages=[{"role": "user", "content": "Верни JSON."}],
+                response_schema={"type": "object"},
+                retry_response_contract_errors=False,
+            )
+
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(raised.exception.result.transport["status"], "succeeded")
+        self.assertTrue(
+            raised.exception.result.transport["output_complete"]
+        )
+        self.assertIn("incomplete JSON", str(raised.exception))
+
+    async def test_complete_structured_response_returns_parsed_result(
+        self,
+    ) -> None:
+        body = _body()
+        body["choices"][0]["message"]["content"] = '{"value":"ok"}'
+        client = _FakeClient(body)
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+        ):
+            result = await chat(
+                model="google/gemini-3.6-flash",
+                messages=[{"role": "user", "content": "Верни JSON."}],
+                response_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+                retry_response_contract_errors=False,
+            )
+
+        self.assertEqual(result.parsed, {"value": "ok"})
+        self.assertTrue(result.transport["output_complete"])
+        self.assertEqual(len(client.requests), 1)
 
     async def test_policy_retry_tells_the_model_why_it_was_rejected(
         self,

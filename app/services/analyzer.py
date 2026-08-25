@@ -43,6 +43,7 @@ from app.services.openrouter import (
     ImageResult,
     OpenRouterError,
     OpenRouterPolicyError,
+    OpenRouterResponseContractError,
     PanelModel,
     WebSearchPolicy,
     chat,
@@ -52,6 +53,8 @@ from app.services.openrouter import (
 )
 from app.services.analysis_critic import (
     CRITIC_MODEL,
+    CRITIC_PRIMARY_MAX_RAW_ANSWERS,
+    CRITIC_PRIMARY_RAW_CHAR_BUDGET,
     CRITIC_VERSION,
     MAX_CRITIC_ITERATIONS,
     repair_analysis_review,
@@ -70,6 +73,21 @@ from app.services.report_semantic_gate import (
     review_final_report_semantics,
     validate_report_semantic_review,
 )
+from app.services.recovery_orchestrator import (
+    ACTION_DETERMINISTIC_FALLBACK,
+    ACTION_RETRY_WITH_GUIDANCE,
+    ACTION_STOP,
+    CHECK_CHECKPOINT_PRESERVED,
+    CHECK_PROMPT_CONTRACT_VALID,
+    CHECK_SEMANTIC_REVIEW_PASSED,
+    OrchestratorContractError,
+)
+from app.services.recovery_state import (
+    finish_recovery,
+    mark_recovery_executing,
+    plan_durable_recovery,
+    stable_digest,
+)
 from app.services.progress import complete_run, fail_run, update_progress
 from app.services.robots_parser import robots_path_allowed
 from app.services.run_lease import (
@@ -85,14 +103,16 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
 MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v2"
-PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v3"
-PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v4"
+PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v4"
+PROMPT_SET_REVIEW_VERSION = f"{PROMPT_VERSION}-intent-review-v5"
+PROMPT_GENERATOR_MAX_ATTEMPTS = 4
+PROMPT_CANDIDATE_ARTIFACT_PREFIX = "prompt_set_candidate_"
 PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v2"
 LEGACY_PANEL_CONTRACT_VERSION = f"{PROMPT_VERSION}-panel-v1"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v6"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v8"
-ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v14"
-METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v17"
+ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v15"
+METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v18"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
 FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v17"
@@ -121,6 +141,10 @@ LEGACY_PROMPT_SET_VERSIONS = {
     "aiv-2026-07-30",
     "aiv-2026-07-30-system-v2",
     "aiv-2026-07-30-system-v2-intent-v2",
+}
+CANONICAL_INTENT_PROMPT_SET_VERSIONS = {
+    f"{PROMPT_VERSION}-intent-v3",
+    PROMPT_SET_VERSION,
 }
 ILLUSTRATION_CONCEPTS_VERSION = f"{PROMPT_VERSION}-visual-v13"
 ILLUSTRATION_COPY_FALLBACK_VERSION = f"{PROMPT_VERSION}-visual-fallback-v1"
@@ -1031,6 +1055,7 @@ def _artifact_cache_matches(
     input_json: dict[str, Any] | list[Any] | None | object = _CACHE_UNSET,
     model: str | None | object = _CACHE_UNSET,
     prompt_version: str = PROMPT_VERSION,
+    require_validated_critic_usage: bool = False,
 ) -> bool:
     if (
         artifact.status != "completed"
@@ -1042,6 +1067,17 @@ def _artifact_cache_matches(
         return False
     if model is not _CACHE_UNSET and artifact.model != model:
         return False
+    if require_validated_critic_usage:
+        usage = (
+            artifact.usage_json
+            if isinstance(artifact.usage_json, dict)
+            else {}
+        )
+        contract = usage.get("_aiv_critic_contract")
+        if not isinstance(contract, dict) or contract.get(
+            "semantic_verdict_status"
+        ) != "validated":
+            return False
     return True
 
 
@@ -1052,6 +1088,7 @@ async def _artifact_output(
     input_json: dict[str, Any] | list[Any] | None | object = _CACHE_UNSET,
     model: str | None | object = _CACHE_UNSET,
     prompt_version: str = PROMPT_VERSION,
+    require_validated_critic_usage: bool = False,
 ) -> dict[str, Any] | list[Any] | None:
     async with SessionLocal() as session:
         artifact = (
@@ -1067,6 +1104,7 @@ async def _artifact_output(
             input_json=input_json,
             model=model,
             prompt_version=prompt_version,
+            require_validated_critic_usage=require_validated_critic_usage,
         ):
             return artifact.output_json
     return None
@@ -1179,6 +1217,11 @@ async def _structured_artifact(
         )
         return result.parsed
     except Exception as exc:
+        failed_raw_text: str | None = None
+        failed_usage: dict[str, Any] | None = None
+        if isinstance(exc, OpenRouterResponseContractError):
+            failed_raw_text = exc.result.text
+            failed_usage = exc.result.usage
         await _save_artifact(
             run_id,
             stage_key=stage_key,
@@ -1186,6 +1229,8 @@ async def _structured_artifact(
             status="failed",
             model=model,
             input_json=user_payload,
+            raw_text=failed_raw_text,
+            usage_json=failed_usage,
             error_message=str(exc),
             prompt_version=prompt_version,
         )
@@ -3079,6 +3124,15 @@ TR — Trend-Driven: тренды, новизна, популярность ил
 риска. Просьба назвать конкретные варианты есть во всех сценариях как
 измерительная рамка; сама по себе она не превращает каждый запрос в E.
 
+Не путай открытый вопрос с утверждением. Просьба назвать несколько студий,
+компаний, мастеров, продуктов, сайтов, страниц или других вариантов — это
+пространство ожидаемого ответа, а не заявление о том, что конкретные варианты
+уже найдены исследованием. Отсутствие заранее подтверждённого списка таких
+вариантов нельзя записывать в unsupported_assumptions. Проверяй как факты
+только то, что сам текст запроса сообщает пользователю как уже известное:
+категорию, задачу, аудиторию, критерий, географию, условие или рыночную
+тенденцию.
+
 В checks верни ровно шесть объектов — по одному на каждый prompt_key из
 prompt_keys_to_check, без пропусков и добавлений.
 
@@ -3090,7 +3144,9 @@ prompt_keys_to_check, без пропусков и добавлений.
 используй его evidence, citations и confidence. Основной бренд бери только из
 site_profile. Если сценарий опирается на неподтверждённое допущение, поставь
 grounded_in_research=false, перечисли unsupported_assumptions и потребуй
-исправления. В supporting_evidence укажи конкретные подтверждения и URL.
+исправления. В supporting_evidence укажи конкретные подтверждения и URL для
+фактических условий запроса; не требуй источника на ещё неизвестные варианты,
+которые пользователь просит назвать в ответе.
 Иначе поставь revise и дай короткую точную инструкцию для исправления каждого
 несовпавшего запроса. Не переписывай всю методологию.
 
@@ -3130,6 +3186,611 @@ grounded_in_research=false, перечисли unsupported_assumptions и пот
     return errors
 
 
+def _prompt_candidate_artifact_key(
+    base_payload_digest: str,
+    budget_attempt: int,
+) -> str:
+    return (
+        f"{PROMPT_CANDIDATE_ARTIFACT_PREFIX}"
+        f"{base_payload_digest}_a{budget_attempt}"
+    )
+
+
+async def _prompt_candidate_state(
+    run_id: str,
+    *,
+    base_payload_digest: str,
+) -> tuple[
+    int,
+    dict[str, Any] | None,
+    str,
+    dict[str, Any],
+    str | None,
+    int,
+]:
+    """Return the durable spend counter and latest recoverable candidate.
+
+    Every matching artifact is a consumed generator attempt, including a
+    ``running`` reservation without output.  This makes a worker crash after
+    reservation fail closed for cost: a restart cannot silently buy four more
+    ordinary generation calls for the same run and immutable input digest.
+    """
+
+    async with SessionLocal() as session:
+        artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.like(
+                            f"{PROMPT_CANDIDATE_ARTIFACT_PREFIX}%"
+                        ),
+                        RunArtifact.prompt_version == PROMPT_SET_VERSION,
+                    )
+                    .order_by(RunArtifact.updated_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    matching: list[RunArtifact] = []
+    for artifact in artifacts:
+        candidate_input = artifact.input_json
+        if (
+            not isinstance(candidate_input, dict)
+            or candidate_input.get("base_payload_digest")
+            != base_payload_digest
+        ):
+            continue
+        matching.append(artifact)
+
+    explicit_budget_attempts = [
+        int(artifact.input_json.get("budget_attempt") or 0)
+        for artifact in matching
+        if isinstance(artifact.input_json, dict)
+        and str(artifact.input_json.get("budget_attempt") or "").isdigit()
+    ]
+    reserved_attempts = max(
+        len(matching),
+        max(explicit_budget_attempts, default=0),
+    )
+    for artifact in matching:
+        if not isinstance(artifact.output_json, dict):
+            continue
+        candidate_input = (
+            artifact.input_json if isinstance(artifact.input_json, dict) else {}
+        )
+        candidate_budget_attempt = int(
+            candidate_input.get("budget_attempt") or reserved_attempts
+        )
+        return (
+            reserved_attempts,
+            dict(artifact.output_json),
+            artifact.raw_text
+            or json.dumps(artifact.output_json, ensure_ascii=False),
+            dict(artifact.usage_json)
+            if isinstance(artifact.usage_json, dict)
+            else {},
+            artifact.artifact_key,
+            candidate_budget_attempt,
+        )
+    return reserved_attempts, None, "", {}, None, 0
+
+
+async def _reserve_prompt_candidate_attempt(
+    run_id: str,
+    *,
+    base_payload_digest: str,
+    budget_attempt: int,
+) -> str:
+    """Persist one spend reservation before calling the generator."""
+
+    artifact_key = _prompt_candidate_artifact_key(
+        base_payload_digest,
+        budget_attempt,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key=artifact_key,
+        status="running",
+        model=ANALYSIS_MODEL,
+        input_json={
+            "base_payload_digest": base_payload_digest,
+            "budget_attempt": budget_attempt,
+        },
+        usage_json={
+            "_aiv_prompt_candidate": {
+                "budget_attempt": budget_attempt,
+                "reservation_state": "reserved",
+            }
+        },
+        prompt_version=PROMPT_SET_VERSION,
+    )
+    return artifact_key
+
+
+async def _save_prompt_candidate(
+    run_id: str,
+    *,
+    artifact_key: str,
+    candidate: dict[str, Any],
+    raw_text: str,
+    usage: dict[str, Any],
+    base_payload_digest: str,
+    budget_attempt: int,
+    validation_errors: list[str],
+    semantic_review_pending: bool,
+) -> None:
+    candidate_usage = dict(usage)
+    candidate_usage["_aiv_prompt_candidate"] = {
+        "budget_attempt": budget_attempt,
+        "reservation_state": (
+            "candidate_saved"
+            if semantic_review_pending
+            else "review_completed"
+        ),
+        "semantic_review_pending": semantic_review_pending,
+        "validation_errors": list(validation_errors),
+        "accepted": not validation_errors and not semantic_review_pending,
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key=artifact_key,
+        status="candidate_ready" if semantic_review_pending else "completed",
+        model=ANALYSIS_MODEL,
+        input_json={
+            "base_payload_digest": base_payload_digest,
+            "budget_attempt": budget_attempt,
+        },
+        output_json=candidate,
+        raw_text=raw_text,
+        usage_json=candidate_usage,
+        error_message=(
+            "; ".join(validation_errors) if validation_errors else None
+        ),
+        prompt_version=PROMPT_SET_VERSION,
+    )
+
+
+async def _fail_prompt_candidate_attempt(
+    run_id: str,
+    *,
+    artifact_key: str,
+    base_payload_digest: str,
+    budget_attempt: int,
+    raw_text: str,
+    usage: dict[str, Any],
+    error_message: str,
+) -> None:
+    """Close a reserved call whose response cannot form a candidate."""
+
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key=artifact_key,
+        status="failed",
+        model=ANALYSIS_MODEL,
+        input_json={
+            "base_payload_digest": base_payload_digest,
+            "budget_attempt": budget_attempt,
+        },
+        raw_text=raw_text,
+        usage_json={
+            **usage,
+            "_aiv_prompt_candidate": {
+                "budget_attempt": budget_attempt,
+                "reservation_state": "response_invalid",
+                "validation_errors": [error_message],
+                "accepted": False,
+            },
+        },
+        error_message=error_message,
+        prompt_version=PROMPT_SET_VERSION,
+    )
+
+
+def _first_research_text(
+    *values: Any,
+    fallback: str,
+) -> str:
+    for value in values:
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            text = re.sub(r"\s+", " ", str(candidate or "")).strip(" .;:\n")
+            if text:
+                return text[:180]
+    return fallback
+
+
+def _without_brand_aliases(text: str, profile: dict[str, Any]) -> str:
+    output = text
+    aliases = [
+        str(value).strip()
+        for value in (
+            profile.get("brand_name"),
+            *(profile.get("brand_aliases") or []),
+        )
+        if str(value or "").strip()
+    ]
+    for alias in sorted(aliases, key=len, reverse=True):
+        output = re.sub(
+            rf"(?<![\w]){re.escape(alias)}(?![\w])",
+            "",
+            output,
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+    return re.sub(r"\s+", " ", output).strip(" .;:\n")
+
+
+def _deterministic_prompt_fallback(
+    profile: dict[str, Any],
+    research: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a neutral INTENT set only from already attested dimensions."""
+
+    external = research.get("external_market_research")
+    site_confirmed = research.get("site_confirmed")
+    if not isinstance(external, dict):
+        external = {}
+    if not isinstance(site_confirmed, dict):
+        site_confirmed = {}
+    category = _without_brand_aliases(
+        _first_research_text(
+            profile.get("category"),
+            site_confirmed.get("category"),
+            external.get("market"),
+            fallback="подходящего поставщика услуг",
+        ),
+        profile,
+    ) or "подходящего поставщика услуг"
+    job = _without_brand_aliases(
+        _first_research_text(
+            external.get("customer_jobs"),
+            profile.get("customer_jobs"),
+            fallback="решить свою задачу",
+        ),
+        profile,
+    ) or "решить свою задачу"
+    criterion = _without_brand_aliases(
+        _first_research_text(
+            external.get("decision_criteria"),
+            profile.get("decision_criteria"),
+            fallback="условия работы",
+        ),
+        profile,
+    ) or "условия работы"
+    geography = _without_brand_aliases(
+        _first_research_text(
+            external.get("geography"),
+            profile.get("geography"),
+            site_confirmed.get("geography"),
+            fallback="моём регионе",
+        ),
+        profile,
+    ) or "моём регионе"
+    brand = str(profile.get("brand_name") or "").strip()
+    if not brand:
+        raise OpenRouterError(
+            "Deterministic prompt fallback requires a confirmed brand name"
+        )
+
+    unbranded = [
+        (
+            "u-i",
+            "I",
+            f"Что важно понимать при выборе решений в категории «{category}» "
+            f"для задачи «{job}»? Назовите конкретные компании или сервисы.",
+            "Запрос сначала собирает общую информацию, затем просит примеры.",
+        ),
+        (
+            "u-e",
+            "E",
+            f"Какие решения в категории «{category}» стоит сравнить по "
+            f"критерию «{criterion}» для задачи «{job}»? Назовите варианты.",
+            "Запрос сопоставляет варианты по подтверждённому критерию выбора.",
+        ),
+        (
+            "u-t",
+            "T",
+            f"К кому можно обратиться для региона «{geography}», чтобы "
+            "решить задачу "
+            f"«{job}»? Назовите конкретные компании и объясните, как начать.",
+            "Запрос выражает готовность обратиться к поставщику.",
+        ),
+        (
+            "u-nb",
+            "NB",
+            f"Мне нужно «{job}» для региона «{geography}». Какие компании "
+            "или сервисы "
+            "помогают с такой задачей? Назовите конкретные варианты.",
+            "Запрос начинается с пользовательской задачи и ограничения.",
+        ),
+        (
+            "u-nav",
+            "NAV",
+            f"Где найти сайты или страницы компаний, которые помогают "
+            f"решить задачу «{job}» для региона «{geography}»? Дайте "
+            "названия и ссылки.",
+            "Запрос ищет конкретные источники и точки входа.",
+        ),
+        (
+            "u-tr",
+            "TR",
+            f"Какие современные подходы используют в категории «{category}» "
+            f"для задачи «{job}»? Назовите компании или сервисы с такими "
+            "подходами.",
+            "Запрос проверяет новые подходы и их конкретных носителей.",
+        ),
+    ]
+    prompts = [
+        {
+            "prompt_key": key,
+            "intent_class": intent,
+            "role": "unbranded_discovery",
+            "text": text,
+            "rationale": rationale,
+            "choice_request": True,
+        }
+        for key, intent, text, rationale in unbranded
+    ]
+    prompts.extend(
+        [
+            {
+                "prompt_key": "b-offer",
+                "intent_class": "I",
+                "role": "brand_diagnostic",
+                "text": f"Какие услуги предлагает {brand} и для каких задач они подходят?",
+                "rationale": "Проверяет базовое знание предложения бренда.",
+                "choice_request": False,
+            },
+            {
+                "prompt_key": "b-compare",
+                "intent_class": "E",
+                "role": "brand_diagnostic",
+                "text": f"Чем {brand} отличается от других вариантов в категории «{category}»?",
+                "rationale": "Проверяет способность сравнить известный бренд.",
+                "choice_request": False,
+            },
+            {
+                "prompt_key": "b-trust",
+                "intent_class": "TR",
+                "role": "brand_diagnostic",
+                "text": f"Что известно о репутации {brand} и насколько ему можно доверять?",
+                "rationale": "Проверяет знание сигналов доверия к бренду.",
+                "choice_request": False,
+            },
+        ]
+    )
+    return {"prompts": prompts}
+
+
+async def _save_accepted_prompt_set(
+    run_id: str,
+    *,
+    payload: dict[str, Any],
+    prompt_set: dict[str, Any],
+    raw_text: str,
+    usage: dict[str, Any],
+    model: str = ANALYSIS_MODEL,
+) -> None:
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="prompt_set",
+        status="completed",
+        model=model,
+        input_json=payload,
+        output_json=prompt_set,
+        raw_text=raw_text,
+        usage_json=usage,
+        prompt_version=PROMPT_SET_VERSION,
+    )
+
+
+async def _recover_prompt_set(
+    run_id: str,
+    *,
+    profile: dict[str, Any],
+    research: dict[str, Any],
+    payload: dict[str, Any],
+    system: str,
+    previous_set: dict[str, Any] | None,
+    last_errors: list[str],
+) -> dict[str, Any]:
+    """Use one durable Fable decision after the ordinary loop fails."""
+
+    facts = {
+        "site_profile": {
+            key: profile.get(key)
+            for key in (
+                "brand_name",
+                "brand_aliases",
+                "category",
+                "audiences",
+                "customer_jobs",
+                "decision_criteria",
+                "geography",
+            )
+        },
+        "market_research_digest": payload["market_research_digest"],
+        "market_research_status": research.get("status"),
+        "market_sufficiency": research.get("sufficiency"),
+        "last_candidate": previous_set,
+    }
+    diagnostics = {
+        "validation_errors": list(last_errors),
+        "candidate_digest": (
+            stable_digest(previous_set) if previous_set is not None else None
+        ),
+    }
+    plan = await plan_durable_recovery(
+        run_id,
+        stage_key="scenario_design",
+        failure_class="repairable_semantic",
+        failure_code="prompt_set_non_convergent",
+        diagnostics=diagnostics,
+        facts=facts,
+        allowed_actions={
+            ACTION_RETRY_WITH_GUIDANCE,
+            ACTION_DETERMINISTIC_FALLBACK,
+            ACTION_STOP,
+        },
+    )
+    await mark_recovery_executing(plan)
+    before_digest = stable_digest(
+        {"candidate": previous_set, "errors": last_errors}
+    )
+    action = str(plan.decision.get("action") or "")
+    requested_checks = set(plan.decision.get("acceptance_checks") or [])
+    required_checks = (
+        {CHECK_CHECKPOINT_PRESERVED}
+        if action == ACTION_STOP
+        else {
+            CHECK_PROMPT_CONTRACT_VALID,
+            CHECK_SEMANTIC_REVIEW_PASSED,
+        }
+    )
+    missing_checks = sorted(required_checks - requested_checks)
+    if missing_checks:
+        failed_digest = stable_digest(
+            {
+                "candidate": previous_set,
+                "errors": last_errors,
+                "missing_acceptance_checks": missing_checks,
+            }
+        )
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=failed_digest,
+            details={"missing_acceptance_checks": missing_checks},
+        )
+        raise OrchestratorContractError(
+            "Recovery plan omitted executable acceptance checks: "
+            + ", ".join(missing_checks)
+        )
+    if action == ACTION_STOP:
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={"reason": "planner_requested_stop"},
+        )
+        raise OpenRouterError(
+            str(plan.decision.get("rationale") or "Prompt recovery stopped")
+        )
+
+    if action == ACTION_DETERMINISTIC_FALLBACK:
+        recovered = _deterministic_prompt_fallback(profile, research)
+        errors = _validate_prompt_set(recovered, profile)
+        if not errors:
+            errors = await _review_prompt_set_semantics(
+                run_id,
+                profile,
+                recovered,
+                research,
+            )
+        raw_text = json.dumps(recovered, ensure_ascii=False)
+        usage = {
+            "_aiv_recovery": {
+                "epoch": plan.epoch,
+                "action": action,
+                "planner_model": settings.OPENROUTER_ORCHESTRATOR_MODEL,
+                "generation_mode": "deterministic_verified_fallback",
+            }
+        }
+    elif action == ACTION_RETRY_WITH_GUIDANCE:
+        repair_payload = dict(payload)
+        repair_payload["previous_prompt_set"] = previous_set
+        repair_payload["validation_errors_to_fix"] = list(last_errors)
+        repair_payload["orchestrator_guidance"] = str(
+            plan.decision.get("guidance") or ""
+        )
+        repair_payload["repair_instruction"] = (
+            "Это последняя ограниченная попытка. Исправь только замечания и "
+            "сохрани без изменения сценарии, которых они не касаются."
+        )
+        result = await chat(
+            model=ANALYSIS_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(repair_payload, ensure_ascii=False),
+                },
+            ],
+            response_schema=PROMPT_SET_SCHEMA,
+            schema_name="aiv_prompt_set_recovery",
+            reasoning_effort="high",
+            max_tokens=7_000,
+            temperature=0.1,
+        )
+        recovered = result.parsed if isinstance(result.parsed, dict) else {}
+        raw_text = result.text
+        usage = dict(result.usage)
+        errors = _validate_prompt_set(recovered, profile)
+        if not errors:
+            errors = await _review_prompt_set_semantics(
+                run_id,
+                profile,
+                recovered,
+                research,
+            )
+    else:  # pragma: no cover - validated by recovery_orchestrator
+        raise OpenRouterError(f"Unsupported prompt recovery action: {action}")
+
+    after_digest = stable_digest({"candidate": recovered, "errors": errors})
+    if errors:
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            details={"validation_errors": errors},
+        )
+        raise OpenRouterError("; ".join(errors))
+    usage["_aiv_recovery"] = {
+        **(
+            usage.get("_aiv_recovery")
+            if isinstance(usage.get("_aiv_recovery"), dict)
+            else {}
+        ),
+        "epoch": plan.epoch,
+        "action": action,
+        "planner_model": settings.OPENROUTER_ORCHESTRATOR_MODEL,
+        "acceptance_checks": plan.decision.get("acceptance_checks") or [],
+        "executed_acceptance_checks": sorted(required_checks),
+    }
+    await _save_accepted_prompt_set(
+        run_id,
+        payload=payload,
+        prompt_set=recovered,
+        raw_text=raw_text,
+        usage=usage,
+        model=(
+            "deterministic/prompt-fallback-v1"
+            if action == ACTION_DETERMINISTIC_FALLBACK
+            else ANALYSIS_MODEL
+        ),
+    )
+    await finish_recovery(
+        plan,
+        succeeded=True,
+        before_digest=before_digest,
+        after_digest=after_digest,
+        details={
+            "accepted_prompt_digest": stable_digest(recovered),
+            "executed_acceptance_checks": sorted(required_checks),
+        },
+    )
+    return recovered
+
+
 async def _generate_prompt_set(
     run_id: str,
     profile: dict[str, Any],
@@ -3144,6 +3805,7 @@ async def _generate_prompt_set(
         "market_research": research,
         "market_research_digest": _stable_json_sha256(research),
     }
+    base_payload_digest = _stable_json_sha256(payload)
     cached = await _artifact_output(
         run_id,
         "prompt_set",
@@ -3151,6 +3813,14 @@ async def _generate_prompt_set(
         model=ANALYSIS_MODEL,
         prompt_version=PROMPT_SET_VERSION,
     )
+    if cached is None:
+        cached = await _artifact_output(
+            run_id,
+            "prompt_set",
+            input_json=payload,
+            model="deterministic/prompt-fallback-v1",
+            prompt_version=PROMPT_SET_VERSION,
+        )
     last_errors: list[str] = []
     if isinstance(cached, dict):
         last_errors = _validate_prompt_set(cached, profile)
@@ -3163,6 +3833,71 @@ async def _generate_prompt_set(
             )
         if not last_errors:
             return cached
+    (
+        reserved_attempts,
+        previous_set,
+        previous_raw_text,
+        previous_usage,
+        previous_artifact_key,
+        previous_budget_attempt,
+    ) = await _prompt_candidate_state(
+        run_id,
+        base_payload_digest=base_payload_digest,
+    )
+    if previous_set is not None:
+        # A parsed response is checkpointed before the semantic model starts.
+        # Therefore a restart must never trust its old metadata: execute both
+        # gates again, and only then promote it to the accepted prompt set.
+        last_errors = _validate_prompt_set(
+            previous_set,
+            profile,
+        )
+        if not last_errors:
+            last_errors = await _review_prompt_set_semantics(
+                run_id,
+                profile,
+                previous_set,
+                research,
+            )
+        if previous_artifact_key is not None:
+            await _save_prompt_candidate(
+                run_id,
+                artifact_key=previous_artifact_key,
+                candidate=previous_set,
+                raw_text=previous_raw_text,
+                usage=previous_usage,
+                base_payload_digest=base_payload_digest,
+                budget_attempt=previous_budget_attempt,
+                validation_errors=last_errors,
+                semantic_review_pending=False,
+            )
+        if not last_errors:
+            accepted_usage = dict(previous_usage)
+            accepted_usage["_aiv_prompt_candidate"] = {
+                **(
+                    previous_usage.get("_aiv_prompt_candidate")
+                    if isinstance(
+                        previous_usage.get("_aiv_prompt_candidate"),
+                        dict,
+                    )
+                    else {}
+                ),
+                "recovered_after_worker_restart": True,
+                "structural_gate_reexecuted": True,
+                "semantic_gate_reexecuted": True,
+                "budget_attempt": previous_budget_attempt,
+                "reservation_state": "review_completed",
+                "semantic_review_pending": False,
+                "accepted": True,
+            }
+            await _save_accepted_prompt_set(
+                run_id,
+                payload=payload,
+                prompt_set=previous_set,
+                raw_text=previous_raw_text,
+                usage=accepted_usage,
+            )
+            return previous_set
     system = f"""
 Ты проектируешь экспресс-проверку AI visibility для одного бренда.
 
@@ -3214,11 +3949,13 @@ choice_request поставь true только если текст действ
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    # Четыре, а не две: строгий семантический критик (все шесть проверок,
-    # processing-модель) обычно требует 2-3 итерации на сходимость — с двумя
-    # попытками прогон profi.travel умирал на одном несведённом TR-сценарии.
-    previous_set: dict[str, Any] | None = None
-    for attempt in range(4):
+    # Четыре попытки — общий durable-бюджет run_id + base_payload_digest, а не
+    # новый лимит на каждое возобновление worker. Reservation пишется до chat:
+    # даже падение во время внешнего вызова расходует одну попытку.
+    for budget_attempt in range(
+        reserved_attempts + 1,
+        PROMPT_GENERATOR_MAX_ATTEMPTS + 1,
+    ):
         user_content = dict(payload)
         if last_errors:
             user_content["validation_errors_to_fix"] = last_errors
@@ -3233,11 +3970,19 @@ choice_request поставь true только если текст действ
                 "previous_prompt_set перенеси в ответ дословно, не меняя ни "
                 "текст, ни prompt_key."
             )
+        artifact_key = await _reserve_prompt_candidate_attempt(
+            run_id,
+            base_payload_digest=base_payload_digest,
+            budget_attempt=budget_attempt,
+        )
         result = await chat(
             model=ANALYSIS_MODEL,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": json.dumps(user_content, ensure_ascii=False),
+                },
             ],
             response_schema=PROMPT_SET_SCHEMA,
             schema_name="aiv_prompt_set",
@@ -3247,9 +3992,32 @@ choice_request поставь true только если текст действ
         )
         if not isinstance(result.parsed, dict):
             last_errors = ["Ответ не является объектом."]
+            await _fail_prompt_candidate_attempt(
+                run_id,
+                artifact_key=artifact_key,
+                base_payload_digest=base_payload_digest,
+                budget_attempt=budget_attempt,
+                raw_text=result.text,
+                usage=result.usage,
+                error_message=last_errors[0],
+            )
             continue
         previous_set = result.parsed
         last_errors = _validate_prompt_set(result.parsed, profile)
+        # This write deliberately happens before the semantic review.  If the
+        # worker dies in that review, the next worker resumes from the parsed
+        # candidate instead of paying for the generator again.
+        await _save_prompt_candidate(
+            run_id,
+            artifact_key=artifact_key,
+            candidate=result.parsed,
+            raw_text=result.text,
+            usage=result.usage,
+            base_payload_digest=base_payload_digest,
+            budget_attempt=budget_attempt,
+            validation_errors=last_errors,
+            semantic_review_pending=not last_errors,
+        )
         if not last_errors:
             last_errors = await _review_prompt_set_semantics(
                 run_id,
@@ -3257,21 +4025,47 @@ choice_request поставь true только если текст действ
                 result.parsed,
                 research,
             )
-        if not last_errors:
-            await _save_artifact(
+            await _save_prompt_candidate(
                 run_id,
-                stage_key="scenario_design",
-                artifact_key="prompt_set",
-                status="completed",
-                model=ANALYSIS_MODEL,
-                input_json=payload,
-                output_json=result.parsed,
+                artifact_key=artifact_key,
+                candidate=result.parsed,
                 raw_text=result.text,
-                usage_json=result.usage,
-                prompt_version=PROMPT_SET_VERSION,
+                usage=result.usage,
+                base_payload_digest=base_payload_digest,
+                budget_attempt=budget_attempt,
+                validation_errors=last_errors,
+                semantic_review_pending=False,
+            )
+        if not last_errors:
+            accepted_usage = dict(result.usage)
+            accepted_usage["_aiv_prompt_candidate"] = {
+                "budget_attempt": budget_attempt,
+                "reservation_state": "review_completed",
+                "semantic_review_pending": False,
+                "accepted": True,
+            }
+            await _save_accepted_prompt_set(
+                run_id,
+                payload=payload,
+                prompt_set=result.parsed,
+                raw_text=result.text,
+                usage=accepted_usage,
             )
             return result.parsed
-    raise OpenRouterError("; ".join(last_errors) or "Prompt set validation failed")
+    if not last_errors:
+        last_errors = [
+            "Обычный durable-бюджет генерации сценариев исчерпан без "
+            "восстанавливаемого кандидата."
+        ]
+    return await _recover_prompt_set(
+        run_id,
+        profile=profile,
+        research=research,
+        payload=payload,
+        system=system,
+        previous_set=previous_set,
+        last_errors=last_errors,
+    )
 
 
 async def _persist_prompts(
@@ -5447,6 +6241,136 @@ def _contextual_alias_is_present(answer_text: str, alias: str) -> bool:
     return bool(_contextual_alias_spans(answer_text, [alias]))
 
 
+_SAFE_SERVICE_ACTION_FORM_FAMILIES = (
+    frozenset(
+        {
+            "бронирование",
+            "бронирования",
+            "бронированию",
+            "бронированием",
+            "бронировании",
+            "бронировать",
+            "забронировать",
+        }
+    ),
+)
+_SAFE_SERVICE_OBJECT_FORM_FAMILIES = (
+    frozenset(
+        {
+            "отель",
+            "отеля",
+            "отелю",
+            "отелем",
+            "отеле",
+            "отели",
+            "отелей",
+            "отелям",
+            "отелями",
+            "отелях",
+        }
+    ),
+)
+_SAFE_SERVICE_FORM_FAMILY_BY_TOKEN = {
+    token: family
+    for family in (
+        *_SAFE_SERVICE_ACTION_FORM_FAMILIES,
+        *_SAFE_SERVICE_OBJECT_FORM_FAMILIES,
+    )
+    for token in family
+}
+
+
+def _allowlisted_service_form_spans(
+    answer_text: str,
+    alias: str,
+) -> list[tuple[int, int]]:
+    """Match one narrow action/object grammar family for attribution.
+
+    This is intentionally not a general-purpose morphology layer.  A match
+    requires a multi-token alias containing both an allowlisted service action
+    and its allowlisted object.  Every other token and separator remains
+    literal, so ``бронирование отелей`` may match ``забронировать
+    отель``, while ``забронировать ресторан`` cannot match it.
+
+    Positive use is further restricted to a confirmed target-owned Markdown
+    scope by ``_target_scoped_contextual_alias_is_present``.
+    """
+
+    normalized_text = answer_text.casefold().replace("ё", "е")
+    normalized_alias = alias.casefold().replace("ё", "е").strip()
+    token_matches = list(re.finditer(r"[а-я]+", normalized_alias))
+    if len(token_matches) < 2:
+        return []
+    alias_tokens = [match.group(0) for match in token_matches]
+    if not any(
+        token in family
+        for token in alias_tokens
+        for family in _SAFE_SERVICE_ACTION_FORM_FAMILIES
+    ) or not any(
+        token in family
+        for token in alias_tokens
+        for family in _SAFE_SERVICE_OBJECT_FORM_FAMILIES
+    ):
+        return []
+
+    pattern_parts: list[str] = []
+    cursor = 0
+    for token_match in token_matches:
+        pattern_parts.append(
+            re.escape(normalized_alias[cursor : token_match.start()])
+        )
+        token = token_match.group(0)
+        family = _SAFE_SERVICE_FORM_FAMILY_BY_TOKEN.get(token)
+        if family is None:
+            pattern_parts.append(re.escape(token))
+        else:
+            variants = sorted(family, key=lambda value: (-len(value), value))
+            pattern_parts.append(
+                "(?:" + "|".join(map(re.escape, variants)) + ")"
+            )
+        cursor = token_match.end()
+    pattern_parts.append(re.escape(normalized_alias[cursor:]))
+    pattern = "".join(pattern_parts)
+    return [
+        match.span()
+        for match in re.finditer(
+            rf"(?<![\w]){pattern}(?![\w])",
+            normalized_text,
+            re.UNICODE,
+        )
+    ]
+
+
+def _attribution_entity_alias_spans(
+    answer_text: str,
+    aliases: list[str],
+) -> list[tuple[int, int]]:
+    """Return exact inflections plus narrowly allowlisted service forms."""
+
+    spans = set(_contextual_alias_spans(answer_text, aliases))
+    for alias in aliases:
+        spans.update(_allowlisted_service_form_spans(answer_text, alias))
+    return sorted(spans)
+
+
+def _attribution_entity_aliases_in_text(
+    answer_text: str,
+    aliases: list[str],
+) -> list[str]:
+    """Return aliases or exact raw surface forms used by attribution checks."""
+
+    matched: list[str] = []
+    for alias in aliases:
+        if _contextual_alias_is_present(answer_text, alias):
+            matched.append(alias)
+            continue
+        for start, end in _allowlisted_service_form_spans(answer_text, alias):
+            surface = answer_text[start:end]
+            if surface:
+                matched.append(surface)
+    return list(dict.fromkeys(matched))
+
+
 def _normalized_evidence_text(value: str) -> str:
     normalized = value.casefold().replace("ё", "е")
     normalized = re.sub(r"[*_`#]+", "", normalized)
@@ -5968,6 +6892,10 @@ _MARKDOWN_BOLD_HEADING = re.compile(
     r"^\s*\*\*([^*]{2,160})\*\*\s*$",
     re.UNICODE,
 )
+_MARKDOWN_BOLD_LIST_HEADING = re.compile(
+    r"^(\s*)[-*•]\s+\*\*([^*]{2,160})\*\*\s*$",
+    re.UNICODE,
+)
 _MARKDOWN_OWNER_FIELD = re.compile(
     r"(?:застройщик|девелопер|оператор|владелец|"
     r"репутация\s+застройщика|компания|бренд)",
@@ -5980,7 +6908,8 @@ _MARKDOWN_CARD_FIELD_LABEL = re.compile(
     r"площадь|отделка|качество\s+отделки|архитектура|"
     r"инфраструктура|транспорт|преимущества|недостатки|"
     r"сильная\s+сторона|специализация|экспертиза|компетенции|"
-    r"описание|что\s+учесть|важно|итог|вывод|"
+    r"описание|что\s+(?:это|предлагает|учесть)|"
+    r"возможност(?:и|ь)|оплата|важно|итог|вывод|"
     r"график\s+платежей|первоначальный\s+взнос"
     r")",
     re.IGNORECASE | re.UNICODE,
@@ -6019,6 +6948,19 @@ def _markdown_heading_signature(line: str) -> tuple[str, int] | None:
                 else ("colon", 0)
             )
         return "bold", 0
+    bold_list_heading = _MARKDOWN_BOLD_LIST_HEADING.match(line)
+    if bold_list_heading is not None:
+        label = bold_list_heading.group(2).strip()
+        if label.endswith(":"):
+            return (
+                None
+                if _markdown_colon_label_is_field(label[:-1].strip())
+                else ("colon", 0)
+            )
+        return (
+            "list-bold",
+            len(bold_list_heading.group(1).expandtabs(4)),
+        )
     colon_label = _markdown_colon_label(line)
     if colon_label and not _markdown_colon_label_is_field(colon_label):
         return "colon", 0
@@ -6175,16 +7117,40 @@ def _has_markdown_scoped_target_attribution(
 
         # A single list item may express the relationship in its second
         # sentence: ``- JOIS (...). В продаже есть квартиры с террасами``.
-        if _line_mentions_any_alias(owner_line, entity_aliases):
+        owner_entity_aliases = _attribution_entity_aliases_in_text(
+            owner_line,
+            entity_aliases,
+        )
+        if owner_entity_aliases:
             normalized_line = _normalized_evidence_text(owner_line)
+            exact_entity_spans = set(
+                _contextual_alias_spans(normalized_line, entity_aliases)
+            )
+            owner_signature = _markdown_heading_signature(owner_line)
+            owner_has_explicit_markdown_scope = bool(
+                (
+                    owner_signature is not None
+                    and owner_signature[0] != "plain"
+                )
+                or re.match(
+                    r"^\s*(?:#{1,6}\s+|[-*•]\s+|\*\*)",
+                    owner_line,
+                    re.UNICODE,
+                )
+            )
             for target_start, target_end in _alias_spans(
                 normalized_line,
                 target_aliases,
             ):
-                for entity_start, entity_end in _contextual_alias_spans(
+                for entity_start, entity_end in _attribution_entity_alias_spans(
                     normalized_line,
                     entity_aliases,
                 ):
+                    if (
+                        (entity_start, entity_end) not in exact_entity_spans
+                        and not owner_has_explicit_markdown_scope
+                    ):
+                        continue
                     if target_end <= entity_start:
                         relation = normalized_line[target_end:entity_start]
                         if (
@@ -6195,7 +7161,7 @@ def _has_markdown_scoped_target_attribution(
                             )
                             and not _structured_field_has_competing_owner(
                                 owner_line,
-                                entity_aliases,
+                                owner_entity_aliases,
                                 target_aliases,
                             )
                             and (
@@ -6272,10 +7238,11 @@ def _has_markdown_scoped_target_attribution(
                     continue
                 if claim_indent <= parent_indent:
                     break
-                if not _line_mentions_any_alias(
+                claim_entity_aliases = _attribution_entity_aliases_in_text(
                     claim_line,
                     entity_aliases,
-                ):
+                )
+                if not claim_entity_aliases:
                     continue
                 candidate = "\n".join(
                     lines[owner_index : claim_index + 1]
@@ -6285,7 +7252,7 @@ def _has_markdown_scoped_target_attribution(
                     and len(candidate) <= 1200
                     and not _structured_field_has_competing_owner(
                         claim_line,
-                        entity_aliases,
+                        claim_entity_aliases,
                         target_aliases,
                     )
                     and not _relation_has_competing_owner(
@@ -6317,7 +7284,22 @@ def _has_markdown_scoped_target_attribution(
                 )
             ):
                 break
-            if not _line_mentions_any_alias(claim_line, entity_aliases):
+            claim_entity_aliases = _attribution_entity_aliases_in_text(
+                claim_line,
+                entity_aliases,
+            )
+            if not claim_entity_aliases:
+                continue
+            if (
+                signature[0] == "plain"
+                and not _contextual_alias_spans(
+                    claim_line,
+                    entity_aliases,
+                )
+            ):
+                # Derivational service forms are deliberately narrower than
+                # ordinary exact aliases: a bare prose line is not a proven
+                # Markdown owner, even when a bullet follows it.
                 continue
             previous_label = (
                 _markdown_colon_label(lines[claim_index - 1])
@@ -6371,7 +7353,7 @@ def _has_markdown_scoped_target_attribution(
                 or len(candidate) > 1200
                 or _structured_field_has_competing_owner(
                     claim_line,
-                    entity_aliases,
+                    claim_entity_aliases,
                     target_aliases,
                 )
                 or _relation_has_competing_owner(
@@ -6382,6 +7364,29 @@ def _has_markdown_scoped_target_attribution(
                 continue
             return True
     return False
+
+
+def _target_scoped_contextual_alias_is_present(
+    answer_text: str,
+    alias: str,
+    target_aliases: list[str],
+    *,
+    direct_target_aliases: list[str] | None = None,
+    confirmed_owner_aliases: list[str] | None = None,
+) -> bool:
+    """Allow derived service forms only inside a proven target card."""
+
+    if _contextual_alias_is_present(answer_text, alias):
+        return True
+    if not _allowlisted_service_form_spans(answer_text, alias):
+        return False
+    return _has_markdown_scoped_target_attribution(
+        answer_text,
+        [alias],
+        target_aliases,
+        direct_target_aliases=direct_target_aliases,
+        confirmed_owner_aliases=confirmed_owner_aliases,
+    )
 
 
 def _has_explicit_target_attribution(
@@ -6578,17 +7583,22 @@ def _evidence_negates_entity(
     """Reject explicit absence/negation of the entity itself."""
 
     normalized = _normalized_evidence_text(evidence)
-    for start, end in _contextual_alias_spans(normalized, entity_aliases):
+    for start, end in _attribution_entity_alias_spans(
+        normalized,
+        entity_aliases,
+    ):
         prefix = normalized[max(0, start - 72) : start]
         suffix = normalized[end : end + 96]
         if re.search(
-            r"(?:^|[.:;—–\-])\s*(?:не|без)\s*$",
+            r"(?:^|[.:;—–\-])\s*"
+            r"(?:не|нельзя|невозмож\w*|без(?:\s+возможности)?)\s*$",
             prefix,
             re.UNICODE,
         ):
             return True
         if re.match(
-            r"^\s*(?:не\s+доступ\w*|недоступ\w*|отсутств\w*|"
+            r"^\s*(?:нельзя\b|невозмож\w*|не\s+доступ\w*|"
+            r"недоступ\w*|отсутств\w*|"
             r"не\s+предлага\w*|[—–\-:]?\s*нет\b)",
             suffix,
             re.UNICODE,
@@ -7051,7 +8061,10 @@ def _literal_target_attribution_evidence(
 ) -> str:
     """Extract the shortest exact local block that proves attribution."""
 
-    entity_spans = _contextual_alias_spans(answer_text, entity_aliases)
+    entity_spans = _attribution_entity_alias_spans(
+        answer_text,
+        entity_aliases,
+    )
     target_spans = _alias_spans(answer_text, target_aliases)
     if not entity_spans or not target_spans:
         return ""
@@ -7171,7 +8184,13 @@ def _portfolio_entity_is_grounded(
         if (
             _alias_is_present(answer_text, alias)
             if policy == "standalone"
-            else _contextual_alias_is_present(answer_text, alias)
+            else _target_scoped_contextual_alias_is_present(
+                answer_text,
+                alias,
+                target_aliases,
+                direct_target_aliases=direct_target_aliases,
+                confirmed_owner_aliases=confirmed_owner_aliases,
+            )
         )
     ]
     if not matching_aliases:
@@ -7237,7 +8256,13 @@ def _explicit_profile_portfolio_facts(
                 profile,
                 excluded_aliases=attribution_aliases,
             )
-            if _contextual_alias_is_present(answer_text, alias)
+            if _target_scoped_contextual_alias_is_present(
+                answer_text,
+                alias,
+                attribution_aliases,
+                direct_target_aliases=direct_aliases,
+                confirmed_owner_aliases=confirmed_owner_aliases,
+            )
         ]
         if not entity_aliases:
             continue
@@ -7309,7 +8334,17 @@ def _reconcile_annotation(
             if (
                 _alias_is_present(answer_text, alias)
                 if policy == "standalone"
-                else _contextual_alias_is_present(answer_text, alias)
+                else (
+                    _target_scoped_contextual_alias_is_present(
+                        answer_text,
+                        alias,
+                        attribution_aliases,
+                        direct_target_aliases=direct_aliases,
+                        confirmed_owner_aliases=confirmed_owner_aliases,
+                    )
+                    if is_portfolio_candidate
+                    else _contextual_alias_is_present(answer_text, alias)
+                )
             )
         ]
         if is_portfolio_candidate:
@@ -7433,7 +8468,13 @@ def _reconcile_annotation(
                 excluded_aliases=attribution_aliases,
             )
             if policy == "requires_target_attribution"
-            and _contextual_alias_is_present(answer_text, alias)
+            and _target_scoped_contextual_alias_is_present(
+                answer_text,
+                alias,
+                attribution_aliases,
+                direct_target_aliases=direct_aliases,
+                confirmed_owner_aliases=confirmed_owner_aliases,
+            )
         ]
         literal_evidence = _literal_target_attribution_evidence(
             answer_text,
@@ -7483,7 +8524,17 @@ def _reconcile_annotation(
             if (
                 _alias_is_present(answer_text, alias)
                 if policy == "standalone"
-                else _contextual_alias_is_present(answer_text, alias)
+                else (
+                    _target_scoped_contextual_alias_is_present(
+                        answer_text,
+                        alias,
+                        attribution_aliases,
+                        direct_target_aliases=direct_aliases,
+                        confirmed_owner_aliases=confirmed_owner_aliases,
+                    )
+                    if is_portfolio_candidate
+                    else _contextual_alias_is_present(answer_text, alias)
+                )
             )
         ]
         if not matching_alias_entries:
@@ -9606,6 +10657,189 @@ def _deterministic_annotation_warnings(
     return warnings
 
 
+def _critic_raw_sample_class(row: dict[str, Any]) -> str:
+    """Classify a row for deterministic primary-critic coverage."""
+
+    annotation = row.get("annotation")
+    if (
+        row.get("status") != "completed"
+        or row.get("metric_eligible", True) is False
+        or not isinstance(annotation, dict)
+        or annotation.get("valid") is not True
+    ):
+        return "failure"
+    if (
+        annotation.get("target_mentioned") is True
+        or any(
+            isinstance(mention, dict)
+            and mention.get("attributed_to_target") is True
+            for mention in annotation.get("entity_mentions") or []
+        )
+        or (
+            isinstance(annotation.get("brand_answer"), dict)
+            and annotation["brand_answer"].get("specificity")
+            in {"specific", "generic"}
+        )
+    ):
+        return "positive"
+    return "negative"
+
+
+def _critic_selected_raw_answer_ids(
+    rows: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+) -> tuple[set[int], dict[str, Any]]:
+    """Select diverse raw evidence under one deterministic global budget.
+
+    Warning-linked rows come first. The remaining budget is spread across
+    positive, negative and failed/unusable rows instead of systematically
+    preferring successful positive examples. Every omitted row remains in the
+    manifest with its digest and annotation.
+    """
+
+    rows_by_id = {
+        int(row["answer_id"]): row
+        for row in rows
+        if isinstance(row.get("answer_id"), int)
+    }
+    referenced_warning_ids = {
+        int(answer_id)
+        for warning in warnings
+        if isinstance(warning, dict)
+        for answer_id in warning.get("answer_ids") or []
+        if isinstance(answer_id, int)
+    }
+    warning_ids = referenced_warning_ids & rows_by_id.keys()
+    missing_warning_ids = sorted(referenced_warning_ids - rows_by_id.keys())
+    priority_ids: list[int] = sorted(warning_ids)
+    labels_to_keys = {model.label: model.key for model in panel_models()}
+    leakage_provider_keys = {
+        labels_to_keys.get(str(provider))
+        for warning in warnings
+        if isinstance(warning, dict)
+        and warning.get("code") == "scope_leakage"
+        for provider in warning.get("providers") or []
+    }
+    leakage_provider_keys.discard(None)
+    for row in rows:
+        answer_id = row.get("answer_id")
+        if (
+            isinstance(answer_id, int)
+            and row.get("provider_key") in leakage_provider_keys
+            and row.get("mode") == "web"
+            and row.get("role") == "unbranded_discovery"
+        ):
+            warning_ids.add(answer_id)
+            if answer_id not in priority_ids:
+                priority_ids.append(answer_id)
+
+    # Build deterministic provider × mode × role buckets. Each bucket offers
+    # at most one positive, one negative and one failure row. The first choice
+    # rotates by bucket so bounded requests do not systematically privilege one
+    # outcome class.
+    buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in sorted(
+        rows,
+        key=lambda item: int(item.get("answer_id") or 0),
+    ):
+        if not isinstance(row.get("answer_id"), int):
+            continue
+        buckets[
+            (
+                str(row.get("provider_key") or ""),
+                str(row.get("mode") or ""),
+                str(row.get("role") or ""),
+            )
+        ].append(row)
+    class_order = ("failure", "negative", "positive")
+    bucket_candidates: list[list[int]] = []
+    for bucket_index, bucket_key in enumerate(sorted(buckets)):
+        by_class: dict[str, int] = {}
+        bucket = buckets[bucket_key]
+        for row in bucket:
+            sample_class = _critic_raw_sample_class(row)
+            if sample_class not in by_class:
+                by_class[sample_class] = int(row["answer_id"])
+        rotated = (
+            class_order[bucket_index % len(class_order) :]
+            + class_order[: bucket_index % len(class_order)]
+        )
+        candidates = [
+            by_class[sample_class]
+            for sample_class in rotated
+            if sample_class in by_class
+        ]
+        if candidates:
+            bucket_candidates.append(candidates)
+
+    # Guarantee global outcome diversity before adding further bucket rows.
+    for sample_class in class_order:
+        representative = next(
+            (
+                int(row["answer_id"])
+                for row in sorted(
+                    rows_by_id.values(),
+                    key=lambda item: int(item.get("answer_id") or 0),
+                )
+                if _critic_raw_sample_class(row) == sample_class
+            ),
+            None,
+        )
+        if representative is not None and representative not in priority_ids:
+            priority_ids.append(representative)
+
+    # Interleave bucket rounds so the budget reaches many strata before taking
+    # a second or third outcome from the same stratum.
+    for round_index in range(3):
+        for candidates in bucket_candidates:
+            if round_index >= len(candidates):
+                continue
+            answer_id = candidates[round_index]
+            if answer_id not in priority_ids:
+                priority_ids.append(answer_id)
+
+    selected: set[int] = set()
+    selected_chars = 0
+    for answer_id in priority_ids:
+        if len(selected) >= CRITIC_PRIMARY_MAX_RAW_ANSWERS:
+            break
+        row = rows_by_id.get(answer_id)
+        if row is None:
+            continue
+        raw_chars = min(
+            len(str(row.get("answer_text") or "")),
+            CRITIC_ANSWER_CHAR_LIMIT,
+        )
+        if selected and selected_chars + raw_chars > CRITIC_PRIMARY_RAW_CHAR_BUDGET:
+            continue
+        if raw_chars > CRITIC_PRIMARY_RAW_CHAR_BUDGET:
+            continue
+        selected.add(answer_id)
+        selected_chars += raw_chars
+
+    omitted_warning_ids = sorted(warning_ids - selected)
+    selected_classes = Counter(
+        _critic_raw_sample_class(rows_by_id[answer_id])
+        for answer_id in selected
+    )
+    return selected, {
+        "strategy": "warning_priority_diverse_stratified_v2",
+        "char_budget": CRITIC_PRIMARY_RAW_CHAR_BUDGET,
+        "max_raw_answers": CRITIC_PRIMARY_MAX_RAW_ANSWERS,
+        "included_raw_chars": selected_chars,
+        "included_class_counts": {
+            sample_class: int(selected_classes.get(sample_class, 0))
+            for sample_class in class_order
+        },
+        "warning_answer_ids": sorted(warning_ids),
+        "omitted_warning_answer_ids": omitted_warning_ids,
+        "missing_warning_answer_ids": missing_warning_ids,
+        "insufficient_warning_evidence_requires_block": bool(
+            omitted_warning_ids or missing_warning_ids
+        ),
+    }
+
+
 def _critic_payload(
     *,
     profile: dict[str, Any],
@@ -9615,6 +10849,21 @@ def _critic_payload(
     policy_history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     scoped_catalog = _scope_entity_catalog_to_profile(catalog, profile)
+    deterministic_warnings = [
+        *_deterministic_metric_warnings(metrics),
+        *_deterministic_annotation_warnings(
+            profile=profile,
+            catalog=scoped_catalog,
+            rows=rows,
+        ),
+    ]
+    raw_answer_ids, raw_selection = _critic_selected_raw_answer_ids(
+        rows,
+        deterministic_warnings,
+    )
+    omitted_warning_ids = set(
+        raw_selection.get("omitted_warning_answer_ids") or []
+    )
     return {
         "site_profile": profile,
         "entity_catalog": scoped_catalog,
@@ -9669,14 +10918,13 @@ def _critic_payload(
             scoped_catalog,
         ),
         "candidate_metrics": metrics,
-        "deterministic_warnings": [
-            *_deterministic_metric_warnings(metrics),
-            *_deterministic_annotation_warnings(
-                profile=profile,
-                catalog=scoped_catalog,
-                rows=rows,
-            ),
-        ],
+        "deterministic_warnings": deterministic_warnings,
+        "raw_evidence_selection": {
+            **raw_selection,
+            "included_answer_ids": sorted(raw_answer_ids),
+            "full_manifest_count": len(rows),
+            "included_raw_count": len(raw_answer_ids),
+        },
         "previous_policy_changes": policy_history,
         "answers": [
             {
@@ -9704,13 +10952,31 @@ def _critic_payload(
                 "raw_answer_sha256": hashlib.sha256(
                     str(row.get("answer_text") or "").encode("utf-8")
                 ).hexdigest(),
-                "raw_answer_truncated": (
-                    len(str(row.get("answer_text") or ""))
+                "raw_answer_included": row.get("answer_id") in raw_answer_ids,
+                "raw_answer_char_count": len(
+                    str(row.get("answer_text") or "")
+                ),
+                "raw_answer_truncated": bool(
+                    row.get("answer_id") in raw_answer_ids
+                    and len(str(row.get("answer_text") or ""))
                     > CRITIC_ANSWER_CHAR_LIMIT
                 ),
-                "raw_answer": str(row.get("answer_text") or "")[
-                    :CRITIC_ANSWER_CHAR_LIMIT
-                ],
+                "raw_answer_omission_reason": (
+                    None
+                    if row.get("answer_id") in raw_answer_ids
+                    else (
+                        "primary_raw_budget_warning_evidence"
+                        if row.get("answer_id") in omitted_warning_ids
+                        else "primary_raw_budget_manifest"
+                    )
+                ),
+                "raw_answer": (
+                    str(row.get("answer_text") or "")[
+                        :CRITIC_ANSWER_CHAR_LIMIT
+                    ]
+                    if row.get("answer_id") in raw_answer_ids
+                    else ""
+                ),
                 "annotation": row.get("annotation"),
             }
             for row in rows
@@ -10004,6 +11270,27 @@ def _critic_review_errors(
             "truncated raw answers require block: "
             + ", ".join(str(value) for value in truncated_answer_ids)
         )
+    raw_selection = (payload or {}).get("raw_evidence_selection")
+    omitted_warning_ids = (
+        raw_selection.get("omitted_warning_answer_ids") or []
+        if isinstance(raw_selection, dict)
+        else []
+    )
+    missing_warning_ids = (
+        raw_selection.get("missing_warning_answer_ids") or []
+        if isinstance(raw_selection, dict)
+        else []
+    )
+    incomplete_warning_ids = [
+        *omitted_warning_ids,
+        *missing_warning_ids,
+    ]
+    if incomplete_warning_ids and verdict != "block":
+        errors.append(
+            "warning-linked raw answers missing or omitted by primary budget "
+            "require block: "
+            + ", ".join(str(value) for value in incomplete_warning_ids)
+        )
     if verdict == "pass":
         unresolved = [
             item
@@ -10273,6 +11560,53 @@ def _deterministic_critic_fallback_review(
     return fallback
 
 
+def _validated_critic_usage(
+    usage: dict[str, Any] | None,
+    *,
+    validation_owner: str = "critic_gate",
+) -> dict[str, Any]:
+    """Record that the model verdict passed the deterministic gate contract."""
+
+    output = dict(usage or {})
+    contract = output.get("_aiv_critic_contract")
+    normalized_contract = (
+        dict(contract) if isinstance(contract, dict) else {}
+    )
+    normalized_contract["semantic_verdict_status"] = "validated"
+    normalized_contract["semantic_validation_owner"] = validation_owner
+    output["_aiv_critic_contract"] = normalized_contract
+    return output
+
+
+def _critic_review_cache_status(
+    review: dict[str, Any],
+    *,
+    allow_deterministic_fallback: bool = False,
+) -> str:
+    """Only reusable decisions may enter the positive artifact cache."""
+
+    verdict = str(review.get("verdict") or "")
+    fallback = review.get("fallback")
+    fallback_kind = (
+        str(fallback.get("kind") or "")
+        if isinstance(fallback, dict)
+        else ""
+    )
+    if fallback_kind:
+        if (
+            allow_deterministic_fallback
+            and verdict == "pass"
+            and fallback_kind == "deterministic_safe_pass"
+        ):
+            return "completed"
+        return "failed"
+    if verdict == "pass":
+        return "completed"
+    if verdict == "revise":
+        return "completed"
+    return "failed"
+
+
 async def _analysis_critic_fallback_artifact(
     run_id: str,
     *,
@@ -10298,11 +11632,22 @@ async def _analysis_critic_fallback_artifact(
         run_id,
         stage_key="knowledge_gap",
         artifact_key=artifact_key,
-        status="completed",
+        status=_critic_review_cache_status(
+            fallback,
+            allow_deterministic_fallback=True,
+        ),
         model="deterministic/critic-fallback-v1",
         input_json=fallback_input,
         output_json=fallback,
-        error_message=None,
+        usage_json=_validated_critic_usage(
+            None,
+            validation_owner="deterministic_fallback",
+        ),
+        error_message=(
+            None
+            if fallback.get("verdict") == "pass"
+            else str(fallback.get("summary") or "Critic fallback blocked")
+        ),
         prompt_version=ANALYSIS_CRITIC_VERSION,
     )
     return fallback
@@ -10330,6 +11675,7 @@ async def _analysis_critic_repair_artifact(
         input_json=repair_input,
         model=CRITIC_MODEL,
         prompt_version=ANALYSIS_CRITIC_VERSION,
+        require_validated_critic_usage=True,
     )
     if isinstance(cached, dict):
         errors = _critic_review_validation_errors(
@@ -10377,6 +11723,7 @@ async def _analysis_critic_repair_artifact(
                 "Analysis critic repair is inconsistent: "
                 + "; ".join(errors)
             )
+        usage = _validated_critic_usage(usage)
     except Exception as exc:
         await _save_artifact(
             run_id,
@@ -10398,16 +11745,22 @@ async def _analysis_critic_repair_artifact(
             incomplete_review=incomplete_review,
             validation_errors=[*validation_errors, str(exc)],
         )
+    repaired_status = _critic_review_cache_status(repaired)
     await _save_artifact(
         run_id,
         stage_key="knowledge_gap",
         artifact_key=artifact_key,
-        status="completed",
+        status=repaired_status,
         model=CRITIC_MODEL,
         input_json=repair_input,
         output_json=repaired,
         raw_text=raw_text,
         usage_json=usage,
+        error_message=(
+            None
+            if repaired_status == "completed"
+            else str(repaired.get("summary") or "Critic repair blocked")
+        ),
         prompt_version=ANALYSIS_CRITIC_VERSION,
     )
     return repaired
@@ -10426,6 +11779,7 @@ async def _analysis_critic_artifact(
         input_json=payload,
         model=CRITIC_MODEL,
         prompt_version=ANALYSIS_CRITIC_VERSION,
+        require_validated_critic_usage=True,
     )
     if isinstance(cached, dict):
         errors = _critic_review_validation_errors(
@@ -10464,13 +11818,51 @@ async def _analysis_critic_artifact(
             payload=payload,
         )
         if errors:
-            review = await _analysis_critic_repair_artifact(
-                run_id,
-                iteration=iteration,
-                payload=payload,
-                incomplete_review=review,
-                validation_errors=errors,
+            prior_attempts = (
+                usage.get("_aiv_critic_attempts")
+                if isinstance(usage, dict)
+                else None
             )
+            if isinstance(prior_attempts, list) and prior_attempts:
+                # review_analysis() already spent the one allowed compact
+                # repair on a transport/schema failure.  A second repair here
+                # would violate MAX_CRITIC_REPAIR_ATTEMPTS and could promote
+                # successively rewritten evidence.  Fail closed instead.
+                review = await _analysis_critic_fallback_artifact(
+                    run_id,
+                    iteration=iteration,
+                    payload=payload,
+                    incomplete_review=review,
+                    validation_errors=[
+                        "Compact critic repair budget already consumed: "
+                        + "; ".join(errors)
+                    ],
+                )
+            else:
+                review = await _analysis_critic_repair_artifact(
+                    run_id,
+                    iteration=iteration,
+                    payload=payload,
+                    incomplete_review=review,
+                    validation_errors=errors,
+                )
+        final_errors = _critic_review_validation_errors(
+            review,
+            payload=payload,
+        )
+        if final_errors:
+            raise OpenRouterError(
+                "Analysis critic final decision is inconsistent: "
+                + "; ".join(final_errors)
+            )
+        fallback = review.get("fallback")
+        if isinstance(fallback, dict) and fallback.get("kind"):
+            usage = _validated_critic_usage(
+                None,
+                validation_owner="deterministic_fallback",
+            )
+        else:
+            usage = _validated_critic_usage(usage)
     except Exception as exc:
         await _save_artifact(
             run_id,
@@ -10486,16 +11878,30 @@ async def _analysis_critic_artifact(
             prompt_version=ANALYSIS_CRITIC_VERSION,
         )
         raise
+    fallback = review.get("fallback")
+    is_deterministic_fallback = bool(
+        isinstance(fallback, dict) and fallback.get("kind")
+    )
+    review_status = _critic_review_cache_status(review)
     await _save_artifact(
         run_id,
         stage_key="knowledge_gap",
         artifact_key=artifact_key,
-        status="completed",
-        model=CRITIC_MODEL,
+        status=review_status,
+        model=(
+            "deterministic/critic-fallback-v1"
+            if is_deterministic_fallback
+            else CRITIC_MODEL
+        ),
         input_json=payload,
         output_json=review,
         raw_text=raw_text,
         usage_json=usage,
+        error_message=(
+            None
+            if review_status == "completed"
+            else str(review.get("summary") or "Critic blocked publication")
+        ),
         prompt_version=ANALYSIS_CRITIC_VERSION,
     )
     return review
@@ -14319,7 +15725,7 @@ async def _uses_canonical_intent_taxonomy(run_id: str) -> bool:
                 )
             )
         ).scalar_one_or_none()
-    return version == PROMPT_SET_VERSION
+    return version in CANONICAL_INTENT_PROMPT_SET_VERSIONS
 
 
 async def _finish_saved_answer_analysis(

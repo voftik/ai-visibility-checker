@@ -129,6 +129,9 @@ class Run(Base):
     artifacts: Mapped[list["RunArtifact"]] = relationship(
         back_populates="run", cascade="all, delete-orphan", passive_deletes=True
     )
+    recovery_epochs: Mapped[list["RecoveryEpoch"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", passive_deletes=True
+    )
     visibility_prompts: Mapped[list["VisibilityPrompt"]] = relationship(
         back_populates="run", cascade="all, delete-orphan", passive_deletes=True
     )
@@ -252,6 +255,42 @@ class RunArtifact(Base):
     )
 
     run: Mapped[Run] = relationship(back_populates="artifacts")
+
+
+class RecoveryEpoch(Base):
+    """Append-only decision record for one bounded recovery attempt."""
+
+    __tablename__ = "recovery_epochs"
+    __table_args__ = (
+        UniqueConstraint("run_id", "epoch", name="uq_recovery_epochs_run_epoch"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    failure_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    failure_code: Mapped[str] = mapped_column(String(96), nullable=False)
+    failure_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    facts_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="diagnosing")
+    model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    input_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    usage_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    outcome_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    run: Mapped[Run] = relationship(back_populates="recovery_epochs")
 
 
 class VisibilityPrompt(Base):

@@ -9,6 +9,14 @@ class Settings(BaseSettings):
     OPENROUTER_ANALYSIS_MODEL: str = "anthropic/claude-opus-5"
     OPENROUTER_PROCESSING_MODEL: str = "openai/gpt-5.6-terra"
     OPENROUTER_CRITIC_MODEL: str = "google/gemini-3.6-flash"
+    # Expensive decision layer. It is not part of the normal happy path and
+    # may only choose from code-supplied, stage-specific recovery actions.
+    OPENROUTER_ORCHESTRATOR_MODEL: str = "anthropic/claude-fable-5"
+    # Expensive recovery is opt-in.  Production enables it explicitly only
+    # after the deterministic canary path is healthy.
+    PIPELINE_ORCHESTRATOR_ENABLED: bool = False
+    PIPELINE_ORCHESTRATOR_MAX_CALLS_PER_RUN: int = 2
+    PIPELINE_ORCHESTRATOR_MAX_INPUT_CHARS: int = 80_000
     OPENROUTER_ILLUSTRATION_CONCEPT_MODEL: str = "anthropic/claude-opus-5"
     OPENROUTER_IMAGE_MODEL: str = "google/gemini-3-pro-image"
     OPENROUTER_OPENAI_MODEL: str = "openai/gpt-chat-latest"

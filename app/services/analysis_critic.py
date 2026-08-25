@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 from app.config import settings
-from app.services.openrouter import OpenRouterError, chat
+from app.services.openrouter import (
+    OpenRouterError,
+    OpenRouterOutputLimitError,
+    OpenRouterResponseContractError,
+    chat,
+)
 
-CRITIC_VERSION = "aiv-analysis-critic-v15"
+CRITIC_VERSION = "aiv-analysis-critic-v17"
+CRITIC_TRANSPORT_CONTRACT_VERSION = "aiv-analysis-critic-transport-v1"
 MAX_CRITIC_ITERATIONS = 2
 MAX_CRITIC_REPAIR_ATTEMPTS = 1
 CRITIC_MODEL = settings.OPENROUTER_CRITIC_MODEL
+CRITIC_REASONING_EFFORT = "medium"
+CRITIC_MAX_TOKENS = 20_000
+CRITIC_REPAIR_REASONING_EFFORT = "low"
+CRITIC_REPAIR_MAX_TOKENS = 8_000
+CRITIC_REPAIR_MAX_AFFECTED_ANSWERS = 12
+CRITIC_REPAIR_RAW_CHAR_LIMIT = 6_000
+CRITIC_PARTIAL_RESPONSE_CHAR_LIMIT = 16_000
+CRITIC_PRIMARY_RAW_CHAR_BUDGET = 120_000
+CRITIC_PRIMARY_MAX_RAW_ANSWERS = 24
 
 CRITIC_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -121,8 +137,16 @@ CRITIC_SCHEMA: dict[str, Any] = {
 CRITIC_SYSTEM = """
 Ты независимый критик-методолог отчёта AI visibility. Проверяй не красоту
 вывода, а происхождение каждой метрики из исходных ответов. Тебе переданы
-профиль исследуемого сайта, каталог сущностей, сценарии, полные raw-ответы,
-разметка и уже рассчитанные срезы.
+профиль исследуемого сайта, каталог сущностей, сценарии, полный индекс
+raw-ответов с SHA, разметка и уже рассчитанные срезы. Длинный raw-текст
+передаётся в первую очередь для строк из deterministic_warnings, затем для
+детерминированной стратифицированной выборки положительных, отрицательных и
+ошибочных исходов, в пределах общего char budget. Остальные строки остаются в
+полном manifest с annotation/provenance и raw_answer_included=false. Плановое
+отсутствие обычной выборочной строки не требует block. Но если
+raw_evidence_selection.omitted_warning_answer_ids или
+missing_warning_answer_ids не пуст, материальному предупреждению не хватило
+raw-контекста: выбери block.
 
 Главные инварианты:
 - metric_evidence_state=legacy_observational означает ограниченный
@@ -179,7 +203,8 @@ CRITIC_SYSTEM = """
   attribution_owner_aliases не переносит услуги или свойства соседнего
   продукта. Упоминание другого бренда, девелопера или компании не создаёт
   атрибуцию;
-- если хотя бы у одного ответа raw_answer_truncated=true, полного контекста
+- если хотя бы у одного включённого ответа raw_answer_truncated=true,
+  полного контекста
   для проверки нет: выбери block, не pass и не revise.
 
 Проверяй и ложные отрицания. Если рассчитанный portfolio равен нулю или резко
@@ -246,8 +271,12 @@ CRITIC_REPAIR_SYSTEM = """
 Ты исправляешь только контракт решения независимого критика AI visibility.
 Первичный критик уже изучил полный набор исходных ответов, но его JSON-решение
 оказалось семантически неполным или неприменимым. Не проводи новое исследование
-и не придумывай новые факты. Сверь исходное решение с audit_payload и верни
-самодостаточное исправленное решение в той же строгой схеме.
+и не придумывай новые факты. Сверь исходное решение с repair_context и верни
+самодостаточное исправленное решение в той же строгой схеме. repair_context
+содержит digest полного неизменяемого audit payload, каталог, метрики, индекс
+всех ответов и raw только для ответов, прямо затронутых предупреждениями или
+исходным решением. Если для безопасной правки не хватает показанного evidence,
+выбери block; не пытайся восстановить пропущенные факты по догадке.
 
 Правила восстановления:
 - сначала проверь по metric_contract и candidate_metrics, влияет ли каждая
@@ -293,6 +322,249 @@ def _normalize_review(parsed: dict[str, Any]) -> dict[str, Any]:
     return dict(parsed)
 
 
+def _stable_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _referenced_answer_ids(value: Any) -> set[int]:
+    output: set[int] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "answer_ids" and isinstance(child, list):
+                output.update(
+                    answer_id
+                    for answer_id in child
+                    if isinstance(answer_id, int)
+                    and not isinstance(answer_id, bool)
+                )
+            else:
+                output.update(_referenced_answer_ids(child))
+    elif isinstance(value, list):
+        for child in value:
+            output.update(_referenced_answer_ids(child))
+    return output
+
+
+def _critic_answer_index(answer: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: answer.get(key)
+        for key in (
+            "answer_id",
+            "mode",
+            "provider",
+            "model",
+            "prompt_id",
+            "prompt_key",
+            "scenario_role",
+            "intent_class",
+            "status",
+            "annotation_state",
+            "metric_eligible",
+            "context_eligible",
+            "metric_evidence_state",
+            "raw_answer_sha256",
+            "raw_answer_included",
+            "raw_answer_char_count",
+            "raw_answer_truncated",
+            "raw_answer_omission_reason",
+        )
+    }
+
+
+def _compact_repair_context(
+    payload: dict[str, Any],
+    incomplete_review: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep repair evidence bounded without changing the audited payload."""
+
+    answers = [
+        answer
+        for answer in payload.get("answers") or []
+        if isinstance(answer, dict)
+    ]
+    referenced_ids = _referenced_answer_ids(
+        [
+            incomplete_review,
+            payload.get("deterministic_warnings") or [],
+        ]
+    )
+    affected = [
+        answer
+        for answer in answers
+        if isinstance(answer.get("answer_id"), int)
+        and answer.get("answer_id") in referenced_ids
+    ]
+    selected = affected[:CRITIC_REPAIR_MAX_AFFECTED_ANSWERS]
+    selected_ids = {
+        int(answer["answer_id"])
+        for answer in selected
+        if isinstance(answer.get("answer_id"), int)
+    }
+    affected_evidence: list[dict[str, Any]] = []
+    for answer in selected:
+        raw_answer = str(answer.get("raw_answer") or "")
+        raw_included = answer.get("raw_answer_included")
+        raw_char_count = answer.get("raw_answer_char_count")
+        repair_raw_missing = bool(
+            raw_included is False
+            or (
+                isinstance(raw_char_count, int)
+                and raw_char_count > 0
+                and not raw_answer
+            )
+        )
+        affected_evidence.append(
+            {
+                **_critic_answer_index(answer),
+                "scenario": answer.get("scenario"),
+                "raw_answer": raw_answer[:CRITIC_REPAIR_RAW_CHAR_LIMIT],
+                "repair_raw_missing": repair_raw_missing,
+                "repair_raw_truncated": (
+                    len(raw_answer) > CRITIC_REPAIR_RAW_CHAR_LIMIT
+                ),
+                "annotation": answer.get("annotation"),
+            }
+        )
+    omitted_referenced_ids = sorted(referenced_ids - selected_ids)
+    return {
+        "audit_payload_sha256": _stable_sha256(payload),
+        "site_profile": payload.get("site_profile"),
+        "entity_catalog": payload.get("entity_catalog"),
+        "metric_contract": payload.get("metric_contract"),
+        "attribution_owner_aliases": payload.get(
+            "attribution_owner_aliases"
+        ),
+        "entity_attribution_aliases": payload.get(
+            "entity_attribution_aliases"
+        ),
+        "candidate_metrics": payload.get("candidate_metrics"),
+        "deterministic_warnings": payload.get("deterministic_warnings") or [],
+        "previous_policy_changes": payload.get("previous_policy_changes") or [],
+        "answer_index": [_critic_answer_index(answer) for answer in answers],
+        "affected_answer_evidence": affected_evidence,
+        "evidence_limits": {
+            "full_answer_count": len(answers),
+            "referenced_answer_count": len(referenced_ids),
+            "included_answer_count": len(affected_evidence),
+            "max_included_answers": CRITIC_REPAIR_MAX_AFFECTED_ANSWERS,
+            "raw_chars_per_answer": CRITIC_REPAIR_RAW_CHAR_LIMIT,
+            "omitted_referenced_answer_ids": omitted_referenced_ids,
+            "insufficient_evidence_requires_block": True,
+        },
+    }
+
+
+def _critic_usage(
+    usage: dict[str, Any],
+    *,
+    recovered_from: str | None = None,
+) -> dict[str, Any]:
+    output = dict(usage)
+    transport = output.get("_aiv_transport")
+    output["_aiv_critic_contract"] = {
+        "version": CRITIC_TRANSPORT_CONTRACT_VERSION,
+        "transport_status": (
+            transport.get("status") if isinstance(transport, dict) else "unknown"
+        ),
+        "transport_output_complete": (
+            transport.get("output_complete")
+            if isinstance(transport, dict)
+            else None
+        ),
+        "semantic_verdict_status": "pending_deterministic_validation",
+        "semantic_validation_owner": "critic_gate",
+        "recovered_from": recovered_from,
+    }
+    return output
+
+
+def _merge_recovery_usage(
+    primary_usage: dict[str, Any],
+    repair_usage: dict[str, Any],
+    *,
+    recovered_from: str,
+) -> dict[str, Any]:
+    output = _critic_usage(repair_usage, recovered_from=recovered_from)
+    output["_aiv_critic_attempts"] = [
+        {"kind": "primary", "usage": primary_usage},
+        {"kind": "compact_repair", "usage": repair_usage},
+    ]
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reasoning_tokens",
+        "cost",
+    ):
+        values = [primary_usage.get(key), repair_usage.get(key)]
+        if all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        ):
+            output[key] = values[0] + values[1]
+    return output
+
+
+def _incomplete_transport_review(
+    error: OpenRouterResponseContractError,
+) -> tuple[dict[str, Any], str]:
+    transport = error.result.transport
+    failure = (
+        "output_limit"
+        if isinstance(error, OpenRouterOutputLimitError)
+        else "response_contract"
+    )
+    partial = error.result.text
+    parsed_partial: dict[str, Any] | None = None
+    try:
+        candidate = json.loads(partial)
+        if isinstance(candidate, dict):
+            parsed_partial = candidate
+    except (TypeError, json.JSONDecodeError):
+        pass
+    return (
+        {
+            "_transport_failure": failure,
+            "_transport": transport,
+            "_partial_response": partial[:CRITIC_PARTIAL_RESPONSE_CHAR_LIMIT],
+            "_partial_response_sha256": hashlib.sha256(
+                partial.encode("utf-8")
+            ).hexdigest(),
+            "_partial_response_chars": len(partial),
+            "_partial_response_truncated": (
+                len(partial) > CRITIC_PARTIAL_RESPONSE_CHAR_LIMIT
+            ),
+            "_parsed_partial_review": parsed_partial,
+        },
+        failure,
+    )
+
+
+def _transport_repair_may_pass(
+    incomplete_review: dict[str, Any],
+) -> bool:
+    """A compact repair cannot invent a passing verdict from broken JSON."""
+
+    partial = incomplete_review.get("_parsed_partial_review")
+    if not isinstance(partial, dict) or partial.get("verdict") != "pass":
+        return False
+    anomalies = partial.get("anomalies")
+    if not isinstance(anomalies, list):
+        return False
+    return not any(
+        isinstance(anomaly, dict)
+        and anomaly.get("severity") in {"critical", "important"}
+        for anomaly in anomalies
+    )
+
+
 async def review_analysis(
     payload: dict[str, Any],
     *,
@@ -302,32 +574,62 @@ async def review_analysis(
 
     if not 1 <= iteration <= MAX_CRITIC_ITERATIONS:
         raise ValueError("Critic iteration is outside the bounded loop")
-    response = await chat(
-        model=CRITIC_MODEL,
-        messages=[
-            {"role": "system", "content": CRITIC_SYSTEM},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "iteration": iteration,
-                        "max_iterations": MAX_CRITIC_ITERATIONS,
-                        **payload,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        response_schema=CRITIC_SCHEMA,
-        schema_name=f"aiv_analysis_critic_{iteration}",
-        reasoning_effort="high",
-        max_tokens=12_000,
-        temperature=0.1,
-    )
+    try:
+        response = await chat(
+            model=CRITIC_MODEL,
+            messages=[
+                {"role": "system", "content": CRITIC_SYSTEM},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "iteration": iteration,
+                            "max_iterations": MAX_CRITIC_ITERATIONS,
+                            **payload,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            response_schema=CRITIC_SCHEMA,
+            schema_name=f"aiv_analysis_critic_{iteration}",
+            reasoning_effort=CRITIC_REASONING_EFFORT,
+            max_tokens=CRITIC_MAX_TOKENS,
+            temperature=0.1,
+            retry_response_contract_errors=False,
+        )
+    except OpenRouterResponseContractError as exc:
+        incomplete_review, failure = _incomplete_transport_review(exc)
+        repaired, raw_text, repair_usage = await repair_analysis_review(
+            payload,
+            incomplete_review,
+            iteration=iteration,
+            validation_errors=[
+                "Primary critic transport completed but its structured response "
+                f"was unusable ({failure}): {exc}"
+            ],
+        )
+        if (
+            repaired.get("verdict") == "pass"
+            and not _transport_repair_may_pass(incomplete_review)
+        ):
+            raise OpenRouterError(
+                "Compact critic repair cannot promote an unparseable or "
+                "non-passing primary response to pass"
+            )
+        return (
+            repaired,
+            raw_text,
+            _merge_recovery_usage(
+                exc.result.usage,
+                repair_usage,
+                recovered_from=failure,
+            ),
+        )
     if not isinstance(response.parsed, dict):
         raise OpenRouterError("Analysis critic returned no structured verdict")
     parsed = _normalize_review(response.parsed)
-    return parsed, response.text, response.usage
+    return parsed, response.text, _critic_usage(response.usage)
 
 
 async def repair_analysis_review(
@@ -339,13 +641,14 @@ async def repair_analysis_review(
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     """Make one bounded attempt to repair an unusable critic decision.
 
-    The full audit payload is intentionally preserved. The repair model may
-    correct the decision contract, but it cannot acquire new evidence or
-    mutate any measured value.
+    The immutable full payload stays bound by digest, while the repair request
+    carries only metrics, catalog, an answer index and directly affected raw
+    evidence. The repair model cannot acquire evidence or mutate measurements.
     """
 
     if not 1 <= iteration <= MAX_CRITIC_ITERATIONS:
         raise ValueError("Critic iteration is outside the bounded loop")
+    repair_context = _compact_repair_context(payload, incomplete_review)
     response = await chat(
         model=CRITIC_MODEL,
         messages=[
@@ -359,7 +662,8 @@ async def repair_analysis_review(
                         "max_repair_attempts": MAX_CRITIC_REPAIR_ATTEMPTS,
                         "validation_errors": validation_errors,
                         "incomplete_review": incomplete_review,
-                        "audit_payload": payload,
+                        "audit_payload_sha256": _stable_sha256(payload),
+                        "repair_context": repair_context,
                     },
                     ensure_ascii=False,
                 ),
@@ -367,16 +671,38 @@ async def repair_analysis_review(
         ],
         response_schema=CRITIC_SCHEMA,
         schema_name=f"aiv_analysis_critic_repair_{iteration}",
-        reasoning_effort="high",
-        max_tokens=12_000,
+        reasoning_effort=CRITIC_REPAIR_REASONING_EFFORT,
+        max_tokens=CRITIC_REPAIR_MAX_TOKENS,
         temperature=0.0,
+        retry_response_contract_errors=False,
     )
     if not isinstance(response.parsed, dict):
         raise OpenRouterError(
             "Analysis critic repair returned no structured verdict"
         )
+    repaired = _normalize_review(response.parsed)
+    omitted_ids = repair_context["evidence_limits"][
+        "omitted_referenced_answer_ids"
+    ]
+    truncated_ids = [
+        evidence.get("answer_id")
+        for evidence in repair_context["affected_answer_evidence"]
+        if evidence.get("repair_raw_truncated") is True
+    ]
+    missing_ids = [
+        evidence.get("answer_id")
+        for evidence in repair_context["affected_answer_evidence"]
+        if evidence.get("repair_raw_missing") is True
+    ]
+    if (
+        omitted_ids or truncated_ids or missing_ids
+    ) and repaired.get("verdict") != "block":
+        raise OpenRouterError(
+            "Analysis critic repair used incomplete affected evidence; "
+            "only block is safe"
+        )
     return (
-        _normalize_review(response.parsed),
+        repaired,
         response.text,
-        response.usage,
+        _critic_usage(response.usage),
     )

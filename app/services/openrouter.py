@@ -5,7 +5,7 @@ import base64
 import binascii
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -30,6 +30,7 @@ class WebSearchPolicy(StrEnum):
 
 
 WEB_ATTESTATION_VERSION = "aiv-openrouter-web-attestation-v1"
+TRANSPORT_METADATA_VERSION = "aiv-openrouter-transport-v1"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,19 @@ class ChatResult:
     request_policy: dict[str, Any]
     web_attestation: dict[str, Any]
     router_metadata: dict[str, Any]
+    transport: dict[str, Any] = field(default_factory=dict)
+
+
+class OpenRouterResponseContractError(OpenRouterError):
+    """HTTP succeeded, but the model response is unusable by the caller."""
+
+    def __init__(self, message: str, *, result: ChatResult):
+        super().__init__(message)
+        self.result = result
+
+
+class OpenRouterOutputLimitError(OpenRouterResponseContractError):
+    """The provider stopped before the requested output was complete."""
 
 
 class OpenRouterPolicyError(OpenRouterError):
@@ -493,6 +507,80 @@ def _empty_response_error(
     )
 
 
+def _normalized_finish_reason(value: Any) -> str:
+    return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+
+
+def _output_limit_reached(choice: dict[str, Any]) -> bool:
+    reasons = {
+        _normalized_finish_reason(choice.get("finish_reason")),
+        _normalized_finish_reason(choice.get("native_finish_reason")),
+    }
+    return any(
+        reason in {"length", "max_tokens", "max_output_tokens", "token_limit"}
+        or "max_token" in reason
+        for reason in reasons
+        if reason
+    )
+
+
+def _transport_metadata(
+    *,
+    body: dict[str, Any],
+    choice: dict[str, Any],
+    requested_model: str,
+    response_model: str,
+    attempt: int,
+) -> dict[str, Any]:
+    """Persist transport completion separately from any semantic verdict."""
+
+    output_limited = _output_limit_reached(choice)
+    finish_reason = _normalized_finish_reason(choice.get("finish_reason"))
+    native_finish_reason = _normalized_finish_reason(
+        choice.get("native_finish_reason")
+    )
+    incomplete_native_reasons = {
+        "content_filter",
+        "error",
+        "pause_turn",
+        "safety",
+        "tool_calls",
+        "tool_use",
+    }
+    output_complete = bool(
+        not output_limited
+        and finish_reason == "stop"
+        and native_finish_reason not in incomplete_native_reasons
+    )
+    if output_limited:
+        incomplete_reason = "output_limit"
+    elif not finish_reason:
+        incomplete_reason = "missing_finish_reason"
+    elif finish_reason != "stop":
+        incomplete_reason = f"finish_reason:{finish_reason}"
+    elif native_finish_reason in incomplete_native_reasons:
+        incomplete_reason = f"native_finish_reason:{native_finish_reason}"
+    else:
+        incomplete_reason = None
+    return {
+        "version": TRANSPORT_METADATA_VERSION,
+        "status": "succeeded",
+        "http_status": 200,
+        "attempt": attempt,
+        "requested_model": requested_model,
+        "response_model": response_model,
+        "provider": str(body.get("provider") or "").strip(),
+        "response_id": str(body.get("id") or "").strip()[:200],
+        "finish_reason": str(choice.get("finish_reason") or "").strip(),
+        "native_finish_reason": str(
+            choice.get("native_finish_reason") or ""
+        ).strip(),
+        "output_complete": output_complete,
+        "output_limited": output_limited,
+        "output_incomplete_reason": incomplete_reason,
+    }
+
+
 def _policy_retry_reminder(
     policy: WebSearchPolicy,
     violations: list[str],
@@ -541,6 +629,7 @@ async def chat(
     reasoning_effort: str | None = None,
     max_tokens: int = 12_000,
     temperature: float = 0.2,
+    retry_response_contract_errors: bool = True,
 ) -> ChatResult:
     payload: dict[str, Any] = {
         "model": model,
@@ -620,18 +709,21 @@ async def chat(
             choices = body.get("choices") or []
             if not choices:
                 raise OpenRouterError("OpenRouter returned no choices")
-            message = choices[0].get("message") or {}
+            choice = choices[0]
+            message = choice.get("message") or {}
             text = _message_text(message)
-            if not text:
-                raise OpenRouterError(
-                    _empty_response_error(choices[0], message)
-                )
-            parsed = _parse_json(text) if response_schema is not None else None
             citations = _citations(message)
             annotations = _annotations(message)
             raw_usage = dict(body.get("usage") or {})
             router_metadata = dict(body.get("openrouter_metadata") or {})
             response_model = str(body.get("model") or "").strip()
+            transport = _transport_metadata(
+                body=body,
+                choice=choice,
+                requested_model=model,
+                response_model=response_model,
+                attempt=attempt,
+            )
             attestation = attest_web_response(
                 requested_model=model,
                 response_model=response_model,
@@ -646,16 +738,41 @@ async def chat(
             usage["_aiv_response_annotations"] = annotations
             usage["_aiv_router_metadata"] = router_metadata
             usage["_aiv_web_attestation"] = attestation
+            usage["_aiv_transport"] = transport
             result = ChatResult(
                 text=text,
-                parsed=parsed,
+                parsed=None,
                 citations=citations,
                 usage=usage,
                 annotations=annotations,
                 request_policy=request_policy,
                 web_attestation=attestation,
                 router_metadata=router_metadata,
+                transport=transport,
             )
+            if transport["output_limited"]:
+                raise OpenRouterOutputLimitError(
+                    "OpenRouter response hit the output limit "
+                    f"(finish_reason={transport['finish_reason'] or '?'}, "
+                    "native_finish_reason="
+                    f"{transport['native_finish_reason'] or '?'}, "
+                    f"max_tokens={max_tokens})",
+                    result=result,
+                )
+            if not transport["output_complete"]:
+                raise OpenRouterResponseContractError(
+                    "OpenRouter response did not reach a complete final turn "
+                    f"({transport['output_incomplete_reason'] or 'unknown'}; "
+                    f"finish_reason={transport['finish_reason'] or '?'}, "
+                    "native_finish_reason="
+                    f"{transport['native_finish_reason'] or '?'})",
+                    result=result,
+                )
+            if not text:
+                raise OpenRouterResponseContractError(
+                    _empty_response_error(choice, message),
+                    result=result,
+                )
             if not attestation["metric_eligible"]:
                 if _citation_routing_failure(attestation):
                     _remember_non_citing_provider(
@@ -670,14 +787,32 @@ async def chat(
                     f"OpenRouter web policy attestation failed: {violations}",
                     result=result,
                 )
+            if response_schema is not None:
+                try:
+                    result = replace(result, parsed=_parse_json(text))
+                except OpenRouterError as exc:
+                    raise OpenRouterResponseContractError(
+                        f"Structured response is unusable: {exc}",
+                        result=result,
+                    ) from exc
             return result
         except asyncio.CancelledError:
             raise
         except (httpx.HTTPError, ValueError, OpenRouterError) as exc:
+            if isinstance(exc, OpenRouterOutputLimitError):
+                raise
+            if (
+                isinstance(exc, OpenRouterResponseContractError)
+                and not retry_response_contract_errors
+            ):
+                raise
             last_error = exc
             if attempt >= 3:
                 break
-    if isinstance(last_error, OpenRouterPolicyError):
+    if isinstance(
+        last_error,
+        (OpenRouterPolicyError, OpenRouterResponseContractError),
+    ):
         raise last_error
     raise OpenRouterError(str(last_error or "OpenRouter request failed"))
 

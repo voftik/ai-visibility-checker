@@ -35,6 +35,7 @@ from app.services import crawler
 from app.services.openrouter import (
     WEB_ATTESTATION_VERSION,
     OpenRouterError,
+    OpenRouterResponseContractError,
     PanelModel,
     WebSearchPolicy,
     attest_web_response,
@@ -82,6 +83,7 @@ from app.services.analyzer import (
     _classify_site,
     _compute_metrics,
     _deterministic_annotation_warnings,
+    _deterministic_prompt_fallback,
     _entity_catalog,
     _entity_alias_entries,
     _evidence_contains_complete_alias,
@@ -119,12 +121,14 @@ from app.services.analyzer import (
     _processing_artifact,
     _probe_access_outcome,
     _reconcile_annotation,
+    _recover_prompt_set,
     reprocess_saved_answers,
     _rendering_assessment,
     _review_prompt_set_semantics,
     _review_illustration,
     _reuse_saved_illustration_assets,
     _scope_entity_catalog_to_profile,
+    _structured_artifact,
     _run_report_branches,
     _run_reused_report_branches,
     _rows_from_full_answer_models,
@@ -139,6 +143,11 @@ from app.services.analyzer import (
 )
 from app.services.content_extractor import extract_text_signals
 from app.services.robots_parser import parse_robots, robots_path_allowed
+from app.services.recovery_orchestrator import (
+    ACTION_DETERMINISTIC_FALLBACK,
+    ACTION_RETRY_WITH_GUIDANCE,
+    ACTION_STOP,
+)
 
 
 def _rules_by_bot(value: str) -> dict[str, tuple[str, str]]:
@@ -1383,6 +1392,55 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(structured.await_args.kwargs["reasoning_effort"], "high")
         self.assertEqual(structured.await_args.kwargs["user_payload"], context)
 
+    async def test_structured_artifact_preserves_contract_failure_evidence(
+        self,
+    ) -> None:
+        usage = {
+            "_aiv_transport": {
+                "status": "succeeded",
+                "output_complete": False,
+                "output_incomplete_reason": "finish_reason:content_filter",
+            }
+        }
+        contract_error = OpenRouterResponseContractError(
+            "Structured response was filtered",
+            result=SimpleNamespace(
+                text='{"partial":',
+                usage=usage,
+            ),
+        )
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+                side_effect=contract_error,
+            ),
+            self.assertRaises(OpenRouterResponseContractError),
+        ):
+            await _structured_artifact(
+                "run-id",
+                stage_key="scenario_design",
+                artifact_key="contract_failure",
+                schema={"type": "object"},
+                schema_name="contract_failure",
+                system="Верни JSON.",
+                user_payload={"value": 1},
+            )
+
+        failed = save_artifact.await_args_list[-1].kwargs
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["raw_text"], '{"partial":')
+        self.assertEqual(failed["usage_json"], usage)
+
     async def test_site_profile_explicitly_models_market_and_customer_choice(self) -> None:
         required = set(SITE_PROFILE_SCHEMA["required"])
         self.assertTrue(
@@ -1830,6 +1888,521 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             retry_payload["validation_errors_to_fix"],
             [critic_error],
         )
+
+    async def test_prompt_generator_budget_is_durable_across_restart_faults(
+        self,
+    ) -> None:
+        profile = {"brand_name": "Example", "brand_aliases": []}
+        research = _ready_market_research()
+        artifacts: dict[str, dict[str, Any]] = {}
+        events: list[tuple[str, str]] = []
+
+        async def candidate_state(
+            _run_id: str,
+            *,
+            base_payload_digest: str,
+        ) -> tuple[int, None, str, dict[str, Any], None, int]:
+            matching = [
+                value
+                for value in artifacts.values()
+                if str(value.get("artifact_key") or "").startswith(
+                    "prompt_set_candidate_"
+                )
+                and value.get("input_json", {}).get("base_payload_digest")
+                == base_payload_digest
+            ]
+            attempts = max(
+                len(matching),
+                max(
+                    (
+                        int(value["input_json"].get("budget_attempt") or 0)
+                        for value in matching
+                    ),
+                    default=0,
+                ),
+            )
+            return attempts, None, "", {}, None, 0
+
+        async def save_artifact(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> None:
+            artifact_key = str(kwargs["artifact_key"])
+            artifacts[artifact_key] = copy.deepcopy(kwargs)
+            events.append(("artifact", str(kwargs["status"])))
+
+        async def failing_chat(**_kwargs: Any) -> None:
+            events.append(("generator", "called"))
+            raise RuntimeError("simulated worker crash after reservation")
+
+        recovered = {"recovery": "fable"}
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._prompt_candidate_state",
+                new=candidate_state,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new=AsyncMock(side_effect=save_artifact),
+            ),
+            patch(
+                "app.services.analyzer.chat",
+                new=AsyncMock(side_effect=failing_chat),
+            ) as generator,
+            patch(
+                "app.services.analyzer._recover_prompt_set",
+                new=AsyncMock(return_value=recovered),
+            ) as recovery,
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+            ) as semantic_review,
+        ):
+            for _restart in range(4):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "simulated worker crash",
+                ):
+                    await _generate_prompt_set(
+                        "run-id",
+                        profile,
+                        market_research=research,
+                    )
+            result = await _generate_prompt_set(
+                "run-id",
+                profile,
+                market_research=research,
+            )
+
+        self.assertEqual(result, recovered)
+        self.assertEqual(generator.await_count, 4)
+        self.assertEqual(len(artifacts), 4)
+        self.assertEqual(
+            {
+                value["input_json"]["budget_attempt"]
+                for value in artifacts.values()
+            },
+            {1, 2, 3, 4},
+        )
+        self.assertTrue(
+            all(value["status"] == "running" for value in artifacts.values())
+        )
+        for index, event in enumerate(events):
+            if event == ("generator", "called"):
+                self.assertEqual(events[index - 1], ("artifact", "running"))
+        recovery.assert_awaited_once()
+        semantic_review.assert_not_awaited()
+
+    async def test_recovered_prompt_candidate_reexecutes_semantic_gate(
+        self,
+    ) -> None:
+        profile = {"brand_name": "Example", "brand_aliases": []}
+        research = _ready_market_research()
+        prompts = [
+            {
+                "prompt_key": f"u-{intent.lower()}",
+                "intent_class": intent,
+                "role": "unbranded_discovery",
+                "text": (
+                    f"Какие решения подходят для задачи {intent}? "
+                    "Назовите конкретные варианты."
+                ),
+                "rationale": f"Проверяет {intent}.",
+                "choice_request": True,
+            }
+            for intent in ("I", "E", "T", "NB", "NAV", "TR")
+        ]
+        prompts.extend(
+            {
+                "prompt_key": f"b-{index}",
+                "intent_class": intent,
+                "role": "brand_diagnostic",
+                "text": f"Что известно об Example для задачи {index}?",
+                "rationale": "Проверяет знание бренда.",
+                "choice_request": False,
+            }
+            for index, intent in enumerate(("I", "E", "TR"), start=1)
+        )
+        candidate = {"prompts": prompts}
+        artifacts: dict[str, dict[str, Any]] = {}
+        events: list[str] = []
+
+        async def candidate_state(
+            _run_id: str,
+            *,
+            base_payload_digest: str,
+        ) -> tuple[
+            int,
+            dict[str, Any] | None,
+            str,
+            dict[str, Any],
+            str | None,
+            int,
+        ]:
+            matching = [
+                value
+                for value in artifacts.values()
+                if str(value.get("artifact_key") or "").startswith(
+                    "prompt_set_candidate_"
+                )
+                and value.get("input_json", {}).get("base_payload_digest")
+                == base_payload_digest
+            ]
+            if not matching:
+                return 0, None, "", {}, None, 0
+            latest = max(
+                matching,
+                key=lambda value: int(
+                    value["input_json"].get("budget_attempt") or 0
+                ),
+            )
+            budget_attempt = int(
+                latest["input_json"].get("budget_attempt") or 0
+            )
+            return (
+                len(matching),
+                copy.deepcopy(latest.get("output_json")),
+                str(latest.get("raw_text") or ""),
+                copy.deepcopy(latest.get("usage_json") or {}),
+                str(latest["artifact_key"]),
+                budget_attempt,
+            )
+
+        async def save_artifact(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> None:
+            artifacts[str(kwargs["artifact_key"])] = copy.deepcopy(kwargs)
+            metadata = (kwargs.get("usage_json") or {}).get(
+                "_aiv_prompt_candidate"
+            )
+            if isinstance(metadata, dict):
+                events.append(str(metadata.get("reservation_state") or ""))
+
+        async def semantic_review(
+            _run_id: str,
+            _profile: dict[str, Any],
+            _candidate: dict[str, Any],
+            _research: dict[str, Any],
+        ) -> list[str]:
+            events.append("semantic_gate")
+            if events.count("semantic_gate") == 1:
+                raise RuntimeError("simulated crash inside semantic gate")
+            return []
+
+        original_validate = _validate_prompt_set
+
+        def structural_review(
+            value: dict[str, Any],
+            value_profile: dict[str, Any],
+        ) -> list[str]:
+            events.append("structural_gate")
+            return original_validate(value, value_profile)
+
+        response = SimpleNamespace(
+            parsed=candidate,
+            text=json.dumps(candidate, ensure_ascii=False),
+            usage={"total_tokens": 1},
+        )
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._prompt_candidate_state",
+                new=candidate_state,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new=AsyncMock(side_effect=save_artifact),
+            ),
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+                return_value=response,
+            ) as generator,
+            patch(
+                "app.services.analyzer._validate_prompt_set",
+                new=structural_review,
+            ),
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new=AsyncMock(side_effect=semantic_review),
+            ) as semantic_gate,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "simulated crash inside semantic gate",
+            ):
+                await _generate_prompt_set(
+                    "run-id",
+                    profile,
+                    market_research=research,
+                )
+            result = await _generate_prompt_set(
+                "run-id",
+                profile,
+                market_research=research,
+            )
+
+        self.assertEqual(result, candidate)
+        self.assertEqual(generator.await_count, 1)
+        self.assertEqual(semantic_gate.await_count, 2)
+        self.assertEqual(events.count("structural_gate"), 2)
+        self.assertLess(
+            events.index("candidate_saved"),
+            events.index("semantic_gate"),
+        )
+        accepted = artifacts["prompt_set"]
+        accepted_metadata = accepted["usage_json"]["_aiv_prompt_candidate"]
+        self.assertTrue(accepted_metadata["recovered_after_worker_restart"])
+        self.assertTrue(accepted_metadata["structural_gate_reexecuted"])
+        self.assertTrue(accepted_metadata["semantic_gate_reexecuted"])
+
+    def test_deterministic_prompt_fallback_is_valid_and_unbranded(self) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": ["Example Lab"],
+            "category": "Аналитика Example",
+            "customer_jobs": ["Сравнить поставщиков аналитики"],
+            "decision_criteria": ["Точность"],
+            "geography": ["Россия"],
+        }
+
+        prompt_set = _deterministic_prompt_fallback(
+            profile,
+            _ready_market_research(),
+        )
+
+        self.assertEqual(_validate_prompt_set(prompt_set, profile), [])
+        unbranded = [
+            item
+            for item in prompt_set["prompts"]
+            if item["role"] == "unbranded_discovery"
+        ]
+        self.assertEqual(len(unbranded), 6)
+        self.assertEqual(
+            {item["intent_class"] for item in unbranded},
+            {"I", "E", "T", "NB", "NAV", "TR"},
+        )
+        self.assertTrue(all(item["choice_request"] for item in unbranded))
+        self.assertTrue(
+            all("example" not in item["text"].casefold() for item in unbranded)
+        )
+
+    async def test_deterministic_prompt_fallback_has_separate_cache_provenance(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "category": "Аналитика",
+            "customer_jobs": ["Сравнить поставщиков"],
+            "decision_criteria": ["Точность"],
+            "geography": ["Россия"],
+        }
+        research = _ready_market_research()
+        fallback = _deterministic_prompt_fallback(profile, research)
+        queried_models: list[str] = []
+
+        async def fake_artifact_output(
+            _run_id: str,
+            _artifact_key: str,
+            **kwargs: object,
+        ) -> dict[str, object] | None:
+            model = str(kwargs.get("model") or "")
+            queried_models.append(model)
+            return (
+                fallback
+                if model == "deterministic/prompt-fallback-v1"
+                else None
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new=fake_artifact_output,
+            ),
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+            ) as chat_mock,
+        ):
+            result = await _generate_prompt_set(
+                "run-id",
+                profile,
+                market_research=research,
+            )
+
+        self.assertEqual(result, fallback)
+        self.assertEqual(
+            queried_models,
+            [ANALYSIS_MODEL, "deterministic/prompt-fallback-v1"],
+        )
+        semantic_review.assert_awaited_once()
+        chat_mock.assert_not_awaited()
+
+    async def test_prompt_recovery_executes_only_the_planner_allowlist(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "category": "Аналитика",
+            "customer_jobs": ["Сравнить поставщиков"],
+            "decision_criteria": ["Точность"],
+            "geography": ["Россия"],
+        }
+        research = _ready_market_research()
+        payload = {
+            "requested_site": {},
+            "site_profile": profile,
+            "market_research": research,
+            "market_research_digest": "a" * 64,
+        }
+        plan = SimpleNamespace(
+            epoch=1,
+            decision={
+                "action": ACTION_DETERMINISTIC_FALLBACK,
+                "rationale": "Локальный цикл не сошёлся.",
+                "guidance": "",
+                "acceptance_checks": [
+                    "prompt_contract_valid",
+                    "semantic_review_passed",
+                ],
+            },
+        )
+        with (
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ) as planner,
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new_callable=AsyncMock,
+            ) as mark,
+            patch(
+                "app.services.analyzer.finish_recovery",
+                new_callable=AsyncMock,
+            ) as finish,
+            patch(
+                "app.services.analyzer._save_accepted_prompt_set",
+                new_callable=AsyncMock,
+            ) as save,
+            patch(
+                "app.services.analyzer.chat",
+                new_callable=AsyncMock,
+            ) as chat_mock,
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as semantic_review,
+        ):
+            recovered = await _recover_prompt_set(
+                "run-id",
+                profile=profile,
+                research=research,
+                payload=payload,
+                system="Системный контракт",
+                previous_set=None,
+                last_errors=["Критик отклонил набор."],
+            )
+
+        planner.assert_awaited_once()
+        self.assertEqual(
+            planner.await_args.kwargs["allowed_actions"],
+            {
+                ACTION_RETRY_WITH_GUIDANCE,
+                ACTION_DETERMINISTIC_FALLBACK,
+                ACTION_STOP,
+            },
+        )
+        mark.assert_awaited_once_with(plan)
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+        save.assert_awaited_once()
+        self.assertEqual(
+            save.await_args.kwargs["model"],
+            "deterministic/prompt-fallback-v1",
+        )
+        semantic_review.assert_awaited_once_with(
+            "run-id",
+            profile,
+            recovered,
+            research,
+        )
+        chat_mock.assert_not_awaited()
+        self.assertEqual(_validate_prompt_set(recovered, profile), [])
+
+    async def test_prompt_recovery_rejects_unexecuted_acceptance_checks(
+        self,
+    ) -> None:
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "category": "Аналитика",
+        }
+        research = _ready_market_research()
+        payload = {
+            "requested_site": {},
+            "site_profile": profile,
+            "market_research": research,
+            "market_research_digest": "a" * 64,
+        }
+        plan = SimpleNamespace(
+            epoch=1,
+            decision={
+                "action": ACTION_DETERMINISTIC_FALLBACK,
+                "rationale": "Локальный цикл не сошёлся.",
+                "guidance": "",
+                "acceptance_checks": ["prompt_contract_valid"],
+            },
+        )
+        with (
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ),
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.finish_recovery",
+                new_callable=AsyncMock,
+            ) as finish,
+            patch(
+                "app.services.analyzer._save_accepted_prompt_set",
+                new_callable=AsyncMock,
+            ) as save,
+            self.assertRaises(OpenRouterError) as raised,
+        ):
+            await _recover_prompt_set(
+                "run-id",
+                profile=profile,
+                research=research,
+                payload=payload,
+                system="Системный контракт",
+                previous_set=None,
+                last_errors=["Критик отклонил набор."],
+            )
+
+        self.assertIn("semantic_review_passed", str(raised.exception))
+        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        save.assert_not_awaited()
 
     async def test_market_research_digest_invalidates_cached_prompt_set(
         self,
@@ -7974,8 +8547,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(discovery["annotated_answers"], 1)
             self.assertEqual(discovery["valid_answers"], 1)
             self.assertEqual(discovery["mention_count"], 1)
-            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v14"))
-            self.assertTrue(METRICS_VERSION.endswith("metrics-v17"))
+            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v15"))
+            self.assertTrue(METRICS_VERSION.endswith("metrics-v18"))
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
