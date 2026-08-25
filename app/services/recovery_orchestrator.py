@@ -35,7 +35,7 @@ from app.services.openrouter import (
     web_request_policy,
 )
 
-ORCHESTRATOR_VERSION = "aiv-recovery-orchestrator-v6"
+ORCHESTRATOR_VERSION = "aiv-recovery-orchestrator-v7"
 ORCHESTRATOR_MODEL = settings.OPENROUTER_ORCHESTRATOR_MODEL
 PROCESSING_MODEL = settings.OPENROUTER_PROCESSING_MODEL
 RECOVERY_INPUT_HARNESS_VERSION = "aiv-recovery-input-harness-v3"
@@ -1803,7 +1803,9 @@ def _decision_schema(allowed_actions: list[str]) -> dict[str, Any]:
         "additionalProperties": False,
         "properties": {
             "action": {"type": "string", "enum": allowed_actions},
-            "rationale": {"type": "string"},
+            # Match the deterministic validator so structured decoding cannot
+            # spend a planner call on an otherwise valid empty explanation.
+            "rationale": {"type": "string", "minLength": 20},
             "confidence": {
                 "type": "string",
                 "enum": ["high", "medium"],
@@ -1811,7 +1813,7 @@ def _decision_schema(allowed_actions: list[str]) -> dict[str, Any]:
             "guidance": {"type": "string"},
             "target_answer_ids": {
                 "type": "array",
-                "items": {"type": "integer"},
+                "items": {"type": "integer", "minimum": 1},
             },
             "invalidate_artifact_keys": {
                 "type": "array",
@@ -2901,6 +2903,10 @@ targeted_annotation_repair выбери только answer_id, которые �
 связал с исправимой проблемой, и обязательно дай конкретное guidance для
 повторной разметки. Guidance не может разрешать изменение raw, ручную правку
 метрик, расширение каталога или ослабление critic gate.
+
+rationale должен содержать не меньше 20 символов и объяснять, почему выбранное
+действие безопасно для данного incident. Даже для stop это содержательное
+обоснование, а не формальная метка.
 
 Предпочитай самый узкий обратимый ремонт. Не предлагай повторный опрос
 модельной панели, если сохранён raw-корпус. Не повторяй действие, которое уже

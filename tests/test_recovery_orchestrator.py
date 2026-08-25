@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from jsonschema import Draft202012Validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -34,6 +35,7 @@ from app.services.recovery_orchestrator import (
     OrchestratorContractError,
     OrchestratorResult,
     _decide_from_exact_claim_ledger,
+    _decision_schema,
     _decision_shard_payload,
     _input_window,
     _map_recovery_source,
@@ -109,6 +111,24 @@ def _chat_result(parsed: dict) -> ChatResult:
 
 
 class RecoveryDecisionContractTests(unittest.TestCase):
+    def test_provider_schema_enforces_deterministic_rationale_floor(self) -> None:
+        schema = _decision_schema([ACTION_STOP])
+        candidate = {
+            "action": ACTION_STOP,
+            "rationale": "Слишком кратко",
+            "confidence": "high",
+            "guidance": "",
+            "target_answer_ids": [],
+            "invalidate_artifact_keys": [],
+            "acceptance_checks": ["checkpoint_preserved"],
+        }
+
+        errors = list(Draft202012Validator(schema).iter_errors(candidate))
+
+        self.assertTrue(
+            any(error.validator == "minLength" for error in errors)
+        )
+
     def test_failure_fingerprint_is_stable_and_stage_specific(self) -> None:
         first = recovery_failure_fingerprint(
             stage_key="scenario_design",
