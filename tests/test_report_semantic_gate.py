@@ -14,7 +14,6 @@ from app.services.report_semantic_gate import (
     CANONICAL_UNAVAILABLE_PORTFOLIO_LIMITATION,
     REPORT_SEMANTIC_MAX_TOKENS,
     REPORT_SEMANTIC_REASONING_EFFORT,
-    REPORT_SEMANTIC_REVIEW_SCHEMA,
     deterministic_report_semantic_errors,
     metric_availability_contract,
     normalize_report_semantic_review,
@@ -1644,12 +1643,6 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
             REPORT_SEMANTIC_REASONING_EFFORT,
         )
         self.assertEqual(kwargs["max_tokens"], REPORT_SEMANTIC_MAX_TOKENS)
-        self.assertEqual(
-            REPORT_SEMANTIC_REVIEW_SCHEMA["properties"]["violations"][
-                "maxItems"
-            ],
-            16,
-        )
 
     async def test_one_repair_is_reviewed_before_publication(self) -> None:
         rejected = _candidate("Память моделей не знает бренд.")

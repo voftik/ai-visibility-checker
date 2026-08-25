@@ -10,7 +10,7 @@ from app.config import settings
 from app.services.openrouter import OpenRouterError, chat
 
 
-REPORT_SEMANTIC_GATE_VERSION = "aiv-final-report-semantic-gate-v22"
+REPORT_SEMANTIC_GATE_VERSION = "aiv-final-report-semantic-gate-v23"
 REPORT_SEMANTIC_MODEL = settings.OPENROUTER_CRITIC_MODEL
 MAX_FINAL_REPORT_REPAIRS = 2
 REPORT_SEMANTIC_REASONING_EFFORT = "medium"
@@ -25,10 +25,9 @@ REPORT_SEMANTIC_REVIEW_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": ["pass", "revise", "block"],
         },
-        "summary": {"type": "string", "maxLength": 2_000},
+        "summary": {"type": "string"},
         "violations": {
             "type": "array",
-            "maxItems": 16,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -50,18 +49,14 @@ REPORT_SEMANTIC_REVIEW_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "enum": ["critical", "important", "observation"],
                     },
-                    "report_path": {"type": "string", "maxLength": 500},
-                    "claim": {"type": "string", "maxLength": 1_000},
+                    "report_path": {"type": "string"},
+                    "claim": {"type": "string"},
                     "evidence_paths": {
                         "type": "array",
-                        "maxItems": 8,
-                        "items": {"type": "string", "maxLength": 500},
+                        "items": {"type": "string"},
                     },
-                    "finding": {"type": "string", "maxLength": 1_000},
-                    "repair_instruction": {
-                        "type": "string",
-                        "maxLength": 1_000,
-                    },
+                    "finding": {"type": "string"},
+                    "repair_instruction": {"type": "string"},
                 },
                 "required": [
                     "code",
