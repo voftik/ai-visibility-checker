@@ -55,6 +55,7 @@ from app.services.recovery_state import (
     finish_recovery,
     mark_recovery_executing,
     plan_durable_recovery,
+    recovery_execution_state,
     recovery_failure_fingerprint,
     recovery_scope_digest,
     stable_digest,
@@ -1783,7 +1784,14 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.epoch_id, second.epoch_id)
         planner.assert_awaited_once()
 
-        await mark_recovery_executing(second)
+        planned_state = await recovery_execution_state(second)
+        self.assertEqual(planned_state.status, "planned")
+        self.assertEqual(planned_state.execution_attempts, 0)
+        execution_attempt = await mark_recovery_executing(second)
+        self.assertEqual(execution_attempt, 1)
+        executing_state = await recovery_execution_state(second)
+        self.assertEqual(executing_state.status, "executing")
+        self.assertEqual(executing_state.execution_attempts, 1)
         await finish_recovery(
             second,
             succeeded=True,
@@ -2085,6 +2093,9 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             await mark_recovery_executing(first_worker)
             second_worker = await plan_durable_recovery(self.run_id, **kwargs)
             await mark_recovery_executing(second_worker)
+            executing_state = await recovery_execution_state(second_worker)
+            self.assertEqual(executing_state.status, "executing")
+            self.assertEqual(executing_state.execution_attempts, 2)
             third_worker = await plan_durable_recovery(self.run_id, **kwargs)
             with self.assertRaises(RecoveryBudgetExceeded):
                 await mark_recovery_executing(third_worker)

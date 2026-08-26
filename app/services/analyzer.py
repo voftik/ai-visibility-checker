@@ -177,6 +177,7 @@ from app.services.recovery_state import (
     finish_recovery,
     mark_recovery_executing,
     plan_durable_recovery,
+    recovery_execution_state,
     stable_digest,
 )
 from app.services.progress import complete_run, fail_run, update_progress
@@ -228,6 +229,12 @@ PANEL_ATTEMPT_ARTIFACT_PREFIX = "panel_attempt_"
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v9"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v11"
 CORE_UNIT_DECISION_LEDGER_VERSION = "aiv-core-unit-decision-ledger-v1"
+CORE_UNIT_QUOTE_REPAIR_VERSION = "aiv-core-unit-quote-markdown-v1"
+ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = (
+    "aiv-entity-catalog-contract-recovery-v1"
+)
+ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE = "entity_catalog_contract"
+ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS = 2
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v18"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v20"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
@@ -3296,6 +3303,126 @@ def _specific_no_fact_reason(reason: str) -> bool:
     )
 
 
+_MARKDOWN_EMPHASIS_PATTERNS = (
+    # Deliberately support emphasis delimiters only.  This is not a general
+    # fuzzy matcher: case, punctuation, words and their order remain byte-for-
+    # byte significant after the delimiters are removed.  Complex/nested
+    # markup is left untouched and therefore fails closed.
+    re.compile(r"(?<![\\*])\*\*(?=\S)([^*\r\n]*?\S)\*\*(?!\*)"),
+    re.compile(r"(?<![\\*])\*(?=\S)([^*\r\n]*?\S)\*(?!\*)"),
+    re.compile(r"(?<![\\\w_])__(?=\S)([^_\r\n]*?\S)__(?![\w_])"),
+    re.compile(r"(?<![\\\w_])_(?=\S)([^_\r\n]*?\S)_(?![\w_])"),
+)
+
+
+def _markdown_emphasis_view(
+    text: str,
+) -> tuple[str, list[int], list[tuple[int, int, int, int]]]:
+    """Return text without simple emphasis delimiters and source mapping.
+
+    Each span is ``(opening_start, body_start, body_end, closing_end)``.
+    Only disjoint, non-nested emphasis pairs are removed.  The position map
+    keeps every surviving character tied to its exact source coordinate.
+    """
+
+    pairs: list[tuple[int, int, int, int]] = []
+    claimed: set[int] = set()
+    removed: set[int] = set()
+    for pattern in _MARKDOWN_EMPHASIS_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span(0)
+            body_start, body_end = match.span(1)
+            marker_positions = {
+                *range(start, body_start),
+                *range(body_end, end),
+            }
+            if any(position in claimed for position in range(start, end)):
+                continue
+            claimed.update(range(start, end))
+            removed.update(marker_positions)
+            pairs.append((start, body_start, body_end, end))
+    pairs.sort()
+    canonical_chars: list[str] = []
+    source_positions: list[int] = []
+    for position, character in enumerate(text):
+        if position in removed:
+            continue
+        canonical_chars.append(character)
+        source_positions.append(position)
+    return "".join(canonical_chars), source_positions, pairs
+
+
+def _unique_markdown_emphasis_quote_repair(
+    core_text: str,
+    submitted_quote: str,
+) -> dict[str, Any] | None:
+    """Map a formatting-only model quote to one exact source span.
+
+    A repair is permitted only when removing simple Markdown emphasis markers
+    produces one and only one literal occurrence.  The returned quote is the
+    original contiguous source substring, including every delimiter belonging
+    to a fully covered emphasized span.  No Unicode, whitespace, case or
+    punctuation normalization is performed.
+    """
+
+    canonical_core, source_positions, source_pairs = _markdown_emphasis_view(
+        core_text
+    )
+    canonical_quote, _quote_positions, _quote_pairs = _markdown_emphasis_view(
+        submitted_quote
+    )
+    if not canonical_quote.strip() or canonical_core == core_text:
+        return None
+
+    occurrences: list[int] = []
+    offset = 0
+    while True:
+        occurrence = canonical_core.find(canonical_quote, offset)
+        if occurrence < 0:
+            break
+        occurrences.append(occurrence)
+        offset = occurrence + 1
+    if not occurrences:
+        return None
+    if len(occurrences) != 1:
+        raise OpenRouterError(
+            "Core-unit Markdown-normalized quote is ambiguous"
+        )
+
+    canonical_start = occurrences[0]
+    canonical_end = canonical_start + len(canonical_quote)
+    source_start = source_positions[canonical_start]
+    source_end = source_positions[canonical_end - 1] + 1
+
+    # Include a delimiter pair only when the occurrence covers its complete
+    # emphasized body.  This avoids attaching the closing marker of `*alpha
+    # beta*` to a quote that contains only `beta`.
+    for opening_start, body_start, body_end, closing_end in source_pairs:
+        if source_start <= body_start and source_end >= body_end:
+            if source_start == body_start:
+                source_start = opening_start
+            if source_end == body_end:
+                source_end = closing_end
+
+    source_quote = core_text[source_start:source_end]
+    repaired_canonical, _positions, _pairs = _markdown_emphasis_view(
+        source_quote
+    )
+    if repaired_canonical != canonical_quote:
+        # A complex or partially covered construct is not safe to repair.
+        return None
+    return {
+        "version": CORE_UNIT_QUOTE_REPAIR_VERSION,
+        "method": "unique_markdown_emphasis_coordinate_map",
+        "submitted_quote": submitted_quote,
+        "submitted_quote_sha256": text_sha256(submitted_quote),
+        "canonical_quote_sha256": text_sha256(canonical_quote),
+        "core_start_char": source_start,
+        "core_end_char": source_end,
+        "source_quote": source_quote,
+    }
+
+
 def _normalize_core_dispositions(
     raw_dispositions: Any,
     *,
@@ -3333,22 +3460,59 @@ def _normalize_core_dispositions(
                     f"Core-unit disposition identity mismatch at {position}: {field}"
                 )
         disposition = str(raw.get("disposition") or "")
-        quote = str(raw.get("evidence_quote") or "")
+        submitted_quote = str(raw.get("evidence_quote") or "")
+        evidence_quote = submitted_quote
+        quote_repair: dict[str, Any] | None = None
         reason = str(raw.get("reason") or "").strip()
         if disposition == "grounded_fact":
-            if not quote.strip():
+            if not submitted_quote.strip():
                 raise OpenRouterError(
                     f"Grounded core-unit disposition has no quote: {claim['unit_id']}"
                 )
-            if quote not in str(claim.get("core_text") or ""):
-                raise OpenRouterError(
-                    f"Core-unit quote is not an exact core substring: {claim['unit_id']}"
+            core_text = str(claim.get("core_text") or "")
+            if submitted_quote not in core_text:
+                try:
+                    quote_repair = _unique_markdown_emphasis_quote_repair(
+                        core_text,
+                        submitted_quote,
+                    )
+                except OpenRouterError as exc:
+                    raise OpenRouterError(
+                        f"{exc}: {claim['unit_id']}"
+                    ) from exc
+                if quote_repair is None:
+                    raise OpenRouterError(
+                        "Core-unit quote is not an exact core substring: "
+                        + str(claim["unit_id"])
+                    )
+                evidence_quote = str(quote_repair.pop("source_quote"))
+                quote_repair["source_quote_sha256"] = text_sha256(
+                    evidence_quote
+                )
+                quote_repair["source_start_char"] = (
+                    int(claim.get("start_char") or 0)
+                    + int(quote_repair["core_start_char"])
+                )
+                quote_repair["source_end_char"] = (
+                    int(claim.get("start_char") or 0)
+                    + int(quote_repair["core_end_char"])
                 )
             if not material:
                 raise OpenRouterError(
                     f"Grounded core-unit output is blank: {claim['unit_id']}"
                 )
-            if not any(quote in value for value in output_strings):
+            quote_visible = any(
+                submitted_quote in value for value in output_strings
+            )
+            if quote_repair is not None and not quote_visible:
+                canonical_quote, _positions, _pairs = _markdown_emphasis_view(
+                    submitted_quote
+                )
+                quote_visible = any(
+                    canonical_quote in _markdown_emphasis_view(value)[0]
+                    for value in output_strings
+                )
+            if not quote_visible:
                 raise OpenRouterError(
                     "Grounded core-unit quote is absent from the analytic output: "
                     + str(claim["unit_id"])
@@ -3358,7 +3522,7 @@ def _normalize_core_dispositions(
                     f"Grounded core-unit disposition has no reason: {claim['unit_id']}"
                 )
         elif disposition == "explicit_no_fact":
-            if quote:
+            if submitted_quote:
                 raise OpenRouterError(
                     f"No-fact core-unit disposition contains a quote: {claim['unit_id']}"
                 )
@@ -3379,10 +3543,12 @@ def _normalize_core_dispositions(
             "version": CORE_UNIT_DECISION_LEDGER_VERSION,
             "claim": claim_receipt,
             "disposition": disposition,
-            "evidence_quote": quote,
-            "evidence_quote_sha256": text_sha256(quote),
+            "evidence_quote": evidence_quote,
+            "evidence_quote_sha256": text_sha256(evidence_quote),
             "reason": reason,
         }
+        if quote_repair is not None:
+            receipt["evidence_quote_repair"] = quote_repair
         receipt["decision_sha256"] = _stable_json_sha256(receipt)
         normalized.append(receipt)
 
@@ -3436,6 +3602,60 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
     quote = str(receipt.get("evidence_quote") or "")
     if text_sha256(quote) != str(receipt.get("evidence_quote_sha256") or ""):
         raise OpenRouterError("Core-unit decision quote digest mismatch")
+    repair = receipt.get("evidence_quote_repair")
+    if repair is not None:
+        if not isinstance(repair, dict):
+            raise OpenRouterError("Core-unit quote repair is not an object")
+        if (
+            repair.get("version") != CORE_UNIT_QUOTE_REPAIR_VERSION
+            or repair.get("method")
+            != "unique_markdown_emphasis_coordinate_map"
+        ):
+            raise OpenRouterError("Core-unit quote repair contract mismatch")
+        submitted_quote = str(repair.get("submitted_quote") or "")
+        if (
+            not submitted_quote
+            or submitted_quote == quote
+            or text_sha256(submitted_quote)
+            != str(repair.get("submitted_quote_sha256") or "")
+        ):
+            raise OpenRouterError("Core-unit submitted quote digest mismatch")
+        canonical_quote, _positions, _pairs = _markdown_emphasis_view(
+            submitted_quote
+        )
+        source_canonical, _source_positions, _source_pairs = (
+            _markdown_emphasis_view(quote)
+        )
+        if (
+            canonical_quote != source_canonical
+            or text_sha256(canonical_quote)
+            != str(repair.get("canonical_quote_sha256") or "")
+            or text_sha256(quote)
+            != str(repair.get("source_quote_sha256") or "")
+        ):
+            raise OpenRouterError("Core-unit quote repair evidence mismatch")
+        try:
+            core_start = int(repair["core_start_char"])
+            core_end = int(repair["core_end_char"])
+            source_start = int(repair["source_start_char"])
+            source_end = int(repair["source_end_char"])
+            claim_start = int(claim.get("start_char") or 0)
+            core_chars = int(claim.get("core_chars") or 0)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OpenRouterError(
+                "Core-unit quote repair coordinates are malformed"
+            ) from exc
+        if (
+            core_start < 0
+            or core_end <= core_start
+            or core_end > core_chars
+            or core_end - core_start != len(quote)
+            or source_start != claim_start + core_start
+            or source_end != claim_start + core_end
+        ):
+            raise OpenRouterError(
+                "Core-unit quote repair coordinates are inconsistent"
+            )
     receipt["decision_sha256"] = digest
     return receipt
 
@@ -12243,6 +12463,1058 @@ async def _answers_for_catalog(run_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _entity_catalog_quote_recovery_incident(
+    error: Exception,
+    *,
+    candidate: dict[str, Any],
+    expected_claims: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Admit only one deterministic exact-quote contract incident.
+
+    This is deliberately narrower than the normalizer.  Unknown failures and
+    ambiguous Markdown-coordinate matches stay terminal.  The strong planner
+    is allowed to consider a retry only when one submitted grounded-fact row
+    points to one immutable core and its quote is demonstrably non-literal.
+    """
+
+    match = re.fullmatch(
+        r"Core-unit quote is not an exact core substring: (.+)",
+        str(error),
+    )
+    if match is None:
+        return None
+    failed_unit_id = match.group(1).strip()
+    matching_claims = [
+        claim
+        for claim in expected_claims
+        if str(claim.get("unit_id") or "") == failed_unit_id
+    ]
+    raw_dispositions = candidate.get("core_dispositions")
+    if len(matching_claims) != 1 or not isinstance(raw_dispositions, list):
+        return None
+    claim = matching_claims[0]
+    matching_rows = [
+        row
+        for row in raw_dispositions
+        if isinstance(row, dict)
+        and str(row.get("unit_id") or "") == failed_unit_id
+        and str(row.get("claim_id") or "")
+        == str(claim.get("claim_id") or "")
+        and str(row.get("core_sha256") or "")
+        == str(claim.get("core_sha256") or "")
+    ]
+    if len(matching_rows) != 1:
+        return None
+    failed_row = matching_rows[0]
+    submitted_quote = str(failed_row.get("evidence_quote") or "")
+    core_text = str(claim.get("core_text") or "")
+    if (
+        failed_row.get("disposition") != "grounded_fact"
+        or not submitted_quote.strip()
+        or not core_text
+        or submitted_quote in core_text
+    ):
+        return None
+    return {
+        "failure_code": "core_quote_not_exact_substring",
+        "failed_unit_id": failed_unit_id,
+        "claim_id": str(claim.get("claim_id") or ""),
+        "core_sha256": str(claim.get("core_sha256") or ""),
+        "submitted_quote_sha256": text_sha256(submitted_quote),
+        "candidate_sha256": stable_digest(candidate),
+    }
+
+
+def _entity_catalog_recovery_checkpoint_identity(
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    claims = _core_unit_claims(job["answers"])
+    return {
+        "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "base_artifact_key": str(job["artifact_key"]),
+        "base_prompt_version": ENTITY_CATALOG_CHUNK_VERSION,
+        "source_units_sha256": stable_digest(job["answers"]),
+        "model_answers_sha256": stable_digest(job["model_answers"]),
+        "core_claims_sha256": stable_digest(claims),
+        "target_sha256": stable_digest(target),
+    }
+
+
+def _entity_catalog_recovery_checkpoint_key(job: dict[str, Any]) -> str:
+    return str(job["artifact_key"]) + "_recovery_accepted"
+
+
+def _entity_catalog_recovery_stage_key(job: dict[str, Any]) -> str:
+    """Give each concurrent catalog chunk its own bounded planner stage."""
+
+    artifact_digest = text_sha256(str(job["artifact_key"]))[:16]
+    return f"{ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE}:{artifact_digest}"
+
+
+def _validate_entity_catalog_leaf_evidence_binding(
+    catalog: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    *,
+    profile: dict[str, Any],
+) -> None:
+    """Require every recovered name to bind to its own grounded core quote.
+
+    A material catalog shared by several core units is not evidence that each
+    entity in it came from a grounded unit.  This validator keeps the leaf
+    atomic: every target alias and downstream alias must occur literally in a
+    grounded source quote, and an entity's evidence must point to that same
+    quote (or to the model's formatting-only submitted form).  A code-owned
+    canonical name may use a literal, independently confirmed alias of the
+    same entity; this admits ``Realweb`` / ``Риалвеб`` without allowing an LLM
+    to invent a canonical/alias pair.
+    """
+
+    grounded: list[tuple[str, tuple[str, ...]]] = []
+    for receipt in receipts:
+        if receipt.get("disposition") != "grounded_fact":
+            continue
+        source_quote = str(receipt.get("evidence_quote") or "")
+        if not source_quote:
+            continue
+        output_views = [source_quote]
+        repair = receipt.get("evidence_quote_repair")
+        if isinstance(repair, dict):
+            submitted = str(repair.get("submitted_quote") or "")
+            if submitted and submitted != source_quote:
+                output_views.append(submitted)
+        grounded.append((source_quote, tuple(output_views)))
+
+    def literal_name_is_grounded(name: str) -> bool:
+        return bool(
+            name
+            and any(
+                _alias_is_present(source, name)
+                for source, _views in grounded
+            )
+        )
+
+    def identity_key(value: str) -> str:
+        return re.sub(
+            r"\s+",
+            " ",
+            unicodedata.normalize("NFKC", value)
+            .casefold()
+            .replace("ё", "е")
+            .strip(),
+        )
+
+    def strictly_bound(name: str, evidence: str) -> bool:
+        return bool(
+            name
+            and evidence
+            and _alias_is_present(evidence, name)
+            and any(
+                _alias_is_present(source_quote, name)
+                and any(view in evidence for view in output_views)
+                for source_quote, output_views in grounded
+            )
+        )
+
+    def code_owned_names(entity: dict[str, Any]) -> set[str]:
+        confirmed: list[str] = []
+        relationship = str(
+            entity.get("target_relationship")
+            or entity.get("relationship")
+            or ""
+        ).strip().casefold()
+        if (
+            entity.get("category") == "target"
+            and relationship == "exact_target"
+        ):
+            confirmed.extend(_target_aliases(profile, catalog))
+        confirmed.extend(
+            _profile_confirmed_names_for_entity(entity, profile)
+        )
+        return {
+            identity_key(value)
+            for value in confirmed
+            if identity_key(value)
+        }
+
+    errors: list[str] = []
+    target_aliases = catalog.get("target_aliases")
+    if not isinstance(target_aliases, list):
+        errors.append("target_aliases is not a list")
+    else:
+        for position, raw_alias in enumerate(target_aliases):
+            alias = str(raw_alias or "").strip()
+            if not literal_name_is_grounded(alias):
+                errors.append(f"target_aliases[{position}] is not grounded")
+
+    entities = catalog.get("entities")
+    if not isinstance(entities, list):
+        errors.append("entities is not a list")
+    else:
+        for position, raw_entity in enumerate(entities):
+            if not isinstance(raw_entity, dict):
+                errors.append(f"entities[{position}] is not an object")
+                continue
+            canonical = str(raw_entity.get("canonical_name") or "").strip()
+            aliases: list[str] = []
+            raw_aliases = raw_entity.get("aliases")
+            if isinstance(raw_aliases, list):
+                for raw_alias in raw_aliases:
+                    value = (
+                        str(raw_alias.get("value") or "").strip()
+                        if isinstance(raw_alias, dict)
+                        else str(raw_alias or "").strip()
+                    )
+                    if value:
+                        aliases.append(value)
+            else:
+                errors.append(f"entities[{position}].aliases is not a list")
+            evidence = str(raw_entity.get("evidence") or "").strip()
+            owned_names = code_owned_names(raw_entity)
+            canonical_bound = strictly_bound(canonical, evidence)
+            if not canonical_bound:
+                canonical_is_owned = identity_key(canonical) in owned_names
+                observed_owned_alias = any(
+                    identity_key(alias) in owned_names
+                    and strictly_bound(alias, evidence)
+                    for alias in aliases
+                )
+                canonical_bound = bool(
+                    canonical_is_owned and observed_owned_alias
+                )
+            if not canonical_bound:
+                errors.append(
+                    f"entities[{position}].canonical_name is not grounded"
+                )
+            for alias_index, alias in enumerate(aliases):
+                if not strictly_bound(alias, evidence):
+                    errors.append(
+                        f"entities[{position}].aliases[{alias_index}] "
+                        "is not grounded"
+                    )
+    if errors:
+        raise OpenRouterError(
+            "Entity-catalog evidence binding failed: "
+            + "; ".join(errors)
+        )
+
+
+def _validated_recovered_entity_catalog_leaf(
+    recovered: dict[str, Any],
+    *,
+    job: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    claims = _core_unit_claims(job["answers"])
+    recovered_catalog = recovered.get("catalog")
+    if not isinstance(recovered_catalog, dict):
+        raise OpenRouterError("Recovered entity-catalog leaf has no catalog")
+    receipts = _normalize_core_dispositions(
+        recovered.get("core_dispositions"),
+        expected_claims=claims,
+        analytic_output=recovered_catalog,
+        output_kind="entity_catalog",
+    )
+    accepted = _attach_core_decisions(
+        recovered_catalog,
+        receipts,
+        [str(item.get("_lr_unit_id") or "") for item in job["answers"]],
+    )
+    _validate_entity_catalog_leaf_evidence_binding(
+        accepted,
+        receipts,
+        profile=profile,
+    )
+    return accepted
+
+
+def _complete_entity_catalog_response_contract_failure(
+    error: BaseException,
+) -> bool:
+    """Return true only for an audited, complete but unusable response.
+
+    A complete HTTP 200 response has spent the semantic attempt and may buy
+    the next bounded attempt.  An incomplete, output-limited, transport, or
+    provenance-ambiguous failure keeps the current attempt reserved for exact
+    resume instead.
+    """
+
+    if not isinstance(error, OpenRouterResponseContractError):
+        return False
+    result = getattr(error, "result", None)
+    if not isinstance(result, ChatResult):
+        return False
+    transport = getattr(result, "transport", None)
+    usage = getattr(result, "usage", None)
+    if not isinstance(transport, dict) or not isinstance(usage, dict):
+        return False
+    usage_transport = usage.get("_aiv_transport")
+    return bool(
+        transport.get("status") == "succeeded"
+        and transport.get("http_status") == 200
+        and transport.get("output_complete") is True
+        and transport.get("output_limited") is False
+        and transport.get("output_incomplete_reason") in (None, "")
+        and isinstance(usage_transport, dict)
+        and usage_transport == transport
+    )
+
+
+def _entity_catalog_recovery_checkpoint_payload(
+    *,
+    identity: dict[str, Any],
+    plan: DurableRecoveryPlan,
+    execution_attempt: int,
+    recovery_artifact_key: str,
+    recovery_payload: dict[str, Any],
+    recovered: dict[str, Any],
+    accepted: dict[str, Any],
+    before_digest: str,
+    after_digest: str,
+) -> dict[str, Any]:
+    body = {
+        "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "identity": copy.deepcopy(identity),
+        "identity_sha256": stable_digest(identity),
+        "epoch_id": int(plan.epoch_id),
+        "epoch": int(plan.epoch),
+        "stage_key": str(plan.stage_key),
+        "failure_fingerprint": str(plan.failure_fingerprint),
+        "facts_digest": str(plan.facts_digest),
+        "plan_digest": str(plan.plan_digest),
+        "execution_attempt": execution_attempt,
+        "recovery_artifact_key": recovery_artifact_key,
+        "recovery_input_sha256": stable_digest(recovery_payload),
+        "recovery_output_sha256": stable_digest(recovered),
+        "accepted_output_sha256": stable_digest(accepted),
+        "before_digest": before_digest,
+        "after_digest": after_digest,
+        "accepted": copy.deepcopy(accepted),
+    }
+    return {
+        **body,
+        "checkpoint_sha256": stable_digest(body),
+    }
+
+
+async def _validate_entity_catalog_recovery_epoch_binding(
+    run_id: str,
+    checkpoint: dict[str, Any],
+    *,
+    recovery_input: dict[str, Any],
+) -> tuple[str, DurableRecoveryPlan]:
+    epoch_id = checkpoint.get("epoch_id")
+    epoch_number = checkpoint.get("epoch")
+    if (
+        not isinstance(epoch_id, int)
+        or isinstance(epoch_id, bool)
+        or epoch_id < 1
+        or not isinstance(epoch_number, int)
+        or isinstance(epoch_number, bool)
+        or epoch_number < 1
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint epoch is malformed"
+        )
+    async with SessionLocal() as session:
+        epoch = (
+            await session.execute(
+                select(RecoveryEpoch).where(
+                    RecoveryEpoch.id == epoch_id,
+                    RecoveryEpoch.run_id == run_id,
+                    RecoveryEpoch.epoch == epoch_number,
+                    RecoveryEpoch.status.in_(("executing", "succeeded")),
+                )
+            )
+        ).scalar_one_or_none()
+    if epoch is None:
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint has no accepted epoch"
+        )
+    plan_json = epoch.plan_json if isinstance(epoch.plan_json, dict) else None
+    bindings = {
+        "stage_key": epoch.stage_key,
+        "failure_fingerprint": epoch.failure_fingerprint,
+        "facts_digest": epoch.facts_digest,
+        "plan_digest": epoch.plan_digest,
+    }
+    for key, actual in bindings.items():
+        if str(checkpoint.get(key) or "") != str(actual or ""):
+            raise OpenRouterError(
+                "Entity-catalog recovery checkpoint epoch binding mismatch: "
+                + key
+            )
+    if (
+        plan_json is None
+        or not epoch.plan_digest
+        or stable_digest(plan_json) != str(epoch.plan_digest)
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint plan digest mismatch"
+        )
+    recovery_contract = recovery_input.get("recovery")
+    incident = (
+        epoch.input_json.get("incident")
+        if isinstance(epoch.input_json, dict)
+        else None
+    )
+    facts = (
+        incident.get("facts") if isinstance(incident, dict) else None
+    )
+    if not isinstance(recovery_contract, dict) or not isinstance(facts, dict):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint provenance is incomplete"
+        )
+    if (
+        str(recovery_contract.get("orchestrator_guidance") or "")
+        != str(plan_json.get("guidance") or "")
+        or str(recovery_contract.get("invalid_candidate_sha256") or "")
+        != str(facts.get("invalid_candidate_sha256") or "")
+        or str(recovery_contract.get("source_units_sha256") or "")
+        != str(facts.get("source_units_sha256") or "")
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint planner provenance mismatch"
+        )
+    attempt = int(checkpoint["execution_attempt"])
+    outcome = epoch.outcome_json if isinstance(epoch.outcome_json, dict) else {}
+    if epoch.status == "executing":
+        if outcome.get("execution_attempts") != attempt:
+            raise OpenRouterError(
+                "Entity-catalog recovery checkpoint reservation mismatch"
+            )
+    else:
+        details = (
+            outcome.get("details")
+            if isinstance(outcome.get("details"), dict)
+            else {}
+        )
+        if (
+            outcome.get("succeeded") is not True
+            or outcome.get("before_digest") != checkpoint.get("before_digest")
+            or outcome.get("after_digest") != checkpoint.get("after_digest")
+            or details.get("accepted_artifact_key")
+            != checkpoint.get("recovery_artifact_key")
+            or details.get("execution_attempt") != attempt
+            or details.get("raw_source_unchanged") is not True
+        ):
+            raise OpenRouterError(
+                "Entity-catalog recovery checkpoint outcome mismatch"
+            )
+    return (
+        str(epoch.status),
+        DurableRecoveryPlan(
+            run_id=run_id,
+            epoch_id=epoch.id,
+            epoch=epoch.epoch,
+            stage_key=epoch.stage_key,
+            decision=copy.deepcopy(plan_json),
+            reused=True,
+            facts_digest=epoch.facts_digest,
+            failure_fingerprint=epoch.failure_fingerprint,
+            plan_digest=str(epoch.plan_digest),
+        ),
+    )
+
+
+async def _entity_catalog_recovery_artifact(
+    run_id: str,
+    artifact_key: str,
+) -> RunArtifact | None:
+    async with SessionLocal() as session:
+        return (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact_key,
+                )
+            )
+        ).scalar_one_or_none()
+
+
+async def _validate_entity_catalog_recovery_checkpoint(
+    run_id: str,
+    value: dict[str, Any],
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    checkpoint = copy.deepcopy(value)
+    checkpoint_digest = str(checkpoint.pop("checkpoint_sha256", ""))
+    if (
+        checkpoint.get("version")
+        != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        or not checkpoint_digest
+        or stable_digest(checkpoint) != checkpoint_digest
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint digest mismatch"
+        )
+    identity = _entity_catalog_recovery_checkpoint_identity(
+        job=job,
+        target=target,
+    )
+    if (
+        checkpoint.get("identity") != identity
+        or str(checkpoint.get("identity_sha256") or "")
+        != stable_digest(identity)
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint input binding mismatch"
+        )
+    epoch = checkpoint.get("epoch")
+    execution_attempt = checkpoint.get("execution_attempt")
+    if (
+        not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or epoch < 1
+        or not isinstance(execution_attempt, int)
+        or isinstance(execution_attempt, bool)
+        or execution_attempt < 1
+        or execution_attempt
+        > ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint attempt is malformed"
+        )
+    recovery_artifact_key = str(
+        checkpoint.get("recovery_artifact_key") or ""
+    )
+    expected_recovery_key = (
+        f"{job['artifact_key']}_recovery_e{epoch}_a{execution_attempt}"
+    )
+    if recovery_artifact_key != expected_recovery_key:
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint artifact binding mismatch"
+        )
+    recovery_artifact = await _entity_catalog_recovery_artifact(
+        run_id,
+        recovery_artifact_key,
+    )
+    recovery_input = (
+        recovery_artifact.input_json
+        if recovery_artifact is not None
+        and isinstance(recovery_artifact.input_json, dict)
+        else None
+    )
+    recovered = (
+        recovery_artifact.output_json
+        if recovery_artifact is not None
+        and isinstance(recovery_artifact.output_json, dict)
+        else None
+    )
+    if (
+        recovery_artifact is None
+        or recovery_artifact.status != "completed"
+        or recovery_artifact.model != PROCESSING_MODEL
+        or recovery_artifact.prompt_version
+        != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        or not isinstance(recovery_input, dict)
+        or stable_digest(recovery_input)
+        != str(checkpoint.get("recovery_input_sha256") or "")
+        or not isinstance(recovered, dict)
+        or stable_digest(recovered)
+        != str(checkpoint.get("recovery_output_sha256") or "")
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint output binding mismatch"
+        )
+    recovery_contract = recovery_input.get("recovery")
+    if (
+        recovery_input.get("target") != target
+        or recovery_input.get("answers") != job["model_answers"]
+        or not isinstance(recovery_contract, dict)
+        or recovery_contract.get("version")
+        != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        or recovery_contract.get("epoch") != epoch
+        or recovery_contract.get("execution_attempt") != execution_attempt
+        or str(recovery_contract.get("source_units_sha256") or "")
+        != str(identity["source_units_sha256"])
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint input provenance mismatch"
+        )
+    accepted = _validated_recovered_entity_catalog_leaf(
+        recovered,
+        job=job,
+        profile=profile,
+    )
+    stored_accepted = checkpoint.get("accepted")
+    if (
+        not isinstance(stored_accepted, dict)
+        or stored_accepted != accepted
+        or stable_digest(accepted)
+        != str(checkpoint.get("accepted_output_sha256") or "")
+    ):
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint accepted-leaf mismatch"
+        )
+    _long_response_lineage(
+        [accepted],
+        expected_unit_ids=[
+            str(item.get("_lr_unit_id") or "") for item in job["answers"]
+        ],
+    )
+    epoch_status, durable_plan = (
+        await _validate_entity_catalog_recovery_epoch_binding(
+            run_id,
+            checkpoint,
+            recovery_input=recovery_input,
+        )
+    )
+    if epoch_status == "executing":
+        await finish_recovery(
+            durable_plan,
+            succeeded=True,
+            before_digest=str(checkpoint["before_digest"]),
+            after_digest=str(checkpoint["after_digest"]),
+            details={
+                "failure_code": str(
+                    recovery_contract.get("failure_code") or ""
+                ),
+                "accepted_artifact_key": recovery_artifact_key,
+                "execution_attempt": execution_attempt,
+                "raw_source_unchanged": True,
+                "resumed_accepted_checkpoint": True,
+                "executed_acceptance_checks": sorted(
+                    {
+                        CHECK_PROMPT_CONTRACT_VALID,
+                        CHECK_RAW_CORPUS_UNCHANGED,
+                    }
+                ),
+            },
+        )
+    return accepted
+
+
+async def _recover_entity_catalog_chunk_contract(
+    run_id: str,
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+    profile: dict[str, Any],
+    extraction_system: str,
+    extraction_window: dict[str, Any],
+    candidate: dict[str, Any],
+    contract_error: Exception,
+    planner_lock: asyncio.Lock | None = None,
+) -> dict[str, Any]:
+    """Run one Fable plan and at most two strict leaf re-extractions."""
+
+    claims = _core_unit_claims(job["answers"])
+    incident = _entity_catalog_quote_recovery_incident(
+        contract_error,
+        candidate=candidate,
+        expected_claims=claims,
+    )
+    if incident is None or not settings.PIPELINE_ORCHESTRATOR_ENABLED:
+        raise contract_error
+
+    source_digest = stable_digest(job["answers"])
+    base_artifact_key = str(job["artifact_key"])
+    required_retry_checks = {
+        CHECK_PROMPT_CONTRACT_VALID,
+        CHECK_RAW_CORPUS_UNCHANGED,
+    }
+    facts = {
+        "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "immutable_core_claims": copy.deepcopy(claims),
+        "immutable_core_claims_sha256": stable_digest(claims),
+        "source_units_sha256": source_digest,
+        "invalid_candidate": copy.deepcopy(candidate),
+        "invalid_candidate_sha256": incident["candidate_sha256"],
+        "executor_contract": {
+            ACTION_RETRY_WITH_GUIDANCE: {
+                "max_execution_attempts_for_stage": (
+                    ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+                ),
+                "source_mutation": "forbidden",
+                "acceptance_checks": sorted(required_retry_checks),
+                "acceptance_gate": (
+                    "same strict _normalize_core_dispositions validator"
+                ),
+            },
+            ACTION_STOP: {
+                "acceptance_checks": [CHECK_CHECKPOINT_PRESERVED],
+            },
+        },
+    }
+    diagnostics = {
+        **incident,
+        "artifact_key": base_artifact_key,
+        "contract_error": str(contract_error),
+    }
+    async def reserve_plan() -> Any:
+        return await plan_durable_recovery(
+            run_id,
+            stage_key=_entity_catalog_recovery_stage_key(job),
+            failure_class="repairable_provider_contract",
+            failure_code=str(incident["failure_code"]),
+            diagnostics=diagnostics,
+            facts=facts,
+            allowed_actions={ACTION_RETRY_WITH_GUIDANCE, ACTION_STOP},
+            permitted_artifact_keys={base_artifact_key},
+            stage_planner_call_limit=1,
+        )
+
+    try:
+        if planner_lock is None:
+            plan = await reserve_plan()
+        else:
+            # Several catalog leaves may fail together under asyncio.gather.
+            # Serialize only the durable epoch reservation/provider planning
+            # boundary; the cheaper leaf retries remain concurrent.
+            async with planner_lock:
+                plan = await reserve_plan()
+    except (asyncio.CancelledError, RunLeaseLostError):
+        raise
+    except Exception as planner_error:
+        raise OpenRouterError(
+            "Entity-catalog contract recovery planner failed after: "
+            + str(contract_error)
+        ) from planner_error
+
+    execution_state = await recovery_execution_state(plan)
+    reserved_attempt = (
+        execution_state.execution_attempts
+        if execution_state.status == "executing"
+        else None
+    )
+
+    async def reserve_or_resume_attempt() -> int:
+        nonlocal reserved_attempt
+        if reserved_attempt is not None:
+            attempt = reserved_attempt
+            reserved_attempt = None
+            return attempt
+        return await mark_recovery_executing(
+            plan,
+            stage_execution_limit=(
+                ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+            ),
+        )
+
+    before_digest = stable_digest(
+        {
+            "candidate": candidate,
+            "source_units_sha256": source_digest,
+        }
+    )
+    action = str(plan.decision.get("action") or "")
+    requested_checks = set(plan.decision.get("acceptance_checks") or [])
+    required_checks = (
+        {CHECK_CHECKPOINT_PRESERVED}
+        if action == ACTION_STOP
+        else required_retry_checks
+    )
+    missing_checks = sorted(required_checks - requested_checks)
+    unsupported_checks = sorted(requested_checks - required_checks)
+    if missing_checks or unsupported_checks:
+        await reserve_or_resume_attempt()
+        after_digest = stable_digest(
+            {
+                "before_digest": before_digest,
+                "missing_acceptance_checks": missing_checks,
+                "unsupported_acceptance_checks": unsupported_checks,
+            }
+        )
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            details={
+                "failure_code": incident["failure_code"],
+                "missing_acceptance_checks": missing_checks,
+                "unsupported_acceptance_checks": unsupported_checks,
+                "raw_source_unchanged": True,
+            },
+        )
+        raise OrchestratorContractError(
+            "Entity-catalog recovery acceptance checks do not match its "
+            "executor"
+        )
+    if action == ACTION_STOP:
+        await reserve_or_resume_attempt()
+        await finish_recovery(
+            plan,
+            succeeded=False,
+            before_digest=before_digest,
+            after_digest=before_digest,
+            details={
+                "failure_code": incident["failure_code"],
+                "reason": "planner_requested_stop",
+                "raw_source_unchanged": True,
+            },
+        )
+        raise contract_error
+    if action != ACTION_RETRY_WITH_GUIDANCE:
+        raise OrchestratorContractError(
+            f"Unsupported entity-catalog recovery action: {action}"
+        )
+
+    recovery_system = (
+        extraction_system
+        + "\n\n"
+        + "Это ограниченное восстановление ошибки строгого контракта. "
+        "Не меняй смысл каталога и не исправляй исходные ответы. Для каждой "
+        "grounded_fact скопируй evidence_quote как непрерывную дословную "
+        "подстроку соответствующего core_claim.core_text. Если такого "
+        "свидетельства нет, верни explicit_no_fact с конкретной причиной. "
+        "Подсказка оркестратора не отменяет эти правила."
+    )
+
+    def recovery_request(
+        attempt_number: int,
+    ) -> tuple[dict[str, Any], str, str]:
+        payload = {
+            "target": copy.deepcopy(target),
+            "answers": copy.deepcopy(job["model_answers"]),
+            "recovery": {
+                "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                "epoch": plan.epoch,
+                "execution_attempt": attempt_number,
+                "failure_code": incident["failure_code"],
+                "failed_unit_id": incident["failed_unit_id"],
+                "source_units_sha256": source_digest,
+                "invalid_candidate_sha256": incident["candidate_sha256"],
+                "orchestrator_guidance": str(
+                    plan.decision.get("guidance") or ""
+                ),
+                "immutable_contract": (
+                    "No source mutation; exact literal core evidence only."
+                ),
+            },
+        }
+        artifact_key = (
+            f"{base_artifact_key}_recovery_e{plan.epoch}_a{attempt_number}"
+        )
+        schema_name = (
+            "aiv_entity_catalog_contract_recovery_"
+            f"e{plan.epoch}_a{attempt_number}"
+        )
+        return payload, artifact_key, schema_name
+
+    def validate_recovered_candidate(
+        recovered: dict[str, Any],
+    ) -> dict[str, Any]:
+        if stable_digest(job["answers"]) != source_digest:
+            raise OrchestratorContractError(
+                "Entity-catalog recovery source units changed"
+            )
+        return _validated_recovered_entity_catalog_leaf(
+            recovered,
+            job=job,
+            profile=profile,
+        )
+
+    attempt_failures: list[dict[str, Any]] = []
+    last_error: Exception = contract_error
+    while True:
+        attempt_number = await reserve_or_resume_attempt()
+        (
+            recovery_payload,
+            recovery_artifact_key,
+            recovery_schema_name,
+        ) = recovery_request(attempt_number)
+        request_bytes = _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=extraction_window["model_envelope"],
+            system=recovery_system,
+            user_payload=recovery_payload,
+            schema=ENTITY_CATALOG_LEAF_SCHEMA,
+            schema_name=recovery_schema_name,
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+        if request_bytes > int(extraction_window["input_utf8_window"]):
+            last_error = OpenRouterError(
+                "Entity-catalog recovery request does not fit the physical "
+                "model input window"
+            )
+            attempt_failures.append(
+                {
+                    "attempt": attempt_number,
+                    "error": str(last_error),
+                    "request_utf8_bytes": request_bytes,
+                }
+            )
+            break
+
+        try:
+            recovered = await _processing_artifact(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=recovery_artifact_key,
+                schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                schema_name=recovery_schema_name,
+                system=recovery_system,
+                user_payload=recovery_payload,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            )
+        except (asyncio.CancelledError, RunLeaseLostError):
+            raise
+        except Exception as processing_error:
+            # The attempt is already reserved and its owner/transport ledger
+            # contains the only safe resume coordinate.  A transport/provider
+            # failure must leave it executing so the next worker re-enters the
+            # same key.  Only an audited HTTP 200 response that reached a
+            # complete final turn but violated the response contract has spent
+            # the semantic attempt and may advance to the next bounded one.
+            if not _complete_entity_catalog_response_contract_failure(
+                processing_error
+            ):
+                raise
+            last_error = processing_error
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=recovery_artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=recovery_payload,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                error=processing_error,
+            )
+            attempt_failures.append(
+                {
+                    "attempt": attempt_number,
+                    "artifact_key": recovery_artifact_key,
+                    "error": str(processing_error)[:2000],
+                    "failure_kind": "complete_response_contract",
+                }
+            )
+            if (
+                attempt_number
+                >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+            ):
+                break
+            continue
+
+        try:
+            accepted = validate_recovered_candidate(recovered)
+        except Exception as retry_error:
+            last_error = retry_error
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=recovery_artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=recovery_payload,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                error=retry_error,
+            )
+            attempt_failures.append(
+                {
+                    "attempt": attempt_number,
+                    "artifact_key": recovery_artifact_key,
+                    "error": str(retry_error)[:2000],
+                }
+            )
+            if "ambiguous" in str(retry_error).casefold():
+                break
+            if (
+                attempt_number
+                >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+            ):
+                break
+            continue
+
+        after_digest = stable_digest(
+            {
+                "accepted": accepted,
+                "source_units_sha256": source_digest,
+            }
+        )
+        checkpoint_identity = _entity_catalog_recovery_checkpoint_identity(
+            job=job,
+            target=target,
+        )
+        checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
+        checkpoint_output = _entity_catalog_recovery_checkpoint_payload(
+            identity=checkpoint_identity,
+            plan=plan,
+            execution_attempt=attempt_number,
+            recovery_artifact_key=recovery_artifact_key,
+            recovery_payload=recovery_payload,
+            recovered=recovered,
+            accepted=accepted,
+            before_digest=before_digest,
+            after_digest=after_digest,
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key=checkpoint_key,
+            status="completed",
+            model=None,
+            input_json=checkpoint_identity,
+            output_json=checkpoint_output,
+            usage_json={
+                "_aiv_entity_catalog_recovery": {
+                    "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                    "epoch": plan.epoch,
+                    "execution_attempt": attempt_number,
+                    "source_units_sha256": source_digest,
+                    "accepted_artifact_key": recovery_artifact_key,
+                    "checkpoint_sha256": checkpoint_output[
+                        "checkpoint_sha256"
+                    ],
+                    "accepted_output_sha256": checkpoint_output[
+                        "accepted_output_sha256"
+                    ],
+                    "recovery_output_sha256": checkpoint_output[
+                        "recovery_output_sha256"
+                    ],
+                    "recovery_input_sha256": checkpoint_output[
+                        "recovery_input_sha256"
+                    ],
+                    "plan_digest": plan.plan_digest,
+                }
+            },
+            prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        )
+        await finish_recovery(
+            plan,
+            succeeded=True,
+            before_digest=before_digest,
+            after_digest=after_digest,
+            details={
+                "failure_code": incident["failure_code"],
+                "accepted_artifact_key": recovery_artifact_key,
+                "execution_attempt": attempt_number,
+                "raw_source_unchanged": True,
+                "executed_acceptance_checks": sorted(required_checks),
+            },
+        )
+        return accepted
+
+    failed_digest = stable_digest(
+        {
+            "before_digest": before_digest,
+            "attempt_failures": attempt_failures,
+            "source_units_sha256": source_digest,
+        }
+    )
+    await finish_recovery(
+        plan,
+        succeeded=False,
+        before_digest=before_digest,
+        after_digest=failed_digest,
+        details={
+            "failure_code": incident["failure_code"],
+            "attempt_failures": attempt_failures,
+            "raw_source_unchanged": (
+                stable_digest(job["answers"]) == source_digest
+            ),
+        },
+    )
+    raise OpenRouterError(
+        "Entity-catalog contract recovery exhausted: " + str(last_error)
+    ) from last_error
+
+
 async def _entity_catalog(
     run_id: str,
     profile: dict[str, Any],
@@ -12419,12 +13691,62 @@ unit_id и core_sha256 скопируй без изменений.
         )
 
     semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
+    recovery_planner_lock = asyncio.Lock()
 
     async def extract_chunk(job: dict[str, Any]) -> dict[str, Any]:
         payload = {
             "target": target,
             "answers": job["model_answers"],
         }
+        checkpoint_identity = _entity_catalog_recovery_checkpoint_identity(
+            job=job,
+            target=target,
+        )
+        checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
+        recovered_checkpoint = await _artifact_output(
+            run_id,
+            checkpoint_key,
+            input_json=checkpoint_identity,
+            model=None,
+            prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        )
+        if recovered_checkpoint is None:
+            checkpoint_artifact = await _entity_catalog_recovery_artifact(
+                run_id,
+                checkpoint_key,
+            )
+            if checkpoint_artifact is not None:
+                mismatches: list[str] = []
+                if checkpoint_artifact.status != "completed":
+                    mismatches.append("status")
+                if checkpoint_artifact.model is not None:
+                    mismatches.append("model")
+                if (
+                    checkpoint_artifact.prompt_version
+                    != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+                ):
+                    mismatches.append("prompt_version")
+                if checkpoint_artifact.input_json != checkpoint_identity:
+                    mismatches.append("input_json")
+                if not isinstance(checkpoint_artifact.output_json, dict):
+                    mismatches.append("output_json")
+                raise OpenRouterError(
+                    "Entity-catalog recovery checkpoint exists but violates "
+                    "its immutable contract: "
+                    + ", ".join(mismatches or ["cache_lookup"])
+                )
+        if recovered_checkpoint is not None:
+            if not isinstance(recovered_checkpoint, dict):
+                raise OpenRouterError(
+                    "Entity-catalog recovery checkpoint is not an object"
+                )
+            return await _validate_entity_catalog_recovery_checkpoint(
+                run_id,
+                recovered_checkpoint,
+                job=job,
+                target=target,
+                profile=profile,
+            )
         async with semaphore:
             wrapped = await _processing_artifact(
                 run_id,
@@ -12436,16 +13758,21 @@ unit_id и core_sha256 скопируй без изменений.
                 user_payload=payload,
                 prompt_version=ENTITY_CATALOG_CHUNK_VERSION,
             )
+        claims = _core_unit_claims(job["answers"])
         try:
             catalog = wrapped.get("catalog")
             if not isinstance(catalog, dict):
                 raise OpenRouterError("Entity-catalog leaf has no catalog")
-            claims = _core_unit_claims(job["answers"])
             receipts = _normalize_core_dispositions(
                 wrapped.get("core_dispositions"),
                 expected_claims=claims,
                 analytic_output=catalog,
                 output_kind="entity_catalog",
+            )
+            _validate_entity_catalog_leaf_evidence_binding(
+                catalog,
+                receipts,
+                profile=profile,
             )
             return _attach_core_decisions(
                 catalog,
@@ -12462,6 +13789,18 @@ unit_id и core_sha256 скопируй без изменений.
                 prompt_version=ENTITY_CATALOG_CHUNK_VERSION,
                 error=exc,
             )
+            if settings.PIPELINE_ORCHESTRATOR_ENABLED:
+                return await _recover_entity_catalog_chunk_contract(
+                    run_id,
+                    job=job,
+                    target=target,
+                    profile=profile,
+                    extraction_system=extraction_system,
+                    extraction_window=extraction_window,
+                    candidate=wrapped,
+                    contract_error=exc,
+                    planner_lock=recovery_planner_lock,
+                )
             raise
 
     # asyncio.gather returns values in input order even when later chunks

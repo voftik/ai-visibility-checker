@@ -59,6 +59,12 @@ class DurableRecoveryPlan:
     plan_digest: str
 
 
+@dataclass(frozen=True)
+class DurableRecoveryExecutionState:
+    status: str
+    execution_attempts: int
+
+
 def _owned_active_run_exists(run_id: str, owner: str | None):
     """Return a SQL lease guard, or ``None`` for legacy unbound callers."""
 
@@ -615,14 +621,16 @@ async def mark_recovery_executing(
     plan: DurableRecoveryPlan,
     *,
     stage_execution_limit: int | None = None,
-) -> None:
+) -> int:
     """Reserve a durable execution for this exact action.
 
     The generic per-epoch budget remains two attempts for restart-tolerant
     stages.  High-risk callers may additionally set a run+stage budget.  The
     analysis-critic recovery uses a budget of one: after annotations have been
     touched once, neither a restarted worker nor a second planner epoch may
-    buy another repair/final-critic cycle.
+    buy another repair/final-critic cycle.  The returned one-based attempt
+    number lets a bounded caller address a distinct durable artifact for each
+    execution without deriving mutable state outside this reservation.
     """
 
     if (
@@ -826,6 +834,74 @@ async def mark_recovery_executing(
                 owner,
                 "Recovery epoch changed while reserving execution attempt",
             )
+        return attempts + 1
+
+
+async def recovery_execution_state(
+    plan: DurableRecoveryPlan,
+) -> DurableRecoveryExecutionState:
+    """Read the exact durable execution reservation for a reusable plan.
+
+    A caller uses this before resuming an owner artifact.  It may continue an
+    already reserved attempt under the same artifact key, but it must not
+    derive or reserve a later attempt from this read.
+    """
+
+    owner = lease_owner_for(plan.run_id)
+    await assert_run_lease(plan.run_id)
+    async with SessionLocal() as session:
+        row = (
+            await session.execute(
+                select(
+                    RecoveryEpoch.status,
+                    RecoveryEpoch.outcome_json,
+                    RecoveryEpoch.plan_json,
+                    RecoveryEpoch.plan_digest,
+                ).where(
+                    *_with_lease_guard(
+                        [
+                            RecoveryEpoch.id == plan.epoch_id,
+                            RecoveryEpoch.run_id == plan.run_id,
+                            RecoveryEpoch.facts_digest == plan.facts_digest,
+                            RecoveryEpoch.failure_fingerprint
+                            == plan.failure_fingerprint,
+                            RecoveryEpoch.status.in_(("planned", "executing")),
+                        ],
+                        run_id=plan.run_id,
+                        owner=owner,
+                    )
+                )
+            )
+        ).one_or_none()
+    if row is None:
+        await _raise_for_lost_lease_or_state(
+            plan.run_id,
+            owner,
+            "Recovery epoch has no resumable execution state",
+        )
+    status, stored_outcome, stored_decision, stored_plan_digest = row
+    _assert_plan_integrity(
+        plan,
+        stored_decision=stored_decision,
+        stored_plan_digest=stored_plan_digest,
+    )
+    outcome = dict(stored_outcome) if isinstance(stored_outcome, dict) else {}
+    raw_attempts = outcome.get("execution_attempts", 0)
+    if (
+        not isinstance(raw_attempts, int)
+        or isinstance(raw_attempts, bool)
+        or raw_attempts < 0
+        or raw_attempts > MAX_RECOVERY_EXECUTION_ATTEMPTS
+        or (status == "planned" and raw_attempts != 0)
+        or (status == "executing" and raw_attempts < 1)
+    ):
+        raise OrchestratorContractError(
+            "Recovery epoch execution reservation is malformed"
+        )
+    return DurableRecoveryExecutionState(
+        status=str(status),
+        execution_attempts=raw_attempts,
+    )
 
 
 async def finish_recovery(

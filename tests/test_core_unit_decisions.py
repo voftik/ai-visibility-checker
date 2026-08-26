@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import unittest
 
@@ -19,6 +20,8 @@ from app.services.analyzer import (
     _normalize_core_dispositions,
     _preserve_entity_catalog_core_decisions,
     _preserve_site_profile_core_decisions,
+    _stable_json_sha256,
+    _validate_core_decision_receipt,
     _validate_final_core_decisions,
     _validate_reducer_core_decisions,
 )
@@ -153,6 +156,227 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                 output_kind="site_profile",
                 source_inputs=[grounded_profile],
             )
+
+    def test_unique_markdown_emphasis_quote_is_repaired_losslessly(self) -> None:
+        core_text = (
+            "Среди альтернатив названы *ST Tattoo*, *Tattoo Roko* и другие."
+        )
+        units, _manifests = partition_text_records(
+            [{"answer_id": 614, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        self.assertEqual(claim["unit_id"], "614:000000")
+        submitted_quote = "ST Tattoo, Tattoo Roko"
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                {
+                    "canonical_name": "ST Tattoo",
+                    "aliases": [],
+                    "category": "competitor",
+                    "target_relationship": "competitor",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "«ST Tattoo, Tattoo Roko и другие»",
+                },
+                {
+                    "canonical_name": "Tattoo Roko",
+                    "aliases": [],
+                    "category": "competitor",
+                    "target_relationship": "competitor",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "«ST Tattoo, Tattoo Roko и другие»",
+                },
+            ],
+            "uncertainties": [],
+        }
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote=submitted_quote,
+                    reason="В core дословно перечислены две альтернативы.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+
+        receipt = receipts[0]
+        exact_source_quote = "*ST Tattoo*, *Tattoo Roko*"
+        source_start = core_text.index(exact_source_quote)
+        repair = receipt["evidence_quote_repair"]
+        self.assertEqual(receipt["evidence_quote"], exact_source_quote)
+        self.assertEqual(
+            receipt["evidence_quote_sha256"],
+            hashlib.sha256(exact_source_quote.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(repair["submitted_quote"], submitted_quote)
+        self.assertEqual(
+            repair["submitted_quote_sha256"],
+            hashlib.sha256(submitted_quote.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            repair["canonical_quote_sha256"],
+            hashlib.sha256(submitted_quote.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            repair["source_quote_sha256"],
+            hashlib.sha256(exact_source_quote.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(repair["core_start_char"], source_start)
+        self.assertEqual(
+            repair["core_end_char"],
+            source_start + len(exact_source_quote),
+        )
+        self.assertEqual(repair["source_start_char"], source_start)
+        self.assertEqual(
+            repair["source_end_char"],
+            source_start + len(exact_source_quote),
+        )
+
+        coordinate_tamper = copy.deepcopy(receipt)
+        coordinate_tamper["evidence_quote_repair"]["core_start_char"] += 1
+        coordinate_tamper.pop("decision_sha256")
+        coordinate_tamper["decision_sha256"] = _stable_json_sha256(
+            coordinate_tamper
+        )
+        with self.assertRaisesRegex(OpenRouterError, "coordinates"):
+            _validate_core_decision_receipt(coordinate_tamper)
+
+        # The immutable receipt survives attachment validation, while the
+        # exact source spelling is restored to the analytic result before the
+        # terminal evidence gate.
+        attached = _attach_core_decisions(
+            catalog,
+            receipts,
+            [str(claim["unit_id"])],
+        )
+        validated_receipts = _core_decisions_from_inputs(
+            [attached],
+            expected_claims=[claim],
+        )
+        restored = _preserve_entity_catalog_core_decisions(
+            catalog,
+            validated_receipts,
+        )
+        self.assertIn(exact_source_quote, restored["uncertainties"][-1])
+        _validate_final_core_decisions(
+            restored,
+            validated_receipts,
+            output_kind="entity_catalog",
+        )
+
+    def test_markdown_quote_repair_keeps_absolute_partition_offsets(self) -> None:
+        answer = (
+            ("Служебный контекст без сущностей. " * 40)
+            + "Альтернативы: *ST Tattoo*, *Tattoo Roko*."
+        )
+        units, _manifests = partition_text_records(
+            [{"answer_id": 614, "answer": answer}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=256,
+        )
+        unit = next(
+            item for item in units if "ST Tattoo" in str(item["_lr_core_text"])
+        )
+        claim = _core_unit_claims([unit])[0]
+        self.assertGreater(claim["start_char"], 0)
+        submitted_quote = "ST Tattoo, Tattoo Roko"
+        profile = _blank_profile()
+        profile["brand_name"] = "ST Tattoo"
+        profile["evidence"] = [submitted_quote]
+        receipt = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote=submitted_quote,
+                    reason="В core перечислены две альтернативы.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=profile,
+            output_kind="site_profile",
+        )[0]
+        repair = receipt["evidence_quote_repair"]
+        self.assertEqual(
+            repair["source_start_char"],
+            claim["start_char"] + repair["core_start_char"],
+        )
+        self.assertEqual(
+            repair["source_end_char"],
+            claim["start_char"] + repair["core_end_char"],
+        )
+        self.assertEqual(
+            answer[
+                repair["source_start_char"] : repair["source_end_char"]
+            ],
+            receipt["evidence_quote"],
+        )
+
+    def test_markdown_quote_repair_rejects_ambiguity_and_invention(self) -> None:
+        repeated = (
+            "*ST Tattoo*, *Tattoo Roko*; "
+            "*ST Tattoo*, *Tattoo Roko*"
+        )
+        _unit, repeated_claim = self._one_site_unit(repeated)
+        profile = _blank_profile()
+        profile["brand_name"] = "ST Tattoo"
+        profile["evidence"] = ["ST Tattoo, Tattoo Roko"]
+        with self.assertRaisesRegex(OpenRouterError, "ambiguous"):
+            _normalize_core_dispositions(
+                [
+                    _decision(
+                        repeated_claim,
+                        disposition="grounded_fact",
+                        quote="ST Tattoo, Tattoo Roko",
+                        reason="В core перечислены альтернативы.",
+                    )
+                ],
+                expected_claims=[repeated_claim],
+                analytic_output=profile,
+                output_kind="site_profile",
+            )
+
+        _unit, claim = self._one_site_unit(
+            "Альтернативы: *ST Tattoo*, *Tattoo Roko*."
+        )
+        for invented_quote in (
+            "ST Tattoo, Tattoo Moko",
+            "ST tattoo, Tattoo Roko",
+            "ST Tattoo — Tattoo Roko",
+        ):
+            with self.subTest(quote=invented_quote):
+                invented_profile = _blank_profile()
+                invented_profile["brand_name"] = "ST Tattoo"
+                invented_profile["evidence"] = [invented_quote]
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "not an exact core substring",
+                ):
+                    _normalize_core_dispositions(
+                        [
+                            _decision(
+                                claim,
+                                disposition="grounded_fact",
+                                quote=invented_quote,
+                                reason=(
+                                    "Ответ модели содержит изменённую цитату."
+                                ),
+                            )
+                        ],
+                        expected_claims=[claim],
+                        analytic_output=invented_profile,
+                        output_kind="site_profile",
+                    )
 
     def test_generic_no_fact_and_invented_reducer_fail_closed(self) -> None:
         _unit, claim = self._one_site_unit("Cookie settings and navigation")

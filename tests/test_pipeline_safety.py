@@ -4675,6 +4675,90 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calls), 2)
 
+    async def test_entity_catalog_repairs_unique_markdown_only_quote(self) -> None:
+        calls: list[tuple[str, str]] = []
+        leaf_catalog = {
+            "target_aliases": [],
+            "entities": [
+                {
+                    "canonical_name": "ST Tattoo",
+                    "aliases": [],
+                    "category": "competitor",
+                    "target_relationship": "competitor",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "«ST Tattoo, Tattoo Roko и другие»",
+                },
+                {
+                    "canonical_name": "Tattoo Roko",
+                    "aliases": [],
+                    "category": "competitor",
+                    "target_relationship": "competitor",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "«ST Tattoo, Tattoo Roko и другие»",
+                },
+            ],
+            "uncertainties": [],
+        }
+
+        async def fake_processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(
+                (str(kwargs["artifact_key"]), str(kwargs["prompt_version"]))
+            )
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                claim = payload["answers"][0]["core_claim"]
+                self.assertEqual(claim["unit_id"], "614:000000")
+                return {
+                    "catalog": copy.deepcopy(leaf_catalog),
+                    "core_dispositions": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "unit_id": claim["unit_id"],
+                            "core_sha256": claim["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": "ST Tattoo, Tattoo Roko",
+                            "reason": (
+                                "В core перечислены две альтернативы."
+                            ),
+                        }
+                    ],
+                }
+            return copy.deepcopy(leaf_catalog)
+
+        with patch(
+            "app.services.analyzer._processing_artifact",
+            new=fake_processing,
+        ):
+            result = await _entity_catalog(
+                "run-id",
+                {
+                    "brand_name": "Makar's Tattoo",
+                    "brand_aliases": [],
+                    "products": [],
+                },
+                [
+                    {
+                        "answer_id": 614,
+                        "answer": (
+                            "Среди альтернатив названы *ST Tattoo*, "
+                            "*Tattoo Roko* и другие."
+                        ),
+                    }
+                ],
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], ENTITY_CATALOG_CHUNK_VERSION)
+        self.assertIn(
+            "*ST Tattoo*, *Tattoo Roko*",
+            "\n".join(result["uncertainties"]),
+        )
+
     async def test_entity_catalog_packs_by_full_request_bytes_before_merge(self) -> None:
         answers = [
             {
@@ -4702,11 +4786,13 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                     kwargs["user_payload"]  # type: ignore[arg-type]
                 )
                 merge_version = str(kwargs["prompt_version"])
-                return {
-                    "target_aliases": ["merged"],
-                    "entities": [],
-                    "uncertainties": ["17"],
-                }
+                return _deterministic_entity_catalog_union(
+                    list(
+                        kwargs["user_payload"][  # type: ignore[index]
+                            "chunk_catalogs"
+                        ]
+                    )
+                )
 
             chunk = kwargs["user_payload"]["answers"]  # type: ignore[index]
             self.assertLessEqual(1_000 + len(chunk) * 1_000, 9_000)
@@ -4724,7 +4810,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep((17 - first_answer_id) / 1000)
                 return {
                     "catalog": {
-                        "target_aliases": [str(first_answer_id)],
+                        "target_aliases": [
+                            str(chunk[0]["core_claim"]["core_text"])
+                        ],
                         "entities": [],
                         "uncertainties": [
                             str(item["core_claim"]["core_text"])
@@ -4786,7 +4874,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 answers,
             )
 
-        self.assertEqual(result["target_aliases"], ["merged"])
+        self.assertEqual(
+            result["target_aliases"],
+            ["Named entity 0", "Named entity 8", "Named entity 16"],
+        )
         self.assertEqual(max_active, PROCESSING_BATCH_CONCURRENCY)
         self.assertEqual(len(set(chunk_artifact_keys)), 3)
         self.assertEqual(
@@ -4803,7 +4894,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 catalog["target_aliases"][0]
                 for catalog in merge_payload["chunk_catalogs"]  # type: ignore[index]
             ],
-            ["1", "9", "17"],
+            ["Named entity 0", "Named entity 8", "Named entity 16"],
         )
 
     async def test_site_profile_reducer_uses_byte_tree_and_lossless_terminal_union(
@@ -4951,7 +5042,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                         "entities": [
                             {
                                 "canonical_name": (
-                                    f"Competitor {item['answer_id']}"
+                                    str(item["core_claim"]["core_text"])
                                 ),
                                 "aliases": [],
                                 "category": "competitor",
@@ -4960,6 +5051,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                                 "mention_policy": "standalone",
                                 "evidence": (
                                     str(item["core_claim"]["core_text"])
+                                    + " — "
                                     + ("e" * 2_000)
                                 ),
                             }
