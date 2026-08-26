@@ -176,6 +176,101 @@ class OfferCatalogEvidenceTests(unittest.TestCase):
         self.assertIn("generic_category_term_without_client_offer_binding", reasons)
         self.assertIn("generic_category_term_is_not_a_proprietary_product", reasons)
 
+    def test_first_party_competitor_seo_is_not_bound_to_client(self) -> None:
+        excerpts = (
+            (
+                "Example объясняет, как агентство Rival "
+                "предлагает SEO "
+                "своим клиентам."
+            ),
+            "Example предлагает обзор SEO у конкурента.",
+        )
+        for index, excerpt in enumerate(excerpts):
+            with self.subTest(excerpt=excerpt):
+                source = SourceUnit.from_text(
+                    source_unit_id=f"page:competitor-case:{index}",
+                    source_url="https://example.test/blog/rival-seo",
+                    text=excerpt,
+                )
+                catalog = build_offer_catalog(
+                    client_domain="example.test",
+                    client_aliases=("Example",),
+                    source_units=(source,),
+                    candidates=(
+                        _candidate(
+                            source,
+                            name="SEO",
+                            excerpt=excerpt,
+                            kind=OfferKind.SERVICE,
+                        ),
+                    ),
+                )
+
+                self.assertEqual(catalog.accepted_offers, ())
+                self.assertEqual(
+                    catalog.dispositions[0].reason,
+                    "generic_category_term_without_client_offer_binding",
+                )
+
+    def test_generic_consultancy_mention_without_ownership_is_rejected(self) -> None:
+        excerpt = (
+            "Example исследует рынок: консалтинг помогает "
+            "компаниям "
+            "перестраивать процессы."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:consultancy-market",
+            source_url="https://example.test/research/consultancy",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="example.test",
+            client_aliases=("Example",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="консалтинг",
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "offer_without_explicit_client_ownership_binding",
+        )
+
+    def test_explicit_actor_offer_ownership_accepts_unknown_category(self) -> None:
+        excerpt = (
+            "Example предлагает консалтинг для производственных компаний."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:consultancy",
+            source_url="https://example.test/services/consultancy",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="example.test",
+            client_aliases=("Example",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="консалтинг",
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(len(catalog.accepted_offers), 1)
+        self.assertTrue(
+            catalog.accepted_offers[0].evidence_refs[0].client_binding_proven
+        )
+
     def test_explicitly_bound_generic_product_label_is_normalized_to_service(self) -> None:
         excerpt = "Realweb предлагает услугу programmatic для крупных брендов."
         catalog = build_offer_catalog(

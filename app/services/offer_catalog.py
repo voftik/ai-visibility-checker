@@ -7,7 +7,8 @@ transport.  It gives the pipeline a code-owned boundary between probabilistic
 site/profile extraction and later market research / INTENT generation:
 
 * every accepted product, service, or business direction is bound to an exact
-  excerpt in a content-addressed source unit;
+  excerpt in a content-addressed source unit and to an explicit grammatical
+  actor/possessor relationship with the client;
 * generic market vocabulary is not promoted to a client offer merely because
   it occurs in a query or answer;
 * duplicate and overflow decisions are explicit and deterministic;
@@ -32,8 +33,8 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 
-OFFER_CATALOG_VERSION = "aiv-offer-catalog-v1"
-OFFER_EVIDENCE_VERSION = "aiv-offer-evidence-v1"
+OFFER_CATALOG_VERSION = "aiv-offer-catalog-v2"
+OFFER_EVIDENCE_VERSION = "aiv-offer-evidence-v2"
 OFFER_CANDIDATE_NORMALIZATION_VERSION = "aiv-offer-candidate-normalization-v1"
 DOMAIN_RESEARCH_PAYLOAD_VERSION = "aiv-domain-research-payload-v1"
 DOMAIN_RESEARCH_MANIFEST_VERSION = "aiv-domain-research-manifest-v1"
@@ -85,18 +86,74 @@ _GENERIC_OFFER_TERMS = frozenset(
     }
 )
 
-_COMMERCIAL_CUE_RE = re.compile(
-    r"(?:"
-    r"\b(?:we|our|offers?|offering|provides?|delivers?|builds?|develops?|"
-    r"speciali[sz](?:e|es|ed|ing)|services?|solutions?|products?|practice)\b"
-    r"|\b(?:мы|наш(?:а|е|и|у|его|ему|им|их)?|предлага(?:ем|ет|ют)|"
-    r"оказыва(?:ем|ет|ют)|предоставля(?:ем|ет|ют)|разрабатыва(?:ем|ет|ют)|"
-    r"запуска(?:ем|ет|ют)|специализиру(?:емся|ется|ются)|помога(?:ем|ет|ют)|"
-    r"услуг(?:а|и|у|ой|ами)?|решени(?:е|я|ю|ем|ями)|продукт(?:а|ы|у|ом|ами)?|"
-    r"направлени(?:е|я|ю|ем|ями))\b"
-    r")",
+_OWNERSHIP_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:[\r\n.!?;:]+|,\s+(?=(?:а|но|однако|but|while|whereas)\b))",
     re.IGNORECASE,
 )
+_OWNERSHIP_ACTION_RE = re.compile(
+    r"(?<!\S)(?:"
+    r"offer(?:s|ed|ing)?|provid(?:e|es|ed|ing)|deliver(?:s|ed|ing)?|"
+    r"develop(?:s|ed|ing)?|build(?:s|ing)?|launch(?:es|ed|ing)?|"
+    r"creat(?:e|es|ed|ing)|operat(?:e|es|ed|ing)|"
+    r"speciali[sz](?:e|es|ed|ing)(?:\s+in)?|"
+    r"предлага(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"оказыва(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"предоставля(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"разрабатыва(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"развива(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"запуска(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"созда(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"выпуска(?:ю|ем|ет|ют|л|ла|ли)|"
+    r"специализиру(?:юсь|емся|ется|ются|лся|лась|лись)"
+    r"(?:\s+на)?"
+    r")(?!\S)",
+    re.IGNORECASE,
+)
+_OWNERSHIP_SAFE_MODIFIERS = frozenset(
+    {
+        "also",
+        "currently",
+        "directly",
+        "now",
+        "nowadays",
+        "активно",
+        "также",
+        "теперь",
+        "уже",
+        "сейчас",
+    }
+)
+_OWNERSHIP_OBJECT_PREFIX_TOKEN_RE = re.compile(
+    r"(?:a|an|the|its|our|own|new|including|"
+    r"наш(?:а|е|и|у|ей|его|ему|им|их)?|"
+    r"собственн\w*|нов\w*|включая|по|"
+    r"product\w*|service\w*|platform\w*|solution\w*|offering\w*|"
+    r"practice\w*|tool\w*|"
+    r"продукт\w*|услуг\w*|сервис\w*|платформ\w*|решени\w*|"
+    r"направлени\w*|практик\w*|инструмент\w*)",
+    re.IGNORECASE,
+)
+_FOREIGN_ATTRIBUTION_MARKERS = frozenset(
+    {"by", "from", "of", "от", "у"}
+)
+_OWNERSHIP_TYPE_PATTERN = (
+    r"(?:product|service|platform|solution|offering|practice|tool|"
+    r"продукт\w*|услуг\w*|сервис\w*|платформ\w*|решени\w*|"
+    r"направлени\w*|практик\w*|инструмент\w*)"
+)
+_OWNERSHIP_CONNECTOR_PATTERN = (
+    r"(?:a|an|the|is|of|from|by|это|компани\w*|агентств\w*|"
+    r"бренд\w*|групп\w*|от|для)"
+)
+_FIRST_PERSON_ACTORS = ("we", "мы")
+_FIRST_PERSON_POSSESSIVES = (
+    "our",
+    "наш",
+    "наша",
+    "наше",
+    "наши",
+)
+_QUOTE_MARKERS = frozenset({'"', "'", "«", "»", "“", "”", "„", "‟"})
 
 
 class OfferCatalogError(ValueError):
@@ -232,6 +289,194 @@ def _contains_normalized_phrase(text: str, phrase: str) -> bool:
 
 def _is_generic_offer_name(value: str) -> bool:
     return _normalize_phrase(value) in _GENERIC_OFFER_TERMS
+
+
+def _phrase_occurrences(text: str, values: Iterable[str]) -> tuple[tuple[int, int], ...]:
+    """Return exact token-boundary spans in already normalized text."""
+
+    spans: set[tuple[int, int]] = set()
+    for value in values:
+        phrase = _normalize_phrase(value)
+        if not phrase:
+            continue
+        pattern = re.compile(rf"(?<!\S){re.escape(phrase)}(?!\S)")
+        spans.update(match.span() for match in pattern.finditer(text))
+    return tuple(sorted(spans))
+
+
+def _only_safe_actor_modifiers(value: str) -> bool:
+    tokens = value.split()
+    return len(tokens) <= 2 and all(
+        token in _OWNERSHIP_SAFE_MODIFIERS for token in tokens
+    )
+
+
+def _structural_offer_object_prefix(value: str) -> bool:
+    """Allow only grammatical offer introducers, never an arbitrary window."""
+
+    tokens = value.split()
+    return len(tokens) <= 5 and all(
+        _OWNERSHIP_OBJECT_PREFIX_TOKEN_RE.fullmatch(token) is not None
+        for token in tokens
+    )
+
+
+def _has_foreign_post_offer_attribution(
+    clause: str,
+    *,
+    offer_end: int,
+    client_aliases: Sequence[str],
+) -> bool:
+    suffix_tokens = clause[offer_end:].split()
+    if not suffix_tokens or suffix_tokens[0] not in _FOREIGN_ATTRIBUTION_MARKERS:
+        return False
+    attribution = " ".join(suffix_tokens[:6])
+    return not bool(_phrase_occurrences(attribution, client_aliases))
+
+
+def _direct_actor_action_offer_binding(
+    clause: str,
+    *,
+    actor_values: Sequence[str],
+    offer_values: Sequence[str],
+    client_aliases: Sequence[str],
+) -> bool:
+    """Prove a grammatical actor -> commercial action -> offer chain.
+
+    Actor adjacency and the absence of another commercial action before the
+    candidate are structural boundaries.  A mere actor/offer co-occurrence in
+    the same sentence, or an arbitrary character-distance window, is not
+    sufficient.
+    """
+
+    actors = _phrase_occurrences(clause, actor_values)
+    offers = _phrase_occurrences(clause, offer_values)
+    actions = tuple(_OWNERSHIP_ACTION_RE.finditer(clause))
+    for _actor_start, actor_end in actors:
+        for action_index, action in enumerate(actions):
+            if action.start() < actor_end:
+                continue
+            if not _only_safe_actor_modifiers(clause[actor_end : action.start()]):
+                continue
+            next_action_start = (
+                actions[action_index + 1].start()
+                if action_index + 1 < len(actions)
+                else len(clause) + 1
+            )
+            for offer_start, offer_end in offers:
+                if not action.end() <= offer_start < next_action_start:
+                    continue
+                if not _structural_offer_object_prefix(
+                    clause[action.end() : offer_start]
+                ):
+                    continue
+                if _has_foreign_post_offer_attribution(
+                    clause,
+                    offer_end=offer_end,
+                    client_aliases=client_aliases,
+                ):
+                    continue
+                return True
+    return False
+
+
+def _copular_or_possessive_offer_binding(
+    clause: str,
+    *,
+    actor_values: Sequence[str],
+    offer_values: Sequence[str],
+) -> bool:
+    """Recognize explicit ownership statements without an action verb."""
+
+    actors = tuple(
+        re.escape(_normalize_phrase(value))
+        for value in actor_values
+        if _normalize_phrase(value)
+    )
+    offers = tuple(
+        re.escape(_normalize_phrase(value))
+        for value in offer_values
+        if _normalize_phrase(value)
+    )
+    if not actors or not offers:
+        return False
+    actor = rf"(?:{'|'.join(actors)})"
+    offer = rf"(?:{'|'.join(offers)})"
+    boundary = r"(?<!\S){}(?!\S)"
+    connector = rf"(?:\s+{_OWNERSHIP_CONNECTOR_PATTERN}){{0,3}}"
+    patterns = (
+        # Compass — продукт Realweb / Compass is a product of Example.
+        rf"{boundary.format(offer)}{connector}\s+{_OWNERSHIP_TYPE_PATTERN}"
+        rf"{connector}\s+{boundary.format(actor)}",
+        # Compass is a Realweb product.
+        rf"{boundary.format(offer)}{connector}\s+{boundary.format(actor)}"
+        rf"\s+{_OWNERSHIP_TYPE_PATTERN}",
+        # Realweb product Compass / Realweb's Compass platform.
+        rf"{boundary.format(actor)}(?:\s+s)?{connector}\s+"
+        rf"(?:{_OWNERSHIP_TYPE_PATTERN}\s+)?{boundary.format(offer)}"
+        rf"(?:\s+{_OWNERSHIP_TYPE_PATTERN})?",
+        # продукт Realweb Compass / платформа Compass от Realweb.
+        rf"(?<!\S){_OWNERSHIP_TYPE_PATTERN}\s+{boundary.format(actor)}"
+        rf"\s+{boundary.format(offer)}",
+        rf"(?<!\S){_OWNERSHIP_TYPE_PATTERN}\s+{boundary.format(offer)}"
+        rf"(?:\s+(?:от|by|of))\s+{boundary.format(actor)}",
+    )
+    return any(re.search(pattern, clause) is not None for pattern in patterns)
+
+
+def _client_offer_binding_proven(
+    excerpt: str,
+    *,
+    offer_names: Sequence[str],
+    client_aliases: Sequence[str],
+    source_is_client_owned: bool,
+) -> bool:
+    """Require an explicit actor-to-offer relation in the exact excerpt.
+
+    A first-party URL establishes who owns the page, not every noun mentioned
+    on it.  It only licenses unquoted first-person ownership forms.  Named
+    client aliases work on any source, but must be the actor or possessor of
+    the candidate offer inside one grammatical clause.
+    """
+
+    clauses = tuple(
+        normalized
+        for raw_clause in _OWNERSHIP_CLAUSE_SPLIT_RE.split(excerpt)
+        if (normalized := _normalize_phrase(raw_clause))
+    )
+    for clause in clauses:
+        if not _phrase_occurrences(clause, offer_names):
+            continue
+        if _direct_actor_action_offer_binding(
+            clause,
+            actor_values=client_aliases,
+            offer_values=offer_names,
+            client_aliases=client_aliases,
+        ) or _copular_or_possessive_offer_binding(
+            clause,
+            actor_values=client_aliases,
+            offer_values=offer_names,
+        ):
+            return True
+
+        # On a client-owned source, first-person language is an explicit actor
+        # only outside quoted/attributed speech.  A competitor quote such as
+        # `Rival: «мы предлагаем SEO»` must not become a client offer.
+        if source_is_client_owned and not any(
+            marker in excerpt for marker in _QUOTE_MARKERS
+        ):
+            if _direct_actor_action_offer_binding(
+                clause,
+                actor_values=_FIRST_PERSON_ACTORS,
+                offer_values=offer_names,
+                client_aliases=client_aliases,
+            ) or _copular_or_possessive_offer_binding(
+                clause,
+                actor_values=_FIRST_PERSON_POSSESSIVES,
+                offer_values=offer_names,
+            ):
+                return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +873,10 @@ class OfferCatalog:
                 _require_sha256(evidence.evidence_sha256, field="evidence_sha256")
                 if _sha256_text(evidence.evidence_excerpt) != evidence.evidence_sha256:
                     raise OfferCatalogError("Accepted offer evidence digest mismatch")
+                if not evidence.client_binding_proven:
+                    raise OfferCatalogError(
+                        "Accepted offer evidence lacks explicit client ownership"
+                    )
             if offer.generic_category_term and offer.kind is OfferKind.PRODUCT:
                 raise OfferCatalogError("Generic category term cannot be an accepted product")
         for disposition in self.dispositions:
@@ -853,20 +1102,20 @@ def _validate_candidate_evidence(
         raise OfferEvidenceError("not_commercially_relevant")
 
     generic = _is_generic_offer_name(candidate.canonical_name)
-    has_commercial_cue = _COMMERCIAL_CUE_RE.search(candidate.evidence_excerpt) is not None
-    has_client_alias = any(
-        _contains_normalized_phrase(candidate.evidence_excerpt, alias)
-        for alias in client_aliases
-    )
     source_is_client_owned = _is_client_owned_url(source.source_url, client_domain)
-    client_binding_proven = has_commercial_cue and (
-        has_client_alias or source_is_client_owned
+    client_binding_proven = _client_offer_binding_proven(
+        candidate.evidence_excerpt,
+        offer_names=names,
+        client_aliases=client_aliases,
+        source_is_client_owned=source_is_client_owned,
     )
 
     if generic and candidate.kind is OfferKind.PRODUCT and not client_binding_proven:
         raise OfferEvidenceError("generic_category_term_is_not_a_proprietary_product")
     if generic and not client_binding_proven:
         raise OfferEvidenceError("generic_category_term_without_client_offer_binding")
+    if not client_binding_proven:
+        raise OfferEvidenceError("offer_without_explicit_client_ownership_binding")
 
     # A generic category can be a proven client service, but it must never be
     # emitted as a proprietary product merely because an extractor chose the

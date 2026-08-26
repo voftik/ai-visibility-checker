@@ -212,6 +212,7 @@ from app.services.recovery_orchestrator import (
     ACTION_DETERMINISTIC_FALLBACK,
     ACTION_RETRY_WITH_GUIDANCE,
     ACTION_STOP,
+    RecoveryPlannerUnavailable,
 )
 
 
@@ -292,9 +293,7 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
             "kind": "catalog_entity",
             "field": "entities",
             "value": {
-                "canonical_name": (
-                    "L" * 250 + " BoundaryEntity " + "R" * 320
-                ),
+                "canonical_name": ("L" * 250 + " BoundaryEntity " + "R" * 320),
                 "aliases": ["BoundaryEntity"],
             },
         }
@@ -313,9 +312,7 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
         self.assertGreater(len(fragments), 1)
         reconstructed = "".join(
             fragment["value"][
-                fragment["core_start_in_context"] : fragment[
-                    "core_end_in_context"
-                ]
+                fragment["core_start_in_context"] : fragment["core_end_in_context"]
             ]
             for fragment in fragments
         )
@@ -323,8 +320,7 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
         self.assertTrue(
             any(
                 fragment["core_start_in_context"] > 0
-                or fragment["core_end_in_context"]
-                < len(fragment["value"])
+                or fragment["core_end_in_context"] < len(fragment["value"])
                 for fragment in fragments
             )
         )
@@ -354,8 +350,7 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                item["ownership_rule"]
-                == "first_decisive_evidence_character_in_core"
+                item["ownership_rule"] == "first_decisive_evidence_character_in_core"
                 and item["core_sha256"]
                 and item["context_sha256"]
                 for item in sent_fragments
@@ -404,10 +399,7 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
         self.assertEqual(catalog["target_aliases"], ["Target"])
         self.assertEqual(catalog["entities"], [])
         self.assertTrue(
-            any(
-                "Unconfirmed product" in value
-                for value in catalog["uncertainties"]
-            )
+            any("Unconfirmed product" in value for value in catalog["uncertainties"])
         )
 
     def test_overlap_context_does_not_double_own_literal_facts(self) -> None:
@@ -484,9 +476,7 @@ def _attested_panel_usage(
     )
     raw_usage: dict[str, object] = {
         "server_tool_use": {
-            "web_search_requests": (
-                1 if policy is WebSearchPolicy.REQUIRED else 0
-            )
+            "web_search_requests": (1 if policy is WebSearchPolicy.REQUIRED else 0)
         }
     }
     attestation = attest_web_response(
@@ -679,8 +669,7 @@ def _profile_with_offer_contract(
     brand_name = str(enriched.get("brand_name") or "Example").strip()
     source_url = source_url or f"https://{domain}/"
     source_text = (
-        f"{brand_name} предлагает продукт «{offer_name}» "
-        "для анализа видимости."
+        f"{brand_name} предлагает продукт «{offer_name}» для анализа видимости."
     )
     source = SourceUnit.from_text(
         source_unit_id=f"{source_url}:000000",
@@ -753,8 +742,7 @@ class RobotsParserTests(unittest.TestCase):
 
     def test_specific_bot_group_overrides_wildcard(self) -> None:
         rules = _rules_by_bot(
-            "User-agent: *\nDisallow: /\n\n"
-            "User-agent: GPTBot\nAllow: /\n"
+            "User-agent: *\nDisallow: /\n\nUser-agent: GPTBot\nAllow: /\n"
         )
         self.assertEqual(rules["GPTBot"][0], "allow_all")
         self.assertEqual(rules["ClaudeBot"][0], "disallow_all")
@@ -769,22 +757,12 @@ class RobotsParserTests(unittest.TestCase):
         self.assertFalse(
             robots_path_allowed(raw, "https://example.com/private/account")
         )
-        self.assertTrue(
-            robots_path_allowed(raw, "https://example.com/private/public")
-        )
+        self.assertTrue(robots_path_allowed(raw, "https://example.com/private/public"))
 
     def test_longest_path_rule_and_allow_tie_are_respected(self) -> None:
-        raw = (
-            "User-agent: *\n"
-            "Disallow: /catalog/*\n"
-            "Allow: /catalog/public\n"
-        )
-        self.assertFalse(
-            robots_path_allowed(raw, "https://example.com/catalog/secret")
-        )
-        self.assertTrue(
-            robots_path_allowed(raw, "https://example.com/catalog/public")
-        )
+        raw = "User-agent: *\nDisallow: /catalog/*\nAllow: /catalog/public\n"
+        self.assertFalse(robots_path_allowed(raw, "https://example.com/catalog/secret"))
+        self.assertTrue(robots_path_allowed(raw, "https://example.com/catalog/public"))
 
 
 class DomainAndJobSafetyTests(unittest.TestCase):
@@ -1176,9 +1154,7 @@ class PanelRoutingTests(unittest.TestCase):
         self.assertTrue(access["metric_eligible"])
         self.assertTrue(access["context_eligible"])
         self.assertEqual(access["metric_evidence_state"], "strict_verified")
-        self.assertTrue(
-            LEGACY_PANEL_EVIDENCE_VERSION.endswith("evidence-v2")
-        )
+        self.assertTrue(LEGACY_PANEL_EVIDENCE_VERSION.endswith("evidence-v2"))
 
     def test_panel_v1_hash_is_verified_without_mutating_usage(self) -> None:
         prompt_text = "Какие сервисы выбрать?"
@@ -1600,9 +1576,7 @@ class PanelRoutingTests(unittest.TestCase):
                 "parent": {"memory": {"data_state": "unavailable"}},
                 "portfolio": {"memory": {"data_state": "unavailable"}},
             },
-            "brand_knowledge": {
-                "memory": {"data_state": "unavailable"}
-            },
+            "brand_knowledge": {"memory": {"data_state": "unavailable"}},
         }
         normalized = _normalize_unpaired_memory_illustration(
             concepts,
@@ -1637,12 +1611,8 @@ class PanelRoutingTests(unittest.TestCase):
                 "generation_version": ILLUSTRATION_GENERATION_VERSION,
             },
         )
-        self.assertTrue(
-            _illustration_cache_matches(illustration, "concept-v2")
-        )
-        self.assertFalse(
-            _illustration_cache_matches(illustration, "concept-v3")
-        )
+        self.assertTrue(_illustration_cache_matches(illustration, "concept-v2"))
+        self.assertFalse(_illustration_cache_matches(illustration, "concept-v3"))
 
     def test_competitive_image_prompt_never_exposes_brand_as_text(self) -> None:
         prompt = _illustration_prompt(
@@ -1726,7 +1696,9 @@ class PanelRoutingTests(unittest.TestCase):
             normalized["core_claim"],
             "Show the measured competitive position.",
         )
-        self.assertEqual(normalized["fact_contract"]["competitors"][0]["name"], "Alternative")
+        self.assertEqual(
+            normalized["fact_contract"]["competitors"][0]["name"], "Alternative"
+        )
         self.assertNotIn("visual_node_count_policy", normalized)
 
     def test_llm_cache_is_bound_to_input_model_and_layer_version(self) -> None:
@@ -1855,9 +1827,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             }
             for item in prompts
         ]
-        need_based = next(
-            check for check in checks if check["declared_intent"] == "NB"
-        )
+        need_based = next(check for check in checks if check["declared_intent"] == "NB")
         need_based["dominant_intent"] = "NAV"
         need_based["matches"] = False
         need_based["reason"] = "Запрос ищет площадку, а не решает задачу."
@@ -1876,9 +1846,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("боль или ограничение", errors[0])
 
     def test_prompt_review_schema_checks_declared_and_dominant_intent(self) -> None:
-        check_properties = (
-            PROMPT_SET_REVIEW_SCHEMA["properties"]["checks"]["items"]["properties"]
-        )
+        check_properties = PROMPT_SET_REVIEW_SCHEMA["properties"]["checks"]["items"][
+            "properties"
+        ]
         self.assertEqual(
             check_properties["declared_intent"]["enum"],
             ["I", "E", "T", "NB", "NAV", "TR"],
@@ -2020,7 +1990,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["raw_text"], '{"partial":')
         self.assertEqual(failed["usage_json"], usage)
 
-    async def test_site_profile_explicitly_models_market_and_customer_choice(self) -> None:
+    async def test_site_profile_explicitly_models_market_and_customer_choice(
+        self,
+    ) -> None:
         required = set(SITE_PROFILE_SCHEMA["required"])
         self.assertTrue(
             {
@@ -2175,9 +2147,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(structuring_request.get("response_schema"))
         self.assertTrue(callable(structuring_request.get("audit_checkpoint")))
         self.assertIn("resume_checkpoint", structuring_request)
-        structuring_payload = json.loads(
-            structuring_request["messages"][1]["content"]
-        )
+        structuring_payload = json.loads(structuring_request["messages"][1]["content"])
         self.assertIn("evidence_tree", structuring_payload)
         self.assertNotIn("site_evidence", structuring_payload["site_input"])
         self.assertEqual(
@@ -2354,9 +2324,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 "title": f"Страница {index}",
                 "meta_description": "Большая страница",
                 "main_text": (f"unit-{index}-evidence " * 1_200),
-                "content_storage_state": (
-                    "prefix_only" if index == 2 else "complete"
-                ),
+                "content_storage_state": ("prefix_only" if index == 2 else "complete"),
                 "absence_claims_allowed": index != 2,
             }
             for index in range(3)
@@ -2391,9 +2359,8 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             unit_id = request["unit_contract"]["source_unit_id"]
             self.assertEqual(unit_id, "market-domain:huge.example")
             citation_url = "https://research.example/market"
-            notes = (
-                f"Подтверждённый вывод для {unit_id}. Источник {citation_url}. "
-                + ("Большие исследовательские заметки. " * 4_500)
+            notes = f"Подтверждённый вывод для {unit_id}. Источник {citation_url}. " + (
+                "Большие исследовательские заметки. " * 4_500
             )
             expected_research_notes = notes
             return SimpleNamespace(
@@ -2423,24 +2390,26 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                     else "evidence"
                 )
                 findings = [
-                        {
-                            "dimension": "site_confirmed",
-                            "claim": f"Положительный факт {unit_id}",
-                            "evidence": "Буквальный фрагмент.",
-                            "source_urls": [page_url],
-                            "source_unit_ids": [unit_id],
-                            "confidence": "high",
-                        },
+                    {
+                        "dimension": "site_confirmed",
+                        "claim": f"Положительный факт {unit_id}",
+                        "evidence": "Буквальный фрагмент.",
+                        "source_urls": [page_url],
+                        "source_unit_ids": [unit_id],
+                        "confidence": "high",
+                    },
                 ]
                 if external_urls:
-                    findings.append({
+                    findings.append(
+                        {
                             "dimension": "market",
                             "claim": f"Рыночный факт {unit_id}",
                             "evidence": "Подтверждено внешним источником.",
                             "source_urls": [external_urls[0]],
                             "source_unit_ids": [unit_id],
                             "confidence": "medium",
-                        })
+                        }
+                    )
                 return {
                     "findings": findings,
                     "uncertainties": (
@@ -2526,9 +2495,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         manifest = tree["manifest"]
-        self.assertEqual(
-            manifest["version"], MARKET_RESEARCH_INPUT_HARNESS_VERSION
-        )
+        self.assertEqual(manifest["version"], MARKET_RESEARCH_INPUT_HARNESS_VERSION)
         self.assertGreater(manifest["source_unit_count"], len(pages))
         self.assertEqual(chat_mock.await_count, 1)
         self.assertEqual(manifest["web_retrieval_tree_count"], 1)
@@ -2538,9 +2505,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         )
         aggregate_timeout.assert_not_called()
         retrieval_contract = manifest["web_retrieval_contract"]
-        self.assertIsNone(
-            retrieval_contract["aggregate_liveness_deadline_seconds"]
-        )
+        self.assertIsNone(retrieval_contract["aggregate_liveness_deadline_seconds"])
         self.assertNotIn("liveness_deadline_seconds", retrieval_contract)
         self.assertEqual(
             retrieval_contract["liveness_policy"],
@@ -2569,13 +2534,11 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             len(mapped_note_payloads),
             manifest["source_unit_count"],
         )
-        note_payloads_by_source: dict[str, list[dict[str, Any]]] = (
-            defaultdict(list)
-        )
+        note_payloads_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in mapped_note_payloads:
-            note_payloads_by_source[
-                str(item["source_unit"]["source_unit_id"])
-            ].append(item)
+            note_payloads_by_source[str(item["source_unit"]["source_unit_id"])].append(
+                item
+            )
         nonempty_note_sources = [
             unit_id
             for unit_id, fragments in note_payloads_by_source.items()
@@ -2588,20 +2551,12 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         for unit_id in nonempty_note_sources:
             fragments = sorted(
                 note_payloads_by_source[unit_id],
-                key=lambda item: int(
-                    item["research_notes_contract"]["unit_index"]
-                ),
+                key=lambda item: int(item["research_notes_contract"]["unit_index"]),
             )
             reconstructed = "".join(
                 item["research_notes"][
-                    int(
-                        item["research_notes_contract"][
-                            "core_start_in_context"
-                        ]
-                    ) : int(
-                        item["research_notes_contract"][
-                            "core_end_in_context"
-                        ]
+                    int(item["research_notes_contract"]["core_start_in_context"]) : int(
+                        item["research_notes_contract"]["core_end_in_context"]
                     )
                 ]
                 for item in fragments
@@ -2623,10 +2578,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             {"https://research.example/market"},
         )
         self.assertTrue(
-            any(
-                item["state"] == "unknown"
-                for item in tree["packet"]["unit_coverage"]
-            )
+            any(item["state"] == "unknown" for item in tree["packet"]["unit_coverage"])
         )
         self.assertTrue(structured_stage_calls)
         self.assertTrue(
@@ -2643,14 +2595,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         attempt_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
-            if call.kwargs["artifact_key"].startswith(
-                "market_research_web_attempt_"
-            )
+            if call.kwargs["artifact_key"].startswith("market_research_web_attempt_")
             and call.kwargs["status"] == "completed"
         ]
-        self.assertEqual(
-            len(attempt_writes), manifest["web_retrieval_post_count"]
-        )
+        self.assertEqual(len(attempt_writes), manifest["web_retrieval_post_count"])
         self.assertTrue(all(call["raw_text"] for call in attempt_writes))
 
     async def test_market_web_limit_refines_without_losing_unicode_prefix(
@@ -2765,9 +2713,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             strict=True,
         ):
             self.assertEqual(
-                output["research_notes"][
-                    row["raw_start_char"] : row["raw_end_char"]
-                ],
+                output["research_notes"][row["raw_start_char"] : row["raw_end_char"]],
                 raw,
             )
         for payload in seen_payloads:
@@ -2810,9 +2756,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         )
 
         children = _market_research_web_children(
-                scope,
-                predecessor_raw_sha256="a" * 64,
-                predecessor_citation_urls=["https://source.example/fact"],
+            scope,
+            predecessor_raw_sha256="a" * 64,
+            predecessor_citation_urls=["https://source.example/fact"],
         )
         self.assertEqual([item["refinement_path"] for item in children], ["0", "1"])
         grandchildren = _market_research_web_children(
@@ -2967,12 +2913,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ),
         ):
-            output, plan, raw, usage = (
-                await _market_research_structuring_shards(
-                    "run-id",
-                    structuring_payload=structuring_payload,
-                    structuring_system="Структурируй только подтверждённые данные.",
-                )
+            output, plan, raw, usage = await _market_research_structuring_shards(
+                "run-id",
+                structuring_payload=structuring_payload,
+                structuring_system="Структурируй только подтверждённые данные.",
             )
 
         self.assertGreater(len(seen_payloads), 1)
@@ -3031,7 +2975,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             return copy.deepcopy(value["output_json"]) if value else None
 
         async def fake_save_artifact(_run_id: str, **kwargs: Any) -> None:
-            if kwargs["status"] == "completed" and kwargs.get("output_json") is not None:
+            if (
+                kwargs["status"] == "completed"
+                and kwargs.get("output_json") is not None
+            ):
                 stored[kwargs["artifact_key"]] = copy.deepcopy(kwargs)
 
         async def fake_chat(**kwargs: Any) -> SimpleNamespace:
@@ -3121,7 +3068,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             return copy.deepcopy(stored[key]["output_json"]) if key in stored else None
 
         async def save(_run_id: str, **kwargs: Any) -> None:
-            if kwargs["status"] == "completed" and kwargs.get("output_json") is not None:
+            if (
+                kwargs["status"] == "completed"
+                and kwargs.get("output_json") is not None
+            ):
                 stored[kwargs["artifact_key"]] = copy.deepcopy(kwargs)
 
         async def complete_chat(**_kwargs: Any) -> SimpleNamespace:
@@ -3178,9 +3128,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
 
             stored.pop(leaf_key)
             receipt_key = next(
-                key
-                for key in stored
-                if key.startswith("market_research_web_attempt_")
+                key for key in stored if key.startswith("market_research_web_attempt_")
             )
             stored[receipt_key]["output_json"]["raw_text"] += " подмена"
             with self.assertRaisesRegex(OpenRouterError, "checksum mismatch"):
@@ -3220,7 +3168,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             return copy.deepcopy(stored[key]["output_json"]) if key in stored else None
 
         async def save(_run_id: str, **kwargs: Any) -> None:
-            if kwargs["status"] == "completed" and kwargs.get("output_json") is not None:
+            if (
+                kwargs["status"] == "completed"
+                and kwargs.get("output_json") is not None
+            ):
                 stored[kwargs["artifact_key"]] = copy.deepcopy(kwargs)
 
         async def checkpoint_then_crash(**kwargs: Any) -> SimpleNamespace:
@@ -3715,10 +3666,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generator.await_count, 4)
         self.assertEqual(len(artifacts), 4)
         self.assertEqual(
-            {
-                value["input_json"]["budget_attempt"]
-                for value in artifacts.values()
-            },
+            {value["input_json"]["budget_attempt"] for value in artifacts.values()},
             {1, 2, 3, 4},
         )
         self.assertTrue(
@@ -3817,9 +3765,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("не вернул пригодный ответ", failed["error_message"])
         for request in generator.await_args_list:
-            self.assertFalse(
-                request.kwargs["retry_response_contract_errors"]
-            )
+            self.assertFalse(request.kwargs["retry_response_contract_errors"])
             self.assertFalse(request.kwargs["retry_transport_errors"])
 
     async def test_prompt_generator_exhausts_four_one_shot_failures_before_recovery(
@@ -3852,9 +3798,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._reserve_prompt_candidate_attempt",
                 new=AsyncMock(
-                    side_effect=tuple(
-                        f"candidate-{attempt}" for attempt in range(1, 5)
-                    )
+                    side_effect=tuple(f"candidate-{attempt}" for attempt in range(1, 5))
                 ),
             ) as reserve,
             patch(
@@ -3965,13 +3909,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 return 0, None, "", {}, None, 0
             latest = max(
                 matching,
-                key=lambda value: int(
-                    value["input_json"].get("budget_attempt") or 0
-                ),
+                key=lambda value: int(value["input_json"].get("budget_attempt") or 0),
             )
-            budget_attempt = int(
-                latest["input_json"].get("budget_attempt") or 0
-            )
+            budget_attempt = int(latest["input_json"].get("budget_attempt") or 0)
             return (
                 len(matching),
                 copy.deepcopy(latest.get("output_json")),
@@ -3986,9 +3926,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             **kwargs: Any,
         ) -> None:
             artifacts[str(kwargs["artifact_key"])] = copy.deepcopy(kwargs)
-            metadata = (kwargs.get("usage_json") or {}).get(
-                "_aiv_prompt_candidate"
-            )
+            metadata = (kwargs.get("usage_json") or {}).get("_aiv_prompt_candidate")
             if isinstance(metadata, dict):
                 events.append(str(metadata.get("reservation_state") or ""))
 
@@ -4129,11 +4067,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         ) -> dict[str, object] | None:
             model = str(kwargs.get("model") or "")
             queried_models.append(model)
-            return (
-                fallback
-                if model == "deterministic/prompt-fallback-v1"
-                else None
-            )
+            return fallback if model == "deterministic/prompt-fallback-v1" else None
 
         with (
             patch(
@@ -4241,6 +4175,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 ACTION_STOP,
             },
         )
+        self.assertEqual(
+            planner.await_args.kwargs["stage_planner_call_limit"],
+            1,
+        )
         mark.assert_awaited_once_with(plan)
         finish.assert_awaited_once()
         self.assertTrue(finish.await_args.kwargs["succeeded"])
@@ -4256,6 +4194,90 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             research,
         )
         chat_mock.assert_not_awaited()
+        self.assertEqual(_validate_prompt_set(recovered, profile), [])
+
+    async def test_prompt_recovery_uses_verified_code_owned_fallback_when_fable_fails(
+        self,
+    ) -> None:
+        profile = _profile_with_offer_contract(
+            {
+                "brand_name": "Example",
+                "brand_aliases": [],
+                "category": "Аналитика",
+                "customer_jobs": ["Сравнить поставщиков"],
+                "decision_criteria": ["Точность"],
+                "geography": ["Россия"],
+            }
+        )
+        research = _ready_market_research()
+        payload = {
+            "requested_site": {},
+            "site_profile": profile,
+            "market_research": research,
+            "market_research_digest": "a" * 64,
+        }
+        plan = SimpleNamespace(
+            epoch=2,
+            decision={
+                "action": ACTION_DETERMINISTIC_FALLBACK,
+                "rationale": "Кодовый fallback сохраняет строгие проверки.",
+                "guidance": "",
+                "acceptance_checks": [
+                    "prompt_contract_valid",
+                    "semantic_review_passed",
+                ],
+            },
+        )
+        with (
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(
+                    side_effect=RecoveryPlannerUnavailable("provider unavailable")
+                ),
+            ) as planner,
+            patch(
+                "app.services.analyzer.plan_code_owned_recovery",
+                new=AsyncMock(return_value=plan),
+            ) as fallback,
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.finish_recovery",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._save_accepted_prompt_set",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._review_prompt_set_semantics",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            recovered = await _recover_prompt_set(
+                "run-id",
+                profile=profile,
+                research=research,
+                payload=payload,
+                system="Системный контракт",
+                previous_set=None,
+                last_errors=["Критик отклонил набор."],
+            )
+
+        planner.assert_awaited_once()
+        fallback.assert_awaited_once()
+        fallback_kwargs = fallback.await_args.kwargs
+        self.assertEqual(
+            fallback_kwargs["decision"]["action"],
+            ACTION_DETERMINISTIC_FALLBACK,
+        )
+        self.assertEqual(
+            set(fallback_kwargs["decision"]["acceptance_checks"]),
+            {"prompt_contract_valid", "semantic_review_passed"},
+        )
         self.assertEqual(_validate_prompt_set(recovered, profile), [])
 
     async def test_guided_prompt_recovery_disables_internal_chat_retries(
@@ -4502,9 +4524,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         research_before = _ready_market_research(
             first_job="Сравнить поставщиков аналитики"
         )
-        research_after = json.loads(
-            json.dumps(research_before, ensure_ascii=False)
-        )
+        research_after = json.loads(json.dumps(research_before, ensure_ascii=False))
         research_after["external_market_research"]["customer_jobs"] = [
             "Проверить полноту рыночных данных"
         ]
@@ -4706,9 +4726,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             _run_id: str,
             **kwargs: Any,
         ) -> dict[str, Any]:
-            calls.append(
-                (str(kwargs["artifact_key"]), str(kwargs["prompt_version"]))
-            )
+            calls.append((str(kwargs["artifact_key"]), str(kwargs["prompt_version"])))
             payload = kwargs["user_payload"]
             if "answers" in payload:
                 claim = payload["answers"][0]["core_claim"]
@@ -4722,9 +4740,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                             "core_sha256": claim["core_sha256"],
                             "disposition": "grounded_fact",
                             "evidence_quote": "ST Tattoo, Tattoo Roko",
-                            "reason": (
-                                "В core перечислены две альтернативы."
-                            ),
+                            "reason": ("В core перечислены две альтернативы."),
                         }
                     ],
                 }
@@ -4759,7 +4775,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             "\n".join(result["uncertainties"]),
         )
 
-    async def test_entity_catalog_packs_by_full_request_bytes_before_merge(self) -> None:
+    async def test_entity_catalog_packs_by_full_request_bytes_before_merge(
+        self,
+    ) -> None:
         answers = [
             {
                 "answer_id": index + 1,
@@ -4810,13 +4828,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep((17 - first_answer_id) / 1000)
                 return {
                     "catalog": {
-                        "target_aliases": [
-                            str(chunk[0]["core_claim"]["core_text"])
-                        ],
+                        "target_aliases": [str(chunk[0]["core_claim"]["core_text"])],
                         "entities": [],
                         "uncertainties": [
-                            str(item["core_claim"]["core_text"])
-                            for item in chunk
+                            str(item["core_claim"]["core_text"]) for item in chunk
                         ],
                     },
                     "core_dispositions": [
@@ -4857,9 +4872,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._structured_provider_request_utf8_bytes",
                 side_effect=lambda **kwargs: (
-                    1_000
-                    + len(kwargs["user_payload"].get("answers", []))
-                    * 1_000
+                    1_000 + len(kwargs["user_payload"].get("answers", [])) * 1_000
                 ),
             ),
         ):
@@ -4951,17 +4964,12 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                         "disposition": "grounded_fact",
                         "evidence_quote": quote,
                         "reason": (
-                            "В core буквально присутствует профильный "
-                            "факт страницы."
+                            "В core буквально присутствует профильный факт страницы."
                         ),
                     },
                 }
-            reducer_payloads.append(
-                (str(kwargs["system"]), copy.deepcopy(payload))
-            )
-            return _deterministic_site_profile_union(
-                list(payload["partial_profiles"])
-            )
+            reducer_payloads.append((str(kwargs["system"]), copy.deepcopy(payload)))
+            return _deterministic_site_profile_union(list(payload["partial_profiles"]))
 
         envelope = {
             "context_length": 40_000,
@@ -5014,9 +5022,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("source_unit_ids", reduction)
             self.assertNotIn("source_manifests", reduction)
         self.assertEqual(
-            save_artifact.await_args.kwargs["usage_json"][
-                "_aiv_analyzer_reducer"
-            ]["mode"],
+            save_artifact.await_args.kwargs["usage_json"]["_aiv_analyzer_reducer"][
+                "mode"
+            ],
             "deterministic_terminal_union",
         )
 
@@ -5050,7 +5058,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                                 "commercially_relevant": True,
                                 "mention_policy": "standalone",
                                 "evidence": (
-                                    str(item["core_claim"]["core_text"])
+                                    "«"
+                                    + str(item["core_claim"]["core_text"])
+                                    + "»"
                                     + " — "
                                     + ("e" * 2_000)
                                 ),
@@ -5075,9 +5085,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 }
             reducer_requests.append((str(kwargs["system"]), copy.deepcopy(payload)))
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         envelope = {
             "context_length": 40_000,
@@ -5095,8 +5103,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._structured_provider_request_utf8_bytes",
                 side_effect=lambda **kwargs: (
-                    20_000
-                    + len(kwargs["user_payload"].get("answers", [])) * 6_000
+                    20_000 + len(kwargs["user_payload"].get("answers", [])) * 6_000
                     if "answers" in kwargs["user_payload"]
                     else _structured_provider_request_utf8_bytes(**kwargs)
                 ),
@@ -5132,9 +5139,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("source_unit_ids", payload["reduction"])
             self.assertNotIn("partition_manifests", payload["reduction"])
         self.assertEqual(
-            save_artifact.await_args.kwargs["usage_json"][
-                "_aiv_analyzer_reducer"
-            ]["mode"],
+            save_artifact.await_args.kwargs["usage_json"]["_aiv_analyzer_reducer"][
+                "mode"
+            ],
             "deterministic_terminal_union",
         )
 
@@ -5307,9 +5314,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._structured_provider_request_utf8_bytes",
                 side_effect=lambda **kwargs: (
-                    1_000
-                    + len(kwargs["user_payload"].get("answers", []))
-                    * 5_000
+                    1_000 + len(kwargs["user_payload"].get("answers", [])) * 5_000
                 ),
             ),
         ):
@@ -5327,9 +5332,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
         # Partition requests may complete independently, but persistence is
         # one code-owned all-or-nothing write for the reconstructed answers.
         self.assertEqual(save_order, [1])
-        progress_values = [
-            call.kwargs["percent"] for call in progress.await_args_list
-        ]
+        progress_values = [call.kwargs["percent"] for call in progress.await_args_list]
         self.assertEqual(progress_values[0], 76)
         self.assertEqual(progress_values[-1], 80)
         self.assertEqual(progress_values, sorted(progress_values))
@@ -5384,9 +5387,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 "mode": "memory",
                 "system": "Test",
                 "answer_model": "test/model",
-                "answer_sha256": hashlib.sha256(
-                    raw_answer.encode("utf-8")
-                ).hexdigest(),
+                "answer_sha256": hashlib.sha256(raw_answer.encode("utf-8")).hexdigest(),
                 "scenario": "Что известно про Example?",
                 "scenario_role": "brand_diagnostic",
                 "intent_class": "I",
@@ -5519,8 +5520,7 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 str(payload["context_provenance"]["all_record_ids_sha256"])
             )
             seen_names.update(
-                str(entity["canonical_name"])
-                for entity in payload["entity_catalog"]
+                str(entity["canonical_name"]) for entity in payload["entity_catalog"]
             )
         self.assertEqual(len(request_ids), len(set(request_ids)))
         self.assertEqual(len(manifest_digests), 1)
@@ -5593,13 +5593,13 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             await reprocess_saved_answers("run-id")
 
         finish.assert_awaited_once()
-        self.assertFalse(
-            finish.await_args.kwargs["regenerate_illustrations"]
-        )
+        self.assertFalse(finish.await_args.kwargs["regenerate_illustrations"])
         generate_prompts.assert_not_awaited()
         run_panel.assert_not_awaited()
 
-    async def test_visual_concepts_use_strong_model_with_independent_artifact(self) -> None:
+    async def test_visual_concepts_use_strong_model_with_independent_artifact(
+        self,
+    ) -> None:
         concepts = {
             "illustrations": [
                 {
@@ -5768,13 +5768,9 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             hashlib.sha256(generation_prompt.encode("utf-8")).hexdigest(),
         )
         self.assertTrue(payload["quality_requirements"]["facts_grounded"])
+        self.assertTrue(payload["quality_requirements"]["no_unsupported_assertions"])
         self.assertTrue(
-            payload["quality_requirements"]["no_unsupported_assertions"]
-        )
-        self.assertTrue(
-            content[1]["image_url"]["url"].startswith(
-                "data:image/png;base64,"
-            )
+            content[1]["image_url"]["url"].startswith("data:image/png;base64,")
         )
         encoded_image = content[1]["image_url"]["url"].split(",", 1)[1]
         self.assertEqual(base64.b64decode(encoded_image), b"fake-png-bytes")
@@ -5839,22 +5835,17 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         cache_inputs = [
-            call.kwargs["input_json"]
-            for call in artifact_output.await_args_list
+            call.kwargs["input_json"] for call in artifact_output.await_args_list
         ]
         request_inputs = [
             json.loads(call.kwargs["messages"][1]["content"][0]["text"])
             for call in chat_mock.await_args_list
         ]
         expected_hashes = [
-            hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            for prompt in prompts
+            hashlib.sha256(prompt.encode("utf-8")).hexdigest() for prompt in prompts
         ]
         self.assertEqual(
-            [
-                payload["generation_prompt_sha256"]
-                for payload in cache_inputs
-            ],
+            [payload["generation_prompt_sha256"] for payload in cache_inputs],
             expected_hashes,
         )
         self.assertEqual(request_inputs, cache_inputs)
@@ -5933,14 +5924,12 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=[rejected, approved]),
             ),
         ):
-            image, review, accepted_prompt, attempts = (
-                await _generate_reviewed_image(
-                    "run-id",
-                    sequence=3,
-                    concept={"role": "web_memory_gap"},
-                    fact_context={"knowledge_gap": 0},
-                    base_prompt="Build a literal comparison.",
-                )
+            image, review, accepted_prompt, attempts = await _generate_reviewed_image(
+                "run-id",
+                sequence=3,
+                concept={"role": "web_memory_gap"},
+                fact_context={"knowledge_gap": 0},
+                base_prompt="Build a literal comparison.",
             )
 
         self.assertEqual(image.content, b"second")
@@ -6007,14 +5996,12 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=[rejected, rejected, approved]),
             ),
         ):
-            image, review, _accepted_prompt, attempts = (
-                await _generate_reviewed_image(
-                    "run-id",
-                    sequence=1,
-                    concept={"role": "technical_access"},
-                    fact_context={"technical": {"score": 95}},
-                    base_prompt="Show server-readable content.",
-                )
+            image, review, _accepted_prompt, attempts = await _generate_reviewed_image(
+                "run-id",
+                sequence=1,
+                concept={"role": "technical_access"},
+                fact_context={"technical": {"score": 95}},
+                base_prompt="Show server-readable content.",
             )
 
         self.assertEqual(image.content, b"candidate-3")
@@ -6376,9 +6363,7 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "app.services.analyzer._illustration_concepts",
-                new=AsyncMock(
-                    side_effect=OpenRouterError("unsupported number 100")
-                ),
+                new=AsyncMock(side_effect=OpenRouterError("unsupported number 100")),
             ),
             patch(
                 "app.services.analyzer._save_artifact",
@@ -6401,8 +6386,7 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
         fallback_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
-            if call.kwargs.get("artifact_key")
-            == "illustration_concepts_fallback"
+            if call.kwargs.get("artifact_key") == "illustration_concepts_fallback"
         ]
         self.assertEqual(len(fallback_writes), 1)
         self.assertEqual(fallback_writes[0]["status"], "completed")
@@ -6415,9 +6399,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
         *,
         last_suffix: str = "LAST-SENTINEL",
     ) -> list[tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation]]:
-        rows: list[
-            tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation]
-        ] = []
+        rows: list[tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation]] = []
         providers = ("openai", "gemini", "perplexity", "deepseek", "claude")
         intents = ("I", "E", "T", "NB", "NAV", "TR")
         for index in range(count):
@@ -6446,11 +6428,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
                 run_id="run-id",
                 prompt_key=f"prompt-{index}",
                 intent_class=intents[index % len(intents)],
-                role=(
-                    "brand_diagnostic"
-                    if index >= 15
-                    else "unbranded_discovery"
-                ),
+                role=("brand_diagnostic" if index >= 15 else "unbranded_discovery"),
                 text=f"Пользовательский сценарий № {index}",
                 sequence=index + 1,
             )
@@ -6464,9 +6442,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
                     "valid": True,
                     "target_mentioned": index % 3 == 0,
                     "target_position": 1 if index % 3 == 0 else None,
-                    "target_role": (
-                        "recommended" if index % 3 == 0 else "absent"
-                    ),
+                    "target_role": ("recommended" if index % 3 == 0 else "absent"),
                     "sentiment": "positive" if index % 3 == 0 else "unknown",
                     "evidence": [],
                     "uncertainties": [],
@@ -6661,9 +6637,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
         for item in selected:
             if item["context_access"] == "full_text":
                 self.assertGreater(len(item["answer_text"]), 5000)
-                self.assertTrue(
-                    item["answer_text"].endswith(("END", "LAST-SENTINEL"))
-                )
+                self.assertTrue(item["answer_text"].endswith(("END", "LAST-SENTINEL")))
                 self.assertEqual(item["verified_mode"], item["requested_mode"])
             else:
                 self.assertEqual(item["context_access"], "metadata_only")
@@ -6678,7 +6652,19 @@ class FinalAnswerCorpusTests(unittest.TestCase):
         specs = [
             (1, "p1", 0, "web", "T", "b", "missing", False, False, "absent", "unknown"),
             (2, "p1", 0, "memory", "T", "u", "missing", True, True, "absent", "mixed"),
-            (3, "p1", 1, "web", "T", "b", "legacy", True, False, "recommended", "positive"),
+            (
+                3,
+                "p1",
+                1,
+                "web",
+                "T",
+                "b",
+                "legacy",
+                True,
+                False,
+                "recommended",
+                "positive",
+            ),
             (4, "p1", 1, "memory", "E", "b", "legacy", True, True, "absent", "unknown"),
             (5, "p2", 0, "web", "I", "u", "ok", True, False, "mentioned", "positive"),
             (6, "p2", 1, "web", "E", "b", "ok", False, True, "absent", "unknown"),
@@ -6846,10 +6832,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             methodology["summary"],
         )
         self.assertFalse(
-            any(
-                "без веб-поиска" in item["name"]
-                for item in methodology["modes"]
-            )
+            any("без веб-поиска" in item["name"] for item in methodology["modes"])
         )
         self.assertIn("не участвует в процентах", methodology["offline_limit"])
 
@@ -6968,16 +6951,16 @@ class FinalAnswerCorpusTests(unittest.TestCase):
         self.assertNotIn("facets", public_memory)
         self.assertTrue(public_memory["qualitative_context_withheld"])
 
-        public_knowledge_provider_memory = (
-            report["brand_knowledge"]["providers"][0]["memory"]
-        )
+        public_knowledge_provider_memory = report["brand_knowledge"]["providers"][0][
+            "memory"
+        ]
         self.assertNotIn("facets", public_knowledge_provider_memory)
         self.assertTrue(
             public_knowledge_provider_memory["qualitative_context_withheld"]
         )
-        public_discovery_provider_memory = (
-            report["discovery"]["providers"][0]["brand_knowledge"]["memory"]
-        )
+        public_discovery_provider_memory = report["discovery"]["providers"][0][
+            "brand_knowledge"
+        ]["memory"]
         self.assertNotIn("facets", public_discovery_provider_memory)
         self.assertTrue(
             public_discovery_provider_memory["qualitative_context_withheld"]
@@ -7174,21 +7157,13 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             [item["answer_id"] for item in corpus],
         )
         self.assertEqual(
-            [
-                item["raw_answer_sha256"]
-                for item in final_manifest["observed_cells"]
-            ],
-            [
-                item["provenance"]["raw_answer_sha256"]
-                for item in corpus
-            ],
+            [item["raw_answer_sha256"] for item in final_manifest["observed_cells"]],
+            [item["provenance"]["raw_answer_sha256"] for item in corpus],
         )
 
     def test_final_context_preflight_is_explicit_and_never_truncates(self) -> None:
         payload = {"answer_corpus": [{"answer_text": "я" * 100}]}
-        serialized_bytes = len(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        )
+        serialized_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
         preflight = _final_input_preflight(payload, token_budget=1)
 
@@ -7216,9 +7191,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
 
     def test_unicode_payload_cannot_bypass_physical_token_window(self) -> None:
         payload = {"answer": "видимость" * 200}
-        serialized_bytes = len(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        )
+        serialized_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
         preflight = _final_input_preflight(
             payload,
@@ -7335,9 +7308,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         return {
             "receipt": _final_root_node_receipt(parent),
             "ordered_child_receipts": parent["child_receipts"],
-            "ordered_child_receipts_sha256": cls._stable_sha(
-                parent["child_receipts"]
-            ),
+            "ordered_child_receipts_sha256": cls._stable_sha(parent["child_receipts"]),
             "packet_sha256": parent["packet_sha256"],
             "model_view": copy.deepcopy(parent["model_view"]),
             "mandatory_fact_count": parent["mandatory_fact_count"],
@@ -7399,9 +7370,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     "source_unit_ids": [str(claim["source_unit_id"])],
                     "source_claim_ids": [str(claim["claim_id"])],
                     "exact_values": (
-                        []
-                        if hide_values
-                        else [str(claim.get("excerpt") or "")[:40]]
+                        [] if hide_values else [str(claim.get("excerpt") or "")[:40]]
                     ),
                     "evidence_excerpt": str(claim.get("excerpt") or "")[:40],
                     "importance": "supporting",
@@ -7448,17 +7417,15 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             target_chars=20_000,
             context_overlap_chars=0,
         )
-        claim_rows, claim_objects, _ids_by_unit, _ledger = (
-            _final_input_claim_ledger(units)
+        claim_rows, claim_objects, _ids_by_unit, _ledger = _final_input_claim_ledger(
+            units
         )
         if len(units) != 1 or len(claim_rows) < 2:
             raise AssertionError("Fixture must create one unit and many claims")
         return source, units, claim_rows, claim_objects
 
     def test_one_observation_cannot_claim_multiple_source_fragments(self) -> None:
-        _source, units, claim_rows, claim_objects = (
-            self._multi_claim_fixture()
-        )
+        _source, units, claim_rows, claim_objects = self._multi_claim_fixture()
         packet = self._packet_for_units(
             units,
             source_claims=claim_rows,
@@ -7479,18 +7446,14 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     str(unit["source_unit_id"]): str(unit["source_path"])
                     for unit in units
                 },
-                allowed_claims={
-                    str(claim["claim_id"]): claim for claim in claim_rows
-                },
+                allowed_claims={str(claim["claim_id"]): claim for claim in claim_rows},
                 claim_objects=claim_objects,
             )
 
     def test_atomic_claim_rows_keep_distinct_evidence_for_every_claim(
         self,
     ) -> None:
-        source, units, claim_rows, claim_objects = (
-            self._multi_claim_fixture()
-        )
+        source, units, claim_rows, claim_objects = self._multi_claim_fixture()
         packet = self._packet_for_units(
             units,
             source_claims=claim_rows,
@@ -7498,12 +7461,9 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         normalized = _normalize_final_evidence_packet(
             packet,
             allowed_unit_paths={
-                str(unit["source_unit_id"]): str(unit["source_path"])
-                for unit in units
+                str(unit["source_unit_id"]): str(unit["source_path"]) for unit in units
             },
-            allowed_claims={
-                str(claim["claim_id"]): claim for claim in claim_rows
-            },
+            allowed_claims={str(claim["claim_id"]): claim for claim in claim_rows},
             claim_objects=claim_objects,
         )
 
@@ -7538,18 +7498,13 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
     def test_reducer_cannot_replace_atomic_claim_rows_with_rephrases(
         self,
     ) -> None:
-        _source, units, claim_rows, claim_objects = (
-            self._multi_claim_fixture()
-        )
+        _source, units, claim_rows, claim_objects = self._multi_claim_fixture()
         canonical = _normalize_final_evidence_packet(
             self._packet_for_units(units, source_claims=claim_rows),
             allowed_unit_paths={
-                str(unit["source_unit_id"]): str(unit["source_path"])
-                for unit in units
+                str(unit["source_unit_id"]): str(unit["source_path"]) for unit in units
             },
-            allowed_claims={
-                str(claim["claim_id"]): claim for claim in claim_rows
-            },
+            allowed_claims={str(claim["claim_id"]): claim for claim in claim_rows},
             claim_objects=claim_objects,
         )
         rewritten = copy.deepcopy(canonical)
@@ -7590,6 +7545,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 )
             if "source_nodes" in user_payload:
                 source_nodes = user_payload["source_nodes"]
+
                 def semantic_text(node: dict[str, Any]) -> str:
                     if isinstance(node.get("summary"), dict):
                         return json.dumps(
@@ -7637,18 +7593,12 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "category": "context",
                             "statement": grounded_statement(node),
-                            "source_node_ids": [
-                                str(node["source_node_id"])
-                            ],
+                            "source_node_ids": [str(node["source_node_id"])],
                             "exact_values": [],
-                            "fact_binding_ids": fact_table_values(
-                                node, "ref"
-                            ),
+                            "fact_binding_ids": fact_table_values(node, "ref"),
                             "evidence_excerpts": [
                                 {
-                                    "source_node_id": str(
-                                        node["source_node_id"]
-                                    ),
+                                    "source_node_id": str(node["source_node_id"]),
                                     "excerpt": grounded_excerpt(node),
                                 }
                             ],
@@ -7660,9 +7610,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     "report_focus": [],
                     "node_coverage": [
                         {
-                            "source_node_id": str(
-                                node["source_node_id"]
-                            ),
+                            "source_node_id": str(node["source_node_id"]),
                             "disposition": "supporting_context",
                             "rationale": "Child node отражён в observation.",
                         }
@@ -7778,8 +7726,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             window["input_token_window"],
         )
         self.assertLessEqual(
-            window["input_token_window"]
-            + positive_envelope["max_completion_tokens"],
+            window["input_token_window"] + positive_envelope["max_completion_tokens"],
             positive_envelope["context_length"],
         )
 
@@ -7909,9 +7856,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             len(
                 {
                     item["claim_id"]
-                    for item in model_payload["evidence_digest"][
-                        "claim_coverage"
-                    ]
+                    for item in model_payload["evidence_digest"]["claim_coverage"]
                 }
             ),
             plan["source_claim_count"],
@@ -7934,6 +7879,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             ("tampered", "Coverage digest mismatch"),
         ):
             with self.subTest(fault=fault):
+
                 async def broken_mapper(
                     *_args: Any,
                     **kwargs: Any,
@@ -7948,9 +7894,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                         packet["observations"].pop()
                         packet["claim_coverage"].pop()
                     else:
-                        packet["claim_coverage"][-1][
-                            "excerpt_sha256"
-                        ] = "f" * 64
+                        packet["claim_coverage"][-1]["excerpt_sha256"] = "f" * 64
                     return packet
 
                 with (
@@ -8020,10 +7964,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             candidate: dict[str, Any],
             _envelope: dict[str, Any],
         ) -> int:
-            mode = str(
-                (candidate.get("long_input_contract") or {}).get("mode")
-                or ""
-            )
+            mode = str((candidate.get("long_input_contract") or {}).get("mode") or "")
             if mode == "bounded_transitive_evidence_tree":
                 return len(
                     json.dumps(
@@ -8080,19 +8021,13 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             sum(int(node["descendant_claim_count"]) for node in root_nodes),
             plan["source_claim_count"],
         )
+        self.assertTrue(all("mandatory_fact_table" not in node for node in root_nodes))
         self.assertTrue(
-            all("mandatory_fact_table" not in node for node in root_nodes)
-        )
-        self.assertTrue(
-            all(
-                "mandatory_fact_provenance_sha256" in node
-                for node in root_nodes
-            )
+            all("mandatory_fact_provenance_sha256" in node for node in root_nodes)
         )
         self.assertTrue(
             any(
-                tail_marker
-                in json.dumps(call, ensure_ascii=False)
+                tail_marker in json.dumps(call, ensure_ascii=False)
                 for call in structured_calls
                 if "source_nodes" in call
             )
@@ -8108,8 +8043,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         proof_outputs = [
             call.kwargs["output_json"]
             for call in save_artifact.await_args_list
-            if "_bounded_root_node_"
-            in str(call.kwargs.get("artifact_key") or "")
+            if "_bounded_root_node_" in str(call.kwargs.get("artifact_key") or "")
         ]
         self.assertTrue(proof_outputs)
         self.assertTrue(
@@ -8117,10 +8051,8 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 isinstance(output.get("fact_provenance"), list)
                 and "mandatory_fact_bindings" not in output
                 and "mandatory_fact_table" not in output
-                and "mandatory_fact_bindings"
-                not in (output.get("model_view") or {})
-                and "mandatory_fact_table"
-                not in (output.get("model_view") or {})
+                and "mandatory_fact_bindings" not in (output.get("model_view") or {})
+                and "mandatory_fact_table" not in (output.get("model_view") or {})
                 for output in proof_outputs
             )
         )
@@ -8161,7 +8093,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                         },
                     ],
                     "importance": "critical",
-                }
+                },
             ],
             "uncertainties": [
                 {
@@ -8186,9 +8118,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(accepted["node_coverage"]), 2)
 
         invented = copy.deepcopy(base)
-        invented["observations"][0]["statement"] = (
-            "Бренд лидирует: 99,9%."
-        )
+        invented["observations"][0]["statement"] = "Бренд лидирует: 99,9%."
         invented["observations"][0]["exact_values"] = ["99,9%"]
         with self.assertRaisesRegex(OpenRouterError, "exact value|invented"):
             _normalize_final_root_summary_packet(
@@ -8458,8 +8388,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "report_data": {
                 "metrics": [
-                    {"name": f"metric-{index}", "value": index}
-                    for index in range(300)
+                    {"name": f"metric-{index}", "value": index} for index in range(300)
                 ]
             }
         }
@@ -8486,12 +8415,9 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     source_claims=user_payload.get("source_claims"),
                 )
                 for observation in packet["observations"]:
-                    exact_excerpt = str(
-                        observation.get("evidence_excerpt") or ""
-                    )
+                    exact_excerpt = str(observation.get("evidence_excerpt") or "")
                     observation["statement"] = (
-                        f"Отдельный подтверждённый факт: {exact_excerpt}. "
-                        * 8
+                        f"Отдельный подтверждённый факт: {exact_excerpt}. " * 8
                     )
                 return packet
             if "source_nodes" in user_payload:
@@ -8559,8 +8485,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         terminal_ledgers = [
             call.kwargs["output_json"]
             for call in save_artifact.await_args_list
-            if "_terminal_ledger_"
-            in str(call.kwargs.get("artifact_key") or "")
+            if "_terminal_ledger_" in str(call.kwargs.get("artifact_key") or "")
         ]
         self.assertEqual(len(terminal_ledgers), 1)
         terminal_evidence = terminal_ledgers[0]["evidence_digest"]
@@ -8674,9 +8599,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             any(
                 observation["exact_values"]
-                for observation in model_payload["evidence_digest"][
-                    "observations"
-                ]
+                for observation in model_payload["evidence_digest"]["observations"]
             )
         )
         passthrough = {
@@ -8695,9 +8618,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             passthrough["/report_data/eligible"]["value"],
             True,
         )
-        self.assertIsNone(
-            passthrough["/report_data/optional_value"]["value"]
-        )
+        self.assertIsNone(passthrough["/report_data/optional_value"]["value"])
 
     async def test_mapper_and_reducer_use_their_own_exact_envelopes(self) -> None:
         envelopes = {
@@ -8829,12 +8750,10 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=self._successful_mapper(hide_values=True),
             ),
         ):
-            model_context, plan = (
-                await _bounded_semantic_model_evidence_context(
-                    "run-id",
-                    review_input=review_input,
-                    attempt=1,
-                )
+            model_context, plan = await _bounded_semantic_model_evidence_context(
+                "run-id",
+                review_input=review_input,
+                attempt=1,
             )
 
         provider_probe = copy.deepcopy(review_input)
@@ -8865,9 +8784,9 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(full_only_marker, provider_serialized)
         self.assertTrue(
-            review_input["evidence_document"]["report_data"][
-                "long_narrative"
-            ].endswith(full_only_marker)
+            review_input["evidence_document"]["report_data"]["long_narrative"].endswith(
+                full_only_marker
+            )
         )
 
     async def test_semantic_wrapper_overhead_forces_near_window_partition(
@@ -8949,12 +8868,10 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=self._successful_mapper(hide_values=True),
             ),
         ):
-            _model_context, plan = (
-                await _bounded_semantic_model_evidence_context(
-                    "run-id",
-                    review_input=review_input,
-                    attempt=1,
-                )
+            _model_context, plan = await _bounded_semantic_model_evidence_context(
+                "run-id",
+                review_input=review_input,
+                attempt=1,
             )
 
         self.assertEqual(plan["input_utf8_window"], expected_window)
@@ -9015,9 +8932,7 @@ class FinalReportPreflightTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "app.services.analyzer._edit_final_report_language",
-                new=AsyncMock(
-                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
-                ),
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
             ),
         ):
             result = await _final_report(
@@ -9253,9 +9168,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "app.services.analyzer._edit_final_report_language",
-                new=AsyncMock(
-                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
-                ),
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
             ),
         ):
             result = await _final_report(
@@ -9297,8 +9210,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
         author_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
-            if call.kwargs.get("artifact_key")
-            == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
+            if call.kwargs.get("artifact_key") == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
         ]
         self.assertEqual(
             [item["status"] for item in author_writes],
@@ -9358,8 +9270,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
         author_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
-            if call.kwargs.get("artifact_key")
-            == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
+            if call.kwargs.get("artifact_key") == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
         ]
         self.assertEqual(
             [item["status"] for item in author_writes],
@@ -9416,9 +9327,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "app.services.analyzer._edit_final_report_language",
-                new=AsyncMock(
-                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
-                ),
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
             ),
         ):
             result = await _final_report(
@@ -9444,8 +9353,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(
             any(
-                call.kwargs.get("artifact_key")
-                == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
+                call.kwargs.get("artifact_key") == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
                 for call in save_artifact.await_args_list
             )
         )
@@ -9470,9 +9378,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                 return None
             if artifact.get("model") != kwargs.get("model"):
                 return None
-            if artifact.get("prompt_version") != kwargs.get(
-                "prompt_version"
-            ):
+            if artifact.get("prompt_version") != kwargs.get("prompt_version"):
                 return None
             return copy.deepcopy(artifact.get("output_json"))
 
@@ -9525,9 +9431,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "app.services.analyzer._edit_final_report_language",
-                new=AsyncMock(
-                    side_effect=lambda _run_id, **kwargs: kwargs["report"]
-                ),
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
             ),
         ):
             with self.assertRaisesRegex(
@@ -9565,8 +9469,7 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_chat.await_count, 2)
         self.assertEqual(semantic_review.await_count, 2)
         reviewed_candidates = [
-            call.kwargs["candidate_report"]
-            for call in semantic_review.await_args_list
+            call.kwargs["candidate_report"] for call in semantic_review.await_args_list
         ]
         self.assertEqual(
             reviewed_candidates,
@@ -9605,11 +9508,7 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
                 await session.flush()
                 for mode in ("web", "memory"):
                     for panel in panel_models():
-                        model = (
-                            panel.model
-                            if mode == "web"
-                            else panel.memory_model
-                        )
+                        model = panel.model if mode == "web" else panel.memory_model
                         if model is None:
                             continue
                         is_last = (
@@ -9617,9 +9516,8 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
                             and mode == "memory"
                             and panel.key == "claude"
                         )
-                        answer_text = (
-                            f"Ответ {prompt_index}/{panel.key}/{mode} "
-                            + ("LAST-DB-SENTINEL" if is_last else "END")
+                        answer_text = f"Ответ {prompt_index}/{panel.key}/{mode} " + (
+                            "LAST-DB-SENTINEL" if is_last else "END"
                         )
                         raw_sha256 = hashlib.sha256(
                             answer_text.encode("utf-8")
@@ -10022,9 +9920,7 @@ class DeterministicMetricTests(unittest.TestCase):
         )
 
     def test_unknown_mentioned_position_is_not_a_top3_failure(self) -> None:
-        def row(
-            *, mentioned: bool, position: int | None, role: str
-        ) -> dict[str, Any]:
+        def row(*, mentioned: bool, position: int | None, role: str) -> dict[str, Any]:
             return {
                 "mode": "web",
                 "role": "unbranded_discovery",
@@ -10059,9 +9955,7 @@ class DeterministicMetricTests(unittest.TestCase):
         raw = "**Jois**\nквартиры с зелёными террасами"
 
         self.assertTrue(_evidence_is_literal(raw, "Jois"))
-        self.assertTrue(
-            _evidence_is_literal(raw, "квартиры с зелёными террасами")
-        )
+        self.assertTrue(_evidence_is_literal(raw, "квартиры с зелёными террасами"))
         self.assertFalse(_evidence_is_literal(raw, "JOIS"))
         self.assertFalse(
             _evidence_is_literal(
@@ -10165,10 +10059,7 @@ class DeterministicMetricTests(unittest.TestCase):
             (
                 "Квартиры с приватными террасами ЖК «Джойс»",
                 ["квартиры с приватными террасами", "зелёными террасами"],
-                (
-                    "- JOIS (MR Group). В продаже есть квартиры с "
-                    "приватными террасами."
-                ),
+                ("- JOIS (MR Group). В продаже есть квартиры с приватными террасами."),
             ),
             (
                 "Двухуровневые пентхаусы ЖК «Джойс»",
@@ -10234,9 +10125,7 @@ class DeterministicMetricTests(unittest.TestCase):
                             "aliases": [
                                 {
                                     "value": alias,
-                                    "match_policy": (
-                                        "requires_target_attribution"
-                                    ),
+                                    "match_policy": ("requires_target_attribution"),
                                 }
                                 for alias in aliases
                             ],
@@ -10333,8 +10222,7 @@ class DeterministicMetricTests(unittest.TestCase):
             "entity_scope": [
                 {
                     "canonical_name": (
-                        "Облачная платформа аналитики "
-                        "(бизнес-юнит Northstar Group)"
+                        "Облачная платформа аналитики (бизнес-юнит Northstar Group)"
                     ),
                     "aliases": [
                         "Orbit Cloud",
@@ -10430,8 +10318,7 @@ class DeterministicMetricTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                item["name"] == "Orbit Cloud"
-                and item["relationship"] == "competitor"
+                item["name"] == "Orbit Cloud" and item["relationship"] == "competitor"
                 for item in metrics["competitors"]
             )
         )
@@ -10553,9 +10440,7 @@ class DeterministicMetricTests(unittest.TestCase):
         )
         self.assertEqual(metrics["competitors"][0]["total_answers"], 1)
         self.assertEqual(metrics["paired_web_lift"]["n_pairs"], 0)
-        self.assertIsNone(
-            metrics["paired_web_lift"]["parent"]["score_lift"]
-        )
+        self.assertIsNone(metrics["paired_web_lift"]["parent"]["score_lift"])
         self.assertIsNone(metrics["knowledge_gap"])
         self.assertEqual(metrics["quality"]["state"], "limited")
         self.assertEqual(metrics["quality"]["coverage_rate"], 50.0)
@@ -10917,9 +10802,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 provider["portfolio_capture"]["unavailable_reason"],
                 "target_portfolio_unconfirmed",
             )
-        intent_i = next(
-            item for item in metrics["intents"] if item["intent"] == "I"
-        )
+        intent_i = next(item for item in metrics["intents"] if item["intent"] == "I")
         self.assertIsNone(intent_i["portfolio_capture"]["score"])
         for intent in metrics["intents"]:
             self.assertIsNone(intent["portfolio_capture"]["score"])
@@ -10948,8 +10831,7 @@ class DeterministicMetricTests(unittest.TestCase):
         self.assertIsNone(metrics["model_consistency"])
         self.assertFalse(
             any(
-                row.get("relationship") == "portfolio"
-                for row in metrics["competitors"]
+                row.get("relationship") == "portfolio" for row in metrics["competitors"]
             )
         )
         self.assertEqual(
@@ -11159,10 +11041,7 @@ class DeterministicMetricTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [
-                item["name"]
-                for item in metrics["brand_knowledge"]["web"]["facets"]
-            ],
+            [item["name"] for item in metrics["brand_knowledge"]["web"]["facets"]],
             ["identity", "offering", "portfolio"],
         )
 
@@ -11183,9 +11062,7 @@ class DeterministicMetricTests(unittest.TestCase):
                     "metric_eligible": True,
                     "context_eligible": False,
                     "metric_evidence_state": "legacy_observational",
-                    "web_attestation_reason": (
-                        LEGACY_MEMORY_OBSERVATION_REASON
-                    ),
+                    "web_attestation_reason": (LEGACY_MEMORY_OBSERVATION_REASON),
                     "annotation": {
                         "valid": True,
                         "target_mentioned": True,
@@ -11528,8 +11405,7 @@ class DeterministicMetricTests(unittest.TestCase):
                     "canonical_name": entity["canonical_name"],
                     "attributed_to_target": True,
                     "evidence": (
-                        "### Realweb\n- Сильная сторона: "
-                        "Okkam предлагает аналитику."
+                        "### Realweb\n- Сильная сторона: Okkam предлагает аналитику."
                     ),
                 },
             )
@@ -11679,8 +11555,7 @@ class DeterministicMetricTests(unittest.TestCase):
             None,
         )
         self.assertTrue(
-            competitor_dooh is None
-            or competitor_dooh["attributed_to_target"] is False
+            competitor_dooh is None or competitor_dooh["attributed_to_target"] is False
         )
         self.assertEqual(
             competitor_only["brand_answer"]["specificity"],
@@ -11937,8 +11812,7 @@ class DeterministicMetricTests(unittest.TestCase):
         self,
     ) -> None:
         answer_text = (
-            "Omni360 — независимая DSP-платформа. "
-            "Programmatic использует DSP и DMP."
+            "Omni360 — независимая DSP-платформа. Programmatic использует DSP и DMP."
         )
         reconciled = _reconcile_annotation(
             {
@@ -12244,9 +12118,7 @@ class DeterministicMetricTests(unittest.TestCase):
     def test_competitor_service_attribution_does_not_leak_to_target(
         self,
     ) -> None:
-        answer_text = (
-            "Okkam предлагает DOOH; Realweb предлагает аналитику."
-        )
+        answer_text = "Okkam предлагает DOOH; Realweb предлагает аналитику."
         generic_entity = {
             "aliases": [],
             "mention_policy": "requires_target_attribution",
@@ -12315,9 +12187,7 @@ class DeterministicMetricTests(unittest.TestCase):
             ],
             "mention_policy": "requires_target_attribution",
         }
-        answer_text = (
-            "Example предлагает разработку стратегий и ведение кампаний."
-        )
+        answer_text = "Example предлагает разработку стратегий и ведение кампаний."
 
         self.assertTrue(
             _portfolio_entity_is_grounded(
@@ -12331,8 +12201,7 @@ class DeterministicMetricTests(unittest.TestCase):
             )
         )
         competitor_text = (
-            "Okkam предлагает разработку стратегий, "
-            "а Example упомянут для сравнения."
+            "Okkam предлагает разработку стратегий, а Example упомянут для сравнения."
         )
         self.assertFalse(
             _portfolio_entity_is_grounded(
@@ -12408,22 +12277,13 @@ class DeterministicMetricTests(unittest.TestCase):
             "1. Realweb\nЭкспертиза: programmatic, DOOH",
             "Realweb\nКомпетенции:\n- DOOH",
             "• Realweb\n- Предлагает планирование и закупку DOOH.",
-            (
-                "Realweb (Риалвеб)\n"
-                "В чём сила: медиазакупка и DOOH."
-            ),
+            ("Realweb (Риалвеб)\nВ чём сила: медиазакупка и DOOH."),
             (
                 "Realweb. Сильная сторона: универсальное агентство. "
                 "Хорошо сочетает performance и DOOH."
             ),
-            (
-                "Realweb (Риалвеб)\n"
-                "Аналитика и технологии: DOOH-дашборды."
-            ),
-            (
-                "Realweb\n"
-                "Аналитика и ПО: собственная DOOH-платформа."
-            ),
+            ("Realweb (Риалвеб)\nАналитика и технологии: DOOH-дашборды."),
+            ("Realweb\nАналитика и ПО: собственная DOOH-платформа."),
             (
                 "Realweb\n"
                 "Сильная сторона: performance\n"
@@ -12537,8 +12397,7 @@ class DeterministicMetricTests(unittest.TestCase):
                     "role": "recommended",
                     "attributed_to_target": True,
                     "evidence": (
-                        "Realweb — предлагает планирование и закупку "
-                        "programmatic DOOH."
+                        "Realweb — предлагает планирование и закупку programmatic DOOH."
                     ),
                 }
             ],
@@ -12592,11 +12451,7 @@ class DeterministicMetricTests(unittest.TestCase):
             profile,
             catalog,
         )
-        self.assertFalse(
-            false_reconciled["entity_mentions"][0][
-                "attributed_to_target"
-            ]
-        )
+        self.assertFalse(false_reconciled["entity_mentions"][0]["attributed_to_target"])
 
     def test_portfolio_grounding_fails_closed_without_raw_answer(self) -> None:
         self.assertFalse(
@@ -12742,9 +12597,7 @@ class DeterministicMetricTests(unittest.TestCase):
             },
         )
 
-        self.assertIsNone(
-            metrics["portfolio_visibility"]["web"]["mention_count"]
-        )
+        self.assertIsNone(metrics["portfolio_visibility"]["web"]["mention_count"])
         self.assertEqual(
             metrics["portfolio_visibility"]["web"]["mentioned_entities"],
             [],
@@ -12828,10 +12681,7 @@ class DeterministicMetricTests(unittest.TestCase):
             set(entity_names),
         )
         self.assertTrue(
-            all(
-                item["answer_count"] == 1
-                for item in portfolio["mentioned_entities"]
-            )
+            all(item["answer_count"] == 1 for item in portfolio["mentioned_entities"])
         )
 
     def test_alias_policy_change_invalidates_annotation_context(self) -> None:
@@ -12992,7 +12842,6 @@ class DeterministicMetricTests(unittest.TestCase):
         )
         self.assertEqual(report["headline_emphasis"], [])
 
-
     def test_competitor_series_retains_every_observed_entity(self) -> None:
         competitor_names = [f"Конкурент {index:02d}" for index in range(20)]
         answer_text = ", ".join(competitor_names)
@@ -13076,9 +12925,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "prompt_key": f"checkpoint-{sequence}",
                 "intent_class": intent,
                 "role": (
-                    "unbranded_discovery"
-                    if sequence <= 6
-                    else "brand_diagnostic"
+                    "unbranded_discovery" if sequence <= 6 else "brand_diagnostic"
                 ),
                 "text": f"Сохранённый сценарий {sequence}",
                 "rationale": f"Проверяет сигнал {sequence}",
@@ -13141,9 +12988,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 mode="web",
                 status=answer_status,
                 response_text=(
-                    "Сохранённый raw-ответ"
-                    if answer_status == "completed"
-                    else None
+                    "Сохранённый raw-ответ" if answer_status == "completed" else None
                 ),
             )
             session.add(answer)
@@ -13225,9 +13070,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
         usage["_aiv_transport"] = {
             "output_limited": limited,
             "output_complete": (
-                not limited
-                if output_complete is None
-                else output_complete
+                not limited if output_complete is None else output_complete
             ),
         }
         return SimpleNamespace(
@@ -13258,9 +13101,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     "prompt_key": f"legacy-{sequence}",
                     "intent_class": ("I", "E", "T")[sequence % 3],
                     "role": (
-                        "brand_diagnostic"
-                        if sequence > 6
-                        else "unbranded_discovery"
+                        "brand_diagnostic" if sequence > 6 else "unbranded_discovery"
                     ),
                     "text": f"Исторический сценарий {sequence}",
                     "rationale": f"Причина {sequence}",
@@ -13323,12 +13164,16 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
 
             async with SessionLocal() as session:
                 answer = (
-                    await session.execute(
-                        select(ModelAnswer)
-                        .where(ModelAnswer.run_id == run_id)
-                        .order_by(ModelAnswer.id)
+                    (
+                        await session.execute(
+                            select(ModelAnswer)
+                            .where(ModelAnswer.run_id == run_id)
+                            .order_by(ModelAnswer.id)
+                        )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 assert answer is not None
                 usage = dict(answer.usage_json or {})
                 provenance = dict(usage["_aiv_panel_contract"])
@@ -13345,12 +13190,16 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
 
             async with SessionLocal() as session:
                 answer = (
-                    await session.execute(
-                        select(ModelAnswer)
-                        .where(ModelAnswer.run_id == run_id)
-                        .order_by(ModelAnswer.id)
+                    (
+                        await session.execute(
+                            select(ModelAnswer)
+                            .where(ModelAnswer.run_id == run_id)
+                            .order_by(ModelAnswer.id)
+                        )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 assert answer is not None
                 await session.delete(answer)
                 await session.commit()
@@ -13370,8 +13219,11 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             enabled = (await session.execute(text("PRAGMA foreign_keys"))).scalar_one()
         self.assertEqual(enabled, 1)
 
-    async def test_site_context_carries_the_user_domain_explicitly(self) -> None:
+    async def test_site_context_uses_only_manifest_selection_with_exact_lineage(
+        self,
+    ) -> None:
         run_id = f"test-context-{uuid.uuid4()}"
+        stored_pages: list[SitePage] = []
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -13381,13 +13233,65 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     config_json={},
                 )
             )
-            session.add(
-                SitePage(
+            for index in range(11):
+                url = (
+                    "https://example.com/"
+                    if index == 0
+                    else f"https://example.com/page-{index}"
+                )
+                main_text = f"Полный текст страницы {index}. " + ("x" * 100)
+                page = SitePage(
                     run_id=run_id,
-                    url="https://example.com/",
-                    page_kind="home",
-                    text_length=12,
-                    main_text="Пример сайта",
+                    url=url,
+                    page_kind="home" if index == 0 else "product",
+                    http_status=200,
+                    text_length=len(main_text),
+                    main_text=main_text,
+                    content_signals={
+                        "_body_truncated": False,
+                        "_body_read_policy": crawler._body_read_policy(
+                            crawler.ProbeResult()
+                        ),
+                        "_source_body_sha256": f"source-body-{index}",
+                    },
+                )
+                session.add(page)
+                stored_pages.append(page)
+            await session.flush()
+
+            selected = [
+                (page.url, page.page_kind)
+                for page in stored_pages[: crawler.AUDIT_PAGE_DEFAULT]
+            ]
+            stored_by_url = {page.url: page for page in stored_pages}
+            receipt = crawler._site_page_receipt(selected, stored_by_url)
+            manifest_input = crawler._site_page_manifest_input("example.com")
+            session.add(
+                RunArtifact(
+                    run_id=run_id,
+                    stage_key="site_discovery",
+                    artifact_key=crawler.SITE_PAGE_MANIFEST_KEY,
+                    status="completed",
+                    prompt_version=crawler.SITE_PAGE_MANIFEST_VERSION,
+                    input_json=manifest_input,
+                    output_json={
+                        "pages": crawler._selected_page_records(selected),
+                        "expected_page_count": len(selected),
+                        "selected_count": len(selected),
+                        "selected_pages_sha256": crawler._selected_pages_sha256(
+                            selected
+                        ),
+                        "discovered_candidate_count": len(stored_pages),
+                        "discovered_count": len(stored_pages),
+                        "page_scope": crawler.PAGE_SCOPE,
+                        "selection_policy": manifest_input["selection_policy"],
+                        "selection_exhausted": False,
+                        "verified_exhaustion": False,
+                        "legacy_snapshot": False,
+                        "discovery_state": "complete",
+                        "coverage_state": "bounded",
+                        "site_page_receipt": receipt,
+                    },
                 )
             )
             await session.commit()
@@ -13400,7 +13304,32 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     "url": "https://example.com/",
                 },
             )
-            self.assertEqual(context["pages"][0]["url"], "https://example.com/")
+            selected_urls = [url for url, _kind in selected]
+            self.assertEqual(len(context["pages"]), crawler.AUDIT_PAGE_DEFAULT)
+            self.assertEqual(
+                [page["url"] for page in context["pages"]],
+                selected_urls,
+            )
+            self.assertEqual(
+                [page["url"] for page in context["selected_pages_manifest"]["pages"]],
+                selected_urls,
+            )
+            self.assertEqual(
+                [
+                    (page["source_unit_id"], page["source_sha256"])
+                    for page in context["pages"]
+                ],
+                [
+                    (page["url"], page["content_sha256"])
+                    for page in receipt["pages"]
+                ],
+            )
+            self.assertTrue(
+                {
+                    page.url
+                    for page in stored_pages[crawler.AUDIT_PAGE_DEFAULT :]
+                }.isdisjoint({page["url"] for page in context["pages"]})
+            )
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
@@ -13496,8 +13425,20 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
         answer_specs = [
             ("current", "completed", "Example указан.", "test/model", "current"),
             ("stale-raw", "completed", "Новый raw.", "test/model", "stale_raw"),
-            ("stale-model", "completed", "Example указан снова.", "test/model", "stale_model"),
-            ("stale-context", "completed", "Example назван.", "test/model", "stale_context"),
+            (
+                "stale-model",
+                "completed",
+                "Example указан снова.",
+                "test/model",
+                "stale_model",
+            ),
+            (
+                "stale-context",
+                "completed",
+                "Example назван.",
+                "test/model",
+                "stale_context",
+            ),
             ("failed", "failed", "Example в старом ответе.", "test/model", "current"),
             ("empty", "completed", "   ", "test/model", "current"),
         ]
@@ -13541,17 +13482,11 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 )
                 session.add(answer)
                 await session.flush()
-                annotation_model = (
-                    "old/model" if stale_kind == "stale_model" else model
-                )
+                annotation_model = "old/model" if stale_kind == "stale_model" else model
                 annotation_context = (
-                    "old-context"
-                    if stale_kind == "stale_context"
-                    else context_sha256
+                    "old-context" if stale_kind == "stale_context" else context_sha256
                 )
-                annotation_raw = (
-                    "Старый raw." if stale_kind == "stale_raw" else raw
-                )
+                annotation_raw = "Старый raw." if stale_kind == "stale_raw" else raw
                 session.add(
                     AnswerAnnotation(
                         answer_id=answer.id,
@@ -13691,9 +13626,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 saved = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
             self.assertEqual(saved.status, "completed")
@@ -13773,9 +13706,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
                 audit_rows = list(
@@ -13895,9 +13826,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "failed")
@@ -13907,9 +13836,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 partial.citations,
             )
             self.assertIn("unexpected output limit", answer.error_message)
-            self.assertTrue(
-                answer.usage_json["_aiv_transport"]["output_limited"]
-            )
+            self.assertTrue(answer.usage_json["_aiv_transport"]["output_limited"])
             provenance = answer.usage_json["_aiv_panel_contract"]
             self.assertEqual(provenance["version"], PANEL_CONTRACT_VERSION)
             self.assertEqual(provenance["output_policy"], PANEL_OUTPUT_POLICY)
@@ -14202,9 +14129,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "failed")
@@ -14220,8 +14145,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     await session.execute(
                         select(RunArtifact).where(
                             RunArtifact.run_id == run_id,
-                            RunArtifact.prompt_version
-                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                            RunArtifact.prompt_version == PANEL_ATTEMPT_AUDIT_VERSION,
                         )
                     )
                 ).scalar_one()
@@ -14468,9 +14392,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "failed")
@@ -14482,8 +14404,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     await session.execute(
                         select(RunArtifact).where(
                             RunArtifact.run_id == run_id,
-                            RunArtifact.prompt_version
-                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                            RunArtifact.prompt_version == PANEL_ATTEMPT_AUDIT_VERSION,
                         )
                     )
                 ).scalar_one()
@@ -14542,9 +14463,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "failed")
@@ -14556,8 +14475,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     await session.execute(
                         select(RunArtifact).where(
                             RunArtifact.run_id == run_id,
-                            RunArtifact.prompt_version
-                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                            RunArtifact.prompt_version == PANEL_ATTEMPT_AUDIT_VERSION,
                         )
                     )
                 ).scalar_one()
@@ -14745,9 +14663,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalar_one()
             self.assertEqual(answer.status, "completed")
@@ -14849,9 +14765,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 provenance["attestation_version"],
                 WEB_ATTESTATION_VERSION,
             )
-            self.assertTrue(
-                provenance["web_attestation"]["metric_eligible"]
-            )
+            self.assertTrue(provenance["web_attestation"]["metric_eligible"])
 
             with (
                 patch(
@@ -14892,11 +14806,14 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
         versions = (PROMPT_SET_VERSION, sorted(LEGACY_PROMPT_SET_VERSIONS)[-1])
         for prompt_version in versions:
             with self.subTest(prompt_version=prompt_version):
-                run_id, _items, prompt_ids, _answer_id = (
-                    await self._create_panel_checkpoint(
-                        prompt_version=prompt_version,
-                        answer_status="pending",
-                    )
+                (
+                    run_id,
+                    _items,
+                    prompt_ids,
+                    _answer_id,
+                ) = await self._create_panel_checkpoint(
+                    prompt_version=prompt_version,
+                    answer_status="pending",
                 )
                 try:
                     checkpoint = await _load_panel_resume_checkpoint(run_id)
@@ -14911,10 +14828,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_panel_resume_checkpoint_validates_running_claim_token(
         self,
     ) -> None:
-        run_id, _items, _prompt_ids, answer_id = (
-            await self._create_panel_checkpoint(
-                answer_status="running:00000001:0123456789ab"
-            )
+        run_id, _items, _prompt_ids, answer_id = await self._create_panel_checkpoint(
+            answer_status="running:00000001:0123456789ab"
         )
         try:
             checkpoint = await _load_panel_resume_checkpoint(run_id)
@@ -14944,9 +14859,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 key=f"provider-{index}",
                 label=f"Provider {index}",
                 model=f"test/web-{index}",
-                memory_model=(
-                    f"test/memory-{index}" if index < 4 else None
-                ),
+                memory_model=(f"test/memory-{index}" if index < 4 else None),
             )
             for index in range(5)
         )
@@ -14989,11 +14902,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             for mode in ("web", "memory"):
                 for prompt in prompts:
                     for panel in panels:
-                        model = (
-                            panel.model
-                            if mode == "web"
-                            else panel.memory_model
-                        )
+                        model = panel.model if mode == "web" else panel.memory_model
                         if model is None:
                             continue
                         cell_index += 1
@@ -15085,9 +14994,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 answers = list(
                     (
                         await session.execute(
-                            select(ModelAnswer).where(
-                                ModelAnswer.run_id == run_id
-                            )
+                            select(ModelAnswer).where(ModelAnswer.run_id == run_id)
                         )
                     )
                     .scalars()
@@ -15097,8 +15004,7 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     await session.execute(
                         select(func.count(RunArtifact.id)).where(
                             RunArtifact.run_id == run_id,
-                            RunArtifact.prompt_version
-                            == PANEL_ATTEMPT_AUDIT_VERSION,
+                            RunArtifact.prompt_version == PANEL_ATTEMPT_AUDIT_VERSION,
                             RunArtifact.artifact_key.contains(
                                 "panel_attempt_import_",
                                 autoescape=True,
@@ -15129,8 +15035,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             await self._delete_run(run_id)
 
     async def test_analyze_run_reuses_exact_panel_checkpoint(self) -> None:
-        run_id, _items, prompt_ids, _answer_id = (
-            await self._create_panel_checkpoint(answer_status="pending")
+        run_id, _items, prompt_ids, _answer_id = await self._create_panel_checkpoint(
+            answer_status="pending"
         )
         market = AsyncMock()
         generate = AsyncMock()
@@ -15195,11 +15101,9 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_analyze_run_checkpoint_mismatch_fails_before_writes(
         self,
     ) -> None:
-        run_id, items, _prompt_ids, answer_id = (
-            await self._create_panel_checkpoint(
-                artifact_mismatch=True,
-                with_annotation=True,
-            )
+        run_id, items, _prompt_ids, answer_id = await self._create_panel_checkpoint(
+            artifact_mismatch=True,
+            with_annotation=True,
         )
         foundation = AsyncMock()
         market = AsyncMock()
@@ -15245,12 +15149,16 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
 
             async with SessionLocal() as session:
                 saved_prompt = (
-                    await session.execute(
-                        select(VisibilityPrompt)
-                        .where(VisibilityPrompt.run_id == run_id)
-                        .order_by(VisibilityPrompt.sequence)
+                    (
+                        await session.execute(
+                            select(VisibilityPrompt)
+                            .where(VisibilityPrompt.run_id == run_id)
+                            .order_by(VisibilityPrompt.sequence)
+                        )
                     )
-                ).scalars().first()
+                    .scalars()
+                    .first()
+                )
                 saved_answer = await session.get(ModelAnswer, answer_id)
                 annotation_count = (
                     await session.execute(
@@ -15335,8 +15243,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_changed_prompt_preserves_panel_answers_and_annotations(
         self,
     ) -> None:
-        run_id, items, prompt_ids, answer_id = (
-            await self._create_panel_checkpoint(with_annotation=True)
+        run_id, items, prompt_ids, answer_id = await self._create_panel_checkpoint(
+            with_annotation=True
         )
         try:
             persisted = await _persist_prompts(
@@ -15400,7 +15308,9 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
             session.add(answer)
             await session.flush()
-            session.add(AnswerAnnotation(answer_id=answer.id, annotation_json={"valid": True}))
+            session.add(
+                AnswerAnnotation(answer_id=answer.id, annotation_json={"valid": True})
+            )
             session.add(
                 SitePage(
                     run_id=run_id,
@@ -15492,7 +15402,9 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.client.aclose()
 
-    async def test_create_run_accepts_only_one_domain_and_uses_fixed_config(self) -> None:
+    async def test_create_run_accepts_only_one_domain_and_uses_fixed_config(
+        self,
+    ) -> None:
         domain = f"api-{uuid.uuid4().hex}.example.com"
         with patch("app.routes.runs.coordinator.wake") as wake:
             response = await self.client.post(
@@ -15555,9 +15467,7 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
             async with SessionLocal() as session:
                 status, resume_count = (
                     await session.execute(
-                        select(Run.status, Run.resume_count).where(
-                            Run.id == run_id
-                        )
+                        select(Run.status, Run.resume_count).where(Run.id == run_id)
                     )
                 ).one()
             self.assertEqual(status, RunStatus.pending)
@@ -15608,7 +15518,7 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                         status="completed",
                         model="test/report-model",
                         output_json={"headline": "Сохранённый отчёт"},
-                        raw_text="{\"headline\":\"Сохранённый отчёт\"}",
+                        raw_text='{"headline":"Сохранённый отчёт"}',
                         usage_json={"total_tokens": 321},
                     ),
                     ModelAnswer(
@@ -15619,9 +15529,7 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                         mode="web",
                         status="completed",
                         response_text="Неизменяемый сырой ответ.",
-                        citations_json=[
-                            {"url": "https://source.example/evidence"}
-                        ],
+                        citations_json=[{"url": "https://source.example/evidence"}],
                         usage_json={"total_tokens": 123},
                     ),
                 ]
@@ -15740,9 +15648,7 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                     new_callable=AsyncMock,
                 ) as pending_count,
             ):
-                response = await self.client.post(
-                    f"/api/runs/{run_id}/retry"
-                )
+                response = await self.client.post(f"/api/runs/{run_id}/retry")
             after = await evidence_snapshot()
 
             self.assertEqual(response.status_code, 409)

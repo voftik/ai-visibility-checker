@@ -32,16 +32,21 @@ from app.services.recovery_orchestrator import (
     ORCHESTRATOR_MODEL,
     ORCHESTRATOR_VERSION,
     PROCESSING_MODEL,
+    RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION,
     OrchestratorContractError,
     OrchestratorResult,
+    RecoveryPlannerUnavailable,
+    RecoveryProviderCheckpointMissing,
     _decide_from_exact_claim_ledger,
     _decision_schema,
     _decision_shard_payload,
     _input_window,
     _map_recovery_source,
     _pack_decision_claims,
+    _persist_recovery_provider_event,
     _recovery_atomic_chat,
     _reduce_recovery_nodes,
+    _source_bound_decision_dossier,
     _source_units,
     _stable_digest,
     _structured_request_utf8_bytes,
@@ -49,11 +54,15 @@ from app.services.recovery_orchestrator import (
     _validate_reduce_node_summaries,
     plan_recovery,
     validate_recovery_decision,
+    validate_recovery_decision_with_rationale_repair,
 )
 from app.services.recovery_state import (
+    RECOVERY_PLANNER_REPLAY_AUDIT_KEY,
+    RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
     RecoveryBudgetExceeded,
     finish_recovery,
     mark_recovery_executing,
+    plan_code_owned_recovery,
     plan_durable_recovery,
     recovery_execution_state,
     recovery_failure_fingerprint,
@@ -66,15 +75,13 @@ def _map_unit_summaries(payload: dict) -> list[dict]:
     summaries: list[dict] = []
     for unit in payload["source_units"]:
         context = unit["context_text"]
-        core = context[
-            unit["core_start_in_context"] : unit["core_end_in_context"]
-        ]
+        core = context[unit["core_start_in_context"] : unit["core_end_in_context"]]
         excerpt = core
         summaries.append(
             {
                 "unit_id": unit["unit_id"],
                 "core_sha256": unit["core_sha256"],
-                "summary": "Содержимое lossless-фрагмента учтено при планировании.",
+                "summary": "Точный смысл unit: " + core[:160],
                 "relevance": "context",
                 "source_excerpt": excerpt,
                 "source_excerpt_sha256": hashlib.sha256(
@@ -95,6 +102,8 @@ def _reduce_node_summaries(payload: dict) -> list[dict]:
         }
         for node in payload["nodes"]
     ]
+
+
 from app.services.run_lease import RunLeaseLostError, bind_run_lease
 
 
@@ -112,7 +121,7 @@ def _chat_result(parsed: dict) -> ChatResult:
 
 
 class RecoveryDecisionContractTests(unittest.TestCase):
-    def test_provider_schema_enforces_deterministic_rationale_floor(self) -> None:
+    def test_provider_schema_does_not_discard_short_rationale_response(self) -> None:
         schema = _decision_schema([ACTION_STOP])
         candidate = {
             "action": ACTION_STOP,
@@ -126,9 +135,103 @@ class RecoveryDecisionContractTests(unittest.TestCase):
 
         errors = list(Draft202012Validator(schema).iter_errors(candidate))
 
-        self.assertTrue(
-            any(error.validator == "minLength" for error in errors)
+        self.assertEqual(errors, [])
+        with self.assertRaisesRegex(
+            OrchestratorContractError,
+            "rationale is too short",
+        ):
+            validate_recovery_decision(
+                candidate,
+                allowed_actions={ACTION_STOP},
+                permitted_answer_ids=set(),
+                permitted_artifact_keys=set(),
+                prior_decisions=[],
+                incident_fingerprint="incident",
+            )
+
+    def test_short_rationale_only_is_repaired_without_executable_change(
+        self,
+    ) -> None:
+        candidate = {
+            "action": ACTION_RETRY_WITH_GUIDANCE,
+            "rationale": "placeholder",
+            "confidence": "high",
+            "guidance": "Повтори только один неизменяемый leaf.",
+            "target_answer_ids": [],
+            "invalidate_artifact_keys": [],
+            "acceptance_checks": [
+                "prompt_contract_valid",
+                "raw_corpus_unchanged",
+            ],
+        }
+        accepted, receipt = validate_recovery_decision_with_rationale_repair(
+            candidate,
+            allowed_actions={ACTION_RETRY_WITH_GUIDANCE},
+            permitted_answer_ids=set(),
+            permitted_artifact_keys=set(),
+            prior_decisions=[],
+            incident_fingerprint="incident",
         )
+
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["original_rationale"], "placeholder")
+        for field in (
+            "action",
+            "confidence",
+            "guidance",
+            "target_answer_ids",
+            "invalidate_artifact_keys",
+            "acceptance_checks",
+        ):
+            self.assertEqual(accepted[field], candidate[field])
+        self.assertGreaterEqual(len(accepted["rationale"]), 20)
+
+    def test_short_rationale_repair_does_not_hide_second_contract_error(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            OrchestratorContractError,
+            "outside the incident",
+        ):
+            validate_recovery_decision_with_rationale_repair(
+                {
+                    "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+                    "rationale": "кратко",
+                    "confidence": "high",
+                    "guidance": "Проверь только разрешённую строку.",
+                    "target_answer_ids": [999],
+                    "invalidate_artifact_keys": [],
+                    "acceptance_checks": ["raw_corpus_unchanged"],
+                },
+                allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
+                permitted_answer_ids={41},
+                permitted_artifact_keys=set(),
+                prior_decisions=[],
+                incident_fingerprint="incident",
+            )
+
+    def test_blank_rationale_is_never_repaired(self) -> None:
+        with self.assertRaisesRegex(
+            OrchestratorContractError,
+            "rationale is too short",
+        ):
+            validate_recovery_decision_with_rationale_repair(
+                {
+                    "action": ACTION_STOP,
+                    "rationale": "",
+                    "confidence": "high",
+                    "guidance": "",
+                    "target_answer_ids": [],
+                    "invalidate_artifact_keys": [],
+                    "acceptance_checks": ["checkpoint_preserved"],
+                },
+                allowed_actions={ACTION_STOP},
+                permitted_answer_ids=set(),
+                permitted_artifact_keys=set(),
+                prior_decisions=[],
+                incident_fingerprint="incident",
+            )
 
     def test_failure_fingerprint_is_stable_and_stage_specific(self) -> None:
         first = recovery_failure_fingerprint(
@@ -295,9 +398,7 @@ class RecoveryDecisionContractTests(unittest.TestCase):
                         {**base, **changes},
                         allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
                         permitted_answer_ids=set(range(0, 50)),
-                        permitted_artifact_keys={
-                            f"artifact-{i}" for i in range(30)
-                        },
+                        permitted_artifact_keys={f"artifact-{i}" for i in range(30)},
                         prior_decisions=[],
                         incident_fingerprint="abc",
                         incident_facts_digest="facts-a",
@@ -386,17 +487,13 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
             "covered_claims": [
                 {
                     "claim_id": entry["claim_id"],
-                    "source_excerpt_sha256": entry[
-                        "source_excerpt_sha256"
-                    ],
+                    "source_excerpt_sha256": entry["source_excerpt_sha256"],
                 }
             ],
             "dispositions": [
                 {
                     "claim_id": entry["claim_id"],
-                    "source_excerpt_sha256": entry[
-                        "source_excerpt_sha256"
-                    ],
+                    "source_excerpt_sha256": entry["source_excerpt_sha256"],
                     "semantic_observation": "TAIL_MARKER",
                     "relevance": "actionable",
                     "candidate_answer_ids": [42],
@@ -474,17 +571,13 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                     "covered_claims": [
                         {
                             "claim_id": entry["claim_id"],
-                            "source_excerpt_sha256": entry[
-                                "source_excerpt_sha256"
-                            ],
+                            "source_excerpt_sha256": entry["source_excerpt_sha256"],
                         }
                     ],
                     "dispositions": [
                         {
                             "claim_id": entry["claim_id"],
-                            "source_excerpt_sha256": entry[
-                                "source_excerpt_sha256"
-                            ],
+                            "source_excerpt_sha256": entry["source_excerpt_sha256"],
                             "semantic_observation": case["excerpt"],
                             "relevance": "actionable",
                             "candidate_answer_ids": case["answer_ids"],
@@ -585,8 +678,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self._enabled = patch(
-            "app.services.recovery_orchestrator.settings."
-            "PIPELINE_ORCHESTRATOR_ENABLED",
+            "app.services.recovery_orchestrator.settings.PIPELINE_ORCHESTRATOR_ENABLED",
             True,
         )
         self._enabled.start()
@@ -725,16 +817,16 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 prior_decisions=[prior],
             )
 
-        payload = json.loads(
-            chat_mock.await_args.kwargs["messages"][1]["content"]
-        )
+        payload = json.loads(chat_mock.await_args.kwargs["messages"][1]["content"])
         self.assertEqual(
             payload["prior_decisions"][0]["facts_digest"],
             "old-facts",
         )
         self.assertEqual(payload["prior_decisions"][0]["status"], "failed")
 
-    async def test_huge_unicode_corpus_is_losslessly_mapped_and_reduced(self) -> None:
+    async def test_huge_unicode_corpus_is_fully_mapped_before_fable_failover(
+        self,
+    ) -> None:
         decision = {
             "action": ACTION_TARGETED_ANNOTATION_REPAIR,
             "rationale": (
@@ -785,9 +877,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 }
             elif kwargs["schema_name"] == "aiv_recovery_input_reduce":
                 parsed = {
-                    "covered_node_ids": [
-                        node["node_id"] for node in payload["nodes"]
-                    ],
+                    "covered_node_ids": [node["node_id"] for node in payload["nodes"]],
                     "synthesis": "Нужен узкий ремонт сохранённой разметки.",
                     "node_summaries": _reduce_node_summaries(payload),
                     "findings": [
@@ -815,9 +905,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                     if relevant
                     else {
                         "action": ACTION_STOP,
-                        "rationale": (
-                            "Этот shard не содержит связанного answer_id."
-                        ),
+                        "rationale": ("Этот shard не содержит связанного answer_id."),
                         "confidence": "high",
                         "guidance": "",
                         "target_answer_ids": [],
@@ -829,26 +917,20 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                     "covered_claims": [
                         {
                             "claim_id": entry["claim_id"],
-                            "source_excerpt_sha256": entry[
-                                "source_excerpt_sha256"
-                            ],
+                            "source_excerpt_sha256": entry["source_excerpt_sha256"],
                         }
                         for entry in entries
                     ],
                     "dispositions": [
                         {
                             "claim_id": entry["claim_id"],
-                            "source_excerpt_sha256": entry[
-                                "source_excerpt_sha256"
-                            ],
+                            "source_excerpt_sha256": entry["source_excerpt_sha256"],
                             "semantic_observation": (
                                 f"{entry['value_kind']} {entry['json_pointer']} "
                                 f"{entry['source_excerpt']}"
                             ),
                             "relevance": "actionable",
-                            "candidate_answer_ids": (
-                                [9] if entry in relevant else []
-                            ),
+                            "candidate_answer_ids": ([9] if entry in relevant else []),
                             "candidate_artifact_keys": (
                                 ["annotations_9"] if entry in relevant else []
                             ),
@@ -864,8 +946,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 parsed = {
                     "covered_candidate_ids": [
-                        node["candidate_id"]
-                        for node in payload["candidate_nodes"]
+                        node["candidate_id"] for node in payload["candidate_nodes"]
                     ],
                     "decision": (
                         decision
@@ -903,42 +984,36 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=provider),
             ) as chat_mock,
         ):
-            result = await plan_recovery(
-                incident={
-                    "stage": "knowledge_gap",
-                    "fingerprint": "huge-unicode",
-                    "facts_digest": "f" * 64,
-                    "facts": {
-                        "answer_id": 9,
-                        "artifact_key": "annotations_9",
-                        "raw": long_text,
+            with self.assertRaisesRegex(
+                RecoveryPlannerUnavailable,
+                "partial strong-model review is forbidden",
+            ):
+                await plan_recovery(
+                    incident={
+                        "stage": "knowledge_gap",
+                        "fingerprint": "huge-unicode",
+                        "facts_digest": "f" * 64,
+                        "facts": {
+                            "answer_id": 9,
+                            "artifact_key": "annotations_9",
+                            "raw": long_text,
+                        },
                     },
-                },
-                allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
-                permitted_answer_ids={3, 9},
-                permitted_artifact_keys={"annotations_3", "annotations_9"},
-                prior_decisions=[
-                    {
-                        "epoch": 1,
-                        "incident_fingerprint": "old",
-                        "facts_digest": "e" * 64,
-                        "status": "failed",
-                        "action": ACTION_RETRY_WITH_GUIDANCE,
-                        "outcome": {"unicode": "ёжик 🦔" * 1_000},
-                    }
-                ],
-            )
+                    allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
+                    permitted_answer_ids={3, 9},
+                    permitted_artifact_keys={"annotations_3", "annotations_9"},
+                    prior_decisions=[
+                        {
+                            "epoch": 1,
+                            "incident_fingerprint": "old",
+                            "facts_digest": "e" * 64,
+                            "status": "failed",
+                            "action": ACTION_RETRY_WITH_GUIDANCE,
+                            "outcome": {"unicode": "ёжик 🦔" * 1_000},
+                        }
+                    ],
+                )
 
-        audit = result.usage["_aiv_recovery_input_harness"]
-        self.assertEqual(
-            audit["mode"],
-            "lossless_exact_claim_decision_shards",
-        )
-        self.assertGreater(audit["source_manifest"]["unit_count"], 1)
-        self.assertGreater(audit["map_receipt_count"], 1)
-        self.assertEqual(audit["reduce_receipt_count"], 0)
-        self.assertGreater(audit["decision_shard_count"], 1)
-        self.assertGreaterEqual(audit["decision_arbiter_rounds"], 1)
         expected_source = {
             "incident": {
                 "stage": "knowledge_gap",
@@ -961,58 +1036,36 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
-        self.assertEqual(
-            audit["source_manifest"]["source_sha256"],
-            _stable_digest(expected_source),
+        records, manifest = _source_units(
+            expected_source,
+            target_chars=1_024,
+            permitted_answer_ids={3, 9},
+            permitted_artifact_keys={"annotations_3", "annotations_9"},
         )
+        self.assertEqual(manifest["source_sha256"], _stable_digest(expected_source))
 
         terra_envelope = envelopes[PROCESSING_MODEL]
         terra_window = int(
             _input_window(PROCESSING_MODEL, terra_envelope)["input_utf8_window"]
         )
         mapped_ids: list[str] = []
+        mapped_cores: list[str] = []
         fable_calls = 0
-        decision_visible_text = ""
-        total_claims = audit["decision_ledger"]["claim_count"]
         for call in chat_mock.await_args_list:
             kwargs = call.kwargs
             payload = json.loads(kwargs["messages"][1]["content"])
             if kwargs["model"] == ORCHESTRATOR_MODEL:
                 fable_calls += 1
-                fable_window = int(
-                    _input_window(
-                        ORCHESTRATOR_MODEL,
-                        envelopes[ORCHESTRATOR_MODEL],
-                    )["input_utf8_window"]
-                )
-                self.assertLessEqual(
-                    _structured_request_utf8_bytes(
-                        model=kwargs["model"],
-                        model_envelope=envelopes[ORCHESTRATOR_MODEL],
-                        system=kwargs["messages"][0]["content"],
-                        user_payload=payload,
-                        schema=kwargs["response_schema"],
-                        schema_name=kwargs["schema_name"],
-                        reasoning_effort=kwargs["reasoning_effort"],
-                        temperature=kwargs["temperature"],
-                    ),
-                    fable_window,
-                )
-                if kwargs["schema_name"] == "aiv_recovery_decision_shard":
-                    manifest_pointer = payload["claim_ledger_manifest"]
-                    self.assertNotIn("entries", manifest_pointer)
-                    shard_entries = payload["shard"]["exact_claim_ledger"]
-                    self.assertLess(len(shard_entries), total_claims)
-                    decision_visible_text += "".join(
-                        entry["source_excerpt"] for entry in shard_entries
-                    )
-                else:
-                    self.assertNotIn("exact_claim_ledger", payload)
                 continue
             if kwargs["schema_name"] == "aiv_recovery_input_map":
-                mapped_ids.extend(
-                    unit["unit_id"] for unit in payload["source_units"]
-                )
+                for unit in payload["source_units"]:
+                    mapped_ids.append(unit["unit_id"])
+                    context = unit["context_text"]
+                    mapped_cores.append(
+                        context[
+                            unit["core_start_in_context"] : unit["core_end_in_context"]
+                        ]
+                    )
             self.assertLessEqual(
                 _structured_request_utf8_bytes(
                     model=kwargs["model"],
@@ -1026,16 +1079,127 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 terra_window,
             )
-        expected_ids = [
-            unit["unit_id"]
-            for leaf in audit["source_manifest"]["leaf_manifests"]
-            for unit in leaf["partition"]["units"]
-        ]
+        expected_ids = [record["unit_id"] for record in records]
         self.assertEqual(mapped_ids, expected_ids)
         self.assertEqual(len(mapped_ids), len(set(mapped_ids)))
-        self.assertGreater(fable_calls, 1)
-        self.assertIn("TAIL_ALPHA", decision_visible_text)
-        self.assertIn("TAIL_BETA", decision_visible_text)
+        self.assertEqual(fable_calls, 0)
+        self.assertIn("TAIL_ALPHA", "".join(mapped_cores))
+        self.assertIn("TAIL_BETA", "".join(mapped_cores))
+
+    async def test_oversized_incident_uses_one_source_bound_fable_dossier(
+        self,
+    ) -> None:
+        decision = {
+            "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+            "rationale": "Полное dossier связывает ошибку только с ответом 9.",
+            "confidence": "high",
+            "guidance": "Повтори разметку ответа 9 без изменения raw.",
+            "target_answer_ids": [9],
+            "invalidate_artifact_keys": ["annotations_9"],
+            "acceptance_checks": ["raw_corpus_unchanged"],
+        }
+        envelopes = {
+            ORCHESTRATOR_MODEL: {
+                "resolution": "test",
+                # The original Cyrillic raw payload still exceeds this
+                # conservative byte window, while the complete source-bound
+                # semantic dossier fits and can be decided in one Fable POST.
+                "context_length": 80_000,
+                "max_completion_tokens": 8_000,
+            },
+            PROCESSING_MODEL: {
+                "resolution": "test",
+                "context_length": 32_000,
+                "max_completion_tokens": 8_000,
+            },
+        }
+
+        async def provider(**kwargs):
+            payload = json.loads(kwargs["messages"][1]["content"])
+            if kwargs["schema_name"] == "aiv_recovery_input_map":
+                covered = [
+                    {
+                        "unit_id": unit["unit_id"],
+                        "core_sha256": unit["core_sha256"],
+                    }
+                    for unit in payload["source_units"]
+                ]
+                evidence_units = [
+                    unit
+                    for unit in payload["source_units"]
+                    if "Ошибка ответа 9"
+                    in unit["context_text"][
+                        unit["core_start_in_context"] : unit["core_end_in_context"]
+                    ]
+                ]
+                parsed = {
+                    "covered_units": covered,
+                    "unit_summaries": _map_unit_summaries(payload),
+                    "findings": [
+                        {
+                            "unit_ids": [evidence_units[0]["unit_id"]],
+                            "statement": "Ошибка ответа 9 требует повторной разметки.",
+                            "relevance": "actionable",
+                            "candidate_answer_ids": [9],
+                            "candidate_artifact_keys": ["annotations_9"],
+                        }
+                    ]
+                    if evidence_units
+                    else [],
+                    "uncertainties": [],
+                }
+            else:
+                self.assertEqual(
+                    payload["input_mode"],
+                    "lossless_source_bound_decision_dossier",
+                )
+                self.assertTrue(payload["coverage"]["complete"])
+                exact_units = payload["executable_scope_evidence"]["exact_source_units"]
+                self.assertEqual(len(exact_units), 1)
+                self.assertIn("Ошибка ответа 9", exact_units[0]["source_excerpt"])
+                parsed = decision
+            return _chat_result(parsed)
+
+        with (
+            patch(
+                "app.services.recovery_orchestrator.model_output_envelope",
+                new=AsyncMock(side_effect=lambda model: envelopes[model]),
+            ),
+            patch(
+                "app.services.recovery_orchestrator.chat",
+                new=AsyncMock(side_effect=provider),
+            ) as chat_mock,
+        ):
+            result = await plan_recovery(
+                incident={
+                    "stage": "knowledge_gap",
+                    "fingerprint": "one-dossier",
+                    "facts_digest": "d" * 64,
+                    "facts": {
+                        "answer_id": 9,
+                        "artifact_key": "annotations_9",
+                        "raw": "Ошибка ответа 9. " + ("контекст видимости. " * 3_000),
+                    },
+                },
+                allowed_actions={ACTION_TARGETED_ANNOTATION_REPAIR},
+                permitted_answer_ids={9},
+                permitted_artifact_keys={"annotations_9"},
+            )
+
+        audit = result.usage["_aiv_recovery_input_harness"]
+        self.assertEqual(
+            audit["mode"],
+            "lossless_source_bound_decision_dossier",
+        )
+        self.assertGreater(audit["map_receipt_count"], 1)
+        self.assertEqual(audit["fable_physical_call_limit"], 1)
+        self.assertEqual(audit["fable_physical_cache_misses"], 1)
+        fable_calls = [
+            call
+            for call in chat_mock.await_args_list
+            if call.kwargs["model"] == ORCHESTRATOR_MODEL
+        ]
+        self.assertEqual(len(fable_calls), 1)
         self.assertEqual(result.decision["target_answer_ids"], [9])
 
     def test_generic_reducer_summary_with_correct_ids_and_digest_fails(self) -> None:
@@ -1058,9 +1222,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                     "node_summaries": [
                         {
                             "source_node_id": "node-tail",
-                            "source_semantic_sha256": _stable_digest(
-                                node["semantic"]
-                            ),
+                            "source_semantic_sha256": _stable_digest(node["semantic"]),
                             "summary": "данные",
                             "relevance": "context",
                         }
@@ -1068,6 +1230,62 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 },
                 nodes=[node],
             )
+
+    def test_non_context_unit_receipts_carry_exact_dossier_evidence(self) -> None:
+        relevances = ["actionable", "blocking", "uncertain"]
+        unit_ids = [f"unit-{index}" for index in range(len(relevances))]
+        receipts = [
+            {
+                "unit_id": unit_id,
+                "core_sha256": "a" * 63 + str(index),
+                "json_pointer": f"/facts/{index}",
+                "value_kind": "str",
+                "summary": f"Источник описывает ошибку {index}",
+                "relevance": relevance,
+                "source_excerpt": f"Ошибка {index} в исходных данных",
+                "source_excerpt_sha256": hashlib.sha256(
+                    f"Ошибка {index} в исходных данных".encode("utf-8")
+                ).hexdigest(),
+                "linked_answer_ids": [],
+                "linked_artifact_keys": [],
+            }
+            for index, (unit_id, relevance) in enumerate(
+                zip(unit_ids, relevances, strict=True)
+            )
+        ]
+        manifest = {
+            "version": "test-manifest",
+            "source_sha256": "s" * 64,
+            "source_utf8_bytes": 123,
+            "leaf_count": 3,
+            "unit_count": 3,
+            "unit_ids_sha256": _stable_digest(unit_ids),
+            "manifest_sha256": "m" * 64,
+        }
+        dossier = _source_bound_decision_dossier(
+            [
+                {
+                    "node_id": "node-1",
+                    "semantic": {
+                        "unit_summaries": receipts,
+                        "findings": [],
+                        "uncertainties": [],
+                    },
+                }
+            ],
+            manifest=manifest,
+            control_plane={"scope_sha256": "c" * 64},
+        )
+        exact_units = dossier["executable_scope_evidence"]["exact_source_units"]
+        self.assertEqual([unit["unit_id"] for unit in exact_units], unit_ids)
+        self.assertEqual(
+            [unit["source_excerpt"] for unit in exact_units],
+            [receipt["source_excerpt"] for receipt in receipts],
+        )
+        self.assertEqual(
+            dossier["executable_scope_evidence"]["supported_answer_ids"],
+            [],
+        )
 
     async def test_missing_or_tampered_map_coverage_fails_before_fable(self) -> None:
         envelope = {
@@ -1103,8 +1321,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(mode=mode):
                 with (
                     patch(
-                        "app.services.recovery_orchestrator."
-                        "model_output_envelope",
+                        "app.services.recovery_orchestrator.model_output_envelope",
                         new=AsyncMock(return_value=envelope),
                     ),
                     patch(
@@ -1165,9 +1382,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 "unit semantic receipts",
             ):
                 await plan_recovery(
-                    incident={
-                        "facts": ("long context " * 10_000) + "TAIL_MARKER"
-                    },
+                    incident={"facts": ("long context " * 10_000) + "TAIL_MARKER"},
                     allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
                 )
         self.assertTrue(calls)
@@ -1225,6 +1440,58 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                     allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
                 )
 
+    async def test_mapper_generic_summary_does_not_prove_semantic_coverage(
+        self,
+    ) -> None:
+        envelope = {
+            "resolution": "test",
+            "context_length": 9_000,
+            "max_completion_tokens": 2_500,
+        }
+        calls: list[str] = []
+
+        async def provider(**kwargs):
+            calls.append(kwargs["model"])
+            payload = json.loads(kwargs["messages"][1]["content"])
+            covered = [
+                {
+                    "unit_id": unit["unit_id"],
+                    "core_sha256": unit["core_sha256"],
+                }
+                for unit in payload["source_units"]
+            ]
+            summaries = _map_unit_summaries(payload)
+            for summary in summaries:
+                summary["summary"] = "Данные фрагмента учтены при планировании."
+            return _chat_result(
+                {
+                    "covered_units": covered,
+                    "unit_summaries": summaries,
+                    "findings": [],
+                    "uncertainties": [],
+                }
+            )
+
+        with (
+            patch(
+                "app.services.recovery_orchestrator.model_output_envelope",
+                new=AsyncMock(return_value=envelope),
+            ),
+            patch(
+                "app.services.recovery_orchestrator.chat",
+                new=AsyncMock(side_effect=provider),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OrchestratorContractError,
+                "generic unit summary",
+            ):
+                await plan_recovery(
+                    incident={"facts": ("важная ошибка атрибуции " * 4_000)},
+                    allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
+                )
+        self.assertNotIn(ORCHESTRATOR_MODEL, calls)
+
     async def test_mapper_output_limit_fails_closed_without_fable_retry(self) -> None:
         envelope = {
             "resolution": "test",
@@ -1245,7 +1512,7 @@ class RecoveryPlannerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=limited),
             ) as chat_mock,
         ):
-            with self.assertRaises(OpenRouterOutputLimitError):
+            with self.assertRaises(RecoveryPlannerUnavailable):
                 await plan_recovery(
                     incident={"facts": "x" * 50_000},
                     allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
@@ -1281,11 +1548,30 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self._lease_session_patch.start()
         self._enabled_patch = patch(
-            "app.services.recovery_state.settings."
-            "PIPELINE_ORCHESTRATOR_ENABLED",
+            "app.services.recovery_state.settings.PIPELINE_ORCHESTRATOR_ENABLED",
             True,
         )
         self._enabled_patch.start()
+        self.model_envelopes = {
+            "version": RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION,
+            "models": {
+                ORCHESTRATOR_MODEL: {
+                    "resolution": "test",
+                    "context_length": 128_000,
+                    "max_completion_tokens": 16_000,
+                },
+                PROCESSING_MODEL: {
+                    "resolution": "test",
+                    "context_length": 128_000,
+                    "max_completion_tokens": 16_000,
+                },
+            },
+        }
+        self._envelopes_patch = patch(
+            "app.services.recovery_state.resolve_recovery_model_envelopes",
+            new=AsyncMock(return_value=self.model_envelopes),
+        )
+        self.mock_resolve_envelopes = self._envelopes_patch.start()
         self.run_id = str(uuid.uuid4())
         async with self.SessionLocal() as session:
             session.add(
@@ -1301,6 +1587,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def asyncTearDown(self) -> None:
+        self._envelopes_patch.stop()
         self._enabled_patch.stop()
         self._lease_session_patch.stop()
         self._session_patch.stop()
@@ -1398,6 +1685,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
                 schema_name="aiv_recovery_checkpoint_test",
                 reasoning_effort="high",
                 temperature=0.1,
+                resume_only=True,
             )
 
         self.assertEqual(post_count, 1)
@@ -1413,8 +1701,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
                     await session.execute(
                         select(RunArtifact).where(
                             RunArtifact.run_id == self.run_id,
-                            RunArtifact.stage_key
-                            == "recovery_provider_checkpoint",
+                            RunArtifact.stage_key == "recovery_provider_checkpoint",
                         )
                     )
                 )
@@ -1424,11 +1711,138 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].output_json["status"], "accepted")
 
+    async def test_cache_only_atomic_replay_miss_never_calls_provider(self) -> None:
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"fact": {"type": "string"}},
+            "required": ["fact"],
+        }
+        provider = AsyncMock()
+        with patch(
+            "app.services.recovery_orchestrator.chat",
+            new=provider,
+        ):
+            with self.assertRaises(RecoveryProviderCheckpointMissing):
+                await _recovery_atomic_chat(
+                    run_id=self.run_id,
+                    sequence_key="missing-cache-only",
+                    model=ORCHESTRATOR_MODEL,
+                    messages=[{"role": "user", "content": "missing"}],
+                    response_schema=schema,
+                    schema_name="aiv_recovery_checkpoint_test",
+                    reasoning_effort="high",
+                    temperature=0.1,
+                    resume_only=True,
+                )
+        provider.assert_not_awaited()
+
+    async def test_rejected_provider_event_is_preserved_losslessly(self) -> None:
+        identity = {
+            "version": "test",
+            "model": ORCHESTRATOR_MODEL,
+            "messages": [{"role": "user", "content": "incident"}],
+        }
+        raw_text = '{"rationale":"short"}'
+        event = {
+            "version": "aiv-openrouter-physical-post-v1",
+            "event_id": "rejected-event",
+            "event_kind": "provider_post",
+            "status": "rejected",
+            "model": ORCHESTRATOR_MODEL,
+            "request_sha256": "a" * 64,
+            "raw_text": raw_text,
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            "transport": {
+                "status": "succeeded",
+                "http_status": 200,
+                "output_complete": True,
+                "output_limited": False,
+            },
+            "error": {
+                "type": "OpenRouterResponseContractError",
+                "message": "Structured response is unusable",
+            },
+        }
+
+        for _attempt in range(2):
+            await _persist_recovery_provider_event(
+                run_id=self.run_id,
+                artifact_key="recovery_provider_test",
+                request_identity=identity,
+                event=event,
+            )
+
+        async with self.SessionLocal() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(RunArtifact).where(
+                            RunArtifact.run_id == self.run_id,
+                            RunArtifact.stage_key == "recovery_provider_checkpoint",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "failed")
+        self.assertEqual(rows[0].raw_text, raw_text)
+        self.assertEqual(rows[0].output_json, event)
+        self.assertEqual(
+            rows[0].input_json["semantic_disposition"],
+            "not_accepted",
+        )
+
+    async def test_code_owned_plan_is_durable_and_model_free(self) -> None:
+        kwargs = {
+            "stage_key": "entity_catalog_contract_v2:test",
+            "failure_class": "repairable_provider_contract",
+            "failure_code": "entity_catalog_evidence_binding_failed",
+            "diagnostics": {"artifact_key": "leaf"},
+            "facts": {"source_units_sha256": "a" * 64},
+            "allowed_actions": {ACTION_RETRY_WITH_GUIDANCE, ACTION_STOP},
+            "permitted_artifact_keys": {"leaf"},
+            "fallback_reason": "planner cap reached",
+            "decision": {
+                "action": ACTION_RETRY_WITH_GUIDANCE,
+                "rationale": (
+                    "Разрешён только узкий повтор неизменяемого leaf-контракта."
+                ),
+                "confidence": "high",
+                "guidance": "Сохрани отдельную точную цитату каждой сущности.",
+                "target_answer_ids": [],
+                "invalidate_artifact_keys": [],
+                "acceptance_checks": [
+                    "prompt_contract_valid",
+                    "raw_corpus_unchanged",
+                ],
+            },
+        }
+
+        first = await plan_code_owned_recovery(self.run_id, **kwargs)
+        second = await plan_code_owned_recovery(self.run_id, **kwargs)
+
+        self.assertFalse(first.reused)
+        self.assertTrue(second.reused)
+        self.assertEqual(first.epoch_id, second.epoch_id)
+        async with self.SessionLocal() as session:
+            row = (
+                await session.execute(
+                    select(RecoveryEpoch).where(RecoveryEpoch.id == first.epoch_id)
+                )
+            ).scalar_one()
+        self.assertIsNone(row.model)
+        self.assertEqual(row.status, "planned")
+        self.assertFalse(
+            row.usage_json["_aiv_code_owned_recovery"]["strong_model_call_made"]
+        )
+
     async def test_disabled_state_does_not_reserve_or_spend_epoch(self) -> None:
         with (
             patch(
-                "app.services.recovery_state.settings."
-                "PIPELINE_ORCHESTRATOR_ENABLED",
+                "app.services.recovery_state.settings.PIPELINE_ORCHESTRATOR_ENABLED",
                 False,
             ),
             patch(
@@ -1450,6 +1864,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
                     allowed_actions={ACTION_DETERMINISTIC_FALLBACK},
                 )
         planner.assert_not_awaited()
+        self.mock_resolve_envelopes.assert_not_awaited()
         async with self.SessionLocal() as session:
             count = len(
                 list(
@@ -1544,9 +1959,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             rows = list(
                 (
                     await session.execute(
-                        select(RecoveryEpoch).where(
-                            RecoveryEpoch.run_id == self.run_id
-                        )
+                        select(RecoveryEpoch).where(RecoveryEpoch.run_id == self.run_id)
                     )
                 )
                 .scalars()
@@ -1566,7 +1979,129 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             "{}",
         )
 
-    async def test_interrupted_planner_attempt_is_accounted_and_reconciled(self) -> None:
+    async def test_interrupted_planner_replays_same_epoch_cache_only(
+        self,
+    ) -> None:
+        diagnostics = {"validation_errors": ["x"]}
+        facts = {"profile_sha256": "a" * 64}
+        action_scope = {ACTION_DETERMINISTIC_FALLBACK}
+        fingerprint = recovery_failure_fingerprint(
+            stage_key="scenario_design",
+            failure_class="repairable_semantic",
+            failure_code="prompt_set_non_convergent",
+            diagnostics=diagnostics,
+        )
+        facts_digest = recovery_scope_digest(
+            facts=facts,
+            allowed_actions=action_scope,
+        )
+        stored_incident = {
+            "run_id": self.run_id,
+            "stage": "scenario_design",
+            "failure_class": "repairable_semantic",
+            "code": "prompt_set_non_convergent",
+            "fingerprint": fingerprint,
+            "attempt_count": 1,
+            "resume_count": 0,
+            "facts_digest": facts_digest,
+            "diagnostics": diagnostics,
+            "facts": facts,
+        }
+        started_input = {
+            "replay_contract_version": RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
+            "incident": stored_incident,
+            "allowed_actions": sorted(action_scope),
+            "permitted_answer_ids": [],
+            "permitted_artifact_keys": [],
+            "model_envelopes": self.model_envelopes,
+            "planner_attempt": {
+                "started": True,
+                "completed": False,
+            },
+        }
+        async with self.SessionLocal() as session:
+            epoch = RecoveryEpoch(
+                run_id=self.run_id,
+                epoch=1,
+                stage_key="scenario_design",
+                failure_class="repairable_semantic",
+                failure_code="prompt_set_non_convergent",
+                failure_fingerprint=fingerprint,
+                facts_digest=facts_digest,
+                status="planning",
+                model=ORCHESTRATOR_MODEL,
+                input_json=started_input,
+                usage_json={
+                    RECOVERY_PLANNER_REPLAY_AUDIT_KEY: {
+                        "version": RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
+                        "input_sha256": stable_digest(started_input),
+                    }
+                },
+            )
+            session.add(epoch)
+            await session.commit()
+            await session.refresh(epoch)
+            epoch_id = epoch.id
+
+        decision = {
+            "action": ACTION_DETERMINISTIC_FALLBACK,
+            "rationale": "Сохранённый ответ безопасно восстановлен без нового вызова.",
+            "confidence": "high",
+            "guidance": "",
+            "target_answer_ids": [],
+            "invalidate_artifact_keys": [],
+            "acceptance_checks": ["prompt_contract_valid"],
+            "incident_fingerprint": fingerprint,
+            "orchestrator_version": ORCHESTRATOR_VERSION,
+        }
+        planned = OrchestratorResult(
+            decision=decision,
+            raw_text="{}",
+            usage={"prompt_tokens": 100},
+            input_digest="input-digest",
+        )
+        with patch(
+            "app.services.recovery_state.plan_recovery",
+            new=AsyncMock(return_value=planned),
+        ) as planner:
+            result = await plan_durable_recovery(
+                self.run_id,
+                stage_key="scenario_design",
+                failure_class="repairable_semantic",
+                failure_code="prompt_set_non_convergent",
+                diagnostics=diagnostics,
+                facts=facts,
+                allowed_actions=action_scope,
+                stage_planner_call_limit=1,
+            )
+
+        self.assertTrue(result.reused)
+        self.assertEqual(result.epoch_id, epoch_id)
+        self.mock_resolve_envelopes.assert_not_awaited()
+        planner.assert_awaited_once()
+        planner_kwargs = planner.await_args.kwargs
+        self.assertTrue(planner_kwargs["resume_only"])
+        self.assertEqual(planner_kwargs["model_envelopes"], self.model_envelopes)
+        async with self.SessionLocal() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(RecoveryEpoch).where(RecoveryEpoch.run_id == self.run_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "planned")
+        self.assertTrue(rows[0].input_json["planner_attempt"]["resumed_after_restart"])
+        self.assertTrue(
+            rows[0].usage_json["_aiv_orchestrator"]["resumed_after_restart"]
+        )
+
+    async def test_interrupted_planner_attempt_is_accounted_and_reconciled(
+        self,
+    ) -> None:
         diagnostics = {"validation_errors": ["x"]}
         facts = {"profile_sha256": "a" * 64}
         fingerprint = recovery_failure_fingerprint(
@@ -1592,10 +2127,25 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
                     status="planning",
                     model=ORCHESTRATOR_MODEL,
                     input_json={
+                        "incident": {
+                            "run_id": self.run_id,
+                            "stage": "scenario_design",
+                            "failure_class": "repairable_semantic",
+                            "code": "prompt_set_non_convergent",
+                            "fingerprint": fingerprint,
+                            "attempt_count": 1,
+                            "resume_count": 0,
+                            "facts_digest": facts_digest,
+                            "diagnostics": diagnostics,
+                            "facts": facts,
+                        },
+                        "allowed_actions": [ACTION_DETERMINISTIC_FALLBACK],
+                        "permitted_answer_ids": [],
+                        "permitted_artifact_keys": [],
                         "planner_attempt": {
                             "started": True,
                             "completed": False,
-                        }
+                        },
                     },
                 )
             )
@@ -1668,6 +2218,92 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             rows[0].usage_json["planner_attempt"]["reconciled_after_restart"]
         )
 
+    async def test_current_replay_contract_missing_envelope_is_corruption(
+        self,
+    ) -> None:
+        diagnostics = {"validation_errors": ["x"]}
+        facts = {"profile_sha256": "a" * 64}
+        action_scope = {ACTION_DETERMINISTIC_FALLBACK}
+        fingerprint = recovery_failure_fingerprint(
+            stage_key="scenario_design",
+            failure_class="repairable_semantic",
+            failure_code="prompt_set_non_convergent",
+            diagnostics=diagnostics,
+        )
+        facts_digest = recovery_scope_digest(
+            facts=facts,
+            allowed_actions=action_scope,
+        )
+        corrupted_input = {
+            "replay_contract_version": RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
+            "incident": {
+                "run_id": self.run_id,
+                "stage": "scenario_design",
+                "failure_class": "repairable_semantic",
+                "code": "prompt_set_non_convergent",
+                "fingerprint": fingerprint,
+                "attempt_count": 1,
+                "resume_count": 0,
+                "facts_digest": facts_digest,
+                "diagnostics": diagnostics,
+                "facts": facts,
+            },
+            "allowed_actions": sorted(action_scope),
+            "permitted_answer_ids": [],
+            "permitted_artifact_keys": [],
+            # model_envelopes was removed from a current-version row.
+            "planner_attempt": {"started": True, "completed": False},
+        }
+        async with self.SessionLocal() as session:
+            session.add(
+                RecoveryEpoch(
+                    run_id=self.run_id,
+                    epoch=1,
+                    stage_key="scenario_design",
+                    failure_class="repairable_semantic",
+                    failure_code="prompt_set_non_convergent",
+                    failure_fingerprint=fingerprint,
+                    facts_digest=facts_digest,
+                    status="planning",
+                    model=ORCHESTRATOR_MODEL,
+                    input_json=corrupted_input,
+                    usage_json={
+                        RECOVERY_PLANNER_REPLAY_AUDIT_KEY: {
+                            "version": RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
+                            "input_sha256": stable_digest(corrupted_input),
+                        }
+                    },
+                )
+            )
+            await session.commit()
+
+        with patch(
+            "app.services.recovery_state.plan_recovery",
+            new_callable=AsyncMock,
+        ) as planner:
+            with self.assertRaisesRegex(
+                OrchestratorContractError,
+                "replay contract.*corrupted",
+            ):
+                await plan_durable_recovery(
+                    self.run_id,
+                    stage_key="scenario_design",
+                    failure_class="repairable_semantic",
+                    failure_code="prompt_set_non_convergent",
+                    diagnostics=diagnostics,
+                    facts=facts,
+                    allowed_actions=action_scope,
+                )
+        planner.assert_not_awaited()
+        self.mock_resolve_envelopes.assert_not_awaited()
+        async with self.SessionLocal() as session:
+            epoch = (
+                await session.execute(
+                    select(RecoveryEpoch).where(RecoveryEpoch.run_id == self.run_id)
+                )
+            ).scalar_one()
+        self.assertEqual(epoch.status, "failed")
+
     async def test_stage_planner_budget_blocks_second_post_after_restart(
         self,
     ) -> None:
@@ -1697,10 +2333,25 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
                     status="planning",
                     model=ORCHESTRATOR_MODEL,
                     input_json={
+                        "incident": {
+                            "run_id": self.run_id,
+                            "stage": "analysis_critic",
+                            "failure_class": "repairable_semantic",
+                            "code": "analysis_critic_non_convergent",
+                            "fingerprint": fingerprint,
+                            "attempt_count": 1,
+                            "resume_count": 0,
+                            "facts_digest": facts_digest,
+                            "diagnostics": diagnostics,
+                            "facts": facts,
+                        },
+                        "allowed_actions": [ACTION_TARGETED_ANNOTATION_REPAIR],
+                        "permitted_answer_ids": [569],
+                        "permitted_artifact_keys": [],
                         "planner_attempt": {
                             "started": True,
                             "completed": False,
-                        }
+                        },
                     },
                 )
             )
@@ -1726,20 +2377,15 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
                     stage_planner_call_limit=1,
                 )
         planner.assert_not_awaited()
+        self.mock_resolve_envelopes.assert_not_awaited()
         async with self.SessionLocal() as session:
             epoch = (
                 await session.execute(
-                    select(RecoveryEpoch).where(
-                        RecoveryEpoch.run_id == self.run_id
-                    )
+                    select(RecoveryEpoch).where(RecoveryEpoch.run_id == self.run_id)
                 )
             ).scalar_one()
         self.assertEqual(epoch.status, "failed")
-        self.assertTrue(
-            epoch.usage_json["planner_attempt"][
-                "reconciled_after_restart"
-            ]
-        )
+        self.assertTrue(epoch.usage_json["planner_attempt"]["reconciled_after_restart"])
 
     async def test_plan_survives_restart_and_finishes_once(self) -> None:
         decision = {
@@ -1803,9 +2449,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
             epochs = list(
                 (
                     await session.execute(
-                        select(RecoveryEpoch).where(
-                            RecoveryEpoch.run_id == self.run_id
-                        )
+                        select(RecoveryEpoch).where(RecoveryEpoch.run_id == self.run_id)
                     )
                 )
                 .scalars()
@@ -1960,9 +2604,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         async with self.SessionLocal() as session:
             epoch = (
                 await session.execute(
-                    select(RecoveryEpoch).where(
-                        RecoveryEpoch.run_id == self.run_id
-                    )
+                    select(RecoveryEpoch).where(RecoveryEpoch.run_id == self.run_id)
                 )
             ).scalar_one()
         self.assertEqual(epoch.status, "planning")
@@ -2048,9 +2690,7 @@ class DurableRecoveryStateTests(unittest.IsolatedAsyncioTestCase):
         async with self.SessionLocal() as session:
             epoch = (
                 await session.execute(
-                    select(RecoveryEpoch).where(
-                        RecoveryEpoch.id == plan.epoch_id
-                    )
+                    select(RecoveryEpoch).where(RecoveryEpoch.id == plan.epoch_id)
                 )
             ).scalar_one()
         self.assertEqual(epoch.status, "executing")

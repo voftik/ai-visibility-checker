@@ -26,7 +26,10 @@ from app.services.recovery_orchestrator import (
     ACTION_RETRY_WITH_GUIDANCE,
     CHECK_PROMPT_CONTRACT_VALID,
     CHECK_RAW_CORPUS_UNCHANGED,
+    OrchestratorContractError,
+    RecoveryPlannerUnavailable,
 )
+from app.services.recovery_state import RecoveryBudgetExceeded
 
 
 def _catalog_candidate(
@@ -94,9 +97,7 @@ def _catalog_candidate_with_entity(
 def _retry_plan(*, reused: bool = False) -> SimpleNamespace:
     decision = {
         "action": ACTION_RETRY_WITH_GUIDANCE,
-        "guidance": (
-            "Повторно извлеки строку, сохранив точные координаты core."
-        ),
+        "guidance": ("Повторно извлеки строку, сохранив точные координаты core."),
         "acceptance_checks": [
             CHECK_PROMPT_CONTRACT_VALID,
             CHECK_RAW_CORPUS_UNCHANGED,
@@ -123,9 +124,7 @@ def _response_contract_error(*, complete: bool) -> Exception:
         "http_status": 200,
         "output_complete": complete,
         "output_limited": False,
-        "output_incomplete_reason": (
-            None if complete else "missing_finish_reason"
-        ),
+        "output_incomplete_reason": (None if complete else "missing_finish_reason"),
     }
     usage = {
         "_aiv_transport": copy.deepcopy(transport),
@@ -169,6 +168,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         plan: Any | None = None,
         attempts: list[int] | None = None,
         planner_mock: AsyncMock | None = None,
+        fallback_plan_mock: AsyncMock | None = None,
         reserve_mock: AsyncMock | None = None,
         finish_mock: AsyncMock | None = None,
         artifact_output_mock: AsyncMock | None = None,
@@ -181,6 +181,9 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         mark_contract_failed_mock: AsyncMock | None = None,
     ) -> tuple[dict[str, Any] | None, AsyncMock, AsyncMock, AsyncMock]:
         planner = planner_mock or AsyncMock(return_value=plan or _retry_plan())
+        fallback_plan = fallback_plan_mock or AsyncMock(
+            return_value=plan or _retry_plan()
+        )
         reserve = reserve_mock or AsyncMock(side_effect=attempts or [1])
         finish = finish_mock or AsyncMock()
         artifact_output = artifact_output_mock or AsyncMock(return_value=None)
@@ -194,15 +197,12 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         epoch_binding = epoch_binding_mock or AsyncMock(
             return_value=("succeeded", None)
         )
-        recovery_artifact = recovery_artifact_mock or AsyncMock(
-            return_value=None
-        )
+        recovery_artifact = recovery_artifact_mock or AsyncMock(return_value=None)
         mark_contract_failed = mark_contract_failed_mock or AsyncMock()
         result: dict[str, Any] | None = None
         with (
             patch(
-                "app.services.analyzer.settings."
-                "PIPELINE_ORCHESTRATOR_ENABLED",
+                "app.services.analyzer.settings.PIPELINE_ORCHESTRATOR_ENABLED",
                 enabled,
             ),
             patch(
@@ -223,6 +223,10 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 planner,
             ),
             patch(
+                "app.services.analyzer.plan_code_owned_recovery",
+                fallback_plan,
+            ),
+            patch(
                 "app.services.analyzer.mark_recovery_executing",
                 reserve,
             ),
@@ -234,18 +238,15 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.analyzer._save_artifact", save),
             patch(
-                "app.services.analyzer."
-                "_validate_entity_catalog_recovery_epoch_binding",
+                "app.services.analyzer._validate_entity_catalog_recovery_epoch_binding",
                 epoch_binding,
             ),
             patch(
-                "app.services.analyzer."
-                "_entity_catalog_recovery_artifact",
+                "app.services.analyzer._entity_catalog_recovery_artifact",
                 recovery_artifact,
             ),
             patch(
-                "app.services.analyzer."
-                "_mark_completed_artifact_contract_failed",
+                "app.services.analyzer._mark_completed_artifact_contract_failed",
                 new=mark_contract_failed,
             ),
         ):
@@ -274,9 +275,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="ALPHA",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, reserve, finish = await self._run_catalog(processing)
 
@@ -293,14 +292,10 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         answers = [{"answer_id": 1, "answer": "ALPHA"}]
         original_answers = copy.deepcopy(answers)
         save = AsyncMock(
-            side_effect=lambda *args, **kwargs: completion_order.append(
-                "checkpoint"
-            )
+            side_effect=lambda *args, **kwargs: completion_order.append("checkpoint")
         )
         finish = AsyncMock(
-            side_effect=lambda *args, **kwargs: completion_order.append(
-                "finish"
-            )
+            side_effect=lambda *args, **kwargs: completion_order.append("finish")
         )
 
         async def processing(
@@ -320,9 +315,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="Alpha",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, reserve, _finish = await self._run_catalog(
             processing,
@@ -354,9 +347,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         finish.assert_awaited_once()
         self.assertTrue(finish.await_args.kwargs["succeeded"])
-        self.assertTrue(
-            finish.await_args.kwargs["details"]["raw_source_unchanged"]
-        )
+        self.assertTrue(finish.await_args.kwargs["details"]["raw_source_unchanged"])
         save.assert_awaited_once()
         saved = save.await_args.kwargs
         self.assertTrue(saved["artifact_key"].endswith("_recovery_accepted"))
@@ -394,9 +385,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 )
                 invalid["catalog"]["target_aliases"] = ["ALPHA"]
                 return invalid
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, reserve, finish = await self._run_catalog(
             processing,
@@ -442,9 +431,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     aliases=["GAMMA"],
                     evidence="ALPHA GAMMA",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, reserve, finish = await self._run_catalog(
             processing,
@@ -462,6 +449,116 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         finish.assert_awaited_once()
         self.assertTrue(finish.await_args.kwargs["succeeded"])
 
+    async def test_entity_recovery_uses_bounded_code_owned_plan_after_cap(
+        self,
+    ) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            artifact_key = str(kwargs["artifact_key"])
+            if "_recovery_" in artifact_key:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="ALPHA",
+                )
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        planner = AsyncMock(side_effect=RecoveryBudgetExceeded("planner cap reached"))
+        fallback = AsyncMock(return_value=_retry_plan())
+        result, _planner, reserve, finish = await self._run_catalog(
+            processing,
+            planner_mock=planner,
+            fallback_plan_mock=fallback,
+        )
+
+        self.assertIsNotNone(result)
+        planner.assert_awaited_once()
+        fallback.assert_awaited_once()
+        fallback_kwargs = fallback.await_args.kwargs
+        self.assertEqual(
+            fallback_kwargs["decision"]["action"],
+            ACTION_RETRY_WITH_GUIDANCE,
+        )
+        self.assertEqual(
+            set(fallback_kwargs["decision"]["acceptance_checks"]),
+            {CHECK_PROMPT_CONTRACT_VALID, CHECK_RAW_CORPUS_UNCHANGED},
+        )
+        reserve.assert_awaited_once()
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+
+    async def test_entity_recovery_uses_code_owned_plan_on_provider_failure(
+        self,
+    ) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            artifact_key = str(kwargs["artifact_key"])
+            quote = "ALPHA" if "_recovery_" in artifact_key else "Alpha"
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote=quote,
+                )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        planner = AsyncMock(
+            side_effect=RecoveryPlannerUnavailable("provider transport failed")
+        )
+        fallback = AsyncMock(return_value=_retry_plan())
+        result, _planner, reserve, finish = await self._run_catalog(
+            processing,
+            planner_mock=planner,
+            fallback_plan_mock=fallback,
+        )
+
+        self.assertIsNotNone(result)
+        planner.assert_awaited_once()
+        fallback.assert_awaited_once()
+        reserve.assert_awaited_once()
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+
+    async def test_entity_recovery_never_masks_durable_plan_corruption(self) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        planner = AsyncMock(
+            side_effect=OrchestratorContractError(
+                "Stored recovery plan digest mismatch"
+            )
+        )
+        fallback = AsyncMock(return_value=_retry_plan())
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "recovery planner failed",
+        ):
+            await self._run_catalog(
+                processing,
+                planner_mock=planner,
+                fallback_plan_mock=fallback,
+            )
+        planner.assert_awaited_once()
+        fallback.assert_not_awaited()
+
     def test_absent_output_incident_rejects_spoofed_candidates(self) -> None:
         core_text = "ALPHA source"
         claim = {
@@ -471,8 +568,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "core_text": core_text,
         }
         error = OpenRouterError(
-            "Grounded core-unit quote is absent from the analytic output: "
-            "1:000000"
+            "Grounded core-unit quote is absent from the analytic output: 1:000000"
         )
         valid_incident = _catalog_candidate(claim, quote=core_text)
         valid_incident["catalog"]["target_aliases"] = ["ALPHA"]
@@ -527,7 +623,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             quote="ALPHA",
             canonical_name="ALPHA",
             aliases=["GAMMA"],
-            evidence="ALPHA GAMMA",
+            evidence="ALPHA",
         )
         exact_error = OpenRouterError(
             "Entity-catalog evidence binding failed: "
@@ -542,8 +638,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(admitted)
 
         for spoofed in (
-            "Entity-catalog evidence binding failed: "
-            "entities[0].aliases is not a list",
+            "Entity-catalog evidence binding failed: entities[0].aliases is not a list",
             "Entity-catalog evidence binding failed: "
             "entities[0].canonical_name is not grounded",
         ):
@@ -576,9 +671,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             artifact_key = str(kwargs["artifact_key"])
             calls.append(artifact_key)
             payload = kwargs["user_payload"]
-            if artifact_key.endswith(
-                f"_recovery_e4_a{attempt_number}"
-            ):
+            if artifact_key.endswith(f"_recovery_e4_a{attempt_number}"):
                 return _catalog_candidate(
                     payload["answers"][0]["core_claim"],
                     quote="ALPHA",
@@ -588,9 +681,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="Alpha",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, _reserve, _finish = await self._run_catalog(
             processing,
@@ -610,15 +701,10 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         reserve.assert_not_awaited()
         finish.assert_awaited_once()
         self.assertTrue(
-            any(
-                key.endswith(f"_recovery_e4_a{attempt_number}")
-                for key in calls
-            )
+            any(key.endswith(f"_recovery_e4_a{attempt_number}") for key in calls)
         )
         if attempt_number == 2:
-            self.assertFalse(
-                any(key.endswith("_recovery_e4_a1") for key in calls)
-            )
+            self.assertFalse(any(key.endswith("_recovery_e4_a1") for key in calls))
 
     async def test_restart_resumes_reserved_attempt_one_without_new_mark(
         self,
@@ -671,9 +757,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reserve.await_count, 2)
         finish.assert_awaited_once()
         self.assertFalse(finish.await_args.kwargs["succeeded"])
-        self.assertTrue(
-            finish.await_args.kwargs["details"]["raw_source_unchanged"]
-        )
+        self.assertTrue(finish.await_args.kwargs["details"]["raw_source_unchanged"])
 
     async def test_transport_failure_preserves_reserved_attempt_for_resume(
         self,
@@ -740,9 +824,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="Alpha",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, _planner, _reserve, _finish = await self._run_catalog(
             processing,
@@ -842,9 +924,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     await self._run_catalog(
                         processing,
                         planner_mock=planner,
-                        recovery_artifact_mock=AsyncMock(
-                            return_value=artifact
-                        ),
+                        recovery_artifact_mock=AsyncMock(return_value=artifact),
                     )
                 processing.assert_not_awaited()
                 planner.assert_not_awaited()
@@ -875,9 +955,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="Alpha",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         async def capture_checkpoint(*args: Any, **kwargs: Any) -> None:
             stored.update(
@@ -961,9 +1039,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     return_value=SimpleNamespace(
                         status="completed",
                         model=PROCESSING_MODEL,
-                        prompt_version=(
-                            ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
-                        ),
+                        prompt_version=(ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION),
                         input_json=tampered_recovery_input,
                         output_json=copy.deepcopy(recovered_leaf),
                     )
@@ -984,17 +1060,13 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     output_json=copy.deepcopy(recovered_leaf),
                 )
             ),
-            epoch_binding_mock=AsyncMock(
-                return_value=("executing", resumed_plan)
-            ),
+            epoch_binding_mock=AsyncMock(return_value=("executing", resumed_plan)),
             finish_mock=reconcile_finish,
         )
         reconcile_finish.assert_awaited_once()
         self.assertTrue(reconcile_finish.await_args.kwargs["succeeded"])
         self.assertEqual(
-            reconcile_finish.await_args.kwargs["details"][
-                "accepted_artifact_key"
-            ],
+            reconcile_finish.await_args.kwargs["details"]["accepted_artifact_key"],
             stored["output_json"]["recovery_artifact_key"],
         )
 
@@ -1020,9 +1092,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         "Tampered checkpoint must fail before processing"
                     )
                 ),
-                artifact_output_mock=AsyncMock(
-                    side_effect=tampered_checkpoint
-                ),
+                artifact_output_mock=AsyncMock(side_effect=tampered_checkpoint),
                 recovery_artifact_mock=AsyncMock(
                     side_effect=AssertionError(
                         "Tampered checkpoint must fail before artifact load"
@@ -1137,13 +1207,237 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     aliases=["Alpha"],
                     evidence="ALPHA Alpha",
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, reserve, finish = await self._run_catalog(
             processing,
             answers=[{"answer_id": 1, "answer": "ALPHA Alpha"}],
+        )
+        self.assertIsNotNone(result)
+        planner.assert_not_awaited()
+        reserve.assert_not_awaited()
+        finish.assert_not_awaited()
+
+    async def test_one_core_accepts_separate_exact_quote_per_entity(self) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                claim = payload["answers"][0]["core_claim"]
+                return {
+                    "catalog": {
+                        "target_aliases": ["ALPHA"],
+                        "entities": [
+                            {
+                                "canonical_name": "ALPHA",
+                                "aliases": [],
+                                "category": "target",
+                                "target_relationship": "exact_target",
+                                "commercially_relevant": True,
+                                "mention_policy": "standalone",
+                                "evidence": "Бренд назван: «ALPHA».",
+                            },
+                            {
+                                "canonical_name": "BETA product",
+                                "aliases": [],
+                                "category": "competitor",
+                                "target_relationship": "competitor",
+                                "commercially_relevant": True,
+                                "mention_policy": "standalone",
+                                "evidence": "Альтернатива названа: «BETA product».",
+                            },
+                        ],
+                        "uncertainties": [],
+                    },
+                    "core_dispositions": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "unit_id": claim["unit_id"],
+                            "core_sha256": claim["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": "ALPHA",
+                            "reason": "Core содержит несколько именованных сущностей.",
+                        }
+                    ],
+                }
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        result, planner, reserve, finish = await self._run_catalog(
+            processing,
+            answers=[
+                {
+                    "answer_id": 1,
+                    "answer": "ALPHA работает рядом с BETA product.",
+                }
+            ],
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            {item["canonical_name"] for item in result["entities"]},
+            {"ALPHA", "BETA product"},
+        )
+        planner.assert_not_awaited()
+        reserve.assert_not_awaited()
+        finish.assert_not_awaited()
+
+    async def test_entity_name_in_prose_cannot_borrow_another_quoted_span(
+        self,
+    ) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                claim = payload["answers"][0]["core_claim"]
+                return _catalog_candidate_with_entity(
+                    claim,
+                    quote="ALPHA",
+                    canonical_name="GAMMA",
+                    aliases=[],
+                    evidence="GAMMA якобы названа здесь: «ALPHA».",
+                    target_aliases=["ALPHA"],
+                )
+            raise AssertionError("Invalid leaf must not reach reducer")
+
+        finish = AsyncMock()
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "contract recovery exhausted",
+        ):
+            await self._run_catalog(
+                processing,
+                attempts=[1, 2],
+                finish_mock=finish,
+                answers=[{"answer_id": 1, "answer": "ALPHA source"}],
+            )
+        failures = finish.await_args.kwargs["details"]["attempt_failures"]
+        self.assertTrue(
+            all("canonical_name is not grounded" in item["error"] for item in failures)
+        )
+
+    async def test_outer_quote_from_another_core_cannot_ground_name(self) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                claims = [item["core_claim"] for item in payload["answers"]]
+                return {
+                    "catalog": {
+                        "target_aliases": ["ALPHA"],
+                        "entities": [
+                            {
+                                "canonical_name": "ALPHA",
+                                "aliases": [],
+                                "category": "target",
+                                "target_relationship": "exact_target",
+                                "commercially_relevant": True,
+                                "mention_policy": "standalone",
+                                "evidence": (
+                                    "ALPHA приписана чужой цитате: "
+                                    '«BETA unrelated» ("ALPHA").'
+                                ),
+                            }
+                        ],
+                        "uncertainties": [],
+                    },
+                    "core_dispositions": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "unit_id": claim["unit_id"],
+                            "core_sha256": claim["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": quote,
+                            "reason": "Core содержит проверяемую строку.",
+                        }
+                        for claim, quote in zip(
+                            claims,
+                            ("ALPHA", "BETA unrelated"),
+                            strict=True,
+                        )
+                    ],
+                }
+            raise AssertionError("Invalid leaf must not reach reducer")
+
+        finish = AsyncMock()
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "contract recovery exhausted",
+        ):
+            await self._run_catalog(
+                processing,
+                attempts=[1, 2],
+                finish_mock=finish,
+                answers=[
+                    {"answer_id": 1, "answer": "ALPHA source"},
+                    {"answer_id": 2, "answer": "BETA unrelated"},
+                ],
+            )
+        self.assertFalse(finish.await_args.kwargs["succeeded"])
+
+    async def test_domain_and_markdown_only_entity_quotes_are_accepted(
+        self,
+    ) -> None:
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                claim = payload["answers"][0]["core_claim"]
+                return {
+                    "catalog": {
+                        "target_aliases": ["ALPHA"],
+                        "entities": [
+                            {
+                                "canonical_name": "ALPHA",
+                                "aliases": [],
+                                "category": "target",
+                                "target_relationship": "exact_target",
+                                "commercially_relevant": True,
+                                "mention_policy": "standalone",
+                                "evidence": "Бренд: «ALPHA».",
+                            },
+                            {
+                                "canonical_name": "makarskatattoo.com",
+                                "aliases": [],
+                                "category": "other",
+                                "target_relationship": "unrelated",
+                                "commercially_relevant": False,
+                                "mention_policy": "standalone",
+                                "evidence": (
+                                    "Источник: «https://makarskatattoo.com/path»."
+                                ),
+                            },
+                        ],
+                        "uncertainties": [],
+                    },
+                    "core_dispositions": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "unit_id": claim["unit_id"],
+                            "core_sha256": claim["core_sha256"],
+                            "disposition": "grounded_fact",
+                            "evidence_quote": "ALPHA",
+                            "reason": "Core содержит бренд и точный домен.",
+                        }
+                    ],
+                }
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        result, planner, reserve, finish = await self._run_catalog(
+            processing,
+            answers=[
+                {
+                    "answer_id": 1,
+                    "answer": "*ALPHA* — https://makarskatattoo.com/path",
+                }
+            ],
         )
         self.assertIsNotNone(result)
         planner.assert_not_awaited()
@@ -1167,9 +1461,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     evidence="Риалвеб",
                     target_aliases=["Риалвеб"],
                 )
-            return _deterministic_entity_catalog_union(
-                list(payload["chunk_catalogs"])
-            )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
 
         result, planner, reserve, finish = await self._run_catalog(
             processing,
@@ -1225,9 +1517,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     "topics": [],
                     "entity_scope": [],
                 },
-                answers=[
-                    {"answer_id": 1, "answer": "Риалвеб Gamma"}
-                ],
+                answers=[{"answer_id": 1, "answer": "Риалвеб Gamma"}],
             )
         planner.assert_awaited_once()
         finish.assert_awaited_once()
@@ -1245,16 +1535,13 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(first, repeated)
         self.assertNotEqual(first, second)
-        self.assertTrue(
-            first.startswith(ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE + ":")
-        )
+        self.assertTrue(first.startswith(ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE + ":"))
 
     async def test_ambiguous_markdown_failure_stays_fail_closed(self) -> None:
         planner = AsyncMock()
         with (
             patch(
-                "app.services.analyzer.settings."
-                "PIPELINE_ORCHESTRATOR_ENABLED",
+                "app.services.analyzer.settings.PIPELINE_ORCHESTRATOR_ENABLED",
                 True,
             ),
             patch(
@@ -1267,9 +1554,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
 
             admitted = _entity_catalog_quote_recovery_incident(
-                OpenRouterError(
-                    "Core-unit Markdown-normalized quote is ambiguous"
-                ),
+                OpenRouterError("Core-unit Markdown-normalized quote is ambiguous"),
                 candidate={"core_dispositions": []},
                 expected_claims=[],
             )

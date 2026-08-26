@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.services.analyzer import (
+    _edit_final_report_language,
     _edit_technical_review_language,
     _technical_editorial_shape_is_safe,
 )
@@ -14,9 +15,15 @@ from app.services.report_editor import (
     REPORT_EDITOR_POLICY_VERSION,
     build_editorial_units,
     edit_report,
+    reader_immutable_passthrough_paths,
     reader_narrative_paths,
+    reader_rendered_string_paths,
+    seal_editorial_audit,
+    technical_review_immutable_passthrough_paths,
     technical_review_narrative_paths,
+    technical_review_rendered_string_paths,
     validate_critic_result,
+    validate_editorial_cache,
     validate_editor_result,
 )
 
@@ -107,8 +114,17 @@ class ReportEditorUnitTests(unittest.TestCase):
         self.assertIn("/headline", paths)
         self.assertIn("/sections/0/body", paths)
         self.assertIn("/actions/0/step", paths)
+        self.assertIn("/limitations/0", paths)
         self.assertNotIn("/actions/0/evidence", paths)
-        self.assertNotIn("/limitations/0", paths)
+
+        immutable = reader_immutable_passthrough_paths(_report())
+        self.assertIn("/headline_emphasis/0", immutable)
+        self.assertIn("/actions/0/priority", immutable)
+        self.assertIn("/actions/0/evidence", immutable)
+        self.assertEqual(
+            set(reader_rendered_string_paths(_report())),
+            set(paths) | set(immutable),
+        )
 
     def test_technical_review_selects_prose_but_not_evidence_or_enum(self) -> None:
         review = _technical_review()
@@ -128,6 +144,15 @@ class ReportEditorUnitTests(unittest.TestCase):
         )
         self.assertNotIn("/findings/0/evidence", paths)
         self.assertNotIn("/findings/0/severity", paths)
+        immutable = technical_review_immutable_passthrough_paths(review)
+        self.assertEqual(
+            immutable,
+            ["/findings/0/severity", "/findings/0/evidence"],
+        )
+        self.assertEqual(
+            set(technical_review_rendered_string_paths(review)),
+            set(paths) | set(immutable),
+        )
 
     def test_explicit_json_pointer_paths_drive_the_lossless_manifest(self) -> None:
         review = _technical_review()
@@ -143,11 +168,47 @@ class ReportEditorUnitTests(unittest.TestCase):
         self.assertEqual(manifest["path_selection"], "explicit_json_pointer")
         self.assertEqual(manifest["prose_paths"], paths)
         self.assertEqual({item.path for item in units}, set(paths))
+        self.assertTrue(manifest["coverage_complete"])
+        self.assertEqual(
+            {item["path"] for item in manifest["immutable_passthrough"]},
+            {"/findings/0/severity", "/findings/0/evidence"},
+        )
         with self.assertRaisesRegex(ValueError, "does not resolve"):
             build_editorial_units(
                 review,
                 prose_paths=["/findings/0/missing"],
             )
+
+    def test_omitted_reader_path_fails_exact_coverage(self) -> None:
+        review = _technical_review()
+        paths = technical_review_narrative_paths(review)
+
+        _units, manifest = build_editorial_units(
+            review,
+            prose_paths=[path for path in paths if path != "/limitations/0"],
+        )
+
+        self.assertFalse(manifest["coverage_complete"])
+        self.assertEqual(manifest["missing_paths"], ["/limitations/0"])
+
+    def test_partial_schema_is_not_admitted_as_an_editorial_document(self) -> None:
+        for missing_key in ("headline_emphasis", "limitations"):
+            with self.subTest(document="final_report", missing_key=missing_key):
+                partial = _report()
+                partial.pop(missing_key)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "unsupported editorial document shape",
+                ):
+                    build_editorial_units(partial)
+
+        partial_review = _technical_review()
+        partial_review.pop("limitations")
+        with self.assertRaisesRegex(
+            ValueError,
+            "unsupported editorial document shape",
+        ):
+            build_editorial_units(partial_review)
 
     def test_long_report_has_lossless_unbounded_unit_manifest(self) -> None:
         tail = "TAIL-EDITOR-41"
@@ -220,7 +281,7 @@ class ReportEditorUnitTests(unittest.TestCase):
         self.assertIn("mechanical_triad", errors)
         self.assertIn("number_carrier_missing", errors)
         self.assertIn("long_dash_forbidden", errors)
-        self.assertEqual(REPORT_EDITOR_POLICY_VERSION, "aiv-ru-editorial-policy-v2")
+        self.assertEqual(REPORT_EDITOR_POLICY_VERSION, "aiv-ru-editorial-policy-v3")
 
     def test_critic_must_confirm_actor_number_carrier_and_natural_style(
         self,
@@ -257,6 +318,89 @@ class ReportEditorUnitTests(unittest.TestCase):
 
 
 class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_final_preflight_returns_source_without_model_call(
+        self,
+    ) -> None:
+        partial = _report()
+        partial.pop("limitations")
+        expected = copy.deepcopy(partial)
+        expected["headline_emphasis"] = []
+        artifact_output = AsyncMock()
+        editor = AsyncMock()
+        save_artifact = AsyncMock()
+
+        with (
+            patch("app.services.analyzer._artifact_output", artifact_output),
+            patch("app.services.analyzer.edit_report", editor),
+            patch("app.services.analyzer._save_artifact", save_artifact),
+        ):
+            result = await _edit_final_report_language(
+                "run-partial-final-editorial",
+                report=partial,
+                public_report={"brand": {"name": "Acme"}},
+                selected_answer_context=[],
+                answer_selection_manifest={},
+                semantic_evidence_document={},
+            )
+
+        self.assertEqual(result, expected)
+        artifact_output.assert_not_awaited()
+        editor.assert_not_awaited()
+        save_artifact.assert_awaited_once()
+        saved = save_artifact.await_args.kwargs
+        self.assertEqual(saved["status"], "completed")
+        self.assertFalse(saved["output_json"]["audit"]["coverage_complete"])
+        self.assertIn("audit_sha256", saved["output_json"]["audit"])
+
+    async def test_unsupported_technical_preflight_returns_source_without_model_call(
+        self,
+    ) -> None:
+        unsupported = {"unexpected": "Сохранённый технический вывод"}
+        artifact_output = AsyncMock()
+        editor = AsyncMock()
+        save_artifact = AsyncMock()
+
+        with (
+            patch("app.services.analyzer._artifact_output", artifact_output),
+            patch("app.services.analyzer.edit_report", editor),
+            patch("app.services.analyzer._save_artifact", save_artifact),
+        ):
+            result = await _edit_technical_review_language(
+                "run-unsupported-technical-editorial",
+                review=unsupported,
+                profile={"brand_name": "Acme"},
+            )
+
+        self.assertEqual(result, unsupported)
+        artifact_output.assert_not_awaited()
+        editor.assert_not_awaited()
+        save_artifact.assert_awaited_once()
+        saved = save_artifact.await_args.kwargs
+        self.assertEqual(saved["status"], "completed")
+        self.assertFalse(saved["output_json"]["audit"]["coverage_complete"])
+        self.assertIn("audit_sha256", saved["output_json"]["audit"])
+
+    async def test_incomplete_reader_contract_fails_before_model_calls(self) -> None:
+        source = _technical_review()
+        editor = AsyncMock()
+        critic = AsyncMock()
+
+        edited, audit = await edit_report(
+            source,
+            editor_call=editor,
+            critic_call=critic,
+            prose_paths=["/overall_conclusion"],
+        )
+
+        self.assertEqual(edited, source)
+        self.assertFalse(audit["coverage_complete"])
+        self.assertIn(
+            "/limitations/0",
+            audit["source_manifest"]["missing_paths"],
+        )
+        editor.assert_not_awaited()
+        critic.assert_not_awaited()
+
     async def test_technical_editorial_pass_returns_edited_review_losslessly(
         self,
     ) -> None:
@@ -326,7 +470,41 @@ class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
             {"used": False, "errors": []},
         )
 
-    async def test_successful_edit_preserves_facts_and_clears_emphasis(self) -> None:
+    async def test_incomplete_cached_review_is_ignored_for_fresh_pass(self) -> None:
+        source = _technical_review()
+        poisoned = copy.deepcopy(source)
+        poisoned["overall_conclusion"] = "Старый неполный результат"
+        fresh = copy.deepcopy(source)
+        fresh["overall_conclusion"] = "Краулер получает HTML на двух страницах."
+        artifact_output = AsyncMock(
+            return_value={
+                "review": poisoned,
+                "audit": {
+                    "version": REPORT_EDITOR_HARNESS_VERSION,
+                    "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                    "coverage_complete": False,
+                },
+            }
+        )
+        save_artifact = AsyncMock()
+        editor = AsyncMock(return_value=(fresh, {}))
+
+        with (
+            patch("app.services.analyzer._artifact_output", artifact_output),
+            patch("app.services.analyzer._save_artifact", save_artifact),
+            patch("app.services.analyzer.edit_report", editor),
+        ):
+            result = await _edit_technical_review_language(
+                "run-poisoned-editorial-cache",
+                review=source,
+                profile={"brand_name": "Acme"},
+            )
+
+        self.assertEqual(result, fresh)
+        editor.assert_awaited_once()
+        self.assertEqual(save_artifact.await_count, 2)
+
+    async def test_successful_edit_preserves_facts_and_passthrough_receipts(self) -> None:
         source = _report()
 
         async def editor(payload: dict) -> dict:
@@ -379,11 +557,76 @@ class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
             protected_terms=["Acme"],
         )
         self.assertEqual(edited["headline"], "Acme виден в ответах")
-        self.assertEqual(edited["headline_emphasis"], [])
+        self.assertEqual(edited["headline_emphasis"], source["headline_emphasis"])
         self.assertEqual(edited["actions"][0]["evidence"], source["actions"][0]["evidence"])
         self.assertEqual(edited["limitations"], source["limitations"])
         self.assertTrue(audit["coverage_complete"])
         self.assertFalse(audit["fallback_units"])
+        self.assertTrue(
+            validate_editorial_cache(
+                source,
+                edited,
+                audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+        incomplete = copy.deepcopy(audit)
+        incomplete["coverage_complete"] = False
+        incomplete = seal_editorial_audit(incomplete)
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                incomplete,
+                protected_terms=["Acme"],
+            )
+        )
+
+        poisoned_result = copy.deepcopy(edited)
+        poisoned_result["actions"][0]["evidence"] = "Подменённое основание"
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                poisoned_result,
+                audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+        poisoned_source = copy.deepcopy(source)
+        poisoned_source["verdict"] = "Другой исходный отчёт"
+        self.assertFalse(
+            validate_editorial_cache(
+                poisoned_source,
+                edited,
+                audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+        tampered_audit = copy.deepcopy(audit)
+        tampered_audit["changed_paths"] = []
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                tampered_audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+        poisoned_audit = copy.deepcopy(audit)
+        poisoned_audit["policy_sha256"] = "0" * 64
+        poisoned_audit = seal_editorial_audit(poisoned_audit)
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                poisoned_audit,
+                protected_terms=["Acme"],
+            )
+        )
 
     async def test_technical_review_edit_keeps_evidence_and_enum_exact(self) -> None:
         source = _technical_review()

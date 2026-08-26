@@ -20,8 +20,8 @@ from typing import Any, Awaitable, Callable, Iterable
 from app.services.long_response import split_lossless_text, text_sha256
 
 
-REPORT_EDITOR_POLICY_VERSION = "aiv-ru-editorial-policy-v2"
-REPORT_EDITOR_HARNESS_VERSION = "aiv-report-editor-lossless-v2"
+REPORT_EDITOR_POLICY_VERSION = "aiv-ru-editorial-policy-v3"
+REPORT_EDITOR_HARNESS_VERSION = "aiv-report-editor-lossless-v3"
 REPORT_EDITOR_UNIT_CHARS = 12_000  # working window, never a corpus limit
 REPORT_EDITOR_CONTEXT_CHARS = 1_200
 REPORT_EDITOR_MAX_REVISIONS = 1
@@ -94,11 +94,28 @@ EDITORIAL_POLICY = """
 ослабляй факты. Сохрани действующее лицо, предмет каждого наблюдения, числа,
 знаменатели, единицы, названия, URL, причинность и границы выборки.
 
-Пиши для руководителя маркетинга или продукта. Заголовок сообщает законченный
-вывод. Сначала вывод, затем доказательство и действие. Отделяй наблюдение от
-интерпретации. Убирай канцелярит, пассив, рекламные эпитеты, синтетические
-надзаголовки, служебное повествование о структуре отчёта и фразы капитана
-очевидность. Не используй ложную формулу «это не X, а Y» и механические тройки.
+Разрешай конфликты в таком порядке: читатель должен правильно понять мысль;
+сила утверждения должна точно совпасть с исходником; фраза должна звучать так,
+как её сказал бы человек; формальные стилевые правила идут после этого. Если
+живая формулировка искажает смысл, сохрани точную исходную формулировку.
+
+Пиши для руководителя маркетинга или продукта. В аналитике субъектом служат
+измеренная система, сайт, модель, пользователь или команда, а не безымянный
+«анализ». Заголовок содержательного блока сообщает законченную мысль и понятен
+без иллюстрации; короткие подписи, названия таблиц и кнопок могут оставаться
+назывными. Сначала вывод, затем доказательство и действие. Отделяй наблюдение
+от интерпретации. Плохой результат называй прямо, не прячь его в вводке.
+
+Убирай канцелярит, отглагольные конструкции, пустые слова-контейнеры,
+рекламные эпитеты, синтетические надзаголовки, служебное повествование о
+структуре отчёта и фразы капитана очевидность. Ставь глагол вместо
+«осуществления», «проведения» и «обеспечения», но не ломай нормальные термины
+вроде «бронирование» или «обучение». Не заменяй конкретное название общим
+«решением», «направлением», «контуром» или «инициативой». Не используй ложную
+формулу «это не X, а Y», парцелляцию ради драматизма и механические тройки.
+Не добавляй вступление, пересказ задачи, «таким образом» или финальную
+любезность. Не хеджируй ради вежливости, но обязательно сохрани исходные
+«может», «вероятно», измеренную долю и любое настоящее ограничение.
 
 Живой русский здесь означает конкретные проверяемые требования:
 - в каждом действии назови деятеля или механизм, если он известен из исходника;
@@ -109,6 +126,13 @@ EDITORIAL_POLICY = """
   ритма; сохраняй реальные три факта, но свяжи их естественной фразой;
 - не объясняй устройство текста, таблицы или диаграммы и не сообщай читателю
   очевидное; сразу назови предметный вывод;
+- называй конкретный сервис, страницу, модель, продукт или действие, если они
+  уже есть в исходнике; никогда не достраивай правдоподобную конкретику;
+- чередуй длину предложений естественно, не делай одинаковые абзацы и не ставь
+  подряд три рубленые фразы; структура должна следовать материалу, а не шаблону;
+- латинское название не бери в кавычки, не склоняй и не меняй его регистр;
+- используй «ёлочки», десятичную запятую и неразрывный пробел перед единицей,
+  если это не меняет защищённые числа и буквальные названия;
 - никогда не используй длинное тире U+2014. Перестрой фразу через точку,
   запятую, двоеточие или глагол. Короткое тире в диапазоне 10–15 не меняй.
 
@@ -207,6 +231,11 @@ EDITOR_CRITIC_POLICY = """
 у каждого числа назван носитель; пассив не прячет деятеля; в edited_text нет
 длинного тире U+2014, лозунга, фразы капитана очевидность, механической триады
 или мета-повествования о разделе, таблице, диаграмме и процессе анализа.
+Проверь, что заголовок передаёт законченную мысль, канцелярит и пустые
+слова-контейнеры заменены конкретным глаголом, латинские названия не склонены,
+мера уверенности не усилилась и не ослабла, а ритм не превратился в три
+одинаковые рубленые фразы. Не требуй удалить подтверждённый факт только ради
+ритма или «уникальности».
 Не требуй выдумать деятеля или носителя, которого нет в source_text.
 Верни только JSON.
 """.strip()
@@ -264,8 +293,7 @@ class EditorialAudit:
         value["changed_paths"] = list(self.changed_paths)
         value["fallback_units"] = [dict(item) for item in self.fallback_units]
         value["critic_verdicts"] = [dict(item) for item in self.critic_verdicts]
-        value["audit_sha256"] = _stable_sha256(value)
-        return value
+        return seal_editorial_audit(value)
 
 
 def _stable_sha256(value: Any) -> str:
@@ -278,6 +306,19 @@ def _stable_sha256(value: Any) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def editorial_policy_sha256() -> str:
+    return text_sha256(EDITORIAL_POLICY + "\n" + EDITOR_CRITIC_POLICY)
+
+
+def seal_editorial_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    """Bind every persisted audit field, including the coverage manifest."""
+
+    value = copy.deepcopy(audit)
+    value.pop("audit_sha256", None)
+    value["audit_sha256"] = _stable_sha256(value)
+    return value
 
 
 def _pointer_get(document: Any, path: str) -> Any:
@@ -321,6 +362,36 @@ def _existing_nonempty_string_paths(
     return paths
 
 
+def _pointer_escape(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def _all_string_leaf_paths(value: Any, path: str = "") -> list[str]:
+    """List every schema string independently from its edit classification."""
+
+    paths: list[str] = []
+    if isinstance(value, str):
+        if path:
+            paths.append(path)
+        return paths
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            paths.extend(_all_string_leaf_paths(item, f"{path}/{index}"))
+        return paths
+    if isinstance(value, dict):
+        for key, item in value.items():
+            paths.extend(
+                _all_string_leaf_paths(item, f"{path}/{_pointer_escape(str(key))}")
+            )
+    return paths
+
+
+def reader_rendered_string_paths(report: dict[str, Any]) -> list[str]:
+    """All final-report strings that can reach Markdown or the report reader."""
+
+    return _all_string_leaf_paths(report)
+
+
 def reader_narrative_paths(report: dict[str, Any]) -> list[str]:
     """Return only prose fields; raw evidence and canonical limits stay exact."""
 
@@ -335,7 +406,31 @@ def reader_narrative_paths(report: dict[str, Any]) -> list[str]:
         paths.extend(
             f"/actions/{index}/{field}" for field in ("title", "why", "step")
         )
+    for index, limitation in enumerate(report.get("limitations") or []):
+        if isinstance(limitation, str):
+            paths.append(f"/limitations/{index}")
     return _existing_nonempty_string_paths(report, paths)
+
+
+def reader_immutable_passthrough_paths(report: dict[str, Any]) -> list[str]:
+    """Final-report labels and factual anchors that the editor cannot rewrite."""
+
+    paths: list[str] = []
+    for index, value in enumerate(report.get("headline_emphasis") or []):
+        if isinstance(value, str):
+            paths.append(f"/headline_emphasis/{index}")
+    for index, action in enumerate(report.get("actions") or []):
+        if isinstance(action, dict):
+            paths.extend(
+                (f"/actions/{index}/priority", f"/actions/{index}/evidence")
+            )
+    return _existing_nonempty_string_paths(report, paths)
+
+
+def technical_review_rendered_string_paths(review: dict[str, Any]) -> list[str]:
+    """All technical-review strings displayed by the report reader."""
+
+    return _all_string_leaf_paths(review)
 
 
 def technical_review_narrative_paths(review: dict[str, Any]) -> list[str]:
@@ -354,6 +449,61 @@ def technical_review_narrative_paths(review: dict[str, Any]) -> list[str]:
         if isinstance(limitation, str):
             paths.append(f"/limitations/{index}")
     return _existing_nonempty_string_paths(review, paths)
+
+
+def technical_review_immutable_passthrough_paths(
+    review: dict[str, Any],
+) -> list[str]:
+    """Technical evidence and enum labels must survive byte-for-byte."""
+
+    paths: list[str] = []
+    for index, finding in enumerate(review.get("findings") or []):
+        if isinstance(finding, dict):
+            paths.extend(
+                (f"/findings/{index}/severity", f"/findings/{index}/evidence")
+            )
+    return _existing_nonempty_string_paths(review, paths)
+
+
+def _editorial_path_contract(
+    document: dict[str, Any],
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Return independent expected/editable/immutable path registries."""
+
+    technical_keys = {
+        "overall_conclusion",
+        "render_conclusion",
+        "findings",
+        "limitations",
+    }
+    final_keys = {
+        "headline",
+        "headline_emphasis",
+        "verdict",
+        "executive_summary",
+        "sections",
+        "actions",
+        "limitations",
+    }
+    if technical_keys.issubset(document):
+        kind = "technical_review"
+        expected = technical_review_rendered_string_paths(document)
+        editable = technical_review_narrative_paths(document)
+        immutable = technical_review_immutable_passthrough_paths(document)
+    elif final_keys.issubset(document):
+        kind = "final_report"
+        expected = reader_rendered_string_paths(document)
+        editable = reader_narrative_paths(document)
+        immutable = reader_immutable_passthrough_paths(document)
+    else:
+        raise ValueError("unsupported editorial document shape")
+
+    # Empty schema strings have no model unit, but are still covered and bound.
+    immutable_set = set(immutable)
+    for path in expected:
+        if path not in editable and _pointer_get(document, path) == "":
+            immutable_set.add(path)
+    return kind, expected, editable, [path for path in expected if path in immutable_set]
 
 
 def _explicit_narrative_paths(
@@ -415,11 +565,32 @@ def build_editorial_units(
 ) -> tuple[list[EditorialUnit], dict[str, Any]]:
     units: list[EditorialUnit] = []
     path_manifests: list[dict[str, Any]] = []
+    protected_term_list = list(
+        dict.fromkeys(str(item).strip() for item in protected_terms if str(item).strip())
+    )
+    document_kind, reader_paths, default_paths, immutable_paths = (
+        _editorial_path_contract(report)
+    )
     selected_paths = (
-        reader_narrative_paths(report)
+        default_paths
         if prose_paths is None
         else _explicit_narrative_paths(report, prose_paths)
     )
+    selected_set = set(selected_paths)
+    immutable_set = set(immutable_paths)
+    reader_set = set(reader_paths)
+    overlap_paths = sorted(selected_set & immutable_set)
+    missing_paths = sorted(reader_set - selected_set - immutable_set)
+    unexpected_paths = sorted((selected_set | immutable_set) - reader_set)
+    coverage_complete = not (overlap_paths or missing_paths or unexpected_paths)
+    passthrough_receipts = [
+        {
+            "path": path,
+            "source_sha256": text_sha256(str(_pointer_get(report, path))),
+            "source_utf8_bytes": len(str(_pointer_get(report, path)).encode("utf-8")),
+        }
+        for path in immutable_paths
+    ]
     for path in selected_paths:
         text = str(_pointer_get(report, path))
         document_id = "editor:" + text_sha256(path)[:16]
@@ -444,22 +615,109 @@ def build_editorial_units(
                     core_end_in_context=item.core_end_in_context,
                     source_sha256=item.sha256,
                     claims=_claims(item.text),
-                    protected_terms=_protected_terms(item.text, protected_terms),
+                    protected_terms=_protected_terms(item.text, protected_term_list),
                 )
             )
     manifest_core = {
         "version": REPORT_EDITOR_HARNESS_VERSION,
+        "policy_version": REPORT_EDITOR_POLICY_VERSION,
+        "policy_sha256": editorial_policy_sha256(),
+        "protected_terms_sha256": _stable_sha256(protected_term_list),
         "source_report_sha256": _stable_sha256(report),
+        "document_kind": document_kind,
         "unit_count": len(units),
         "unit_ids": [item.unit_id for item in units],
         "path_selection": (
             "reader_report_default" if prose_paths is None else "explicit_json_pointer"
         ),
+        "reader_string_paths": reader_paths,
         "prose_paths": selected_paths,
+        "immutable_passthrough": passthrough_receipts,
+        "missing_paths": missing_paths,
+        "unexpected_paths": unexpected_paths,
+        "overlap_paths": overlap_paths,
         "path_manifests": path_manifests,
-        "coverage_complete": True,
+        "coverage_complete": coverage_complete,
     }
     return units, {**manifest_core, "manifest_sha256": _stable_sha256(manifest_core)}
+
+
+def validate_editorial_cache(
+    source: dict[str, Any],
+    result: dict[str, Any],
+    audit: dict[str, Any],
+    *,
+    prose_paths: Iterable[str] | None = None,
+    protected_terms: Iterable[str] = (),
+) -> bool:
+    """Accept a cached edit only when hashes and exact path coverage revalidate."""
+
+    if not isinstance(source, dict) or not isinstance(result, dict) or not isinstance(
+        audit, dict
+    ):
+        return False
+    try:
+        _units, expected_manifest = build_editorial_units(
+            source,
+            prose_paths=prose_paths,
+            protected_terms=protected_terms,
+        )
+    except (TypeError, ValueError):
+        return False
+    if expected_manifest.get("coverage_complete") is not True:
+        return False
+    if audit.get("coverage_complete") is not True:
+        return False
+    if audit.get("version") != REPORT_EDITOR_HARNESS_VERSION:
+        return False
+    if audit.get("policy_version") != REPORT_EDITOR_POLICY_VERSION:
+        return False
+    if audit.get("policy_sha256") != editorial_policy_sha256():
+        return False
+    if audit.get("source_report_sha256") != _stable_sha256(source):
+        return False
+    if audit.get("result_report_sha256") != _stable_sha256(result):
+        return False
+    if audit.get("source_manifest") != expected_manifest:
+        return False
+    if seal_editorial_audit(audit).get("audit_sha256") != audit.get("audit_sha256"):
+        return False
+    if audit.get("unit_count") != expected_manifest.get("unit_count"):
+        return False
+    if audit.get("processed_unit_count") != expected_manifest.get("unit_count"):
+        return False
+    if set(_all_string_leaf_paths(result)) != set(
+        expected_manifest.get("reader_string_paths") or []
+    ):
+        return False
+
+    editable_paths = set(expected_manifest.get("prose_paths") or [])
+    actual_changed_paths: set[str] = set()
+    try:
+        for path in expected_manifest.get("reader_string_paths") or []:
+            source_value = _pointer_get(source, path)
+            result_value = _pointer_get(result, path)
+            if source_value != result_value:
+                actual_changed_paths.add(path)
+        for receipt in expected_manifest.get("immutable_passthrough") or []:
+            path = str(receipt["path"])
+            source_value = _pointer_get(source, path)
+            result_value = _pointer_get(result, path)
+            if source_value != result_value:
+                return False
+            if receipt.get("source_sha256") != text_sha256(str(source_value)):
+                return False
+            if receipt.get("source_utf8_bytes") != len(
+                str(source_value).encode("utf-8")
+            ):
+                return False
+    except (IndexError, KeyError, TypeError, ValueError):
+        return False
+    if not actual_changed_paths.issubset(editable_paths):
+        return False
+    if set(audit.get("changed_paths") or []) != actual_changed_paths:
+        return False
+    return True
 
 
 def _normalized_numbers(text: str) -> Counter[str]:
@@ -598,6 +856,28 @@ async def edit_report(
         prose_paths=prose_paths,
         protected_terms=protected_terms,
     )
+    if manifest.get("coverage_complete") is not True:
+        audit = EditorialAudit(
+            version=REPORT_EDITOR_HARNESS_VERSION,
+            policy_version=REPORT_EDITOR_POLICY_VERSION,
+            policy_sha256=editorial_policy_sha256(),
+            source_report_sha256=manifest["source_report_sha256"],
+            result_report_sha256=_stable_sha256(source),
+            unit_count=len(units),
+            processed_unit_count=0,
+            changed_paths=(),
+            fallback_units=(
+                {
+                    "unit_id": "*",
+                    "verdict": "fallback",
+                    "reason": "reader_string_coverage_incomplete",
+                },
+            ),
+            critic_verdicts=(),
+            coverage_complete=False,
+        ).as_dict()
+        audit["source_manifest"] = manifest
+        return source, seal_editorial_audit(audit)
     semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
     async def process(unit: EditorialUnit) -> tuple[str, str, dict[str, str]]:
@@ -713,11 +993,6 @@ async def edit_report(
         if value != _pointer_get(source, path):
             changed_paths.append(path)
         _pointer_set(result, path, value)
-    # The product design requires one even weight/size in the report hero.
-    # Emphasis metadata is presentation-only and must never survive a rewrite.
-    if "headline_emphasis" in result:
-        result["headline_emphasis"] = []
-
     processed_ids = [row[0] for row in outcomes]
     coverage_complete = (
         len(processed_ids) == len(units)
@@ -732,7 +1007,7 @@ async def edit_report(
     audit = EditorialAudit(
         version=REPORT_EDITOR_HARNESS_VERSION,
         policy_version=REPORT_EDITOR_POLICY_VERSION,
-        policy_sha256=text_sha256(EDITORIAL_POLICY + "\n" + EDITOR_CRITIC_POLICY),
+        policy_sha256=editorial_policy_sha256(),
         source_report_sha256=manifest["source_report_sha256"],
         result_report_sha256=_stable_sha256(result),
         unit_count=len(units),
@@ -743,4 +1018,4 @@ async def edit_report(
         coverage_complete=coverage_complete,
     ).as_dict()
     audit["source_manifest"] = manifest
-    return result, audit
+    return result, seal_editorial_audit(audit)

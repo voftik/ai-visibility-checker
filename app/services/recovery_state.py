@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -16,7 +17,9 @@ from app.services.recovery_orchestrator import (
     ORCHESTRATOR_MODEL,
     ORCHESTRATOR_VERSION,
     OrchestratorContractError,
+    RecoveryProviderCheckpointMissing,
     plan_recovery,
+    resolve_recovery_model_envelopes,
     validate_recovery_decision,
 )
 from app.services.run_lease import (
@@ -30,6 +33,8 @@ class RecoveryBudgetExceeded(RuntimeError):
 
 
 MAX_RECOVERY_EXECUTION_ATTEMPTS = 2
+RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION = "aiv-recovery-planner-replay-v1"
+RECOVERY_PLANNER_REPLAY_AUDIT_KEY = "_aiv_recovery_planner_replay"
 _ACTIVE_RUN_STATUSES = (
     RunStatus.pending,
     RunStatus.crawling,
@@ -113,6 +118,64 @@ def stable_digest(value: object) -> str:
     ).hexdigest()
 
 
+def _planner_replay_audit(started_input: dict[str, Any]) -> dict[str, Any]:
+    return {
+        RECOVERY_PLANNER_REPLAY_AUDIT_KEY: {
+            "version": RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
+            "input_sha256": stable_digest(started_input),
+        }
+    }
+
+
+def _is_exact_legacy_planning_input(
+    value: dict[str, Any],
+    *,
+    usage_json: object,
+) -> bool:
+    """Recognize only the pre-replay-contract planning row shape.
+
+    This compatibility path is deliberately narrower than a generic
+    ``model_envelopes is missing`` check. A current-version row with either
+    replay marker present can never be downgraded to legacy after corruption.
+    """
+
+    if isinstance(usage_json, dict) and usage_json:
+        return False
+    if set(value) != {
+        "incident",
+        "allowed_actions",
+        "permitted_answer_ids",
+        "permitted_artifact_keys",
+        "planner_attempt",
+    }:
+        return False
+    incident = value.get("incident")
+    attempt = value.get("planner_attempt")
+    return (
+        isinstance(incident, dict)
+        and set(incident)
+        == {
+            "run_id",
+            "stage",
+            "failure_class",
+            "code",
+            "fingerprint",
+            "attempt_count",
+            "resume_count",
+            "facts_digest",
+            "diagnostics",
+            "facts",
+        }
+        and isinstance(value.get("allowed_actions"), list)
+        and isinstance(value.get("permitted_answer_ids"), list)
+        and isinstance(value.get("permitted_artifact_keys"), list)
+        and isinstance(attempt, dict)
+        and set(attempt).issubset({"started", "completed", "lease_owner"})
+        and attempt.get("started") is True
+        and attempt.get("completed") is False
+    )
+
+
 def recovery_scope_digest(
     *,
     facts: dict[str, Any],
@@ -129,9 +192,7 @@ def recovery_scope_digest(
             "scope": {
                 "allowed_actions": sorted(allowed_actions),
                 "permitted_answer_ids": sorted(permitted_answer_ids or set()),
-                "permitted_artifact_keys": sorted(
-                    permitted_artifact_keys or set()
-                ),
+                "permitted_artifact_keys": sorted(permitted_artifact_keys or set()),
             },
         }
     )
@@ -203,6 +264,116 @@ async def _prior_decisions(run_id: str) -> list[dict[str, Any]]:
     ]
 
 
+async def _complete_planning_epoch(
+    *,
+    run_id: str,
+    owner: str | None,
+    epoch_id: int,
+    started_input: dict[str, Any],
+    result: Any,
+    resumed_after_restart: bool,
+) -> str:
+    await assert_run_lease(run_id)
+    plan_digest = stable_digest(result.decision)
+    planner_usage = dict(result.usage)
+    planner_usage["_aiv_orchestrator"] = {
+        "input_digest": result.input_digest,
+        "raw_text": result.raw_text,
+        "resumed_after_restart": resumed_after_restart,
+    }
+    async with SessionLocal() as session:
+        changed = await session.execute(
+            update(RecoveryEpoch)
+            .where(
+                *_with_lease_guard(
+                    [
+                        RecoveryEpoch.id == epoch_id,
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.status == "planning",
+                    ],
+                    run_id=run_id,
+                    owner=owner,
+                )
+            )
+            .values(
+                status="planned",
+                plan_json=result.decision,
+                plan_digest=plan_digest,
+                usage_json=planner_usage,
+                input_json={
+                    **started_input,
+                    "planner_attempt": {
+                        **dict(started_input.get("planner_attempt") or {}),
+                        "completed": True,
+                        "succeeded": True,
+                        "resumed_after_restart": resumed_after_restart,
+                    },
+                },
+                error_message=None,
+            )
+        )
+        await session.commit()
+        if changed.rowcount != 1:
+            if owner is not None:
+                await assert_run_lease(run_id)
+            raise OrchestratorContractError(
+                "Recovery epoch changed while the planner was running"
+            )
+    return plan_digest
+
+
+async def _fail_interrupted_planning_epoch(
+    *,
+    run_id: str,
+    owner: str | None,
+    epoch_id: int,
+    started_input: dict[str, Any],
+    error_message: str,
+    checkpoint_missing: bool,
+) -> None:
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        changed = await session.execute(
+            update(RecoveryEpoch)
+            .where(
+                *_with_lease_guard(
+                    [
+                        RecoveryEpoch.id == epoch_id,
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.status == "planning",
+                        RecoveryEpoch.plan_json.is_(None),
+                    ],
+                    run_id=run_id,
+                    owner=owner,
+                )
+            )
+            .values(
+                status="failed",
+                input_json={
+                    **started_input,
+                    "planner_attempt": {
+                        **dict(started_input.get("planner_attempt") or {}),
+                        "completed": True,
+                        "succeeded": False,
+                        "resume_only_attempted": True,
+                    },
+                },
+                error_message=error_message[:2000],
+                usage_json={
+                    "planner_attempt": {
+                        "started": True,
+                        "completed": False,
+                        "reconciled_after_restart": True,
+                        "exact_checkpoint_missing": checkpoint_missing,
+                    }
+                },
+            )
+        )
+        await session.commit()
+        if changed.rowcount != 1 and owner is not None:
+            await assert_run_lease(run_id)
+
+
 async def plan_durable_recovery(
     run_id: str,
     *,
@@ -218,13 +389,10 @@ async def plan_durable_recovery(
 ) -> DurableRecoveryPlan:
     """Reserve one epoch, call the planner once, and persist its safe plan."""
 
-    if (
-        stage_planner_call_limit is not None
-        and (
-            not isinstance(stage_planner_call_limit, int)
-            or isinstance(stage_planner_call_limit, bool)
-            or stage_planner_call_limit < 1
-        )
+    if stage_planner_call_limit is not None and (
+        not isinstance(stage_planner_call_limit, int)
+        or isinstance(stage_planner_call_limit, bool)
+        or stage_planner_call_limit < 1
     ):
         raise ValueError("stage_planner_call_limit must be a positive integer")
 
@@ -254,34 +422,35 @@ async def plan_durable_recovery(
     # the failure and all code-owned facts are byte-for-byte identical.
     async with SessionLocal() as session:
         reusable = (
-            await session.execute(
-                select(RecoveryEpoch)
-                .where(
-                    *_with_lease_guard(
-                        [
-                            RecoveryEpoch.run_id == run_id,
-                            RecoveryEpoch.failure_fingerprint == fingerprint,
-                            RecoveryEpoch.facts_digest == facts_digest,
-                            RecoveryEpoch.status.in_(("planned", "executing")),
-                            RecoveryEpoch.plan_json.is_not(None),
-                        ],
-                        run_id=run_id,
-                        owner=owner,
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        *_with_lease_guard(
+                            [
+                                RecoveryEpoch.run_id == run_id,
+                                RecoveryEpoch.failure_fingerprint == fingerprint,
+                                RecoveryEpoch.facts_digest == facts_digest,
+                                RecoveryEpoch.status.in_(("planned", "executing")),
+                                RecoveryEpoch.plan_json.is_not(None),
+                            ],
+                            run_id=run_id,
+                            owner=owner,
+                        )
                     )
+                    .order_by(RecoveryEpoch.epoch.desc())
                 )
-                .order_by(RecoveryEpoch.epoch.desc())
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if reusable is not None and isinstance(reusable.plan_json, dict):
             stored_decision = dict(reusable.plan_json)
             stored_plan_digest = str(reusable.plan_digest or "")
-            if (
-                not stored_plan_digest
-                or stored_plan_digest != stable_digest(stored_decision)
+            if not stored_plan_digest or stored_plan_digest != stable_digest(
+                stored_decision
             ):
-                raise OrchestratorContractError(
-                    "Stored recovery plan digest mismatch"
-                )
+                raise OrchestratorContractError("Stored recovery plan digest mismatch")
             validate_recovery_decision(
                 stored_decision,
                 allowed_actions=action_scope,
@@ -304,43 +473,178 @@ async def plan_durable_recovery(
                 plan_digest=stored_plan_digest,
             )
 
-        # ``planning`` means that the expensive request was reserved and may
-        # have reached the provider.  If a worker disappeared before it could
-        # persist a result, conservatively account for that call and close the
-        # interrupted epoch before considering another one.  A merely
-        # ``diagnosing`` epoch has not started a model call and costs no budget.
-        interrupted = await session.execute(
-            update(RecoveryEpoch)
-            .where(
-                *_with_lease_guard(
-                    [
-                        RecoveryEpoch.run_id == run_id,
-                        RecoveryEpoch.failure_fingerprint == fingerprint,
-                        RecoveryEpoch.facts_digest == facts_digest,
-                        RecoveryEpoch.status == "planning",
-                        RecoveryEpoch.plan_json.is_(None),
-                    ],
-                    run_id=run_id,
-                    owner=owner,
+        interrupted_epoch = (
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        *_with_lease_guard(
+                            [
+                                RecoveryEpoch.run_id == run_id,
+                                RecoveryEpoch.failure_fingerprint == fingerprint,
+                                RecoveryEpoch.facts_digest == facts_digest,
+                                RecoveryEpoch.status == "planning",
+                                RecoveryEpoch.plan_json.is_(None),
+                            ],
+                            run_id=run_id,
+                            owner=owner,
+                        )
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
                 )
             )
-            .values(
-                status="failed",
-                error_message=(
-                    "Planner attempt was interrupted before a durable result"
-                ),
-                usage_json={
-                    "planner_attempt": {
-                        "started": True,
-                        "completed": False,
-                        "reconciled_after_restart": True,
-                    }
-                },
-            )
+            .scalars()
+            .first()
         )
-        if interrupted.rowcount:
-            await session.commit()
 
+    # A planning epoch can already have every paid physical response durably
+    # checkpointed. Replay only those exact identities before charging the
+    # interrupted logical call as failed. The replay receives frozen model
+    # envelopes and ``resume_only=True``; neither metadata GETs nor model POSTs
+    # are possible on this path.
+    if interrupted_epoch is not None:
+        stored_input = (
+            copy.deepcopy(interrupted_epoch.input_json)
+            if isinstance(interrupted_epoch.input_json, dict)
+            else {}
+        )
+        stored_usage = (
+            copy.deepcopy(interrupted_epoch.usage_json)
+            if isinstance(interrupted_epoch.usage_json, dict)
+            else {}
+        )
+        stored_incident = stored_input.get("incident")
+        model_envelopes = stored_input.get("model_envelopes")
+        replay_version = stored_input.get("replay_contract_version")
+        replay_audit = stored_usage.get(RECOVERY_PLANNER_REPLAY_AUDIT_KEY)
+        current_replay = replay_version == RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION
+        exact_legacy = replay_version is None and _is_exact_legacy_planning_input(
+            stored_input,
+            usage_json=stored_usage,
+        )
+        current_replay_valid = (
+            current_replay
+            and isinstance(replay_audit, dict)
+            and replay_audit.get("version") == RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION
+            and replay_audit.get("input_sha256") == stable_digest(stored_input)
+            and isinstance(stored_incident, dict)
+            and isinstance(model_envelopes, dict)
+        )
+        if not exact_legacy and not current_replay_valid:
+            error = OrchestratorContractError(
+                "Interrupted recovery planner replay contract is missing, "
+                "unknown, or corrupted"
+            )
+            await _fail_interrupted_planning_epoch(
+                run_id=run_id,
+                owner=owner,
+                epoch_id=interrupted_epoch.id,
+                started_input=stored_input,
+                error_message=str(error),
+                checkpoint_missing=False,
+            )
+            raise error
+        if exact_legacy:
+            await _fail_interrupted_planning_epoch(
+                run_id=run_id,
+                owner=owner,
+                epoch_id=interrupted_epoch.id,
+                started_input=stored_input,
+                error_message=(
+                    "Planner attempt predates durable cache-only replay metadata"
+                ),
+                checkpoint_missing=True,
+            )
+            model_envelopes = None
+        stable_incident = {
+            key: value
+            for key, value in (
+                stored_incident.items() if isinstance(stored_incident, dict) else ()
+            )
+            if key not in {"attempt_count", "resume_count"}
+        }
+        expected_incident = {
+            "run_id": run_id,
+            "stage": stage_key,
+            "failure_class": failure_class,
+            "code": failure_code,
+            "fingerprint": fingerprint,
+            "facts_digest": facts_digest,
+            "diagnostics": diagnostics,
+            "facts": facts,
+        }
+        exact_scope = (
+            stable_incident == expected_incident
+            and stored_input.get("allowed_actions") == sorted(action_scope)
+            and stored_input.get("permitted_answer_ids") == sorted(answer_scope)
+            and stored_input.get("permitted_artifact_keys") == sorted(artifact_scope)
+        )
+        if current_replay_valid and not exact_scope:
+            error = OrchestratorContractError(
+                "Interrupted recovery planner input does not match current scope"
+            )
+            await _fail_interrupted_planning_epoch(
+                run_id=run_id,
+                owner=owner,
+                epoch_id=interrupted_epoch.id,
+                started_input=stored_input,
+                error_message=str(error),
+                checkpoint_missing=False,
+            )
+            raise error
+        if current_replay_valid:
+            history = await _prior_decisions(run_id)
+            try:
+                resumed_result = await plan_recovery(
+                    incident=dict(stored_incident),
+                    allowed_actions=action_scope,
+                    permitted_answer_ids=answer_scope,
+                    permitted_artifact_keys=artifact_scope,
+                    prior_decisions=history,
+                    model_envelopes=copy.deepcopy(model_envelopes),
+                    resume_only=True,
+                )
+            except RecoveryProviderCheckpointMissing as exc:
+                await _fail_interrupted_planning_epoch(
+                    run_id=run_id,
+                    owner=owner,
+                    epoch_id=interrupted_epoch.id,
+                    started_input=stored_input,
+                    error_message=str(exc),
+                    checkpoint_missing=True,
+                )
+            except Exception as exc:
+                await _fail_interrupted_planning_epoch(
+                    run_id=run_id,
+                    owner=owner,
+                    epoch_id=interrupted_epoch.id,
+                    started_input=stored_input,
+                    error_message=str(exc),
+                    checkpoint_missing=False,
+                )
+                raise
+            else:
+                plan_digest = await _complete_planning_epoch(
+                    run_id=run_id,
+                    owner=owner,
+                    epoch_id=interrupted_epoch.id,
+                    started_input=stored_input,
+                    result=resumed_result,
+                    resumed_after_restart=True,
+                )
+                return DurableRecoveryPlan(
+                    run_id=run_id,
+                    epoch_id=interrupted_epoch.id,
+                    epoch=interrupted_epoch.epoch,
+                    stage_key=interrupted_epoch.stage_key,
+                    decision=resumed_result.decision,
+                    reused=True,
+                    facts_digest=facts_digest,
+                    failure_fingerprint=fingerprint,
+                    plan_digest=plan_digest,
+                )
+
+    async with SessionLocal() as session:
         planner_calls = int(
             (
                 await session.execute(
@@ -365,9 +669,7 @@ async def plan_durable_recovery(
                             RecoveryEpoch.run_id == run_id,
                             RecoveryEpoch.stage_key == stage_key,
                             RecoveryEpoch.model.is_not(None),
-                            RecoveryEpoch.status.in_(
-                                _PLANNER_CALL_STARTED_STATUSES
-                            ),
+                            RecoveryEpoch.status.in_(_PLANNER_CALL_STARTED_STATUSES),
                         )
                     )
                 ).scalar_one()
@@ -377,15 +679,6 @@ async def plan_durable_recovery(
                     "Recovery stage planner call budget exhausted "
                     f"({stage_planner_calls}/{stage_planner_call_limit})"
                 )
-        next_epoch = int(
-            (
-                await session.execute(
-                    select(func.coalesce(func.max(RecoveryEpoch.epoch), 0)).where(
-                        RecoveryEpoch.run_id == run_id
-                    )
-                )
-            ).scalar_one()
-        ) + 1
         run_conditions: list[Any] = [Run.id == run_id]
         if owner is not None:
             run_conditions.extend(
@@ -402,47 +695,108 @@ async def plan_durable_recovery(
             if owner is not None:
                 await assert_run_lease(run_id)
             raise LookupError(f"Run not found: {run_id}")
-        incident = {
-            "run_id": run_id,
-            "stage": stage_key,
-            "failure_class": failure_class,
-            "code": failure_code,
-            "fingerprint": fingerprint,
-            "attempt_count": int(run.attempt_count or 0),
-            "resume_count": int(run.resume_count or 0),
-            "facts_digest": facts_digest,
-            "diagnostics": diagnostics,
-            "facts": facts,
-        }
-        planner_input = {
-            "incident": incident,
-            "allowed_actions": sorted(action_scope),
-            "permitted_answer_ids": sorted(answer_scope),
-            "permitted_artifact_keys": sorted(artifact_scope),
-            "planner_attempt": {
-                "started": False,
-                "completed": False,
-            },
-        }
-        prepared = (
-            await session.execute(
-                select(RecoveryEpoch)
-                .where(
-                    *_with_lease_guard(
-                        [
-                            RecoveryEpoch.run_id == run_id,
-                            RecoveryEpoch.failure_fingerprint == fingerprint,
-                            RecoveryEpoch.facts_digest == facts_digest,
-                            RecoveryEpoch.status == "diagnosing",
-                            RecoveryEpoch.plan_json.is_(None),
-                        ],
-                        run_id=run_id,
-                        owner=owner,
+        attempt_count = int(run.attempt_count or 0)
+        resume_count = int(run.resume_count or 0)
+
+    # Never hold an SQLite transaction or pool slot while fetching provider
+    # model metadata. The lease and both budgets are checked again before the
+    # snapshot is attached to a durable diagnosing epoch.
+    model_envelopes = await resolve_recovery_model_envelopes()
+    await assert_run_lease(run_id)
+    incident = {
+        "run_id": run_id,
+        "stage": stage_key,
+        "failure_class": failure_class,
+        "code": failure_code,
+        "fingerprint": fingerprint,
+        "attempt_count": attempt_count,
+        "resume_count": resume_count,
+        "facts_digest": facts_digest,
+        "diagnostics": diagnostics,
+        "facts": facts,
+    }
+    planner_input = {
+        "replay_contract_version": RECOVERY_PLANNER_REPLAY_CONTRACT_VERSION,
+        "incident": incident,
+        "allowed_actions": sorted(action_scope),
+        "permitted_answer_ids": sorted(answer_scope),
+        "permitted_artifact_keys": sorted(artifact_scope),
+        "model_envelopes": model_envelopes,
+        "planner_attempt": {
+            "started": False,
+            "completed": False,
+        },
+    }
+    async with SessionLocal() as session:
+        planner_calls = int(
+            (
+                await session.execute(
+                    select(func.count(RecoveryEpoch.id)).where(
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.model.is_not(None),
+                        RecoveryEpoch.status.in_(_PLANNER_CALL_STARTED_STATUSES),
                     )
                 )
-                .order_by(RecoveryEpoch.epoch.desc())
+            ).scalar_one()
+        )
+        limit = max(0, int(settings.PIPELINE_ORCHESTRATOR_MAX_CALLS_PER_RUN))
+        if planner_calls >= limit:
+            raise RecoveryBudgetExceeded(
+                f"Recovery planner call budget exhausted ({planner_calls}/{limit})"
             )
-        ).scalars().first()
+        if stage_planner_call_limit is not None:
+            stage_planner_calls = int(
+                (
+                    await session.execute(
+                        select(func.count(RecoveryEpoch.id)).where(
+                            RecoveryEpoch.run_id == run_id,
+                            RecoveryEpoch.stage_key == stage_key,
+                            RecoveryEpoch.model.is_not(None),
+                            RecoveryEpoch.status.in_(_PLANNER_CALL_STARTED_STATUSES),
+                        )
+                    )
+                ).scalar_one()
+            )
+            if stage_planner_calls >= stage_planner_call_limit:
+                raise RecoveryBudgetExceeded(
+                    "Recovery stage planner call budget exhausted "
+                    f"({stage_planner_calls}/{stage_planner_call_limit})"
+                )
+        next_epoch = (
+            int(
+                (
+                    await session.execute(
+                        select(func.coalesce(func.max(RecoveryEpoch.epoch), 0)).where(
+                            RecoveryEpoch.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            )
+            + 1
+        )
+        prepared = (
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        *_with_lease_guard(
+                            [
+                                RecoveryEpoch.run_id == run_id,
+                                RecoveryEpoch.failure_fingerprint == fingerprint,
+                                RecoveryEpoch.facts_digest == facts_digest,
+                                RecoveryEpoch.status == "diagnosing",
+                                RecoveryEpoch.plan_json.is_(None),
+                            ],
+                            run_id=run_id,
+                            owner=owner,
+                        )
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
         if prepared is None:
             row = RecoveryEpoch(
                 run_id=run_id,
@@ -455,6 +809,7 @@ async def plan_durable_recovery(
                 status="diagnosing",
                 model=None,
                 input_json=planner_input,
+                usage_json=_planner_replay_audit(planner_input),
             )
             session.add(row)
             await session.commit()
@@ -465,6 +820,7 @@ async def plan_durable_recovery(
             next_epoch = row.epoch
             epoch_id = row.id
             row.input_json = planner_input
+            row.usage_json = _planner_replay_audit(planner_input)
             row.error_message = None
             await session.commit()
 
@@ -501,6 +857,7 @@ async def plan_durable_recovery(
                 status="planning",
                 model=ORCHESTRATOR_MODEL,
                 input_json=started_input,
+                usage_json=_planner_replay_audit(started_input),
                 error_message=None,
             )
         )
@@ -520,6 +877,7 @@ async def plan_durable_recovery(
             permitted_answer_ids=answer_scope,
             permitted_artifact_keys=artifact_scope,
             prior_decisions=history,
+            model_envelopes=model_envelopes,
         )
     except Exception as exc:
         # A stale worker must not mutate even the diagnostic epoch. If the
@@ -559,57 +917,212 @@ async def plan_durable_recovery(
         raise
 
     # Fable can run long enough for the coordinator to replace this worker.
-    # Re-validate first, then repeat the ownership predicate inside the write.
-    await assert_run_lease(run_id)
-    plan_digest = stable_digest(result.decision)
-    planner_usage = dict(result.usage)
-    planner_usage["_aiv_orchestrator"] = {
-        "input_digest": result.input_digest,
-        "raw_text": result.raw_text,
-    }
-    async with SessionLocal() as session:
-        changed = await session.execute(
-            update(RecoveryEpoch)
-            .where(
-                *_with_lease_guard(
-                    [
-                        RecoveryEpoch.id == epoch_id,
-                        RecoveryEpoch.run_id == run_id,
-                        RecoveryEpoch.status == "planning",
-                    ],
-                    run_id=run_id,
-                    owner=owner,
-                )
-            )
-            .values(
-                status="planned",
-                plan_json=result.decision,
-                plan_digest=plan_digest,
-                usage_json=planner_usage,
-                input_json={
-                    **started_input,
-                    "planner_attempt": {
-                        **started_input["planner_attempt"],
-                        "completed": True,
-                        "succeeded": True,
-                    },
-                },
-                error_message=None,
-            )
-        )
-        await session.commit()
-        if changed.rowcount != 1:
-            if owner is not None:
-                await assert_run_lease(run_id)
-            raise OrchestratorContractError(
-                "Recovery epoch changed while the planner was running"
-            )
+    # The helper repeats the ownership predicate inside the final write.
+    plan_digest = await _complete_planning_epoch(
+        run_id=run_id,
+        owner=owner,
+        epoch_id=epoch_id,
+        started_input=started_input,
+        result=result,
+        resumed_after_restart=False,
+    )
     return DurableRecoveryPlan(
         run_id=run_id,
         epoch_id=epoch_id,
         epoch=next_epoch,
         stage_key=stage_key,
         decision=result.decision,
+        reused=False,
+        facts_digest=facts_digest,
+        failure_fingerprint=fingerprint,
+        plan_digest=plan_digest,
+    )
+
+
+async def plan_code_owned_recovery(
+    run_id: str,
+    *,
+    stage_key: str,
+    failure_class: str,
+    failure_code: str,
+    diagnostics: dict[str, Any],
+    facts: dict[str, Any],
+    allowed_actions: set[str],
+    decision: dict[str, Any],
+    fallback_reason: str,
+    permitted_answer_ids: set[int] | None = None,
+    permitted_artifact_keys: set[str] | None = None,
+) -> DurableRecoveryPlan:
+    """Persist a caller-owned safe plan when the optional planner cannot act.
+
+    This path never guesses an action. The caller supplies a decision from its
+    own narrow executor contract, and the same scope/action/loop validator used
+    for a strong-model plan must accept it. It is intentionally model-free, so
+    it neither hides nor increases the configured Fable call budget. A durable
+    epoch makes restarts reuse the exact fallback instead of creating an
+    unbounded local retry loop.
+    """
+
+    if not settings.PIPELINE_ORCHESTRATOR_ENABLED:
+        raise OrchestratorContractError("Pipeline orchestrator is disabled")
+    owner = lease_owner_for(run_id)
+    await assert_run_lease(run_id)
+    action_scope = set(allowed_actions)
+    answer_scope = set(permitted_answer_ids or set())
+    artifact_scope = set(permitted_artifact_keys or set())
+    facts_digest = recovery_scope_digest(
+        facts=facts,
+        allowed_actions=action_scope,
+        permitted_answer_ids=answer_scope,
+        permitted_artifact_keys=artifact_scope,
+    )
+    fingerprint = recovery_failure_fingerprint(
+        stage_key=stage_key,
+        failure_class=failure_class,
+        failure_code=failure_code,
+        diagnostics=diagnostics,
+    )
+    history = await _prior_decisions(run_id)
+    normalized = validate_recovery_decision(
+        copy.deepcopy(decision),
+        allowed_actions=action_scope,
+        permitted_answer_ids=answer_scope,
+        permitted_artifact_keys=artifact_scope,
+        prior_decisions=history,
+        incident_fingerprint=fingerprint,
+        incident_facts_digest=facts_digest,
+    )
+    plan_digest = stable_digest(normalized)
+
+    async with SessionLocal() as session:
+        reusable = (
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        *_with_lease_guard(
+                            [
+                                RecoveryEpoch.run_id == run_id,
+                                RecoveryEpoch.failure_fingerprint == fingerprint,
+                                RecoveryEpoch.facts_digest == facts_digest,
+                                RecoveryEpoch.model.is_(None),
+                                RecoveryEpoch.status.in_(("planned", "executing")),
+                                RecoveryEpoch.plan_json.is_not(None),
+                            ],
+                            run_id=run_id,
+                            owner=owner,
+                        )
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if reusable is not None:
+            stored = (
+                dict(reusable.plan_json)
+                if isinstance(reusable.plan_json, dict)
+                else None
+            )
+            if stored != normalized or str(reusable.plan_digest or "") != plan_digest:
+                raise OrchestratorContractError(
+                    "Stored code-owned recovery plan digest mismatch"
+                )
+            return DurableRecoveryPlan(
+                run_id=run_id,
+                epoch_id=reusable.id,
+                epoch=reusable.epoch,
+                stage_key=reusable.stage_key,
+                decision=stored,
+                reused=True,
+                facts_digest=facts_digest,
+                failure_fingerprint=fingerprint,
+                plan_digest=plan_digest,
+            )
+
+        next_epoch = (
+            int(
+                (
+                    await session.execute(
+                        select(func.coalesce(func.max(RecoveryEpoch.epoch), 0)).where(
+                            RecoveryEpoch.run_id == run_id
+                        )
+                    )
+                ).scalar_one()
+            )
+            + 1
+        )
+        run_conditions: list[Any] = [Run.id == run_id]
+        if owner is not None:
+            run_conditions.extend(
+                (
+                    Run.execution_slot == 1,
+                    Run.lease_owner == owner,
+                    Run.status.in_(_ACTIVE_RUN_STATUSES),
+                )
+            )
+        if (
+            await session.execute(select(Run.id).where(*run_conditions))
+        ).scalar_one_or_none() is None:
+            if owner is not None:
+                await assert_run_lease(run_id)
+            raise LookupError(f"Run not found: {run_id}")
+        incident = {
+            "run_id": run_id,
+            "stage": stage_key,
+            "failure_class": failure_class,
+            "code": failure_code,
+            "fingerprint": fingerprint,
+            "facts_digest": facts_digest,
+            "diagnostics": diagnostics,
+            "facts": facts,
+        }
+        row = RecoveryEpoch(
+            run_id=run_id,
+            epoch=next_epoch,
+            stage_key=stage_key,
+            failure_class=failure_class,
+            failure_code=failure_code,
+            failure_fingerprint=fingerprint,
+            facts_digest=facts_digest,
+            status="planned",
+            model=None,
+            input_json={
+                "incident": incident,
+                "allowed_actions": sorted(action_scope),
+                "permitted_answer_ids": sorted(answer_scope),
+                "permitted_artifact_keys": sorted(artifact_scope),
+                "planner_attempt": {
+                    "started": False,
+                    "completed": True,
+                    "succeeded": False,
+                    "code_owned_fallback": True,
+                    "reason": fallback_reason,
+                },
+            },
+            plan_json=normalized,
+            plan_digest=plan_digest,
+            usage_json={
+                "_aiv_code_owned_recovery": {
+                    "version": "aiv-code-owned-recovery-plan-v1",
+                    "reason": fallback_reason,
+                    "plan_digest": plan_digest,
+                    "strong_model_call_made": False,
+                }
+            },
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        epoch_id = row.id
+
+    return DurableRecoveryPlan(
+        run_id=run_id,
+        epoch_id=epoch_id,
+        epoch=next_epoch,
+        stage_key=stage_key,
+        decision=normalized,
         reused=False,
         facts_digest=facts_digest,
         failure_fingerprint=fingerprint,
@@ -633,13 +1146,10 @@ async def mark_recovery_executing(
     execution without deriving mutable state outside this reservation.
     """
 
-    if (
-        stage_execution_limit is not None
-        and (
-            not isinstance(stage_execution_limit, int)
-            or isinstance(stage_execution_limit, bool)
-            or stage_execution_limit < 1
-        )
+    if stage_execution_limit is not None and (
+        not isinstance(stage_execution_limit, int)
+        or isinstance(stage_execution_limit, bool)
+        or stage_execution_limit < 1
     ):
         raise ValueError("stage_execution_limit must be a positive integer")
 
@@ -686,7 +1196,8 @@ async def mark_recovery_executing(
         raw_attempts = current_outcome.get("execution_attempts", 0)
         attempts = (
             raw_attempts
-            if isinstance(raw_attempts, int) and not isinstance(raw_attempts, bool)
+            if isinstance(raw_attempts, int)
+            and not isinstance(raw_attempts, bool)
             and raw_attempts >= 0
             else MAX_RECOVERY_EXECUTION_ATTEMPTS
         )
@@ -914,8 +1425,10 @@ async def finish_recovery(
 ) -> None:
     await assert_run_lease(plan.run_id)
     no_progress = before_digest == after_digest
-    status = "succeeded" if succeeded and not no_progress else (
-        "no_progress" if no_progress else "failed"
+    status = (
+        "succeeded"
+        if succeeded and not no_progress
+        else ("no_progress" if no_progress else "failed")
     )
     await _mark_recovery_status(
         plan,

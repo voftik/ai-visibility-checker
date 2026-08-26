@@ -430,7 +430,7 @@ schema-invalid verdict не становится готовым решением
 непрозрачный резерв лишь сокращал полезный контекст, не добавляя отдельной
 гарантии безопасности.
 
-#### Bounded recovery после второго critic round
+#### Ограниченное восстановление после второго critic round
 
 Если опциональный Fable-orchestrator включён и второй обычный critic вернул именно `revise`, допускается одна узкая попытка восстановления:
 
@@ -439,7 +439,7 @@ schema-invalid verdict не становится готовым решением
 3. Метрики пересчитываются детерминированно из нового набора аннотаций. SHA исходного корпуса до и после обязан совпасть.
 4. Отдельный Gemini round 3 заново проверяет результат. Полный raw каждого repaired `answer_id` включается в полный raw-корпус как mandatory evidence; если он отсутствует или не совпадает с manifest и provenance, gate закрывается. Публикация разрешена только по полному schema-valid `pass` первичного ответа; targeted/semantic repair, deterministic fallback и повышение `revise`/`block` до `pass` запрещены. Оборванный или неразбираемый round 3 всегда закрывает gate.
 
-Для stage `analysis_critic` разрешены максимум один Fable provider call, одно исполнение ремонта и один финальный critic call. Эти бюджеты и план хранятся в `recovery_epochs`, поэтому рестарт не открывает новую попытку. Targeted-аннотация содержит отдельный audit provenance и атомарный checkpoint контекста recovery, но остаётся актуальной при обычном resume, пока неизменны raw/model и базовый контекст. После рестарта post-repair state не возвращается к обычным round 1/2: если r3 ещё не был зарезервирован, выполняется ровно один оставшийся final call; exact completed primary r3 и его gate переиспользуются без provider call; `running`, `failed` или несовпадающий r3 закрывает публикацию fail-closed. Успешный resume требует одновременно совпадающие plan/provenance/state digests, validated primary r3 artifact и gate — один gate не считается authority. Если финальный gate не пройден, terminal block связывается с digest фактического post-repair состояния: следующий worker останавливается до round 1 и не расходует новые токены. Любая потеря lease или CAS-конфликт оставляет аннотации без частичной записи.
+Для stage `analysis_critic` разрешены максимум один физический Fable POST, одно исполнение ремонта и один финальный critic call. Эти бюджеты и план хранятся в `recovery_epochs`, поэтому рестарт не открывает новую попытку. Targeted-аннотация содержит отдельный audit provenance и атомарный checkpoint контекста recovery, но остаётся актуальной при обычном resume, пока неизменны raw/model и базовый контекст. После рестарта post-repair state не возвращается к обычным round 1/2: если r3 ещё не был зарезервирован, выполняется ровно один оставшийся final call; exact completed primary r3 и его gate переиспользуются без provider call; `running`, `failed` или несовпадающий r3 закрывает публикацию fail-closed. Успешный resume требует одновременно совпадающие plan/provenance/state digests, validated primary r3 artifact и gate — один gate не считается authority. Если финальный gate не пройден, terminal block связывается с digest фактического post-repair состояния: следующий worker останавливается до round 1 и не расходует новые токены. Любая потеря lease или CAS-конфликт оставляет аннотации без частичной записи.
 
 ### 10. Финальный отчёт и визуальная ветка
 
@@ -714,6 +714,27 @@ facts в тематические domain capsules. Для ответа моде�
 concept model, он проходит тот же иерархический evidence-tree с точным lineage;
 output концепций собирается structured-continuation harness и принимается
 только после полной JSON Schema validation.
+
+### Финальная редактура русского текста
+
+После смысловой приёмки аналитики отдельный редакционный слой обрабатывает все
+читательские строки итогового отчёта и технического аудита. Политика
+`aiv-ru-editorial-policy-v3` переносит в исполняемые требования правила
+`ru-text` и внутренней инструкции RW+ «Живой русский язык»: называет деятеля и
+носителя каждого числа, отделяет наблюдение от интерпретации, убирает пассив,
+канцелярит, лозунги, механические тройки, длинное тире, мета-повествование и
+фразы «капитана очевидность».
+
+Редактор не имеет права менять числа, знаменатели, бренды, продукты, URL,
+причинность, модальность, границы выборки или набор утверждений. Текст любой
+длины делится на lossless units без общего потолка; каждый claim получает
+receipt, независимый critic сравнивает исходную и новую формулировки, а спорный
+unit проходит не более одной арбитражной правки. Для финального отчёта вся
+отредактированная версия повторно проходит полный semantic gate на исходных
+данных. Если покрытие неполно, факт изменился или редакционный вызов недоступен,
+публикуется уже проверенная исходная формулировка и сохраняется явный fallback
+audit. Редактура никогда не блокирует готовый доказанный отчёт и не может
+исправлять метрики словом.
 
 ### Structured responses
 
@@ -1037,7 +1058,7 @@ FastAPI OpenAPI и интерактивная документация откл�
 | `OPENROUTER_CRITIC_MODEL` | `google/gemini-3.6-flash` | Prompt critic, analysis critic, semantic gate |
 | `OPENROUTER_ORCHESTRATOR_MODEL` | `anthropic/claude-fable-5` | Дорогой planner только для исключительного восстановления |
 | `PIPELINE_ORCHESTRATOR_ENABLED` | `false` | Опционально разрешает bounded recovery после исчерпания обычного контура; включается явно после канарейки |
-| `PIPELINE_ORCHESTRATOR_MAX_CALLS_PER_RUN` | `2` | Лимит recovery-эпох на одну проверку; большой incident внутри одной эпохи может потребовать несколько bounded decision-shards, каждый с durable receipt |
+| `PIPELINE_ORCHESTRATOR_MAX_CALLS_PER_RUN` | `2` | Лимит логических recovery-эпох на одну проверку; в каждой эпохе Fable получает не более одного физического POST |
 | `PIPELINE_ORCHESTRATOR_MAX_INPUT_CHARS` | `0` | Deprecated compatibility knob; `0` отключает старое посимвольное ограничение planner-контекста |
 | `OPENROUTER_ILLUSTRATION_CONCEPT_MODEL` | `anthropic/claude-opus-5` | Art direction |
 | `OPENROUTER_IMAGE_MODEL` | `google/gemini-3-pro-image` | Генерация изображений |
@@ -1068,18 +1089,32 @@ Recovery-orchestrator не участвует в штатном happy path. По
 
 Если весь incident помещается в физическое окно Fable, выполняется один direct
 decision. Для большего входа код строит lossless JSON-leaf manifest с JSON
-Pointer, UTF-8 offsets и SHA-256. Terra читает каждый exact core и формирует
-ordered claim ledger с полной исходной цитатой. Затем Fable получает столько
-физически preflighted decision-shards, сколько требуется корпусу: каждый claim
-обязан получить source-grounded disposition, а общая формулировка при верных
-ID/SHA отклоняется. Bounded arbiter объединяет только полные candidate decisions
-и не может расширить answer/artifact scope. Поэтому хэш подтверждает
-происхождение, но больше не подменяет чтение смысла последнего leaf.
+Pointer, UTF-8 offsets и SHA-256. Terra читает каждый exact core в любом числе
+физически допустимых shards. Код требует exact-once coverage, проверяет digest
+каждого unit, буквальную опору выводов и допустимую область answer/artifact ID,
+затем собирает одно полное source-bound decision dossier. В досье входят
+смысловые квитанции всех units, findings, uncertainties, manifest и неизменяемый
+code-owned control plane; исходный raw и точные цитаты остаются в связанных
+audit receipts. Fable получает ровно один физический POST с этим досье и не
+может выбрать объект, которого нет в `executable_scope_evidence`.
 
-Каждый map, decision-shard, arbiter и direct POST имеет content-addressed
-`RunArtifact` checkpoint. Accepted provider response после падения worker
-восстанавливается по точному wire contract без повторной оплаты. Все receipts,
-coverage и runtime-счётчики сохраняются в
+Общего ограничения длины incident или числа Terra-shards нет. Если даже полное
+семантическое досье не помещается в физическое окно Fable, сильная модель не
+получает обрывок и не принимает частичное решение. Stage использует только
+предусмотренный кодом узкий fallback либо сохраняет checkpoint и
+останавливается. Так физический лимит провайдера не превращается в скрытую
+потерю данных и одновременно не создаёт неограниченное число дорогих вызовов.
+
+Каждый Terra map и Fable POST имеет content-addressed `RunArtifact` checkpoint.
+Accepted provider response после падения worker восстанавливается по точному
+wire contract без повторной оплаты. Planning epoch заранее сохраняет frozen
+model-envelope snapshot; crash-replay работает только в cache-only режиме и не
+делает metadata GET или provider POST. Если нужной квитанции нет, прерванная
+эпоха помечается failed, а новая попытка подчиняется прежнему глобальному и
+stage-бюджету. Несовпадение incident, scope, envelope или digest закрывает
+recovery fail-closed.
+
+Все receipts, coverage и runtime-счётчики сохраняются в
 `usage_json._aiv_recovery_input_harness`; пропуск, перестановка или подмена leaf
 закрывают recovery fail-closed. Модель не исполняет код, не меняет raw-ответы,
 SQL или метрики. Решение проходит кодовую проверку области, сохраняется в

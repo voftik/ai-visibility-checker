@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 from app.db import SessionLocal, init_db
 from app.models import DomainProbe, ProbeType, Run, RunStatus, SitePage
 from app.services import crawler
+from app.services.analyzer import _site_context
 
 
 def _policy() -> dict:
@@ -243,6 +244,55 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(admission["legacy_snapshot"])
         self.assertEqual(admission["coverage_state"], "limited")
         self.assertEqual(admission["page_count"], 1)
+
+    async def test_legacy_bootstrap_preserves_historical_page_kind_lineage(
+        self,
+    ) -> None:
+        run_id = await self._run(config={"user_agents": ["GPTBot"]})
+        home_url = "https://example.com/"
+        service_url = "https://example.com/services"
+        historical_service_kind = "other"
+        self.assertNotEqual(
+            crawler._page_kind(service_url),
+            historical_service_kind,
+        )
+        await self._page(run_id, home_url, "home", legacy=True)
+        await self._page(
+            run_id,
+            service_url,
+            historical_service_kind,
+            legacy=True,
+        )
+        await self._probe(run_id, home_url, "GPTBot", legacy=True)
+        await self._probe(run_id, service_url, "GPTBot", legacy=True)
+
+        with patch.object(crawler, "_probe_with_transport", AsyncMock()) as network:
+            admission = await crawler.bootstrap_legacy_crawl_admission(
+                run_id,
+                domain="example.com",
+            )
+        context = await _site_context(run_id)
+
+        network.assert_not_awaited()
+        self.assertTrue(admission["legacy_snapshot"])
+        self.assertLessEqual(admission["page_count"], crawler.AUDIT_PAGE_HARD_MAX)
+        self.assertEqual(
+            [(page["url"], page["page_kind"]) for page in context["pages"]],
+            [
+                (home_url, "home"),
+                (service_url, historical_service_kind),
+            ],
+        )
+        self.assertEqual(
+            [
+                (page["url"], page["page_kind"])
+                for page in context["selected_pages_manifest"]["pages"]
+            ],
+            [
+                (home_url, "home"),
+                (service_url, historical_service_kind),
+            ],
+        )
 
 
 if __name__ == "__main__":

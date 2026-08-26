@@ -8,6 +8,7 @@ validates the decision before another layer sees it.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ from app.services.long_response import (
     verify_units,
 )
 from app.services.openrouter import (
+    OpenRouterAuditCheckpointError,
     OpenRouterError,
     OutputTokenPolicy,
     WebSearchPolicy,
@@ -45,7 +47,10 @@ RECOVERY_REDUCE_VERSION = "aiv-recovery-input-reduce-v2"
 RECOVERY_DECISION_LEDGER_VERSION = "aiv-recovery-decision-ledger-v2"
 RECOVERY_DECISION_SHARD_VERSION = "aiv-recovery-decision-shard-v3"
 RECOVERY_DECISION_ARBITER_VERSION = "aiv-recovery-decision-arbiter-v2"
+RECOVERY_DECISION_DOSSIER_VERSION = "aiv-recovery-decision-dossier-v2"
 RECOVERY_PROVIDER_CHECKPOINT_VERSION = "aiv-recovery-provider-checkpoint-v1"
+RECOVERY_RATIONALE_REPAIR_VERSION = "aiv-recovery-rationale-repair-v1"
+RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION = "aiv-recovery-model-envelopes-v1"
 
 # These are per-physical-request fallbacks used only when OpenRouter model
 # metadata is unavailable.  They never limit the total incident corpus: code
@@ -98,12 +103,59 @@ class OrchestratorContractError(OpenRouterError):
     """The planner returned a decision outside the deterministic contract."""
 
 
+class RecoveryProviderCheckpointMissing(OrchestratorContractError):
+    """An exact accepted provider event is absent during cache-only replay."""
+
+
+class RecoveryPlannerUnavailable(OpenRouterError):
+    """The optional planner provider failed before a safe decision existed."""
+
+
+class RecoveryDecisionRejected(OrchestratorContractError):
+    """A provider decision failed the executable code-owned contract."""
+
+
 @dataclass(frozen=True)
 class OrchestratorResult:
     decision: dict[str, Any]
     raw_text: str
     usage: dict[str, Any]
     input_digest: str
+
+
+async def resolve_recovery_model_envelopes() -> dict[str, Any]:
+    """Resolve and freeze every model window before a paid planner attempt.
+
+    Batch boundaries are part of a content-addressed provider request. Keeping
+    the exact envelopes in the durable planning epoch lets a restarted worker
+    reconstruct those identities without a metadata GET or a new model POST.
+    """
+
+    models: dict[str, dict[str, Any]] = {}
+    for model in dict.fromkeys((ORCHESTRATOR_MODEL, PROCESSING_MODEL)):
+        models[model] = dict(await model_output_envelope(model))
+    return {
+        "version": RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION,
+        "models": models,
+    }
+
+
+def _model_envelope_from_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    model: str,
+) -> dict[str, Any]:
+    if snapshot.get("version") != RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION:
+        raise OrchestratorContractError(
+            "Recovery model-envelope snapshot version is invalid"
+        )
+    models = snapshot.get("models")
+    envelope = models.get(model) if isinstance(models, dict) else None
+    if not isinstance(envelope, dict):
+        raise OrchestratorContractError(
+            f"Recovery model-envelope snapshot has no entry for {model}"
+        )
+    return copy.deepcopy(envelope)
 
 
 def _stable_digest(value: object) -> str:
@@ -321,16 +373,17 @@ async def _persist_recovery_provider_event(
 ) -> None:
     from app.services import recovery_state
 
-    if event.get("status") != "accepted":
-        # Rejected/uncertain POSTs remain visible through the enclosing epoch's
-        # failure. Only a complete accepted response is reusable as paid work.
-        return
     event_digest = _stable_digest(event)
+    accepted = event.get("status") == "accepted"
+    persisted_artifact_key = (
+        artifact_key if accepted else f"{artifact_key}_audit_{event_digest[:24]}"
+    )
     input_json = {
         "version": RECOVERY_PROVIDER_CHECKPOINT_VERSION,
         "request_identity_sha256": _stable_digest(request_identity),
         "provider_event_sha256": event_digest,
         "physical_request_sha256": event.get("request_sha256"),
+        "semantic_disposition": ("accepted" if accepted else "not_accepted"),
     }
     await recovery_state.assert_run_lease(run_id)
     async with recovery_state.SessionLocal() as session:
@@ -339,8 +392,8 @@ async def _persist_recovery_provider_event(
             .values(
                 run_id=run_id,
                 stage_key="recovery_provider_checkpoint",
-                artifact_key=artifact_key,
-                status="completed",
+                artifact_key=persisted_artifact_key,
+                status="completed" if accepted else "failed",
                 model=str(event.get("model") or ""),
                 prompt_version=RECOVERY_PROVIDER_CHECKPOINT_VERSION,
                 input_json=input_json,
@@ -355,6 +408,11 @@ async def _persist_recovery_provider_event(
                     if isinstance(event.get("usage"), dict)
                     else None
                 ),
+                error_message=(
+                    str((event.get("error") or {}).get("message") or "")[:2000]
+                    if isinstance(event.get("error"), dict)
+                    else None
+                ),
             )
             .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
         )
@@ -363,12 +421,14 @@ async def _persist_recovery_provider_event(
                 await session.execute(
                     select(RunArtifact).where(
                         RunArtifact.run_id == run_id,
-                        RunArtifact.artifact_key == artifact_key,
+                        RunArtifact.artifact_key == persisted_artifact_key,
                     )
                 )
             ).scalar_one_or_none()
-            if existing is None or existing.output_json != event or (
-                existing.input_json != input_json
+            if (
+                existing is None
+                or existing.output_json != event
+                or (existing.input_json != input_json)
             ):
                 raise OrchestratorContractError(
                     "Recovery provider checkpoint collision is not identical"
@@ -387,6 +447,7 @@ async def _recovery_atomic_chat(
     schema_name: str,
     reasoning_effort: str,
     temperature: float,
+    resume_only: bool = False,
 ) -> tuple[Any, list[dict[str, Any]], bool]:
     """Resume one accepted paid POST or checkpoint it before returning.
 
@@ -425,6 +486,15 @@ async def _recovery_atomic_chat(
             )
             return restored, [stored_event], True
 
+    if resume_only:
+        if not run_id:
+            raise RecoveryProviderCheckpointMissing(
+                "Cache-only recovery replay requires a durable run id"
+            )
+        raise RecoveryProviderCheckpointMissing(
+            "Exact accepted recovery provider checkpoint is missing"
+        )
+
     physical_events: list[dict[str, Any]] = []
 
     async def checkpoint(event: dict[str, Any]) -> None:
@@ -437,27 +507,36 @@ async def _recovery_atomic_chat(
                 event=dict(event),
             )
 
-    result = await chat(
-        model=model,
-        messages=messages,
-        response_schema=response_schema,
-        schema_name=schema_name,
-        web_policy=WebSearchPolicy.FORBIDDEN,
-        reasoning_effort=reasoning_effort,
-        output_token_policy=OutputTokenPolicy.MODEL_MAX,
-        temperature=temperature,
-        retry_response_contract_errors=False,
-        retry_transport_errors=False,
-        audit_checkpoint=checkpoint,
-        audit_context={
-            "document_id": "recovery-provider-" + identity_sha[:24],
-            "sequence": sequence_key,
-            "resume_contract": {
-                "version": RECOVERY_PROVIDER_CHECKPOINT_VERSION,
-                "request_identity_sha256": identity_sha,
+    try:
+        result = await chat(
+            model=model,
+            messages=messages,
+            response_schema=response_schema,
+            schema_name=schema_name,
+            web_policy=WebSearchPolicy.FORBIDDEN,
+            reasoning_effort=reasoning_effort,
+            output_token_policy=OutputTokenPolicy.MODEL_MAX,
+            temperature=temperature,
+            retry_response_contract_errors=False,
+            retry_transport_errors=False,
+            audit_checkpoint=checkpoint,
+            audit_context={
+                "document_id": "recovery-provider-" + identity_sha[:24],
+                "sequence": sequence_key,
+                "resume_contract": {
+                    "version": RECOVERY_PROVIDER_CHECKPOINT_VERSION,
+                    "request_identity_sha256": identity_sha,
+                },
             },
-        },
-    )
+        )
+    except OpenRouterAuditCheckpointError:
+        # A response that could not be durably recorded is an integrity event,
+        # not ordinary provider unavailability. Callers must fail closed.
+        raise
+    except OpenRouterError as exc:
+        raise RecoveryPlannerUnavailable(
+            f"Recovery planner provider call failed: {exc}"
+        ) from exc
     if run_id and physical_events:
         # Reload through the independent validator before allowing any later
         # stage to consume the paid answer.
@@ -635,9 +714,7 @@ def _source_leaves(
         permitted_artifact_keys=artifact_scope,
     )
     linked_answer_ids = inherited_answer_ids | frozenset(direct_answer_ids)
-    linked_artifact_keys = inherited_artifact_keys | frozenset(
-        direct_artifact_keys
-    )
+    linked_artifact_keys = inherited_artifact_keys | frozenset(direct_artifact_keys)
 
     if isinstance(value, dict) and value:
         output: list[dict[str, Any]] = []
@@ -742,9 +819,7 @@ def _source_units(
             unit_answer_ids, unit_artifact_keys = _literal_scope_links(
                 unit.text,
                 permitted_answer_ids=set(permitted_answer_ids or set()),
-                permitted_artifact_keys=set(
-                    permitted_artifact_keys or set()
-                ),
+                permitted_artifact_keys=set(permitted_artifact_keys or set()),
             )
             records.append(
                 {
@@ -761,12 +836,10 @@ def _source_units(
                     "core_end_in_context": unit.core_end_in_context,
                     "context_text": unit.context_text,
                     "linked_answer_ids": sorted(
-                        set(leaf["record_linked_answer_ids"])
-                        | unit_answer_ids
+                        set(leaf["record_linked_answer_ids"]) | unit_answer_ids
                     ),
                     "linked_artifact_keys": sorted(
-                        set(leaf["record_linked_artifact_keys"])
-                        | unit_artifact_keys
+                        set(leaf["record_linked_artifact_keys"]) | unit_artifact_keys
                     ),
                 }
             )
@@ -794,6 +867,145 @@ def _manifest_pointer(manifest: dict[str, Any]) -> dict[str, Any]:
         "unit_ids_sha256": manifest["unit_ids_sha256"],
         "manifest_sha256": manifest["manifest_sha256"],
     }
+
+
+def _source_bound_decision_dossier(
+    nodes: list[dict[str, Any]],
+    *,
+    manifest: dict[str, Any],
+    control_plane: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one bounded semantic dossier after lossless Terra coverage.
+
+    Every raw byte remains in the immutable source manifest and map receipts.
+    Fable receives every validated unit-level meaning, but not a second copy of
+    the full raw corpus. This keeps strong-model physical spend at one POST per
+    logical epoch without turning a finite context window into a corpus cap.
+    """
+
+    units: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    uncertainties: list[dict[str, Any]] = []
+    supported_answer_ids: set[int] = set()
+    supported_artifact_keys: set[str] = set()
+    source_evidence_by_unit: dict[str, dict[str, Any]] = {}
+    executable_evidence_unit_ids: set[str] = set()
+    for node in nodes:
+        node_id = str(node["node_id"])
+        semantic = node.get("semantic")
+        if not isinstance(semantic, dict):
+            raise OrchestratorContractError(
+                "Recovery mapper node has no validated semantic payload"
+            )
+        for receipt in semantic.get("unit_summaries") or []:
+            if not isinstance(receipt, dict):
+                raise OrchestratorContractError(
+                    "Recovery dossier unit receipt is invalid"
+                )
+            unit_id = str(receipt["unit_id"])
+            unit_receipt = {
+                "unit_id": unit_id,
+                "core_sha256": str(receipt["core_sha256"]),
+                "json_pointer": str(receipt["json_pointer"]),
+                "value_kind": str(receipt["value_kind"]),
+                "summary": str(receipt["summary"]),
+                "relevance": str(receipt["relevance"]),
+                "source_excerpt_sha256": str(receipt["source_excerpt_sha256"]),
+                "linked_answer_ids": list(receipt["linked_answer_ids"]),
+                "linked_artifact_keys": list(receipt["linked_artifact_keys"]),
+                "source_node_id": node_id,
+            }
+            units.append(unit_receipt)
+            source_evidence_by_unit[unit_id] = {
+                **copy.deepcopy(unit_receipt),
+                "source_excerpt": str(receipt["source_excerpt"]),
+            }
+            if str(receipt.get("relevance") or "") in {
+                "actionable",
+                "blocking",
+                "uncertain",
+            }:
+                executable_evidence_unit_ids.add(unit_id)
+        for finding in semantic.get("findings") or []:
+            if not isinstance(finding, dict):
+                raise OrchestratorContractError("Recovery dossier finding is invalid")
+            accepted = {**copy.deepcopy(finding), "source_node_id": node_id}
+            findings.append(accepted)
+            candidate_answer_ids = {
+                int(value) for value in finding.get("candidate_answer_ids") or []
+            }
+            candidate_artifact_keys = {
+                str(value) for value in finding.get("candidate_artifact_keys") or []
+            }
+            # A model may mention an ID in contextual or uncertain prose, but
+            # that does not authorize a mutation. Only an actionable/blocking
+            # finding exposes executable scope, and Fable receives the exact
+            # source cores behind that finding instead of trusting a summary.
+            relevance = str(finding.get("relevance") or "")
+            if relevance in {"actionable", "blocking", "uncertain"}:
+                executable_evidence_unit_ids.update(
+                    str(value) for value in finding.get("unit_ids") or []
+                )
+            if relevance in {"actionable", "blocking"}:
+                supported_answer_ids.update(candidate_answer_ids)
+                supported_artifact_keys.update(candidate_artifact_keys)
+        for uncertainty in semantic.get("uncertainties") or []:
+            uncertainties.append(
+                {
+                    "source_node_id": node_id,
+                    "statement": str(uncertainty),
+                }
+            )
+
+    unit_ids = [str(unit["unit_id"]) for unit in units]
+    if (
+        len(unit_ids) != int(manifest.get("unit_count") or -1)
+        or len(unit_ids) != len(set(unit_ids))
+        or _stable_digest(unit_ids) != manifest.get("unit_ids_sha256")
+    ):
+        raise OrchestratorContractError(
+            "Recovery decision dossier does not cover the source manifest exactly"
+        )
+    uncertain_unit_ids = [
+        str(unit["unit_id"]) for unit in units if unit["relevance"] == "uncertain"
+    ]
+    executable_evidence_units = [
+        copy.deepcopy(source_evidence_by_unit[unit_id])
+        for unit_id in unit_ids
+        if unit_id in executable_evidence_unit_ids
+    ]
+    if executable_evidence_unit_ids != {
+        str(unit["unit_id"]) for unit in executable_evidence_units
+    }:
+        raise OrchestratorContractError(
+            "Recovery dossier finding references unavailable source evidence"
+        )
+    dossier = {
+        "version": RECOVERY_DECISION_DOSSIER_VERSION,
+        "input_mode": "lossless_source_bound_decision_dossier",
+        "control_plane": control_plane,
+        "source_manifest": _manifest_pointer(manifest),
+        "coverage": {
+            "complete": True,
+            "unit_count": len(units),
+            "unit_ids_sha256": _stable_digest(unit_ids),
+            "semantic_receipts_sha256": _stable_digest(units),
+        },
+        "unit_semantic_receipts": units,
+        "findings": findings,
+        "uncertainties": uncertainties,
+        "executable_scope_evidence": {
+            "supported_answer_ids": sorted(supported_answer_ids),
+            "supported_artifact_keys": sorted(supported_artifact_keys),
+            "exact_source_units": executable_evidence_units,
+            "exact_source_units_sha256": _stable_digest(executable_evidence_units),
+            "uncertain_unit_ids": uncertain_unit_ids,
+            "uncertainty_count": len(uncertainties),
+            "safety_relevant_uncertainty": bool(uncertain_unit_ids or uncertainties),
+        },
+    }
+    dossier["dossier_sha256"] = _stable_digest(dossier)
+    return dossier
 
 
 def _map_schema() -> dict[str, Any]:
@@ -1116,9 +1328,7 @@ def _validate_map_unit_summaries(
             )
         context = str(record["context_text"])
         core = context[
-            int(record["core_start_in_context"]) : int(
-                record["core_end_in_context"]
-            )
+            int(record["core_start_in_context"]) : int(record["core_end_in_context"])
         ]
         if excerpt != core:
             raise OrchestratorContractError(
@@ -1127,6 +1337,20 @@ def _validate_map_unit_summaries(
         if receipt.get("source_excerpt_sha256") != text_sha256(excerpt):
             raise OrchestratorContractError(
                 "Recovery mapper unit excerpt digest is invalid"
+            )
+        exact_short_core = core.strip()
+        source_grounded = _semantic_text_is_source_grounded(
+            summary,
+            source_text=core,
+        ) or (
+            bool(exact_short_core)
+            and len(exact_short_core) <= 256
+            and exact_short_core in summary
+        )
+        if not source_grounded:
+            raise OrchestratorContractError(
+                "Recovery mapper returned a generic unit summary without "
+                "source-grounded meaning"
             )
         accepted.append(
             {
@@ -1139,9 +1363,7 @@ def _validate_map_unit_summaries(
                 "source_excerpt": excerpt,
                 "source_excerpt_sha256": text_sha256(excerpt),
                 "linked_answer_ids": list(record["linked_answer_ids"]),
-                "linked_artifact_keys": list(
-                    record["linked_artifact_keys"]
-                ),
+                "linked_artifact_keys": list(record["linked_artifact_keys"]),
             }
         )
     return accepted
@@ -1361,7 +1583,7 @@ def _recovery_entry_has_mutation_evidence(entry: dict[str, Any]) -> bool:
             + list(entry.get("linked_artifact_keys") or [])
         )
     }
-    unquoted_excerpt = excerpt.strip('"\' ').casefold()
+    unquoted_excerpt = excerpt.strip("\"' ").casefold()
     if unquoted_excerpt in linked_literals:
         return False
     if re.fullmatch(r'"?[0-9a-f]{32,}"?', normalized_excerpt):
@@ -1431,8 +1653,18 @@ async def _map_recovery_source(
     permitted_answer_ids: set[int],
     permitted_artifact_keys: set[str],
     run_id: str | None = None,
+    model_envelope: dict[str, Any] | None = None,
+    resume_only: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    envelope = await model_output_envelope(PROCESSING_MODEL)
+    if resume_only and model_envelope is None:
+        raise RecoveryProviderCheckpointMissing(
+            "Cache-only recovery mapper has no durable model envelope"
+        )
+    envelope = (
+        copy.deepcopy(model_envelope)
+        if model_envelope is not None
+        else dict(await model_output_envelope(PROCESSING_MODEL))
+    )
     window = _input_window(PROCESSING_MODEL, envelope)
     window_bytes = int(window["input_utf8_window"])
     target_chars = RECOVERY_SOURCE_UNIT_TARGET_CHARS
@@ -1492,6 +1724,7 @@ async def _map_recovery_source(
             schema_name="aiv_recovery_input_map",
             reasoning_effort="high",
             temperature=0.0,
+            resume_only=resume_only,
         )
         if not isinstance(result.parsed, dict):
             raise OrchestratorContractError(
@@ -1536,8 +1769,7 @@ async def _map_recovery_source(
             "uncertainties": result.parsed["uncertainties"],
         }
         node_id = (
-            f"map-{batch_index:08d}-"
-            f"{_stable_digest([source_unit_ids, semantic])[:20]}"
+            f"map-{batch_index:08d}-{_stable_digest([source_unit_ids, semantic])[:20]}"
         )
         nodes.append(
             {
@@ -1567,9 +1799,7 @@ async def _map_recovery_source(
         )
 
     expected_ids = [str(record["unit_id"]) for record in records]
-    observed_ids = [
-        unit_id for node in nodes for unit_id in node["source_unit_ids"]
-    ]
+    observed_ids = [unit_id for node in nodes for unit_id in node["source_unit_ids"]]
     if observed_ids != expected_ids:
         raise OrchestratorContractError(
             "Recovery mapper did not cover every source unit exactly once"
@@ -1722,10 +1952,7 @@ async def _reduce_recovery_nodes(
                 if (
                     not isinstance(source_node_ids, list)
                     or not source_node_ids
-                    or any(
-                        not isinstance(node_id, str)
-                        for node_id in source_node_ids
-                    )
+                    or any(not isinstance(node_id, str) for node_id in source_node_ids)
                     or not set(source_node_ids).issubset(expected_node_id_set)
                 ):
                     raise OrchestratorContractError(
@@ -1780,9 +2007,7 @@ async def _reduce_recovery_nodes(
                 }
             )
         after_bytes = len(_canonical_json(next_nodes).encode("utf-8"))
-        still_needs_reduction = len(next_nodes) > 1 or not fable_fits(
-            next_nodes[0]
-        )
+        still_needs_reduction = len(next_nodes) > 1 or not fable_fits(next_nodes[0])
         if (
             still_needs_reduction
             and len(next_nodes) >= len(nodes)
@@ -1803,9 +2028,11 @@ def _decision_schema(allowed_actions: list[str]) -> dict[str, Any]:
         "additionalProperties": False,
         "properties": {
             "action": {"type": "string", "enum": allowed_actions},
-            # Match the deterministic validator so structured decoding cannot
-            # spend a planner call on an otherwise valid empty explanation.
-            "rationale": {"type": "string", "minLength": 20},
+            # Keep the wire contract structural. A complete provider response
+            # with a short non-empty rationale is checkpointed before a
+            # deterministic, audit-visible metadata repair. The executable
+            # action/scope/checks still pass the full validator below.
+            "rationale": {"type": "string"},
             "confidence": {
                 "type": "string",
                 "enum": ["high", "medium"],
@@ -2005,10 +2232,7 @@ def _recovery_decision_ledger(
             "core_sha256": str(item["core_sha256"]),
             "source_excerpt_sha256": str(excerpt_sha),
         }
-        claim_id = (
-            f"recovery-claim-{index:08d}-"
-            f"{_stable_digest(identity)[:24]}"
-        )
+        claim_id = f"recovery-claim-{index:08d}-{_stable_digest(identity)[:24]}"
         claim_ids.append(claim_id)
         entries.append(
             {
@@ -2020,9 +2244,7 @@ def _recovery_decision_ledger(
                 "mapper_summary": str(item.get("summary") or ""),
                 "mapper_relevance": str(item.get("relevance") or "uncertain"),
                 "linked_answer_ids": list(item.get("linked_answer_ids") or []),
-                "linked_artifact_keys": list(
-                    item.get("linked_artifact_keys") or []
-                ),
+                "linked_artifact_keys": list(item.get("linked_artifact_keys") or []),
             }
         )
     if len(claim_ids) != len(set(claim_ids)):
@@ -2107,7 +2329,12 @@ def _validate_decision_shard(
     prior_decisions: list[dict[str, Any]],
     incident_fingerprint: str,
     incident_facts_digest: str | None,
-) -> tuple[dict[str, Any], list[int], list[str]]:
+) -> tuple[
+    dict[str, Any],
+    list[int],
+    list[str],
+    dict[str, Any] | None,
+]:
     expected = [
         {
             "claim_id": entry["claim_id"],
@@ -2215,7 +2442,7 @@ def _validate_decision_shard(
         raise OrchestratorContractError(
             "Recovery decision shard returned no candidate decision"
         )
-    accepted = validate_recovery_decision(
+    accepted, rationale_repair = validate_recovery_decision_with_rationale_repair(
         decision,
         allowed_actions=allowed_actions,
         permitted_answer_ids=permitted_answer_ids,
@@ -2240,6 +2467,7 @@ def _validate_decision_shard(
         accepted,
         list(accepted["target_answer_ids"]),
         list(accepted["invalidate_artifact_keys"]),
+        rationale_repair,
     )
 
 
@@ -2329,9 +2557,7 @@ def _decision_arbiter_payload(
             {
                 "candidate_id": node["candidate_id"],
                 "source_claim_count": len(node["source_claim_ids"]),
-                "source_claim_ids_sha256": _stable_digest(
-                    node["source_claim_ids"]
-                ),
+                "source_claim_ids_sha256": _stable_digest(node["source_claim_ids"]),
                 "decision": node["decision"],
             }
             for node in nodes
@@ -2376,8 +2602,7 @@ def _pack_decision_candidates(
             continue
         if not current:
             raise OrchestratorContractError(
-                "One recovery candidate decision exceeds the Fable arbiter "
-                "envelope"
+                "One recovery candidate decision exceeds the Fable arbiter envelope"
             )
         batches.append(current)
         current = [node]
@@ -2400,8 +2625,7 @@ def _pack_decision_candidates(
         )
         if singleton_bytes > window_bytes:
             raise OrchestratorContractError(
-                "One recovery candidate decision exceeds the Fable arbiter "
-                "envelope"
+                "One recovery candidate decision exceeds the Fable arbiter envelope"
             )
     if current:
         batches.append(current)
@@ -2427,6 +2651,7 @@ async def _decide_from_exact_claim_ledger(
     model_envelope: dict[str, Any],
     window_bytes: int,
     run_id: str | None = None,
+    resume_only: bool = False,
 ) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]:
     """Let Fable read every exact claim in bounded independent decisions.
 
@@ -2481,8 +2706,7 @@ async def _decide_from_exact_claim_ledger(
         result, physical_events, resumed = await _recovery_atomic_chat(
             run_id=run_id,
             sequence_key=(
-                f"decision-shard:{shard_index}:"
-                f"{_stable_digest(payload)[:20]}"
+                f"decision-shard:{shard_index}:{_stable_digest(payload)[:20]}"
             ),
             model=ORCHESTRATOR_MODEL,
             messages=messages,
@@ -2490,6 +2714,7 @@ async def _decide_from_exact_claim_ledger(
             schema_name="aiv_recovery_decision_shard",
             reasoning_effort="high",
             temperature=0.1,
+            resume_only=resume_only,
         )
         if not isinstance(result.parsed, dict):
             raise OrchestratorContractError(
@@ -2499,6 +2724,7 @@ async def _decide_from_exact_claim_ledger(
             decision,
             available_answer_ids,
             available_artifact_keys,
+            rationale_repair,
         ) = _validate_decision_shard(
             result.parsed,
             entries=batch,
@@ -2537,6 +2763,7 @@ async def _decide_from_exact_claim_ledger(
                 "parsed_sha256": _stable_digest(result.parsed),
                 "raw_text": result.text,
                 "parsed": result.parsed,
+                "rationale_repair": rationale_repair,
                 "usage": result.usage,
                 "physical_provider_events": physical_events,
                 "resumed_from_durable_provider_checkpoint": resumed,
@@ -2599,6 +2826,7 @@ async def _decide_from_exact_claim_ledger(
                 schema_name="aiv_recovery_decision_arbiter",
                 reasoning_effort="high",
                 temperature=0.1,
+                resume_only=resume_only,
             )
             last_result = result
             if not isinstance(result.parsed, dict):
@@ -2625,18 +2853,18 @@ async def _decide_from_exact_claim_ledger(
                 raise OrchestratorContractError(
                     "Recovery decision arbiter returned no decision"
                 )
-            decision = validate_recovery_decision(
-                decision_value,
-                allowed_actions=shard_allowed_actions,
-                permitted_answer_ids=permitted_answer_ids,
-                permitted_artifact_keys=permitted_artifact_keys,
-                prior_decisions=prior_decisions,
-                incident_fingerprint=incident_fingerprint,
-                incident_facts_digest=incident_facts_digest,
+            decision, rationale_repair = (
+                validate_recovery_decision_with_rationale_repair(
+                    decision_value,
+                    allowed_actions=shard_allowed_actions,
+                    permitted_answer_ids=permitted_answer_ids,
+                    permitted_artifact_keys=permitted_artifact_keys,
+                    prior_decisions=prior_decisions,
+                    incident_fingerprint=incident_fingerprint,
+                    incident_facts_digest=incident_facts_digest,
+                )
             )
-            if not set(decision["target_answer_ids"]).issubset(
-                child_answer_ids
-            ):
+            if not set(decision["target_answer_ids"]).issubset(child_answer_ids):
                 raise OrchestratorContractError(
                     "Recovery arbiter introduced an answer outside child decisions"
                 )
@@ -2647,9 +2875,7 @@ async def _decide_from_exact_claim_ledger(
                     "Recovery arbiter introduced an artifact outside child decisions"
                 )
             source_claim_ids = [
-                claim_id
-                for node in batch
-                for claim_id in node["source_claim_ids"]
+                claim_id for node in batch for claim_id in node["source_claim_ids"]
             ]
             if len(source_claim_ids) != len(set(source_claim_ids)):
                 raise OrchestratorContractError(
@@ -2685,6 +2911,7 @@ async def _decide_from_exact_claim_ledger(
                     "parsed_sha256": _stable_digest(result.parsed),
                     "raw_text": result.text,
                     "parsed": result.parsed,
+                    "rationale_repair": rationale_repair,
                     "usage": result.usage,
                     "physical_provider_events": physical_events,
                     "resumed_from_durable_provider_checkpoint": resumed,
@@ -2820,6 +3047,92 @@ def validate_recovery_decision(
     }
 
 
+def validate_recovery_decision_with_rationale_repair(
+    decision: dict[str, Any],
+    *,
+    allowed_actions: set[str],
+    permitted_answer_ids: set[int],
+    permitted_artifact_keys: set[str],
+    prior_decisions: list[dict[str, Any]],
+    incident_fingerprint: str,
+    incident_facts_digest: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Repair only a non-empty short rationale, then rerun the full gate.
+
+    Rationale is explanatory metadata; it never authorizes an action.  Some
+    providers honour the JSON shape but ignore its former length annotation.
+    Losing that complete paid response would discard a valid action, scope,
+    guidance and acceptance-check set.  This helper admits exactly one repair:
+    append a code-owned, fact-free explanation when the *only* validation
+    error is a 1..19 character rationale. Every executable field remains
+    byte-for-byte identical and the complete validator runs again.
+    """
+
+    try:
+        return (
+            validate_recovery_decision(
+                decision,
+                allowed_actions=allowed_actions,
+                permitted_answer_ids=permitted_answer_ids,
+                permitted_artifact_keys=permitted_artifact_keys,
+                prior_decisions=prior_decisions,
+                incident_fingerprint=incident_fingerprint,
+                incident_facts_digest=incident_facts_digest,
+            ),
+            None,
+        )
+    except OrchestratorContractError as error:
+        if str(error) != "rationale is too short":
+            raise RecoveryDecisionRejected(str(error)) from error
+
+    original = str(decision.get("rationale") or "").strip()
+    if not original or len(original) >= 20:
+        raise RecoveryDecisionRejected("rationale is too short")
+    repaired_input = copy.deepcopy(decision)
+    repaired_input["rationale"] = (
+        original.rstrip(". ")
+        + ". Исполняемые поля повторно прошли полный кодовый контракт."
+    )
+    accepted = validate_recovery_decision(
+        repaired_input,
+        allowed_actions=allowed_actions,
+        permitted_answer_ids=permitted_answer_ids,
+        permitted_artifact_keys=permitted_artifact_keys,
+        prior_decisions=prior_decisions,
+        incident_fingerprint=incident_fingerprint,
+        incident_facts_digest=incident_facts_digest,
+    )
+    executable_fields = (
+        "action",
+        "confidence",
+        "guidance",
+        "target_answer_ids",
+        "invalidate_artifact_keys",
+        "acceptance_checks",
+    )
+    original_executable = {
+        key: copy.deepcopy(decision.get(key)) for key in executable_fields
+    }
+    repaired_executable = {
+        key: copy.deepcopy(repaired_input.get(key)) for key in executable_fields
+    }
+    if original_executable != repaired_executable:  # pragma: no cover
+        raise OrchestratorContractError(
+            "Rationale repair changed an executable recovery field"
+        )
+    return (
+        accepted,
+        {
+            "version": RECOVERY_RATIONALE_REPAIR_VERSION,
+            "method": "append_code_owned_non_executable_explanation",
+            "original_rationale": original,
+            "original_decision_sha256": _stable_digest(decision),
+            "repaired_decision_sha256": _stable_digest(repaired_input),
+            "executable_fields_sha256": _stable_digest(original_executable),
+        },
+    )
+
+
 async def plan_recovery(
     *,
     incident: dict[str, Any],
@@ -2827,6 +3140,8 @@ async def plan_recovery(
     permitted_answer_ids: set[int] | None = None,
     permitted_artifact_keys: set[str] | None = None,
     prior_decisions: list[dict[str, Any]] | None = None,
+    model_envelopes: dict[str, Any] | None = None,
+    resume_only: bool = False,
 ) -> OrchestratorResult:
     """Ask Fable for one decision, then enforce the code-owned boundary."""
 
@@ -2847,14 +3162,11 @@ async def plan_recovery(
         if not (
             isinstance(item, dict)
             and not str(item.get("action") or "").strip()
-            and str(item.get("status") or "")
-            in {"diagnosing", "planning", "failed"}
+            and str(item.get("status") or "") in {"diagnosing", "planning", "failed"}
             and not item.get("outcome")
         )
     ]
-    incident_fingerprint = str(
-        incident.get("fingerprint") or _stable_digest(incident)
-    )
+    incident_fingerprint = str(incident.get("fingerprint") or _stable_digest(incident))
     incident_facts_digest = (
         str(incident.get("facts_digest"))
         if incident.get("facts_digest") is not None
@@ -2917,16 +3229,30 @@ facts_digest. Успешное прошлое действие или решен
 guidance — короткий дополнительный контекст для следующего слоя, а не новая
 методология и не разрешение ослабить инварианты.
 
-Если input_mode=lossless_exact_claim_decision_shards, каждый атомарный
-source_excerpt уже был дословно прочитан отдельным strong-model decision-shard,
-а итог получен арбитражем полных кандидатных решений. Хэши доказывают
-происхождение, но не заменяют содержание. control_plane и списки
+Если input_mode=lossless_source_bound_decision_dossier, дешёвый mapper прочитал
+весь исходный корпус без пропусков. unit_semantic_receipts перечисляет смысл
+каждого точного source-unit, а полный raw, точные цитаты и их хэши сохранены в
+аудит-квитанциях. coverage.complete обязателен. Для каждой разрешённой мутации
+executable_scope_evidence.exact_source_units содержит дословные core-фрагменты,
+на которых основан actionable/blocking finding. Сверяй решение именно с ними,
+а не только с пересказом mapper. Не выбирай target_answer_ids или
+invalidate_artifact_keys без соответствующей записи в
+executable_scope_evidence. При safety_relevant_uncertainty предпочитай stop или
+узкий повтор под неизменным кодовым валидатором. control_plane и списки
 allowed_actions, permitted_answer_ids, permitted_artifact_keys — единственная
 авторитетная граница исполняемого решения.
 """.strip()
 
     schema = _decision_schema(ordered_actions)
-    fable_envelope = await model_output_envelope(ORCHESTRATOR_MODEL)
+    if resume_only and model_envelopes is None:
+        raise RecoveryProviderCheckpointMissing(
+            "Cache-only recovery replay has no durable model-envelope snapshot"
+        )
+    fable_envelope = (
+        _model_envelope_from_snapshot(model_envelopes, model=ORCHESTRATOR_MODEL)
+        if model_envelopes is not None
+        else dict(await model_output_envelope(ORCHESTRATOR_MODEL))
+    )
     fable_window = _input_window(ORCHESTRATOR_MODEL, fable_envelope)
     fable_window_bytes = int(fable_window["input_utf8_window"])
 
@@ -2952,15 +3278,13 @@ allowed_actions, permitted_answer_ids, permitted_artifact_keys — единст�
         "runtime_attempt_context": runtime_attempt_context,
     }
     model_payload = payload
-    precomputed_decision: dict[str, Any] | None = None
-    precomputed_raw_text: str | None = None
-    precomputed_usage: dict[str, Any] | None = None
     if original_request_bytes <= fable_window_bytes:
         harness_audit.update(
             {
                 "mode": "direct_atomic",
                 "source_manifest": None,
                 "map_reduce_receipts": [],
+                "fable_physical_call_limit": 1,
             }
         )
     else:
@@ -2968,13 +3292,20 @@ allowed_actions, permitted_answer_ids, permitted_artifact_keys — единст�
             "incident": payload["incident"],
             "prior_decisions": payload["prior_decisions"],
         }
-        nodes, manifest, map_receipts, processing_contract = (
-            await _map_recovery_source(
-                source,
-                permitted_answer_ids=answer_ids,
-                permitted_artifact_keys=artifact_keys,
-                run_id=recovery_run_id,
-            )
+        nodes, manifest, map_receipts, processing_contract = await _map_recovery_source(
+            source,
+            permitted_answer_ids=answer_ids,
+            permitted_artifact_keys=artifact_keys,
+            run_id=recovery_run_id,
+            model_envelope=(
+                _model_envelope_from_snapshot(
+                    model_envelopes,
+                    model=PROCESSING_MODEL,
+                )
+                if model_envelopes is not None
+                else None
+            ),
+            resume_only=resume_only,
         )
         exact_prior_guard = [
             {
@@ -3003,9 +3334,7 @@ allowed_actions, permitted_answer_ids, permitted_artifact_keys — единст�
             "permitted_answer_id_count": len(answer_ids),
             "permitted_answer_ids_sha256": _stable_digest(sorted(answer_ids)),
             "permitted_artifact_key_count": len(artifact_keys),
-            "permitted_artifact_keys_sha256": _stable_digest(
-                sorted(artifact_keys)
-            ),
+            "permitted_artifact_keys_sha256": _stable_digest(sorted(artifact_keys)),
             "prior_decision_guard_count": len(exact_prior_guard),
             "prior_decision_guard_sha256": _stable_digest(exact_prior_guard),
             "coverage_complete": True,
@@ -3023,98 +3352,99 @@ allowed_actions, permitted_answer_ids, permitted_artifact_keys — единст�
         }
         control_plane["scope_sha256"] = _stable_digest(control_plane)
 
-        (
-            precomputed_decision,
-            precomputed_raw_text,
-            precomputed_usage,
-            decision_audit,
-        ) = await _decide_from_exact_claim_ledger(
+        model_payload = _source_bound_decision_dossier(
             nodes,
             manifest=manifest,
             control_plane=control_plane,
-            allowed_actions=allowed_actions,
-            permitted_answer_ids=answer_ids,
-            permitted_artifact_keys=artifact_keys,
-            prior_decisions=history,
-            incident_fingerprint=incident_fingerprint,
-            incident_facts_digest=incident_facts_digest,
-            model_envelope=fable_envelope,
-            window_bytes=fable_window_bytes,
-            run_id=recovery_run_id,
         )
-        model_payload = {
-            "version": ORCHESTRATOR_VERSION,
-            "input_mode": "lossless_exact_claim_decision_shards",
-            "control_plane": control_plane,
-            "source_manifest": _manifest_pointer(manifest),
-            "decision_ledger": _decision_ledger_pointer(
-                decision_audit["decision_ledger"]
-            ),
-            "root_candidate_id": decision_audit["root_candidate_id"],
-        }
+        dossier_request_bytes = fable_request_bytes(model_payload)
+        if dossier_request_bytes > fable_window_bytes:
+            raise RecoveryPlannerUnavailable(
+                "Complete source-bound recovery dossier exceeds the Fable "
+                "physical envelope; partial strong-model review is forbidden"
+            )
         harness_audit.update(
             {
-                "mode": "lossless_exact_claim_decision_shards",
+                "mode": "lossless_source_bound_decision_dossier",
                 "source_manifest": manifest,
                 "processing_model": PROCESSING_MODEL,
                 "processing_contract": processing_contract,
                 "map_receipt_count": len(map_receipts),
                 "reduce_receipt_count": 0,
                 "map_reduce_receipts": map_receipts,
-                **decision_audit,
+                "decision_dossier_sha256": model_payload["dossier_sha256"],
+                "decision_dossier_request_utf8_bytes": dossier_request_bytes,
+                "fable_physical_call_limit": 1,
                 "control_plane_sha256": control_plane["scope_sha256"],
                 "authorization_scope_ledger": authorization_scope_ledger,
             }
         )
     harness_audit["fable_input_sha256"] = _stable_digest(model_payload)
     harness_audit["fable_input"] = model_payload
-    if precomputed_decision is None:
-        direct_messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": json.dumps(model_payload, ensure_ascii=False),
-            },
-        ]
-        result, direct_physical_events, direct_resumed = (
-            await _recovery_atomic_chat(
-                run_id=recovery_run_id,
-                sequence_key=(
-                    "direct:" + _stable_digest(model_payload)[:20]
-                ),
-                model=ORCHESTRATOR_MODEL,
-                messages=direct_messages,
-                response_schema=schema,
-                schema_name="aiv_recovery_orchestrator",
-                reasoning_effort="high",
-                temperature=0.1,
+    direct_messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": json.dumps(model_payload, ensure_ascii=False),
+        },
+    ]
+    result, direct_physical_events, direct_resumed = await _recovery_atomic_chat(
+        run_id=recovery_run_id,
+        sequence_key=("direct:" + _stable_digest(model_payload)[:20]),
+        model=ORCHESTRATOR_MODEL,
+        messages=direct_messages,
+        response_schema=schema,
+        schema_name="aiv_recovery_orchestrator",
+        reasoning_effort="high",
+        temperature=0.1,
+        resume_only=resume_only,
+    )
+    harness_audit["direct_physical_provider_events"] = direct_physical_events
+    harness_audit["direct_resumed_from_durable_provider_checkpoint"] = direct_resumed
+    harness_audit["fable_physical_cache_misses"] = 0 if direct_resumed else 1
+    if not isinstance(result.parsed, dict):
+        raise RecoveryDecisionRejected(
+            "Recovery orchestrator returned a non-object response"
+        )
+    decision, rationale_repair = validate_recovery_decision_with_rationale_repair(
+        result.parsed,
+        allowed_actions=allowed_actions,
+        permitted_answer_ids=answer_ids,
+        permitted_artifact_keys=artifact_keys,
+        prior_decisions=history,
+        incident_fingerprint=incident_fingerprint,
+        incident_facts_digest=incident_facts_digest,
+    )
+    if model_payload.get("input_mode") == "lossless_source_bound_decision_dossier":
+        scope_evidence = model_payload["executable_scope_evidence"]
+        if not set(decision["target_answer_ids"]).issubset(
+            set(scope_evidence["supported_answer_ids"])
+        ):
+            raise RecoveryDecisionRejected(
+                "Recovery dossier decision targets an answer without source-bound "
+                "support"
             )
-        )
-        harness_audit["direct_physical_provider_events"] = (
-            direct_physical_events
-        )
-        harness_audit["direct_resumed_from_durable_provider_checkpoint"] = (
-            direct_resumed
-        )
-        if not isinstance(result.parsed, dict):
-            raise OrchestratorContractError(
-                "Recovery orchestrator returned a non-object response"
+        if not set(decision["invalidate_artifact_keys"]).issubset(
+            set(scope_evidence["supported_artifact_keys"])
+        ):
+            raise RecoveryDecisionRejected(
+                "Recovery dossier decision targets an artifact without source-bound "
+                "support"
             )
-        decision = validate_recovery_decision(
-            result.parsed,
-            allowed_actions=allowed_actions,
-            permitted_answer_ids=answer_ids,
-            permitted_artifact_keys=artifact_keys,
-            prior_decisions=history,
-            incident_fingerprint=incident_fingerprint,
-            incident_facts_digest=incident_facts_digest,
-        )
-        raw_text = result.text
-        usage = dict(result.usage)
-    else:
-        decision = precomputed_decision
-        raw_text = str(precomputed_raw_text or "")
-        usage = dict(precomputed_usage or {})
+        unsafe_actions = {
+            ACTION_TARGETED_ANNOTATION_REPAIR,
+            ACTION_RECOMPUTE_DERIVED,
+            ACTION_PUBLISH_LIMITED,
+        }
+        if scope_evidence["safety_relevant_uncertainty"] and (
+            decision["action"] in unsafe_actions
+        ):
+            raise RecoveryDecisionRejected(
+                "Recovery dossier contains unresolved safety-relevant evidence"
+            )
+    harness_audit["direct_rationale_repair"] = rationale_repair
+    raw_text = result.text
+    usage = dict(result.usage)
     usage["_aiv_recovery_input_harness"] = harness_audit
     return OrchestratorResult(
         decision=decision,

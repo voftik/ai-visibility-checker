@@ -4,6 +4,7 @@ LLMs annotate evidence and write explanations. All public metrics are computed
 deterministically from those atomic annotations; missing data never becomes a
 zero.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -136,8 +137,12 @@ from app.services.report_editor import (
     EDITORIAL_POLICY,
     REPORT_EDITOR_HARNESS_VERSION,
     REPORT_EDITOR_POLICY_VERSION,
+    build_editorial_units,
     edit_report,
+    editorial_policy_sha256,
+    seal_editorial_audit,
     technical_review_narrative_paths,
+    validate_editorial_cache,
 )
 from app.services.offer_catalog import (
     AnswerSetReceipt,
@@ -171,11 +176,15 @@ from app.services.recovery_orchestrator import (
     CHECK_RAW_CORPUS_UNCHANGED,
     CHECK_SEMANTIC_REVIEW_PASSED,
     OrchestratorContractError,
+    RecoveryDecisionRejected,
+    RecoveryPlannerUnavailable,
 )
 from app.services.recovery_state import (
     DurableRecoveryPlan,
+    RecoveryBudgetExceeded,
     finish_recovery,
     mark_recovery_executing,
+    plan_code_owned_recovery,
     plan_durable_recovery,
     recovery_execution_state,
     stable_digest,
@@ -205,7 +214,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
 SITE_PROFILE_VERSION = f"{PROMPT_VERSION}-site-profile-v5"
-OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v1"
+OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v2"
 PROMPT_FOUNDATION_PIPELINE_VERSION = f"{PROMPT_VERSION}-prompt-foundation-v1"
 ANSWER_SET_RECEIPT_PIPELINE_VERSION = f"{PROMPT_VERSION}-answer-receipt-v1"
 LEGACY_FOUNDATION_AUDIT_VERSION = f"{PROMPT_VERSION}-legacy-foundation-v1"
@@ -230,18 +239,16 @@ ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v9"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v11"
 CORE_UNIT_DECISION_LEDGER_VERSION = "aiv-core-unit-decision-ledger-v1"
 CORE_UNIT_QUOTE_REPAIR_VERSION = "aiv-core-unit-quote-markdown-v1"
-ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = (
-    "aiv-entity-catalog-contract-recovery-v1"
-)
-ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE = "entity_catalog_contract"
+ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = "aiv-entity-catalog-contract-recovery-v1"
+ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE = "entity_catalog_contract_v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS = 2
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v18"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v20"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
 FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v28"
-FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v2"
-TECHNICAL_EDITORIAL_VERSION = f"{TECHNICAL_REVIEW_VERSION}-ru-editor-v2"
+FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v3"
+TECHNICAL_EDITORIAL_VERSION = f"{TECHNICAL_REVIEW_VERSION}-ru-editor-v3"
 FINAL_REPORT_SHARD_PLAN_VERSION = "aiv-final-report-shards-v5"
 FINAL_REPORT_SHARD_MERGE_VERSION = "aiv-final-report-merge-v5"
 FINAL_CORPUS_MANIFEST_VERSION = f"{PROMPT_VERSION}-final-corpus-v4"
@@ -313,9 +320,7 @@ LEGACY_PANEL_MODELS = {
     "claude": "anthropic/claude-sonnet-5",
 }
 LEGACY_MEMORY_MODELS = {
-    key: model
-    for key, model in LEGACY_PANEL_MODELS.items()
-    if key != "perplexity"
+    key: model for key, model in LEGACY_PANEL_MODELS.items() if key != "perplexity"
 }
 LEGACY_PIPELINE_VERSION = "aiv-2026-07"
 LEGACY_PROMPT_SET_VERSIONS = {
@@ -834,8 +839,13 @@ MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA: dict[str, Any] = {
                     "dimension": {
                         "type": "string",
                         "enum": [
-                            "site_confirmed", "market", "topics", "geography",
-                            "audiences", "customer_jobs", "decision_criteria",
+                            "site_confirmed",
+                            "market",
+                            "topics",
+                            "geography",
+                            "audiences",
+                            "customer_jobs",
+                            "decision_criteria",
                             "terminology",
                         ],
                     },
@@ -855,8 +865,12 @@ MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA: dict[str, Any] = {
                     },
                 },
                 "required": [
-                    "dimension", "claim", "evidence", "source_urls",
-                    "source_unit_ids", "confidence",
+                    "dimension",
+                    "claim",
+                    "evidence",
+                    "source_urls",
+                    "source_unit_ids",
+                    "confidence",
                 ],
             },
         },
@@ -1860,15 +1874,12 @@ def _artifact_cache_matches(
     if model is not _CACHE_UNSET and artifact.model != model:
         return False
     if require_validated_critic_usage:
-        usage = (
-            artifact.usage_json
-            if isinstance(artifact.usage_json, dict)
-            else {}
-        )
+        usage = artifact.usage_json if isinstance(artifact.usage_json, dict) else {}
         contract = usage.get("_aiv_critic_contract")
-        if not isinstance(contract, dict) or contract.get(
-            "semantic_verdict_status"
-        ) != "validated":
+        if (
+            not isinstance(contract, dict)
+            or contract.get("semantic_verdict_status") != "validated"
+        ):
             return False
     return True
 
@@ -2043,27 +2054,22 @@ async def _structured_artifact(
             "content": json.dumps(user_payload, ensure_ascii=False),
         },
     ]
-    document_id = (
-        f"{run_id}:{artifact_key}:"
-        f"{_stable_json_sha256(user_payload)[:20]}"
-    )
+    document_id = f"{run_id}:{artifact_key}:{_stable_json_sha256(user_payload)[:20]}"
     try:
         if continuable:
-            audit_checkpoint, resume_checkpoint = (
-                await _durable_structured_transport(
-                    run_id,
-                    stage_key=stage_key,
-                    owner_artifact_key=artifact_key,
-                    source_input=user_payload,
-                    model=model,
-                    owner_prompt_version=prompt_version,
-                    messages=messages,
-                    schema_name=schema_name,
-                    response_schema=schema,
-                    document_id=document_id,
-                    reasoning_effort=reasoning_effort,
-                    temperature=0.15,
-                )
+            audit_checkpoint, resume_checkpoint = await _durable_structured_transport(
+                run_id,
+                stage_key=stage_key,
+                owner_artifact_key=artifact_key,
+                source_input=user_payload,
+                model=model,
+                owner_prompt_version=prompt_version,
+                messages=messages,
+                schema_name=schema_name,
+                response_schema=schema,
+                document_id=document_id,
+                reasoning_effort=reasoning_effort,
+                temperature=0.15,
             )
             result = await chat_continuable_structured(
                 model=model,
@@ -2177,28 +2183,81 @@ async def _site_context(run_id: str) -> dict[str, Any]:
         domain = (
             await session.execute(select(Run.domain).where(Run.id == run_id))
         ).scalar_one()
+        page_manifest_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == SITE_PAGE_MANIFEST_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+        manifest_output = validated_site_page_manifest_output(
+            page_manifest_artifact,
+            domain=str(domain or ""),
+            allow_legacy_snapshot=True,
+        )
+        if manifest_output is None:
+            raise CrawlAdmissionIncomplete(
+                "site_page_manifest is not valid for semantic analysis"
+            )
+        manifest_pages = manifest_output.get("pages")
+        if not isinstance(manifest_pages, list):
+            raise CrawlAdmissionIncomplete(
+                "site_page_manifest has no ordered page selection"
+            )
+        selected_urls = [str(item["url"]) for item in manifest_pages]
         pages = list(
             (
                 await session.execute(
-                    select(SitePage)
-                    .where(SitePage.run_id == run_id)
-                    .order_by(SitePage.id)
+                    select(SitePage).where(
+                        SitePage.run_id == run_id,
+                        SitePage.url.in_(selected_urls),
+                    )
                 )
             )
             .scalars()
             .all()
         )
-        page_manifest_artifact = (
-            await session.execute(
-                select(RunArtifact).where(
-                    RunArtifact.run_id == run_id,
-                    RunArtifact.artifact_key == "site_page_manifest",
-                )
-            )
-        ).scalar_one_or_none()
-    context_pages: list[dict[str, Any]] = []
+
+    pages_by_url: dict[str, SitePage] = {}
     for page in pages:
+        if page.url in pages_by_url:
+            raise CrawlAdmissionIncomplete(
+                f"Duplicate SitePage row for selected URL: {page.url}"
+            )
+        pages_by_url[page.url] = page
+    missing_urls = [url for url in selected_urls if url not in pages_by_url]
+    if missing_urls:
+        raise CrawlAdmissionIncomplete(
+            "Selected SitePage rows are missing: " + ", ".join(missing_urls)
+        )
+
+    receipt = manifest_output.get("site_page_receipt")
+    receipt_pages = receipt.get("pages") if isinstance(receipt, dict) else None
+    if not isinstance(receipt_pages, list) or len(receipt_pages) != len(manifest_pages):
+        raise CrawlAdmissionIncomplete(
+            "site_page_manifest receipt does not cover the selected pages"
+        )
+
+    context_pages: list[dict[str, Any]] = []
+    for ordinal, manifest_page in enumerate(manifest_pages):
+        expected_url = selected_urls[ordinal]
+        expected_kind = str(manifest_page["page_kind"])
+        receipt_page = receipt_pages[ordinal]
+        page = pages_by_url[expected_url]
         main_text = page.main_text or ""
+        source_sha256 = text_sha256(main_text)
+        if (
+            page.page_kind != expected_kind
+            or not isinstance(receipt_page, dict)
+            or receipt_page.get("ordinal") != ordinal
+            or receipt_page.get("url") != expected_url
+            or receipt_page.get("page_kind") != expected_kind
+            or receipt_page.get("content_sha256") != source_sha256
+        ):
+            raise CrawlAdmissionIncomplete(
+                f"SitePage lineage no longer matches manifest: {expected_url}"
+            )
         declared_text_length = (
             int(page.text_length)
             if isinstance(page.text_length, int)
@@ -2208,17 +2267,14 @@ async def _site_context(run_id: str) -> dict[str, Any]:
         )
         signals = page.content_signals or {}
         stored_prefix_only = bool(signals.get("_body_truncated")) or (
-            declared_text_length is not None
-            and declared_text_length > len(main_text)
+            declared_text_length is not None and declared_text_length > len(main_text)
         )
-        source_unit_id = str(page.url)
-        source_sha256 = text_sha256(main_text)
         context_pages.append(
             {
-                "url": page.url,
-                "source_unit_id": source_unit_id,
+                "url": expected_url,
+                "source_unit_id": expected_url,
                 "source_sha256": source_sha256,
-                "page_kind": page.page_kind,
+                "page_kind": expected_kind,
                 "title": page.title,
                 "meta_description": page.meta_description,
                 "main_text": main_text,
@@ -2231,33 +2287,13 @@ async def _site_context(run_id: str) -> dict[str, Any]:
                 "signals": signals,
             }
         )
-    manifest_output = (
-        copy.deepcopy(page_manifest_artifact.output_json)
-        if page_manifest_artifact is not None
-        and page_manifest_artifact.status == "completed"
-        and isinstance(page_manifest_artifact.output_json, dict)
-        else {
-            "version": "aiv-site-page-manifest-derived-v1",
-            "pages": [
-                {
-                    "ordinal": index,
-                    "url": page["url"],
-                    "page_kind": page.get("page_kind"),
-                    "source_sha256": page["source_sha256"],
-                }
-                for index, page in enumerate(context_pages)
-            ],
-            "selected_count": len(context_pages),
-            "derived_from_saved_site_pages": True,
-        }
-    )
     return {
         "requested_site": {
             "domain": domain,
             "url": f"https://{domain}/",
         },
         "pages": context_pages,
-        "selected_pages_manifest": manifest_output,
+        "selected_pages_manifest": copy.deepcopy(manifest_output),
     }
 
 
@@ -2269,10 +2305,7 @@ def _probe_access_outcome(
         return "unknown"
     if probe.challenge_detected:
         return "blocked"
-    if (
-        probe.http_status in _TRANSIENT_HTTP_STATUSES
-        or 500 <= probe.http_status < 600
-    ):
+    if probe.http_status in _TRANSIENT_HTTP_STATUSES or 500 <= probe.http_status < 600:
         return "unknown"
     if not 200 <= probe.http_status < 400:
         return "blocked"
@@ -2295,8 +2328,7 @@ def _probe_access_outcome(
         return "blocked"
     length = int(probe.content_extractable_text_length or 0)
     body_truncated = bool(signals.get("_body_truncated")) or (
-        getattr(probe, "response_size_bytes", None)
-        == LEGACY_RESPONSE_BODY_LIMIT_BYTES
+        getattr(probe, "response_size_bytes", None) == LEGACY_RESPONSE_BODY_LIMIT_BYTES
     )
     if body_truncated:
         # A readable prefix proves that this user-agent received page content,
@@ -2479,9 +2511,7 @@ def _technical_page_coverage(
         else None
     )
     required_floor = max(evaluated, selected or 0)
-    if discovered is not None and (
-        discovered <= 0 or discovered < required_floor
-    ):
+    if discovered is not None and (discovered <= 0 or discovered < required_floor):
         # An internally inconsistent denominator must not look like full coverage.
         discovered = None
 
@@ -2574,9 +2604,7 @@ def _entity_structured_data_types(values: Any) -> list[str]:
 
 async def _technical_summary(run_id: str) -> dict[str, Any]:
     async with SessionLocal() as session:
-        run = (
-            await session.execute(select(Run).where(Run.id == run_id))
-        ).scalar_one()
+        run = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
         probes = list(
             (
                 await session.execute(
@@ -2652,7 +2680,9 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
         utility_pages += int(is_utility)
         variants = page_groups.get(page.url, {})
         control = variants.get(CONTROL_LABEL)
-        baseline = int(control.content_extractable_text_length or 0) if control else None
+        baseline = (
+            int(control.content_extractable_text_length or 0) if control else None
+        )
         accessible_families: set[str] = set()
         blocked_families: set[str] = set()
         unknown_families: set[str] = set()
@@ -2764,9 +2794,7 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
         "DeepSeekBot",
     )
     content_urls = [
-        page.url
-        for page in pages
-        if not _is_utility_page(page.url, page.page_kind)
+        page.url for page in pages if not _is_utility_page(page.url, page.page_kind)
     ]
     robot_allowed = 0
     robot_known = 0
@@ -2831,9 +2859,7 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
         and page.get("content_storage_state") == "prefix_only"
     )
     structured_content_pages = [
-        page
-        for page in pages
-        if not _is_utility_page(page.url, page.page_kind)
+        page for page in pages if not _is_utility_page(page.url, page.page_kind)
     ]
     structured_positive_pages = [
         page
@@ -2842,31 +2868,22 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
             (page.content_signals or {}).get("structured_data_types")
         )
     ]
-    structured_positive_object_ids = {
-        id(page) for page in structured_positive_pages
-    }
+    structured_positive_object_ids = {id(page) for page in structured_positive_pages}
     structured_complete_negative_pages = [
         page
         for page in structured_content_pages
         if id(page) not in structured_positive_object_ids
         and not bool((page.content_signals or {}).get("_body_truncated"))
-        and (
-            (page.content_signals or {}).get("structured_data_complete")
-            is not False
-        )
+        and ((page.content_signals or {}).get("structured_data_complete") is not False)
     ]
     # A successfully parsed entity type is positive evidence even when a
     # different JSON-LD script failed.  Incompleteness only forbids absence
     # claims; it must not erase a fact already observed in the stored prefix.
     structured_pages = len(structured_positive_pages)
-    structured_total = (
-        structured_pages + len(structured_complete_negative_pages)
-    )
+    structured_total = structured_pages + len(structured_complete_negative_pages)
     structured_unknown_pages = max(0, content_page_count - structured_total)
     page_coverage = _technical_page_coverage(content_page_count, manifest)
-    structured_ratio = (
-        structured_pages / structured_total if structured_total else None
-    )
+    structured_ratio = structured_pages / structured_total if structured_total else None
 
     weighted_parts: list[tuple[float, float]] = []
     if fetch_ratio is not None:
@@ -3027,8 +3044,7 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
                             f"{round(rendering['evaluated_pages'] * render_ratio)} из "
                             f"{content_page_count} подтверждены"
                             + (
-                                f"; {rendering['unknown_pages']} "
-                                "не определено"
+                                f"; {rendering['unknown_pages']} не определено"
                                 if rendering["unknown_pages"]
                                 else ""
                             )
@@ -3105,7 +3121,9 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
         },
         "rendering": {
             "counts": dict(render_counts),
-            "server_readable_share": round(render_ratio * 100) if render_ratio is not None else None,
+            "server_readable_share": round(render_ratio * 100)
+            if render_ratio is not None
+            else None,
             "evaluated_pages": rendering["evaluated_pages"],
             "unknown_pages": rendering["unknown_pages"],
             "conclusion": rendering["conclusion"],
@@ -3115,9 +3133,7 @@ async def _technical_summary(run_id: str) -> dict[str, Any]:
             "evaluated_pages": structured_total,
             "unknown_pages": structured_unknown_pages,
             "entity_share": (
-                round(structured_ratio * 100)
-                if structured_ratio is not None
-                else None
+                round(structured_ratio * 100) if structured_ratio is not None else None
             ),
         },
         "auth": {
@@ -3168,13 +3184,10 @@ def _long_response_lineage(
         ):
             raise OpenRouterError("Long-response reducer input has no lineage")
         values.extend(raw)
-    duplicates = sorted(
-        value for value, count in Counter(values).items() if count != 1
-    )
+    duplicates = sorted(value for value, count in Counter(values).items() if count != 1)
     if duplicates:
         raise OpenRouterError(
-            "Long-response reducer lineage duplicated units: "
-            + ", ".join(duplicates)
+            "Long-response reducer lineage duplicated units: " + ", ".join(duplicates)
         )
     normalized = sorted(values)
     if expected_unit_ids is not None:
@@ -3296,11 +3309,7 @@ def _specific_no_fact_reason(reason: str) -> bool:
         "n/a",
     }
     words = re.findall(r"[\w-]+", normalized, re.UNICODE)
-    return bool(
-        normalized not in generic
-        and len(normalized) >= 20
-        and len(words) >= 4
-    )
+    return bool(normalized not in generic and len(normalized) >= 20 and len(words) >= 4)
 
 
 _MARKDOWN_EMPHASIS_PATTERNS = (
@@ -3365,9 +3374,7 @@ def _unique_markdown_emphasis_quote_repair(
     punctuation normalization is performed.
     """
 
-    canonical_core, source_positions, source_pairs = _markdown_emphasis_view(
-        core_text
-    )
+    canonical_core, source_positions, source_pairs = _markdown_emphasis_view(core_text)
     canonical_quote, _quote_positions, _quote_pairs = _markdown_emphasis_view(
         submitted_quote
     )
@@ -3385,9 +3392,7 @@ def _unique_markdown_emphasis_quote_repair(
     if not occurrences:
         return None
     if len(occurrences) != 1:
-        raise OpenRouterError(
-            "Core-unit Markdown-normalized quote is ambiguous"
-        )
+        raise OpenRouterError("Core-unit Markdown-normalized quote is ambiguous")
 
     canonical_start = occurrences[0]
     canonical_end = canonical_start + len(canonical_quote)
@@ -3405,9 +3410,7 @@ def _unique_markdown_emphasis_quote_repair(
                 source_end = closing_end
 
     source_quote = core_text[source_start:source_end]
-    repaired_canonical, _positions, _pairs = _markdown_emphasis_view(
-        source_quote
-    )
+    repaired_canonical, _positions, _pairs = _markdown_emphasis_view(source_quote)
     if repaired_canonical != canonical_quote:
         # A complex or partially covered construct is not safe to repair.
         return None
@@ -3451,9 +3454,7 @@ def _normalize_core_dispositions(
         zip(raw_dispositions, expected_claims, strict=True)
     ):
         if not isinstance(raw, dict):
-            raise OpenRouterError(
-                f"Core-unit disposition {position} is not an object"
-            )
+            raise OpenRouterError(f"Core-unit disposition {position} is not an object")
         for field in ("claim_id", "unit_id", "core_sha256"):
             if str(raw.get(field) or "") != str(claim.get(field) or ""):
                 raise OpenRouterError(
@@ -3477,33 +3478,25 @@ def _normalize_core_dispositions(
                         submitted_quote,
                     )
                 except OpenRouterError as exc:
-                    raise OpenRouterError(
-                        f"{exc}: {claim['unit_id']}"
-                    ) from exc
+                    raise OpenRouterError(f"{exc}: {claim['unit_id']}") from exc
                 if quote_repair is None:
                     raise OpenRouterError(
                         "Core-unit quote is not an exact core substring: "
                         + str(claim["unit_id"])
                     )
                 evidence_quote = str(quote_repair.pop("source_quote"))
-                quote_repair["source_quote_sha256"] = text_sha256(
-                    evidence_quote
-                )
-                quote_repair["source_start_char"] = (
-                    int(claim.get("start_char") or 0)
-                    + int(quote_repair["core_start_char"])
-                )
-                quote_repair["source_end_char"] = (
-                    int(claim.get("start_char") or 0)
-                    + int(quote_repair["core_end_char"])
-                )
+                quote_repair["source_quote_sha256"] = text_sha256(evidence_quote)
+                quote_repair["source_start_char"] = int(
+                    claim.get("start_char") or 0
+                ) + int(quote_repair["core_start_char"])
+                quote_repair["source_end_char"] = int(
+                    claim.get("start_char") or 0
+                ) + int(quote_repair["core_end_char"])
             if not material:
                 raise OpenRouterError(
                     f"Grounded core-unit output is blank: {claim['unit_id']}"
                 )
-            quote_visible = any(
-                submitted_quote in value for value in output_strings
-            )
+            quote_visible = any(submitted_quote in value for value in output_strings)
             if quote_repair is not None and not quote_visible:
                 canonical_quote, _positions, _pairs = _markdown_emphasis_view(
                     submitted_quote
@@ -3595,9 +3588,7 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
             "end_char",
         )
     }
-    if str(claim.get("claim_id") or "") != (
-        f"cuc_{_stable_json_sha256(identity)}"
-    ):
+    if str(claim.get("claim_id") or "") != (f"cuc_{_stable_json_sha256(identity)}"):
         raise OpenRouterError("Core-unit decision claim identity mismatch")
     quote = str(receipt.get("evidence_quote") or "")
     if text_sha256(quote) != str(receipt.get("evidence_quote_sha256") or ""):
@@ -3608,8 +3599,7 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
             raise OpenRouterError("Core-unit quote repair is not an object")
         if (
             repair.get("version") != CORE_UNIT_QUOTE_REPAIR_VERSION
-            or repair.get("method")
-            != "unique_markdown_emphasis_coordinate_map"
+            or repair.get("method") != "unique_markdown_emphasis_coordinate_map"
         ):
             raise OpenRouterError("Core-unit quote repair contract mismatch")
         submitted_quote = str(repair.get("submitted_quote") or "")
@@ -3620,18 +3610,15 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
             != str(repair.get("submitted_quote_sha256") or "")
         ):
             raise OpenRouterError("Core-unit submitted quote digest mismatch")
-        canonical_quote, _positions, _pairs = _markdown_emphasis_view(
-            submitted_quote
-        )
-        source_canonical, _source_positions, _source_pairs = (
-            _markdown_emphasis_view(quote)
+        canonical_quote, _positions, _pairs = _markdown_emphasis_view(submitted_quote)
+        source_canonical, _source_positions, _source_pairs = _markdown_emphasis_view(
+            quote
         )
         if (
             canonical_quote != source_canonical
             or text_sha256(canonical_quote)
             != str(repair.get("canonical_quote_sha256") or "")
-            or text_sha256(quote)
-            != str(repair.get("source_quote_sha256") or "")
+            or text_sha256(quote) != str(repair.get("source_quote_sha256") or "")
         ):
             raise OpenRouterError("Core-unit quote repair evidence mismatch")
         try:
@@ -3653,9 +3640,7 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
             or source_start != claim_start + core_start
             or source_end != claim_start + core_end
         ):
-            raise OpenRouterError(
-                "Core-unit quote repair coordinates are inconsistent"
-            )
+            raise OpenRouterError("Core-unit quote repair coordinates are inconsistent")
     receipt["decision_sha256"] = digest
     return receipt
 
@@ -3692,9 +3677,7 @@ def _core_decisions_from_inputs(
                 "end_char",
             ):
                 if claim.get(field) != expected.get(field):
-                    raise OpenRouterError(
-                        f"Reducer core-unit claim mismatch: {field}"
-                    )
+                    raise OpenRouterError(f"Reducer core-unit claim mismatch: {field}")
     return receipts
 
 
@@ -3726,14 +3709,10 @@ def _core_decision_pointer(receipts: list[dict[str, Any]]) -> dict[str, Any]:
             [str(item["claim"].get("unit_id") or "") for item in validated]
         ),
         "first_unit_id": (
-            str(validated[0]["claim"].get("unit_id") or "")
-            if validated
-            else None
+            str(validated[0]["claim"].get("unit_id") or "") if validated else None
         ),
         "last_unit_id": (
-            str(validated[-1]["claim"].get("unit_id") or "")
-            if validated
-            else None
+            str(validated[-1]["claim"].get("unit_id") or "") if validated else None
         ),
     }
 
@@ -3798,17 +3777,12 @@ def _validate_core_decision_item(
             raise OpenRouterError("Leaf core-unit decision shard is malformed")
         actual = [_validate_core_decision_receipt(value) for value in raw]
         actual_by_unit = {
-            str(value["claim"].get("unit_id") or ""): value
-            for value in actual
+            str(value["claim"].get("unit_id") or ""): value for value in actual
         }
         expected_by_unit = {
-            str(value["claim"].get("unit_id") or ""): value
-            for value in expected
+            str(value["claim"].get("unit_id") or ""): value for value in expected
         }
-        if (
-            len(actual_by_unit) != len(actual)
-            or actual_by_unit != expected_by_unit
-        ):
+        if len(actual_by_unit) != len(actual) or actual_by_unit != expected_by_unit:
             raise OpenRouterError("Leaf core-unit decision shard mismatch")
 
 
@@ -3856,13 +3830,9 @@ def _validate_final_core_decisions(
     *,
     output_kind: str,
 ) -> None:
-    grounded = [
-        item for item in receipts if item.get("disposition") == "grounded_fact"
-    ]
+    grounded = [item for item in receipts if item.get("disposition") == "grounded_fact"]
     if not grounded:
-        raise OpenRouterError(
-            f"{output_kind} has no grounded core-unit decision"
-        )
+        raise OpenRouterError(f"{output_kind} has no grounded core-unit decision")
     material = (
         _site_profile_has_material_fact(output)
         if output_kind == "site_profile"
@@ -3875,14 +3845,12 @@ def _validate_final_core_decisions(
         str(item.get("claim", {}).get("claim_id") or "")
         for item in grounded
         if not any(
-            str(item.get("evidence_quote") or "") in value
-            for value in visible_strings
+            str(item.get("evidence_quote") or "") in value for value in visible_strings
         )
     ]
     if missing:
         raise OpenRouterError(
-            f"{output_kind} lost grounded core-unit quotes: "
-            + ", ".join(missing)
+            f"{output_kind} lost grounded core-unit quotes: " + ", ".join(missing)
         )
 
 
@@ -3900,9 +3868,7 @@ def _validate_reducer_core_decisions(
         if output_kind == "site_profile"
         else _entity_catalog_has_material_fact(output)
     )
-    grounded = any(
-        item.get("disposition") == "grounded_fact" for item in receipts
-    )
+    grounded = any(item.get("disposition") == "grounded_fact" for item in receipts)
     if grounded and not material:
         raise OpenRouterError(
             f"{output_kind} reducer collapsed grounded cores to a blank summary"
@@ -4175,11 +4141,7 @@ def _deterministic_site_profile_union(
     ):
         output[field] = _append_unique_strings(
             [],
-            (
-                value
-                for item in clean
-                for value in (item.get(field) or [])
-            ),
+            (value for item in clean for value in (item.get(field) or [])),
         )
 
     offer_candidates: list[dict[str, Any]] = []
@@ -4248,9 +4210,7 @@ def _deterministic_site_profile_union(
             )
     output["entity_scope"] = entities
     output["uncertainties"] = uncertainties
-    output["confidence"] = _confidence_floor(
-        item.get("confidence") for item in clean
-    )
+    output["confidence"] = _confidence_floor(item.get("confidence") for item in clean)
     return output
 
 
@@ -4263,20 +4223,12 @@ def _deterministic_entity_catalog_union(
     output: dict[str, Any] = {
         "target_aliases": _append_unique_strings(
             [],
-            (
-                value
-                for item in clean
-                for value in (item.get("target_aliases") or [])
-            ),
+            (value for item in clean for value in (item.get("target_aliases") or [])),
         ),
         "entities": [],
         "uncertainties": _append_unique_strings(
             [],
-            (
-                value
-                for item in clean
-                for value in (item.get("uncertainties") or [])
-            ),
+            (value for item in clean for value in (item.get("uncertainties") or [])),
         ),
     }
     entity_index: dict[str, int] = {}
@@ -4350,9 +4302,7 @@ def _deterministic_entity_catalog_union(
 def _append_unique_strings(target: list[Any], values: Iterable[Any]) -> list[str]:
     return list(
         dict.fromkeys(
-            text
-            for value in [*target, *values]
-            if (text := str(value or "").strip())
+            text for value in [*target, *values] if (text := str(value or "").strip())
         )
     )
 
@@ -4370,11 +4320,7 @@ def _preserve_site_profile_reduction(
     # turning it into an active product/alias.
     uncertainties = _append_unique_strings(
         list(output.get("uncertainties") or []),
-        (
-            value
-            for item in inputs
-            for value in (item.get("uncertainties") or [])
-        ),
+        (value for item in inputs for value in (item.get("uncertainties") or [])),
     )
     for field in (
         "brand_aliases",
@@ -4403,7 +4349,9 @@ def _preserve_site_profile_reduction(
                         ],
                     )
 
-    scope = [item for item in output.get("entity_scope") or [] if isinstance(item, dict)]
+    scope = [
+        item for item in output.get("entity_scope") or [] if isinstance(item, dict)
+    ]
     names = {
         str(item.get("canonical_name") or "").strip().casefold()
         for item in scope
@@ -4448,11 +4396,7 @@ def _preserve_entity_catalog_reduction(
     output = copy.deepcopy(merged)
     uncertainties = _append_unique_strings(
         list(output.get("uncertainties") or []),
-        (
-            value
-            for item in inputs
-            for value in (item.get("uncertainties") or [])
-        ),
+        (value for item in inputs for value in (item.get("uncertainties") or [])),
     )
     retained_aliases = {
         str(value or "").strip().casefold()
@@ -4471,11 +4415,7 @@ def _preserve_entity_catalog_reduction(
                     ],
                 )
 
-    entities = [
-        item
-        for item in output.get("entities") or []
-        if isinstance(item, dict)
-    ]
+    entities = [item for item in output.get("entities") or [] if isinstance(item, dict)]
 
     def rebuild_name_index() -> dict[str, int]:
         index: dict[str, int] = {}
@@ -4557,17 +4497,12 @@ absence_claims_allowed=false, передан весь сохранённый и�
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    pages = [
-        page
-        for page in site_context.get("pages") or []
-        if isinstance(page, dict)
-    ]
+    pages = [page for page in site_context.get("pages") or [] if isinstance(page, dict)]
     if not pages:
         raise OpenRouterError("Site profile input has no page core units")
 
     leaf_system = (
-        system
-        + "\n\nПередан один точный фрагмент страницы. Фиксируй "
+        system + "\n\nПередан один точный фрагмент страницы. Фиксируй "
         "только наблюдаемые в нём факты; отсутствие факта в этом "
         "фрагменте не доказывает отсутствие на сайте. Верни profile и "
         "ровно один core_disposition для переданного core_claim. Если core "
@@ -4586,9 +4521,7 @@ absence_claims_allowed=false, передан весь сохранённый и�
         return {
             "requested_site": site_context.get("requested_site"),
             "page_unit": {
-                key: value
-                for key, value in item.items()
-                if not key.startswith("_")
+                key: value for key, value in item.items() if not key.startswith("_")
             },
             "unit_contract": {
                 "version": LONG_RESPONSE_HARNESS_VERSION,
@@ -4721,9 +4654,7 @@ absence_claims_allowed=false, передан весь сохранённый и�
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    expected_unit_ids = [
-        str(item.get("_lr_unit_id") or "") for item in page_units
-    ]
+    expected_unit_ids = [str(item.get("_lr_unit_id") or "") for item in page_units]
     expected_claims = _core_unit_claims(page_units)
     leaf_profiles = list(profiles)
     all_decisions = _core_decisions_from_inputs(
@@ -4794,9 +4725,7 @@ absence_claims_allowed=false, передан весь сохранённый и�
             {
                 "leaf_unit_count": len(page_units),
                 "source_manifest": _long_response_manifest_pointer(manifests),
-                "complete_lineage": _long_response_lineage_pointer(
-                    complete_lineage
-                ),
+                "complete_lineage": _long_response_lineage_pointer(complete_lineage),
             }
         )
         if site_profile_request_bytes(
@@ -5003,8 +4932,7 @@ async def _bind_offer_catalog(
         normalize_offer_candidates_against_sources(
             source_units=source_units,
             candidates=[
-                copy.deepcopy(value)
-                for value in profile.get("offer_candidates") or []
+                copy.deepcopy(value) for value in profile.get("offer_candidates") or []
             ],
         )
     )
@@ -5024,8 +4952,7 @@ async def _bind_offer_catalog(
         value
         for value in raw_products
         if value
-        and value.casefold()
-        not in {item.casefold() for item in accepted_products}
+        and value.casefold() not in {item.casefold() for item in accepted_products}
     ]
     enriched["products"] = accepted_products
     enriched["offer_catalog"] = catalog.as_dict()
@@ -5041,9 +4968,8 @@ async def _bind_offer_catalog(
                 "привязки к сайту: " + "; ".join(rejected_product_names)
             ],
         )
-    if (
-        int(normalization_audit.get("malformed_candidate_count") or 0)
-        or int(normalization_audit.get("unresolved_evidence_count") or 0)
+    if int(normalization_audit.get("malformed_candidate_count") or 0) or int(
+        normalization_audit.get("unresolved_evidence_count") or 0
     ):
         enriched["uncertainties"] = _append_unique_strings(
             list(enriched.get("uncertainties") or []),
@@ -5057,9 +4983,7 @@ async def _bind_offer_catalog(
         "profile_sha256": offer_artifact_digest(profile),
         "source_manifest_digest": catalog.source_manifest_digest,
         "candidate_count": len(profile.get("offer_candidates") or []),
-        "candidate_normalization_sha256": normalization_audit[
-            "manifest_sha256"
-        ],
+        "candidate_normalization_sha256": normalization_audit["manifest_sha256"],
     }
     await _save_artifact(
         run_id,
@@ -5069,9 +4993,7 @@ async def _bind_offer_catalog(
         model=None,
         input_json={
             "profile_sha256": offer_artifact_digest(profile),
-            "source_manifest_digest": normalization_audit[
-                "source_manifest_digest"
-            ],
+            "source_manifest_digest": normalization_audit["source_manifest_digest"],
         },
         output_json=normalization_audit,
         prompt_version=OFFER_CATALOG_PIPELINE_VERSION,
@@ -5257,9 +5179,7 @@ async def _market_research_model_window(*, system: str) -> dict[str, Any]:
         safety_tokens=MARKET_RESEARCH_SAFETY_TOKENS,
         fallback_window_bytes=MARKET_RESEARCH_FALLBACK_WINDOW_BYTES,
         minimum_input_tokens=256,
-        no_window_error=(
-            "Market-research model metadata leaves no safe input window"
-        ),
+        no_window_error=("Market-research model metadata leaves no safe input window"),
         system=system,
     )
     return {
@@ -5326,9 +5246,7 @@ def _normalize_market_evidence_packet(
     for uncertainty in output.get("uncertainties") or []:
         if not isinstance(uncertainty, dict):
             raise OpenRouterError("Market uncertainty is not an object")
-        unit_ids = [
-            str(value) for value in uncertainty.get("source_unit_ids") or []
-        ]
+        unit_ids = [str(value) for value in uncertainty.get("source_unit_ids") or []]
         if (
             not unit_ids
             or len(unit_ids) != len(set(unit_ids))
@@ -5345,9 +5263,8 @@ def _normalize_market_evidence_packet(
         for item in coverage
         if isinstance(item, dict)
     ]
-    if (
-        len(coverage_ids) != len(coverage)
-        or Counter(coverage_ids) != Counter(allowed_unit_ids)
+    if len(coverage_ids) != len(coverage) or Counter(coverage_ids) != Counter(
+        allowed_unit_ids
     ):
         raise OpenRouterError(
             "Market evidence packet must account for every source unit once"
@@ -5533,13 +5450,18 @@ def _aggregate_market_web_attestation(
             if str(value)
         )
     )
-    verified = bool(attestations) and len(attestations) == len(leaves) and all(
-        item.get("version") == WEB_ATTESTATION_VERSION
-        and item.get("policy") == WebSearchPolicy.REQUIRED.value
-        and item.get("state") == "verified"
-        and item.get("metric_eligible") is True
-        for item in attestations
-    ) and not violations
+    verified = (
+        bool(attestations)
+        and len(attestations) == len(leaves)
+        and all(
+            item.get("version") == WEB_ATTESTATION_VERSION
+            and item.get("policy") == WebSearchPolicy.REQUIRED.value
+            and item.get("state") == "verified"
+            and item.get("metric_eligible") is True
+            for item in attestations
+        )
+        and not violations
+    )
     return {
         "version": WEB_ATTESTATION_VERSION,
         "policy": WebSearchPolicy.REQUIRED.value,
@@ -5564,14 +5486,17 @@ def _market_research_web_scope(
     refinement_path: str = "",
 ) -> dict[str, Any]:
     normalized = [str(value) for value in dimensions]
-    if not normalized or any(value not in _MARKET_RESEARCH_DIMENSIONS for value in normalized):
+    if not normalized or any(
+        value not in _MARKET_RESEARCH_DIMENSIONS for value in normalized
+    ):
         raise OpenRouterError("Market web scope has an invalid dimension")
     if len(normalized) != len(set(normalized)):
         raise OpenRouterError("Market web scope repeats a dimension")
     if facet is not None:
-        if len(normalized) != 1 or facet not in _MARKET_RESEARCH_DIMENSION_FACETS[
-            normalized[0]
-        ]:
+        if (
+            len(normalized) != 1
+            or facet not in _MARKET_RESEARCH_DIMENSION_FACETS[normalized[0]]
+        ):
             raise OpenRouterError("Market web scope has an invalid facet")
     if (
         not isinstance(refinement_path, str)
@@ -5642,9 +5567,7 @@ def _market_research_web_children(
                 path=f"{path}.facet.{index}",
                 facet=value,
             )
-            for index, value in enumerate(
-                _MARKET_RESEARCH_DIMENSION_FACETS[dimension]
-            )
+            for index, value in enumerate(_MARKET_RESEARCH_DIMENSION_FACETS[dimension])
         ]
     # A facet response can itself be physically cut off. Re-query it through
     # two independently grounded semantic lanes instead of pretending that a
@@ -5702,9 +5625,7 @@ def _market_research_web_task_input(
                 _MARKET_RESEARCH_REFINEMENT_AXES[
                     index % len(_MARKET_RESEARCH_REFINEMENT_AXES)
                 ][int(bit)]
-                for index, bit in enumerate(
-                    str(scope.get("refinement_path") or "")
-                )
+                for index, bit in enumerate(str(scope.get("refinement_path") or ""))
             ],
             "segment_index": scope.get("segment_index"),
             "external_absence_claims_allowed": False,
@@ -5823,9 +5744,10 @@ def _market_research_web_receipt(
     """Validate and bind one complete or provider-limited physical POST."""
 
     expected_request_sha256 = _stable_json_sha256(expected_physical_payload)
-    if event.get("request_payload") != expected_physical_payload or str(
-        event.get("request_sha256") or ""
-    ) != expected_request_sha256:
+    if (
+        event.get("request_payload") != expected_physical_payload
+        or str(event.get("request_sha256") or "") != expected_request_sha256
+    ):
         raise OpenRouterError("Market web receipt has a physical-request mismatch")
     if str(event.get("model") or "") != ANALYSIS_MODEL:
         raise OpenRouterError("Market web receipt was produced by another model")
@@ -5988,10 +5910,7 @@ def _market_research_result_event(
     )
     usage.setdefault(
         "_aiv_response_annotations",
-        [
-            {"type": "url_citation", "url_citation": item}
-            for item in citations
-        ],
+        [{"type": "url_citation", "url_citation": item} for item in citations],
     )
     transport = copy.deepcopy(getattr(result, "transport", {}) or {})
     transport["output_limited"] = limited
@@ -6081,9 +6000,7 @@ def _compose_market_research_web_leaf(
         "unit_id": unit_id,
         "root_task_id": root_task_id,
         "node_count": len(node_rows),
-        "node_ids_sha256": _stable_json_sha256(
-            [row["task_id"] for row in node_rows]
-        ),
+        "node_ids_sha256": _stable_json_sha256([row["task_id"] for row in node_rows]),
         "research_notes_sha256": text_sha256(research_notes),
         "research_notes_chars": len(research_notes),
         "research_notes_utf8_bytes": len(research_notes.encode("utf-8")),
@@ -6274,9 +6191,7 @@ def _validate_market_research_web_leaf(
         and (normalized := _normalized_research_url(item.get("url")))
     }
     node_citation_urls = {
-        str(value)
-        for row in rows
-        for value in row.get("citation_urls") or []
+        str(value) for row in rows for value in row.get("citation_urls") or []
     }
     if citation_urls != node_citation_urls:
         raise OpenRouterError("Market web leaf citation coverage mismatch")
@@ -6293,8 +6208,7 @@ def _validate_market_research_web_leaf(
         or attestation.get("metric_eligible") is not True
         or bool(attestation.get("violations"))
         or int(attestation.get("leaf_count") or 0) != len(rows)
-        or manifest.get("web_attestation_sha256")
-        != _stable_json_sha256(attestation)
+        or manifest.get("web_attestation_sha256") != _stable_json_sha256(attestation)
     ):
         raise OpenRouterError("Market web leaf aggregate attestation is invalid")
     expected_completeness = (
@@ -6358,9 +6272,7 @@ async def _market_research_web_leaf(
     leaf_cache_input = {
         "contract_version": MARKET_RESEARCH_WEB_HARNESS_VERSION,
         "root_task_sha256": _stable_json_sha256(root_input),
-        "root_physical_request_sha256": _stable_json_sha256(
-            root_physical_payload
-        ),
+        "root_physical_request_sha256": _stable_json_sha256(root_physical_payload),
         "window_bytes": window_bytes,
     }
     cached = await _artifact_output(
@@ -6424,10 +6336,7 @@ async def _market_research_web_leaf(
         # instead of overwriting it or accidentally promoting it under a new
         # request contract.  28 + 64 + 1 + 64 = 157 characters, within the
         # RunArtifact.artifact_key(160) storage contract.
-        attempt_key = (
-            "market_research_web_attempt_"
-            f"{task_id}_{physical_request_sha256}"
-        )
+        attempt_key = f"market_research_web_attempt_{task_id}_{physical_request_sha256}"
         cached_receipt = await _artifact_output(
             run_id,
             attempt_key,
@@ -6489,9 +6398,7 @@ async def _market_research_web_leaf(
                     retry_transport_errors=False,
                     audit_checkpoint=audit_checkpoint,
                     audit_context={
-                        "document_id": (
-                            f"market-web:{run_id}:{unit_id}:{task_id}"
-                        ),
+                        "document_id": (f"market-web:{run_id}:{unit_id}:{task_id}"),
                         "sequence": int(scope.get("segment_index") or 0),
                     },
                 )
@@ -6683,8 +6590,8 @@ unknown и uncertainties; не повышай уверенность и не в�
         _MARKET_RESEARCH_DIMENSIONS,
         path="root",
     )
-    domain_source_unit, domain_identity_profile = (
-        _market_research_domain_source_unit(payload)
+    domain_source_unit, domain_identity_profile = _market_research_domain_source_unit(
+        payload
     )
     domain_root_input = _market_research_web_task_input(
         source_unit=domain_source_unit,
@@ -6702,9 +6609,7 @@ unknown и uncertainties; не повышай уверенность и не в�
             "Domain identity cannot fit the exact physical market-research "
             "web-search POST without truncation"
         )
-    expected_unit_ids = [
-        str(item.get("_lr_unit_id") or "") for item in source_units
-    ]
+    expected_unit_ids = [str(item.get("_lr_unit_id") or "") for item in source_units]
     manifest = {
         "version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
         "mode": "hierarchical_evidence_tree",
@@ -6726,9 +6631,7 @@ unknown и uncertainties; не повышай уверенность и не в�
             "input_utf8_window": leaf_window,
             "local_output_or_part_count_cap": None,
             "semantic_retry_post_cap": MARKET_RESEARCH_MAX_WEB_POSTS,
-            "facet_refinement_depth_cap": (
-                MARKET_RESEARCH_MAX_REFINEMENT_DEPTH
-            ),
+            "facet_refinement_depth_cap": (MARKET_RESEARCH_MAX_REFINEMENT_DEPTH),
             "internet_exhaustiveness_claimed": False,
             "external_absence_claims_allowed": False,
             "aggregate_liveness_deadline_seconds": None,
@@ -6799,26 +6702,22 @@ unknown и uncertainties; не повышай уверенность и не в�
             min(max(256, len(notes_text)), max(256, leaf_window // 3)),
         )
 
-        def note_payload(note_unit: Any, note_manifest: dict[str, Any]) -> dict[str, Any]:
+        def note_payload(
+            note_unit: Any, note_manifest: dict[str, Any]
+        ) -> dict[str, Any]:
             return {
                 "contract_version": MARKET_RESEARCH_INPUT_HARNESS_VERSION,
                 "source_unit": {
                     "source_unit_id": unit_id,
                     "page_url": page_url,
-                    "content_storage_state": source_unit.get(
-                        "content_storage_state"
-                    ),
-                    "absence_claims_allowed": source_unit.get(
-                        "absence_claims_allowed"
-                    ),
+                    "content_storage_state": source_unit.get("content_storage_state"),
+                    "absence_claims_allowed": source_unit.get("absence_claims_allowed"),
                     "core_sha256": source_unit.get("_lr_unit_sha256"),
                     "context_sha256": source_unit.get("_lr_context_sha256"),
                     "core_start_in_context": source_unit.get(
                         "_lr_core_start_in_context"
                     ),
-                    "core_end_in_context": source_unit.get(
-                        "_lr_core_end_in_context"
-                    ),
+                    "core_end_in_context": source_unit.get("_lr_core_end_in_context"),
                 },
                 "source_context": {
                     "title": source_unit.get("title"),
@@ -6837,9 +6736,7 @@ unknown и uncertainties; не повышай уверенность и не в�
                     "core_end_in_context": note_unit.core_end_in_context,
                     "core_sha256": note_unit.sha256,
                     "context_sha256": note_unit.context_sha256,
-                    "ownership_rule": (
-                        "first_decisive_evidence_character_in_core"
-                    ),
+                    "ownership_rule": ("first_decisive_evidence_character_in_core"),
                     "overlap_counts_toward_coverage": False,
                     "observation_completeness": retrieval.get(
                         "observation_completeness",
@@ -6857,8 +6754,7 @@ unknown и uncertainties; не повышай уверенность и не в�
             note_units, text_manifest = split_lossless_text(
                 notes_text,
                 document_id=(
-                    f"market-research-notes:{unit_id}:"
-                    f"{text_sha256(notes_text)[:16]}"
+                    f"market-research-notes:{unit_id}:{text_sha256(notes_text)[:16]}"
                 ),
                 target_chars=notes_target_chars,
                 context_overlap_chars=min(
@@ -6872,8 +6768,7 @@ unknown и uncertainties; не повышай уверенность и не в�
                 "complete",
             )
             map_payloads = [
-                note_payload(note_unit, note_manifest)
-                for note_unit in note_units
+                note_payload(note_unit, note_manifest) for note_unit in note_units
             ]
             request_sizes = [
                 _structured_provider_request_utf8_bytes(
@@ -7061,8 +6956,7 @@ uncertainties и точные source_unit_ids. unit_coverage обязан пер
                 run_id,
                 stage_key="scenario_design",
                 artifact_key=(
-                    "market_research_reduce_l"
-                    f"{current_level}_{group_index}_{digest}"
+                    f"market_research_reduce_l{current_level}_{group_index}_{digest}"
                 ),
                 schema=MARKET_RESEARCH_EVIDENCE_PACKET_SCHEMA,
                 schema_name=(
@@ -7092,9 +6986,7 @@ uncertainties и точные source_unit_ids. unit_coverage обязан пер
                 for value in finding.get("source_urls") or []
             }
             if output_urls != allowed_urls:
-                raise OpenRouterError(
-                    "Market reducer omitted a confirmed source URL"
-                )
+                raise OpenRouterError("Market reducer omitted a confirmed source URL")
             input_states = {
                 str(item.get("source_unit_id") or ""): item.get("state")
                 for packet in group
@@ -7208,10 +7100,7 @@ def _research_url_host(value: Any) -> str:
 def _same_site_host(host: str, requested_domain: str) -> bool:
     host = str(host or "").casefold().removeprefix("www.").strip(".")
     requested_domain = (
-        str(requested_domain or "")
-        .casefold()
-        .removeprefix("www.")
-        .strip(".")
+        str(requested_domain or "").casefold().removeprefix("www.").strip(".")
     )
     if not host or not requested_domain:
         return False
@@ -7234,9 +7123,7 @@ def _market_research_input(
         "selected_pages_manifest": copy.deepcopy(
             site_context.get("selected_pages_manifest") or {}
         ),
-        "crawl_admission": copy.deepcopy(
-            site_context.get("crawl_admission") or {}
-        ),
+        "crawl_admission": copy.deepcopy(site_context.get("crawl_admission") or {}),
         "site_evidence": copy.deepcopy(site_context.get("pages") or []),
     }
 
@@ -7247,9 +7134,10 @@ def _site_profile_research_errors(
 ) -> list[str]:
     errors: list[str] = []
     requested_site = payload.get("requested_site")
-    if not isinstance(requested_site, dict) or not str(
-        requested_site.get("domain") or ""
-    ).strip():
+    if (
+        not isinstance(requested_site, dict)
+        or not str(requested_site.get("domain") or "").strip()
+    ):
         errors.append("Не подтверждён домен исследуемого сайта.")
     if not str(profile.get("brand_name") or "").strip():
         errors.append("Сайт не подтвердил название основного бренда.")
@@ -7261,9 +7149,7 @@ def _site_profile_research_errors(
             raise OfferCatalogError("offer_catalog is missing")
         OfferCatalog.from_mapping(catalog_value)
     except OfferCatalogError as exc:
-        errors.append(
-            "Каталог предложений не прошёл проверку источников: " + str(exc)
-        )
+        errors.append("Каталог предложений не прошёл проверку источников: " + str(exc))
     pages = payload.get("site_evidence")
     if not isinstance(pages, list) or not any(
         isinstance(page, dict)
@@ -7344,18 +7230,12 @@ def _market_research_sufficiency(
         if not _same_site_host(_research_url_host(normalized), requested_domain):
             external_confirmed_source_urls.add(normalized)
         if str(source.get("confidence") or "") == "low":
-            limited.append(
-                f"Источник {normalized} помечен низкой уверенностью."
-            )
+            limited.append(f"Источник {normalized} помечен низкой уверенностью.")
     unconfirmed_declared_sources = declared_source_urls - confirmed_source_urls
     for normalized in sorted(unconfirmed_declared_sources):
-        limited.append(
-            f"Источник {normalized} не подтверждён URL-цитатой OpenRouter."
-        )
+        limited.append(f"Источник {normalized} не подтверждён URL-цитатой OpenRouter.")
     if len(external_confirmed_source_urls) < 2:
-        limited.append(
-            "Нужно не менее двух подтверждённых внешних источников о рынке."
-        )
+        limited.append("Нужно не менее двух подтверждённых внешних источников о рынке.")
 
     site_evidence_urls = {
         normalized
@@ -7452,9 +7332,7 @@ def _market_research_sufficiency(
         "required_dimensions": list(_MARKET_RESEARCH_DIMENSIONS),
         "evidenced_dimensions": sorted(evidence_dimensions),
         "confirmed_source_urls": sorted(confirmed_source_urls),
-        "confirmed_external_source_urls": sorted(
-            external_confirmed_source_urls
-        ),
+        "confirmed_external_source_urls": sorted(external_confirmed_source_urls),
         "confirmed_site_claims": confirmed_site_claims,
     }
 
@@ -7486,9 +7364,7 @@ def _market_research_with_gate(
             for item in site_confirmed.get("evidence") or []
             if isinstance(item, dict)
         ]
-        seen_evidence = {
-            _stable_json_sha256(item) for item in evidence_rows
-        }
+        seen_evidence = {_stable_json_sha256(item) for item in evidence_rows}
         for offer in catalog.accepted_offers:
             for evidence in offer.evidence_refs:
                 row = {
@@ -7535,15 +7411,11 @@ def _require_market_research_usable(
     """
 
     if not isinstance(research, dict):
-        raise MarketResearchGateError(
-            "Нельзя строить сценарии без исследования рынка."
-        )
+        raise MarketResearchGateError("Нельзя строить сценарии без исследования рынка.")
     sufficiency = research.get("sufficiency")
     web_evidence = research.get("web_evidence")
     attestation = (
-        web_evidence.get("attestation")
-        if isinstance(web_evidence, dict)
-        else None
+        web_evidence.get("attestation") if isinstance(web_evidence, dict) else None
     )
     if (
         research.get("status") not in {"ready", "limited"}
@@ -7591,13 +7463,9 @@ def _empty_market_research_document(
             ),
             "site_type": str(profile.get("site_type") or "").strip(),
             "category": str(profile.get("category") or "").strip(),
-            "products": _append_unique_strings(
-                [], profile.get("products") or []
-            ),
+            "products": _append_unique_strings([], profile.get("products") or []),
             "topics": _append_unique_strings([], profile.get("topics") or []),
-            "geography": _append_unique_strings(
-                [], profile.get("geography") or []
-            ),
+            "geography": _append_unique_strings([], profile.get("geography") or []),
             "evidence": [],
         },
         "external_market_research": {
@@ -7665,7 +7533,9 @@ def _deterministic_market_research_document(
             )
         )
         if dimension == "site_confirmed":
-            site_urls = source_urls or ([fallback_site_url] if fallback_site_url else [])
+            site_urls = source_urls or (
+                [fallback_site_url] if fallback_site_url else []
+            )
             for url in site_urls:
                 row = {"claim": claim, "url": url, "excerpt": evidence}
                 if row not in output["site_confirmed"]["evidence"]:
@@ -7785,8 +7655,7 @@ def _normalize_market_structuring_shard(
         ):
             raise OpenRouterError("Market structuring shard has an invalid receipt")
     actual_brand = str(
-        (result["research"].get("site_confirmed") or {}).get("primary_brand")
-        or ""
+        (result["research"].get("site_confirmed") or {}).get("primary_brand") or ""
     ).strip()
     if expected_brand and actual_brand.casefold() != expected_brand.casefold():
         raise OpenRouterError("Market structuring shard changed the primary brand")
@@ -7966,11 +7835,15 @@ uncertain. Не цитируй весь длинный core только рад�
     for unit in units:
         candidate = [*current, unit]
         pack_index = len(packs) + 1
-        if current and request_bytes(
-            pack_index,
-            candidate,
-            source_payload_sha256=source_payload_sha256,
-        ) > window_bytes:
+        if (
+            current
+            and request_bytes(
+                pack_index,
+                candidate,
+                source_payload_sha256=source_payload_sha256,
+            )
+            > window_bytes
+        ):
             packs.append(current)
             current = [unit]
         else:
@@ -8078,9 +7951,7 @@ uncertain. Не цитируй весь длинный core только рад�
         json.dumps(output, ensure_ascii=False, separators=(",", ":")),
         {
             "_aiv_market_structuring_shards": plan,
-            "_aiv_market_structuring_shard_outputs_sha256": _stable_json_sha256(
-                shards
-            ),
+            "_aiv_market_structuring_shard_outputs_sha256": _stable_json_sha256(shards),
         },
     )
 
@@ -8294,6 +8165,7 @@ tree неполным только из-за иерархической форм
     }
     structuring_input_plan: dict[str, Any] | None = None
     try:
+
         def market_structuring_request_bytes(
             candidate: dict[str, Any],
             envelope: dict[str, Any],
@@ -8309,9 +8181,7 @@ tree неполным только из-за иерархической форм
                 temperature=0.1,
             )
 
-        structuring_window = await _final_model_input_window(
-            model=ANALYSIS_MODEL
-        )
+        structuring_window = await _final_model_input_window(model=ANALYSIS_MODEL)
         direct_request_bytes = market_structuring_request_bytes(
             structuring_payload,
             structuring_window["model_envelope"],
@@ -8324,9 +8194,7 @@ tree неполным только из-за иерархической форм
             **structuring_window,
             "version": MARKET_RESEARCH_STRUCTURING_HARNESS_VERSION,
             "mode": "direct" if direct_fits else "bounded_schema_valid_shards",
-            "source_payload_sha256": _stable_json_sha256(
-                structuring_payload
-            ),
+            "source_payload_sha256": _stable_json_sha256(structuring_payload),
             "source_payload_utf8_bytes": len(
                 json.dumps(
                     structuring_payload,
@@ -8345,9 +8213,7 @@ tree неполным только из-за иерархической форм
             status="completed",
             model=ANALYSIS_MODEL,
             input_json={
-                "source_payload_sha256": _stable_json_sha256(
-                    structuring_payload
-                ),
+                "source_payload_sha256": _stable_json_sha256(structuring_payload),
             },
             output_json=structuring_input_plan,
             prompt_version=MARKET_RESEARCH_VERSION,
@@ -8367,21 +8233,19 @@ tree неполным только из-за иерархической форм
                 f"{run_id}:market-research:"
                 f"{_stable_json_sha256(model_structuring_payload)[:20]}"
             )
-            audit_checkpoint, resume_checkpoint = (
-                await _durable_structured_transport(
-                    run_id,
-                    stage_key="scenario_design",
-                    owner_artifact_key="market_research",
-                    source_input=model_structuring_payload,
-                    model=ANALYSIS_MODEL,
-                    owner_prompt_version=MARKET_RESEARCH_VERSION,
-                    messages=messages,
-                    schema_name="aiv_market_research",
-                    response_schema=MARKET_RESEARCH_SCHEMA,
-                    document_id=document_id,
-                    reasoning_effort="high",
-                    temperature=0.1,
-                )
+            audit_checkpoint, resume_checkpoint = await _durable_structured_transport(
+                run_id,
+                stage_key="scenario_design",
+                owner_artifact_key="market_research",
+                source_input=model_structuring_payload,
+                model=ANALYSIS_MODEL,
+                owner_prompt_version=MARKET_RESEARCH_VERSION,
+                messages=messages,
+                schema_name="aiv_market_research",
+                response_schema=MARKET_RESEARCH_SCHEMA,
+                document_id=document_id,
+                reasoning_effort="high",
+                temperature=0.1,
             )
             try:
                 structured = await chat_continuable_structured(
@@ -8402,12 +8266,9 @@ tree неполным только из-за иерархической форм
             ) as length_exc:
                 failed_result = getattr(length_exc, "result", None)
                 failed_transport = getattr(failed_result, "transport", None)
-                if (
-                    isinstance(length_exc, OpenRouterResponseContractError)
-                    and not (
-                        isinstance(failed_transport, dict)
-                        and failed_transport.get("output_limited") is True
-                    )
+                if isinstance(length_exc, OpenRouterResponseContractError) and not (
+                    isinstance(failed_transport, dict)
+                    and failed_transport.get("output_limited") is True
                 ):
                     raise
                 (
@@ -8465,18 +8326,14 @@ tree неполным только из-за иерархической форм
             usage_json={
                 "_aiv_web_attestation": evidence_tree["web_attestation"],
                 "_aiv_market_research_tree": evidence_tree["manifest"],
-                "_aiv_market_research_structuring_input": (
-                    structuring_input_plan
-                ),
+                "_aiv_market_research_structuring_input": (structuring_input_plan),
                 "_aiv_structuring_failure": (
                     dict(getattr(failed_result, "usage", {}) or {})
                     if failed_result is not None
                     else {}
                 ),
             },
-            raw_text=(
-                str(getattr(failed_result, "text", "") or "") or None
-            ),
+            raw_text=(str(getattr(failed_result, "text", "") or "") or None),
             error_message=str(exc),
             prompt_version=MARKET_RESEARCH_VERSION,
         )
@@ -8565,7 +8422,9 @@ def _validate_prompt_set(
         errors.append("Нужно шесть безбрендовых и три брендовых сценария.")
     expected = {"I", "E", "T", "NB", "NAV", "TR"}
     if {item.get("intent_class") for item in unbranded} != expected:
-        errors.append("Безбрендовый набор должен покрывать I, E, T, NB, NAV и TR по одному разу.")
+        errors.append(
+            "Безбрендовый набор должен покрывать I, E, T, NB, NAV и TR по одному разу."
+        )
     aliases = [
         str(value).strip()
         for value in [profile.get("brand_name"), *(profile.get("brand_aliases") or [])]
@@ -8643,21 +8502,16 @@ def _validate_prompt_set(
         if cluster_id not in known_clusters:
             errors.append(f"Исключён неизвестный кластер {cluster_id or 'без id'}.")
         if len(reason) < 12:
-            errors.append(
-                f"Исключение кластера {cluster_id or 'без id'} не объяснено."
-            )
+            errors.append(f"Исключение кластера {cluster_id or 'без id'} не объяснено.")
         if cluster_id in excluded_clusters:
             errors.append(f"Кластер {cluster_id} исключён больше одного раза.")
         excluded_clusters.add(cluster_id)
     overlap = covered_clusters & excluded_clusters
     if overlap:
         errors.append(
-            "Кластеры одновременно покрыты и исключены: "
-            + ", ".join(sorted(overlap))
+            "Кластеры одновременно покрыты и исключены: " + ", ".join(sorted(overlap))
         )
-    missing_clusters = known_clusters.difference(
-        covered_clusters | excluded_clusters
-    )
+    missing_clusters = known_clusters.difference(covered_clusters | excluded_clusters)
     if missing_clusters:
         errors.append(
             "Безбрендовые сценарии не покрывают предложения сайта: "
@@ -8676,12 +8530,10 @@ def _prompt_review_errors(
     research_citation_urls = {
         normalized
         for item in (
-            (
-                market_research.get("web_evidence", {}).get("citations", [])
-                if isinstance(market_research, dict)
-                and isinstance(market_research.get("web_evidence"), dict)
-                else []
-            )
+            market_research.get("web_evidence", {}).get("citations", [])
+            if isinstance(market_research, dict)
+            and isinstance(market_research.get("web_evidence"), dict)
+            else []
         )
         if isinstance(item, dict)
         and (normalized := _normalized_research_url(item.get("url")))
@@ -8807,9 +8659,7 @@ async def _review_prompt_set_semantics(
         "market_research_digest": research_digest,
         "canonical_intent_definitions": INTENT_DEFINITIONS,
         "prompts": prompts,
-        "prompt_keys_to_check": [
-            str(item.get("prompt_key") or "") for item in prompts
-        ],
+        "prompt_keys_to_check": [str(item.get("prompt_key") or "") for item in prompts],
     }
     system = f"""
 Ты независимый методолог-критик экспресс-исследования AI visibility.
@@ -8861,13 +8711,16 @@ cluster_exclusions допустимы только с конкретной пр�
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    system += "\n\n" + """
+    system += (
+        "\n\n"
+        + """
 Если вход содержит long_input_contract, evidence_digest и
 deterministic_passthrough, это полное иерархическое представление исходного
 пакета. Каждый source leaf и точный scalar учтены code-owned lineage. Проверяй
 шесть сценариев по всем переданным observations и точным значениям; unknown не
 превращай в отсутствие, число, URL или сущность не пересчитывай и не изменяй.
 """.strip()
+    )
     errors: list[str] = []
     for review_attempt in range(3):
         attempt_payload = dict(payload)
@@ -8875,9 +8728,8 @@ deterministic_passthrough, это полное иерархическое пре
             # Кэш-бастер: _structured_artifact кэширует по input_json, и без
             # изменения входа повтор вернул бы тот же дефектный вердикт.
             attempt_payload["review_attempt"] = review_attempt
-            attempt_payload["previous_review_error"] = (
-                _REVIEW_STRUCTURALLY_INVALID
-            )
+            attempt_payload["previous_review_error"] = _REVIEW_STRUCTURALLY_INVALID
+
         def prompt_review_request_bytes(
             candidate: dict[str, Any],
             envelope: dict[str, Any],
@@ -8893,19 +8745,15 @@ deterministic_passthrough, это полное иерархическое пре
                 temperature=0.15,
             )
 
-        model_attempt_payload, _review_input_plan = (
-            await _prepare_final_model_payload(
-                run_id,
-                payload=attempt_payload,
-                system=system,
-                target_model=PROCESSING_MODEL,
-                stage_key="scenario_design",
-                artifact_namespace=(
-                    f"prompt_semantic_review_input_a{review_attempt}"
-                ),
-                prompt_version=PROMPT_SET_REVIEW_VERSION,
-                final_request_utf8_bytes=prompt_review_request_bytes,
-            )
+        model_attempt_payload, _review_input_plan = await _prepare_final_model_payload(
+            run_id,
+            payload=attempt_payload,
+            system=system,
+            target_model=PROCESSING_MODEL,
+            stage_key="scenario_design",
+            artifact_namespace=(f"prompt_semantic_review_input_a{review_attempt}"),
+            prompt_version=PROMPT_SET_REVIEW_VERSION,
+            final_request_utf8_bytes=prompt_review_request_bytes,
         )
         review = await _structured_artifact(
             run_id,
@@ -8935,10 +8783,7 @@ def _prompt_candidate_artifact_key(
     base_payload_digest: str,
     budget_attempt: int,
 ) -> str:
-    return (
-        f"{PROMPT_CANDIDATE_ARTIFACT_PREFIX}"
-        f"{base_payload_digest}_a{budget_attempt}"
-    )
+    return f"{PROMPT_CANDIDATE_ARTIFACT_PREFIX}{base_payload_digest}_a{budget_attempt}"
 
 
 async def _prompt_candidate_state(
@@ -8984,8 +8829,7 @@ async def _prompt_candidate_state(
         candidate_input = artifact.input_json
         if (
             not isinstance(candidate_input, dict)
-            or candidate_input.get("base_payload_digest")
-            != base_payload_digest
+            or candidate_input.get("base_payload_digest") != base_payload_digest
         ):
             continue
         matching.append(artifact)
@@ -9012,11 +8856,8 @@ async def _prompt_candidate_state(
         return (
             reserved_attempts,
             dict(artifact.output_json),
-            artifact.raw_text
-            or json.dumps(artifact.output_json, ensure_ascii=False),
-            dict(artifact.usage_json)
-            if isinstance(artifact.usage_json, dict)
-            else {},
+            artifact.raw_text or json.dumps(artifact.output_json, ensure_ascii=False),
+            dict(artifact.usage_json) if isinstance(artifact.usage_json, dict) else {},
             artifact.artifact_key,
             candidate_budget_attempt,
         )
@@ -9072,9 +8913,7 @@ async def _save_prompt_candidate(
     candidate_usage["_aiv_prompt_candidate"] = {
         "budget_attempt": budget_attempt,
         "reservation_state": (
-            "candidate_saved"
-            if semantic_review_pending
-            else "review_completed"
+            "candidate_saved" if semantic_review_pending else "review_completed"
         ),
         "semantic_review_pending": semantic_review_pending,
         "validation_errors": list(validation_errors),
@@ -9093,9 +8932,7 @@ async def _save_prompt_candidate(
         output_json=candidate,
         raw_text=raw_text,
         usage_json=candidate_usage,
-        error_message=(
-            "; ".join(validation_errors) if validation_errors else None
-        ),
+        error_message=("; ".join(validation_errors) if validation_errors else None),
         prompt_version=PROMPT_SET_VERSION,
     )
 
@@ -9185,40 +9022,52 @@ def _deterministic_prompt_fallback(
         external = {}
     if not isinstance(site_confirmed, dict):
         site_confirmed = {}
-    category = _without_brand_aliases(
-        _first_research_text(
-            profile.get("category"),
-            site_confirmed.get("category"),
-            external.get("market"),
-            fallback="подходящего поставщика услуг",
-        ),
-        profile,
-    ) or "подходящего поставщика услуг"
-    job = _without_brand_aliases(
-        _first_research_text(
-            external.get("customer_jobs"),
-            profile.get("customer_jobs"),
-            fallback="решить свою задачу",
-        ),
-        profile,
-    ) or "решить свою задачу"
-    criterion = _without_brand_aliases(
-        _first_research_text(
-            external.get("decision_criteria"),
-            profile.get("decision_criteria"),
-            fallback="условия работы",
-        ),
-        profile,
-    ) or "условия работы"
-    geography = _without_brand_aliases(
-        _first_research_text(
-            external.get("geography"),
-            profile.get("geography"),
-            site_confirmed.get("geography"),
-            fallback="моём регионе",
-        ),
-        profile,
-    ) or "моём регионе"
+    category = (
+        _without_brand_aliases(
+            _first_research_text(
+                profile.get("category"),
+                site_confirmed.get("category"),
+                external.get("market"),
+                fallback="подходящего поставщика услуг",
+            ),
+            profile,
+        )
+        or "подходящего поставщика услуг"
+    )
+    job = (
+        _without_brand_aliases(
+            _first_research_text(
+                external.get("customer_jobs"),
+                profile.get("customer_jobs"),
+                fallback="решить свою задачу",
+            ),
+            profile,
+        )
+        or "решить свою задачу"
+    )
+    criterion = (
+        _without_brand_aliases(
+            _first_research_text(
+                external.get("decision_criteria"),
+                profile.get("decision_criteria"),
+                fallback="условия работы",
+            ),
+            profile,
+        )
+        or "условия работы"
+    )
+    geography = (
+        _without_brand_aliases(
+            _first_research_text(
+                external.get("geography"),
+                profile.get("geography"),
+                site_confirmed.get("geography"),
+                fallback="моём регионе",
+            ),
+            profile,
+        )
+        or "моём регионе"
+    )
     brand = str(profile.get("brand_name") or "").strip()
     if not brand:
         raise OpenRouterError(
@@ -9387,23 +9236,56 @@ async def _recover_prompt_set(
             stable_digest(previous_set) if previous_set is not None else None
         ),
     }
-    plan = await plan_durable_recovery(
-        run_id,
-        stage_key="scenario_design",
-        failure_class="repairable_semantic",
-        failure_code="prompt_set_non_convergent",
-        diagnostics=diagnostics,
-        facts=facts,
-        allowed_actions={
-            ACTION_RETRY_WITH_GUIDANCE,
-            ACTION_DETERMINISTIC_FALLBACK,
-            ACTION_STOP,
-        },
-    )
+    recovery_actions = {
+        ACTION_RETRY_WITH_GUIDANCE,
+        ACTION_DETERMINISTIC_FALLBACK,
+        ACTION_STOP,
+    }
+    try:
+        plan = await plan_durable_recovery(
+            run_id,
+            stage_key="scenario_design",
+            failure_class="repairable_semantic",
+            failure_code="prompt_set_non_convergent",
+            diagnostics=diagnostics,
+            facts=facts,
+            allowed_actions=recovery_actions,
+            stage_planner_call_limit=1,
+        )
+    except (
+        RecoveryBudgetExceeded,
+        RecoveryDecisionRejected,
+        RecoveryPlannerUnavailable,
+    ) as planner_error:
+        plan = await plan_code_owned_recovery(
+            run_id,
+            stage_key="scenario_design",
+            failure_class="repairable_semantic",
+            failure_code="prompt_set_non_convergent",
+            diagnostics=diagnostics,
+            facts=facts,
+            allowed_actions=recovery_actions,
+            fallback_reason=(f"{type(planner_error).__name__}: {planner_error}")[:1000],
+            decision={
+                "action": ACTION_DETERMINISTIC_FALLBACK,
+                "rationale": (
+                    "Сильный планировщик недоступен; используется только "
+                    "детерминированный набор сценариев под теми же валидаторами."
+                ),
+                "confidence": "high",
+                "guidance": "",
+                "target_answer_ids": [],
+                "invalidate_artifact_keys": [],
+                "acceptance_checks": sorted(
+                    {
+                        CHECK_PROMPT_CONTRACT_VALID,
+                        CHECK_SEMANTIC_REVIEW_PASSED,
+                    }
+                ),
+            },
+        )
     await mark_recovery_executing(plan)
-    before_digest = stable_digest(
-        {"candidate": previous_set, "errors": last_errors}
-    )
+    before_digest = stable_digest({"candidate": previous_set, "errors": last_errors})
     action = str(plan.decision.get("action") or "")
     requested_checks = set(plan.decision.get("acceptance_checks") or [])
     required_checks = (
@@ -9487,6 +9369,7 @@ async def _recover_prompt_set(
             "Это последняя ограниченная попытка. Исправь только замечания и "
             "сохрани без изменения сценарии, которых они не касаются."
         )
+
         def prompt_recovery_request_bytes(
             candidate: dict[str, Any],
             envelope: dict[str, Any],
@@ -9502,19 +9385,15 @@ async def _recover_prompt_set(
                 temperature=0.1,
             )
 
-        model_repair_payload, recovery_input_plan = (
-            await _prepare_final_model_payload(
-                run_id,
-                payload=repair_payload,
-                system=system,
-                target_model=ANALYSIS_MODEL,
-                stage_key="scenario_design",
-                artifact_namespace=(
-                    f"prompt_set_recovery_input_e{plan.epoch}"
-                ),
-                prompt_version=PROMPT_SET_VERSION,
-                final_request_utf8_bytes=prompt_recovery_request_bytes,
-            )
+        model_repair_payload, recovery_input_plan = await _prepare_final_model_payload(
+            run_id,
+            payload=repair_payload,
+            system=system,
+            target_model=ANALYSIS_MODEL,
+            stage_key="scenario_design",
+            artifact_namespace=(f"prompt_set_recovery_input_e{plan.epoch}"),
+            prompt_version=PROMPT_SET_VERSION,
+            final_request_utf8_bytes=prompt_recovery_request_bytes,
         )
         result = await chat(
             model=ANALYSIS_MODEL,
@@ -9799,6 +9678,7 @@ deterministic_passthrough, это полное иерархическое пре
             budget_attempt=budget_attempt,
         )
         try:
+
             def prompt_generation_request_bytes(
                 candidate: dict[str, Any],
                 envelope: dict[str, Any],
@@ -9814,21 +9694,18 @@ deterministic_passthrough, это полное иерархическое пре
                     temperature=0.2,
                 )
 
-            model_user_content, _generator_input_plan = (
-                await _prepare_final_model_payload(
-                    run_id,
-                    payload=user_content,
-                    system=system,
-                    target_model=ANALYSIS_MODEL,
-                    stage_key="scenario_design",
-                    artifact_namespace=(
-                        f"prompt_generator_input_a{budget_attempt}"
-                    ),
-                    prompt_version=PROMPT_SET_VERSION,
-                    final_request_utf8_bytes=(
-                        prompt_generation_request_bytes
-                    ),
-                )
+            (
+                model_user_content,
+                _generator_input_plan,
+            ) = await _prepare_final_model_payload(
+                run_id,
+                payload=user_content,
+                system=system,
+                target_model=ANALYSIS_MODEL,
+                stage_key="scenario_design",
+                artifact_namespace=(f"prompt_generator_input_a{budget_attempt}"),
+                prompt_version=PROMPT_SET_VERSION,
+                final_request_utf8_bytes=(prompt_generation_request_bytes),
             )
             result = await chat(
                 model=ANALYSIS_MODEL,
@@ -10046,8 +9923,7 @@ async def _panel_resume_checkpoint_from_session(
 
     artifact_output = (
         prompt_artifact.output_json
-        if prompt_artifact is not None
-        and isinstance(prompt_artifact.output_json, dict)
+        if prompt_artifact is not None and isinstance(prompt_artifact.output_json, dict)
         else {}
     )
     artifact_items = artifact_output.get("prompts")
@@ -10215,11 +10091,9 @@ def _offer_contracts_from_profile(
         for item in profile.get("offer_clusters") or []
         if isinstance(item, dict)
     )
-    if {
-        offer_id
-        for cluster in clusters
-        for offer_id in cluster.offer_ids
-    } != {offer.offer_id for offer in catalog.accepted_offers}:
+    if {offer_id for cluster in clusters for offer_id in cluster.offer_ids} != {
+        offer.offer_id for offer in catalog.accepted_offers
+    }:
         raise OfferCatalogError(
             "Offer clusters do not partition the proven offer catalog"
         )
@@ -10249,13 +10123,11 @@ async def _save_prompt_foundation(
             intent=str(item.get("intent_class") or ""),
             text=str(item.get("text") or ""),
             supporting_cluster_ids=tuple(
-                str(value)
-                for value in item.get("supporting_cluster_ids") or []
+                str(value) for value in item.get("supporting_cluster_ids") or []
             ),
         )
         for item in prompt_set.get("prompts") or []
-        if isinstance(item, dict)
-        and item.get("role") == "unbranded_discovery"
+        if isinstance(item, dict) and item.get("role") == "unbranded_discovery"
     ]
     exclusions = tuple(
         ClusterExclusion.from_mapping(item)
@@ -10344,18 +10216,14 @@ async def _discovery_answers_by_prompt(
                 "status": str(answer.status or ""),
                 "response_sha256": text_sha256(response_text),
                 "response_utf8_bytes": len(response_text.encode("utf-8")),
-                "citations_sha256": offer_artifact_digest(
-                    answer.citations_json or []
-                ),
+                "citations_sha256": offer_artifact_digest(answer.citations_json or []),
             }
         )
     return answers
 
 
 async def _save_answer_set_receipt(run_id: str) -> AnswerSetReceipt | None:
-    foundation_value = await _completed_artifact_output(
-        run_id, "prompt_foundation"
-    )
+    foundation_value = await _completed_artifact_output(run_id, "prompt_foundation")
     if foundation_value is None:
         await _save_artifact(
             run_id,
@@ -10373,9 +10241,7 @@ async def _save_answer_set_receipt(run_id: str) -> AnswerSetReceipt | None:
         )
         return None
     foundation = PromptFoundation.from_mapping(foundation_value)
-    answers = await _discovery_answers_by_prompt(
-        run_id, foundation.prompt_keys
-    )
+    answers = await _discovery_answers_by_prompt(run_id, foundation.prompt_keys)
     incomplete = [
         key
         for key, cells in answers.items()
@@ -10422,9 +10288,7 @@ async def _validate_panel_foundation_resume(
 ) -> None:
     """Fail closed for new runs; keep old panels as explicit legacy snapshots."""
 
-    foundation_value = await _completed_artifact_output(
-        run_id, "prompt_foundation"
-    )
+    foundation_value = await _completed_artifact_output(run_id, "prompt_foundation")
     if foundation_value is None:
         await _save_artifact(
             run_id,
@@ -10443,9 +10307,7 @@ async def _validate_panel_foundation_resume(
             prompt_version=LEGACY_FOUNDATION_AUDIT_VERSION,
         )
         return
-    market_research = await _completed_artifact_output(
-        run_id, "market_research"
-    )
+    market_research = await _completed_artifact_output(run_id, "market_research")
     if market_research is None:
         raise PanelCheckpointMismatchError(
             "Panel checkpoint mismatch: market_research_missing"
@@ -10469,13 +10331,11 @@ async def _validate_panel_foundation_resume(
             intent=str(item.get("intent_class") or ""),
             text=str(item.get("text") or ""),
             supporting_cluster_ids=tuple(
-                str(value)
-                for value in item.get("supporting_cluster_ids") or []
+                str(value) for value in item.get("supporting_cluster_ids") or []
             ),
         )
         for item in prompt_set_value.get("prompts") or []
-        if isinstance(item, dict)
-        and item.get("role") == "unbranded_discovery"
+        if isinstance(item, dict) and item.get("role") == "unbranded_discovery"
     ]
     current_exclusions = tuple(
         ClusterExclusion.from_mapping(item)
@@ -10493,9 +10353,7 @@ async def _validate_panel_foundation_resume(
         raise PanelCheckpointMismatchError(
             "Panel checkpoint mismatch: prompt_foundation_content_changed"
         )
-    receipt_value = await _completed_artifact_output(
-        run_id, "answer_set_receipt"
-    )
+    receipt_value = await _completed_artifact_output(run_id, "answer_set_receipt")
     receipt = (
         AnswerSetReceipt.from_mapping(receipt_value)
         if receipt_value is not None
@@ -10762,9 +10620,7 @@ def _panel_attempt_audit_record(
         if not isinstance(raw_transport, dict):
             raw_transport = getattr(result, "transport", None)
         transport = (
-            copy.deepcopy(raw_transport)
-            if isinstance(raw_transport, dict)
-            else {}
+            copy.deepcopy(raw_transport) if isinstance(raw_transport, dict) else {}
         )
         citations = copy.deepcopy(list(result.citations or []))
     output = {
@@ -10802,16 +10658,12 @@ async def _reserve_panel_attempt(
     """Append a durable reservation before exactly one provider POST."""
 
     await assert_run_lease(run_id)
-    artifact_key = (
-        f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}{answer_id}_{uuid.uuid4().hex}"
-    )
+    artifact_key = f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}{answer_id}_{uuid.uuid4().hex}"
     async with SessionLocal() as session:
         session.add(
             RunArtifact(
                 run_id=run_id,
-                stage_key=(
-                    "web_visibility" if mode == "web" else "knowledge_gap"
-                ),
+                stage_key=("web_visibility" if mode == "web" else "knowledge_gap"),
                 artifact_key=artifact_key,
                 status="running",
                 model=model,
@@ -10899,8 +10751,7 @@ async def _restore_panel_provider_receipt(
                         RunArtifact.artifact_key.like(
                             f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}{answer_id}_%"
                         ),
-                        RunArtifact.prompt_version
-                        == PANEL_ATTEMPT_AUDIT_VERSION,
+                        RunArtifact.prompt_version == PANEL_ATTEMPT_AUDIT_VERSION,
                     )
                     .order_by(RunArtifact.id.desc())
                 )
@@ -10966,9 +10817,7 @@ async def _finalize_panel_attempt(
         if isinstance(current_output, dict) and isinstance(
             current_output.get("provider_event"), dict
         ):
-            output["provider_event"] = copy.deepcopy(
-                current_output["provider_event"]
-            )
+            output["provider_event"] = copy.deepcopy(current_output["provider_event"])
         changed = await session.execute(
             update(RunArtifact)
             .where(
@@ -11035,9 +10884,7 @@ def _legacy_usage_count(usage: dict[str, Any], key: str) -> int:
         (
             value
             for value in values
-            if isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
         ),
         default=0,
     )
@@ -11096,10 +10943,7 @@ def _legacy_memory_trace_reasons(answer: ModelAnswer) -> list[str]:
                     ):
                         reasons.append("usage." + ".".join(child_path))
                     continue
-                if any(
-                    fragment in key
-                    for fragment in _LEGACY_RETRIEVAL_KEY_FRAGMENTS
-                ):
+                if any(fragment in key for fragment in _LEGACY_RETRIEVAL_KEY_FRAGMENTS):
                     if child not in (None, [], {}):
                         reasons.append("usage." + ".".join(child_path))
                     continue
@@ -11279,8 +11123,7 @@ def _panel_answer_attestation(
             if not isinstance(output_envelope, dict):
                 return False, "missing_output_envelope"
             if (
-                output_envelope.get("policy")
-                != OutputTokenPolicy.MODEL_MAX.value
+                output_envelope.get("policy") != OutputTokenPolicy.MODEL_MAX.value
                 or output_envelope.get("requested_model") != answer.model
             ):
                 return False, "output_envelope_mismatch"
@@ -11300,8 +11143,7 @@ def _panel_answer_attestation(
             if (
                 not isinstance(persisted_max_tokens, int)
                 or isinstance(persisted_max_tokens, bool)
-                or persisted_max_tokens
-                not in LEGACY_PANEL_MAX_TOKENS_ALLOWLIST
+                or persisted_max_tokens not in LEGACY_PANEL_MAX_TOKENS_ALLOWLIST
             ):
                 return False, "unapproved_panel_max_tokens"
             expected_request_sha256 = _bounded_panel_request_sha256(
@@ -11327,9 +11169,7 @@ def _panel_answer_attestation(
     if request_policy.get("policy") != expected_policy:
         return False, "request_policy_mismatch"
     stored_policy_contract = {
-        key: value
-        for key, value in request_policy.items()
-        if key != "sha256"
+        key: value for key, value in request_policy.items() if key != "sha256"
     }
     stored_policy_sha256 = hashlib.sha256(
         json.dumps(
@@ -11361,9 +11201,7 @@ def _panel_answer_attestation(
     def count(value: Any) -> int:
         return (
             value
-            if isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
             else 0
         )
 
@@ -11544,7 +11382,10 @@ async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
 
     reasons: list[str] = []
     config = run.config_json if run is not None else {}
-    if not isinstance(config, dict) or config.get("pipeline_version") != LEGACY_PIPELINE_VERSION:
+    if (
+        not isinstance(config, dict)
+        or config.get("pipeline_version") != LEGACY_PIPELINE_VERSION
+    ):
         reasons.append("pipeline_version_mismatch")
     if prompt_artifact is None or prompt_artifact.status != "completed":
         reasons.append("prompt_set_not_completed")
@@ -11553,8 +11394,7 @@ async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
 
     artifact_output = (
         prompt_artifact.output_json
-        if prompt_artifact is not None
-        and isinstance(prompt_artifact.output_json, dict)
+        if prompt_artifact is not None and isinstance(prompt_artifact.output_json, dict)
         else {}
     )
     artifact_prompts = artifact_output.get("prompts")
@@ -11621,9 +11461,7 @@ async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
             row_reasons.append("unexpected_provider")
         elif str(answer.model or "").casefold() != expected_model:
             row_reasons.append("model_mismatch")
-        if answer.status != "completed" or not str(
-            answer.response_text or ""
-        ).strip():
+        if answer.status != "completed" or not str(answer.response_text or "").strip():
             row_reasons.append("answer_incomplete")
         if ":online" in str(answer.model or "").casefold():
             row_reasons.append("online_variant")
@@ -11635,12 +11473,10 @@ async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
             if not isinstance(provenance, dict) or prompt_text is None:
                 row_reasons.append("invalid_panel_v1_provenance")
             else:
-                _verified, attestation_reason = (
-                    _legacy_panel_answer_attestation(
-                        answer,
-                        prompt_text=prompt_text,
-                        provenance=provenance,
-                    )
+                _verified, attestation_reason = _legacy_panel_answer_attestation(
+                    answer,
+                    prompt_text=prompt_text,
+                    provenance=provenance,
                 )
                 if attestation_reason != LEGACY_MEMORY_OBSERVATION_REASON:
                     row_reasons.append(attestation_reason)
@@ -11655,9 +11491,7 @@ async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
                 "raw_answer_sha256": hashlib.sha256(
                     str(answer.response_text or "").encode("utf-8")
                 ).hexdigest(),
-                "citations_sha256": _stable_json_sha256(
-                    answer.citations_json or []
-                ),
+                "citations_sha256": _stable_json_sha256(answer.citations_json or []),
                 "usage_sha256": _stable_json_sha256(usage),
                 "reasons": sorted(set(row_reasons)),
             }
@@ -11673,7 +11507,9 @@ async def _legacy_panel_run_contract(run_id: str) -> dict[str, Any]:
 
     contract = {
         "version": LEGACY_PANEL_EVIDENCE_VERSION,
-        "pipeline_version": config.get("pipeline_version") if isinstance(config, dict) else None,
+        "pipeline_version": config.get("pipeline_version")
+        if isinstance(config, dict)
+        else None,
         "prompt_set_version": (
             prompt_artifact.prompt_version if prompt_artifact is not None else None
         ),
@@ -11702,9 +11538,7 @@ def _panel_evidence_sha256(
             "usage": answer.usage_json or {},
             "citations": answer.citations_json or [],
             "legacy_run_contract_digest": (
-                legacy_contract.get("digest")
-                if reason.startswith("legacy_")
-                else None
+                legacy_contract.get("digest") if reason.startswith("legacy_") else None
             ),
         }
     )
@@ -11735,9 +11569,7 @@ async def _ensure_answer_rows(
                 )
             )
         generation = (
-            await session.execute(
-                select(Run.attempt_count).where(*run_conditions)
-            )
+            await session.execute(select(Run.attempt_count).where(*run_conditions))
         ).scalar_one_or_none()
         if generation is None:
             if owner is not None:
@@ -11756,9 +11588,7 @@ async def _ensure_answer_rows(
             .scalars()
             .all()
         )
-        existing = {
-            (row.prompt_id, row.provider_key): row for row in existing_rows
-        }
+        existing = {(row.prompt_id, row.provider_key): row for row in existing_rows}
         annotation_by_answer_id: dict[int, dict[str, Any]] = {}
         if existing_rows:
             annotation_by_answer_id = {
@@ -11820,9 +11650,7 @@ async def _ensure_answer_rows(
                         )
                     ).scalar_one()
                     existing[(prompt.id, panel.key)] = row
-                if row.status == "completed" and str(
-                    row.response_text or ""
-                ).strip():
+                if row.status == "completed" and str(row.response_text or "").strip():
                     # Raw panel answers are append-only evidence. A legacy or
                     # stale completed cell remains visible for audit/rebuild,
                     # but _metric_rows will fail it closed unless its exact
@@ -11842,21 +11670,16 @@ async def _ensure_answer_rows(
                         + previous_status
                     )
                 existing_usage = (
-                    dict(row.usage_json)
-                    if isinstance(row.usage_json, dict)
-                    else {}
+                    dict(row.usage_json) if isinstance(row.usage_json, dict) else {}
                 )
                 existing_citations = copy.deepcopy(row.citations_json or [])
                 existing_annotation = annotation_by_answer_id.get(row.id)
-                if (
-                    running_generation is None
-                    and (
-                        row.response_text is not None
-                        or row.citations_json is not None
-                        or row.usage_json is not None
-                        or row.error_message is not None
-                        or existing_annotation is not None
-                    )
+                if running_generation is None and (
+                    row.response_text is not None
+                    or row.citations_json is not None
+                    or row.usage_json is not None
+                    or row.error_message is not None
+                    or existing_annotation is not None
                 ):
                     historical_evidence = {
                         "canonical_status": previous_status,
@@ -11889,9 +11712,7 @@ async def _ensure_answer_rows(
                         .values(
                             run_id=run_id,
                             stage_key=(
-                                "web_visibility"
-                                if mode == "web"
-                                else "knowledge_gap"
+                                "web_visibility" if mode == "web" else "knowledge_gap"
                             ),
                             artifact_key=(
                                 f"{PANEL_ATTEMPT_ARTIFACT_PREFIX}import_"
@@ -11908,9 +11729,7 @@ async def _ensure_answer_rows(
                                 "provider_key": row.provider_key,
                                 "model": row.model,
                                 "max_tokens": contract.get("max_tokens"),
-                                "request_sha256": contract.get(
-                                    "request_sha256"
-                                ),
+                                "request_sha256": contract.get("request_sha256"),
                                 "evidence_digest": evidence_digest,
                             },
                             output_json={
@@ -11972,9 +11791,7 @@ async def _ensure_answer_rows(
                     # Another worker claimed or completed this exact cell.
                     continue
                 await session.execute(
-                    delete(AnswerAnnotation).where(
-                        AnswerAnnotation.answer_id == row.id
-                    )
+                    delete(AnswerAnnotation).where(AnswerAnnotation.answer_id == row.id)
                 )
                 jobs.append(
                     (
@@ -12083,8 +11900,7 @@ async def _wait_for_panel_claims(
         heartbeat = utc_value(heartbeat_at)
         expires = utc_value(lease_expires_at)
         heartbeat_fresh_until = (
-            heartbeat
-            + timedelta(seconds=max(15, int(settings.RUN_LEASE_SECONDS)))
+            heartbeat + timedelta(seconds=max(15, int(settings.RUN_LEASE_SECONDS)))
             if heartbeat is not None
             else None
         )
@@ -12100,9 +11916,7 @@ async def _wait_for_panel_claims(
             and (bound_owner is None or persisted_owner == bound_owner)
         )
         if not lease_is_fresh:
-            raise RunLeaseLostError(
-                f"Panel owner heartbeat is stale for run {run_id}"
-            )
+            raise RunLeaseLostError(f"Panel owner heartbeat is stale for run {run_id}")
         await assert_run_lease(run_id)
         await asyncio.sleep(poll_seconds)
 
@@ -12117,14 +11931,9 @@ async def _run_panel(
 ) -> None:
     async with SessionLocal() as session:
         config_json = (
-            await session.execute(
-                select(Run.config_json).where(Run.id == run_id)
-            )
+            await session.execute(select(Run.config_json).where(Run.id == run_id))
         ).scalar_one_or_none()
-    if (
-        isinstance(config_json, dict)
-        and SAVED_ANSWERS_ONLY_MARKER_KEY in config_json
-    ):
+    if isinstance(config_json, dict) and SAVED_ANSWERS_ONLY_MARKER_KEY in config_json:
         raise OpenRouterError(
             "Panel mutation is forbidden during saved-answers-only reprocess"
         )
@@ -12339,12 +12148,10 @@ async def _run_panel(
                     accept_output_limited=True,
                     retry_response_contract_errors=False,
                     retry_transport_errors=False,
-                    audit_checkpoint=lambda event: (
-                        _checkpoint_panel_provider_event(
-                            run_id,
-                            artifact_key=artifact_key,
-                            event=event,
-                        )
+                    audit_checkpoint=lambda event: _checkpoint_panel_provider_event(
+                        run_id,
+                        artifact_key=artifact_key,
+                        event=event,
                     ),
                 )
             except asyncio.CancelledError:
@@ -12510,10 +12317,8 @@ def _entity_catalog_quote_recovery_incident(
             for row in raw_dispositions
             if isinstance(row, dict)
             and str(row.get("unit_id") or "") == failed_unit_id
-            and str(row.get("claim_id") or "")
-            == str(claim.get("claim_id") or "")
-            and str(row.get("core_sha256") or "")
-            == str(claim.get("core_sha256") or "")
+            and str(row.get("claim_id") or "") == str(claim.get("claim_id") or "")
+            and str(row.get("core_sha256") or "") == str(claim.get("core_sha256") or "")
         ]
         if len(matching_rows) != 1:
             return None
@@ -12567,8 +12372,7 @@ def _entity_catalog_quote_recovery_incident(
         r"entities\[\d+\]\.aliases\[\d+\]) is not grounded"
     )
     if not binding_failures or any(
-        allowed_binding_failure.fullmatch(item) is None
-        for item in binding_failures
+        allowed_binding_failure.fullmatch(item) is None for item in binding_failures
     ):
         return None
     try:
@@ -12584,6 +12388,7 @@ def _entity_catalog_quote_recovery_incident(
         _validate_entity_catalog_leaf_evidence_binding(
             catalog,
             receipts,
+            expected_claims=expected_claims,
             profile=profile or {},
         )
     except OpenRouterError as reproduced:
@@ -12634,86 +12439,136 @@ def _validate_entity_catalog_leaf_evidence_binding(
     catalog: dict[str, Any],
     receipts: list[dict[str, Any]],
     *,
+    expected_claims: list[dict[str, Any]],
     profile: dict[str, Any],
 ) -> None:
-    """Require every recovered name to bind to its own grounded core quote.
+    """Bind every catalog name to its own exact span in a grounded core.
 
-    A material catalog shared by several core units is not evidence that each
-    entity in it came from a grounded unit.  This validator keeps the leaf
-    atomic: every target alias and downstream alias must occur literally in a
-    grounded source quote, and an entity's evidence must point to that same
-    quote (or to the model's formatting-only submitted form).  A code-owned
-    canonical name may use a literal, independently confirmed alias of the
-    same entity; this admits ``Realweb`` / ``Риалвеб`` without allowing an LLM
-    to invent a canonical/alias pair.
+    ``core_dispositions`` contains one representative decision per core, not
+    one decision per entity.  A single core can legitimately contain many
+    brands, products, platforms and sources.  Requiring every name to occur in
+    the one representative ``evidence_quote`` makes that schema impossible to
+    satisfy.  Instead, a grounded disposition opens only its own immutable
+    ``core_text`` for inspection, and each entity must carry a separate exact
+    source span in ``evidence`` that contains that name.
+
+    Quoted evidence is preferred and must match one complete delimited span.
+    A bare evidence value is accepted only when the whole value is an exact
+    core substring.  The sole repair remains the existing unique Markdown
+    emphasis coordinate map; case, punctuation, whitespace, words and order
+    are never normalised.  A code-owned canonical may use a literal,
+    independently confirmed alias of the same entity, admitting
+    ``Realweb`` / ``Риалвеб`` without allowing an answer-derived canonical to
+    borrow an unrelated alias.
     """
 
-    grounded: list[tuple[str, tuple[str, ...]]] = []
+    claims_by_identity = {
+        (
+            str(claim.get("claim_id") or ""),
+            str(claim.get("unit_id") or ""),
+            str(claim.get("core_sha256") or ""),
+        ): claim
+        for claim in expected_claims
+        if isinstance(claim, dict)
+    }
+    grounded_cores: list[str] = []
     for receipt in receipts:
         if receipt.get("disposition") != "grounded_fact":
             continue
-        source_quote = str(receipt.get("evidence_quote") or "")
-        if not source_quote:
+        receipt_claim = receipt.get("claim")
+        if not isinstance(receipt_claim, dict):
             continue
-        output_views = [source_quote]
-        repair = receipt.get("evidence_quote_repair")
-        if isinstance(repair, dict):
-            submitted = str(repair.get("submitted_quote") or "")
-            if submitted and submitted != source_quote:
-                output_views.append(submitted)
-        grounded.append((source_quote, tuple(output_views)))
+        identity = (
+            str(receipt_claim.get("claim_id") or ""),
+            str(receipt_claim.get("unit_id") or ""),
+            str(receipt_claim.get("core_sha256") or ""),
+        )
+        claim = claims_by_identity.get(identity)
+        if claim is None:
+            continue
+        core_text = str(claim.get("core_text") or "")
+        if core_text and text_sha256(core_text) == identity[2]:
+            grounded_cores.append(core_text)
+
+    evidence_quote_patterns = (
+        re.compile(r"«([^«»]+)»", re.DOTALL),
+        re.compile(r"“([^“”]+)”", re.DOTALL),
+        re.compile(r"„([^„“]+)“", re.DOTALL),
+        re.compile(r"‘([^‘’]+)’", re.DOTALL),
+        re.compile(r'"([^"\r\n]+)"'),
+        re.compile(r"`([^`\r\n]+)`"),
+    )
+
+    def literal_name_is_present(text: str, name: str) -> bool:
+        # Catalog evidence also contains URLs and e-mail-like identifiers.
+        # `_alias_is_present` deliberately excludes those for mention metrics,
+        # so it cannot serve as this provenance predicate.
+        if not name:
+            return False
+        return bool(
+            re.search(
+                rf"(?<![\w]){re.escape(name)}(?![\w])",
+                text,
+                re.UNICODE,
+            )
+        )
+
+    def evidence_spans(evidence: str) -> list[str]:
+        # Patterns are ordered outermost-first. Once a delimiter family is
+        # present, nested quote styles cannot shrink a failed outer citation
+        # down to a convenient entity name from a different core.
+        for pattern in evidence_quote_patterns:
+            quoted = [
+                match.group(1) for match in pattern.finditer(evidence) if match.group(1)
+            ]
+            if quoted:
+                return list(dict.fromkeys(quoted))
+        # If the model explicitly used quotation marks, prose outside them is
+        # classification commentary and cannot become source evidence.
+        return [evidence]
+
+    def exact_span_in_core(span: str, core_text: str) -> bool:
+        if span in core_text:
+            return True
+        try:
+            repair = _unique_markdown_emphasis_quote_repair(core_text, span)
+        except OpenRouterError:
+            return False
+        return repair is not None
 
     def literal_name_is_grounded(name: str) -> bool:
         return bool(
-            name
-            and any(
-                _alias_is_present(source, name)
-                for source, _views in grounded
-            )
+            name and any(literal_name_is_present(core, name) for core in grounded_cores)
         )
 
     def identity_key(value: str) -> str:
         return re.sub(
             r"\s+",
             " ",
-            unicodedata.normalize("NFKC", value)
-            .casefold()
-            .replace("ё", "е")
-            .strip(),
+            unicodedata.normalize("NFKC", value).casefold().replace("ё", "е").strip(),
         )
 
     def strictly_bound(name: str, evidence: str) -> bool:
-        return bool(
-            name
-            and evidence
-            and _alias_is_present(evidence, name)
-            and any(
-                _alias_is_present(source_quote, name)
-                and any(view in evidence for view in output_views)
-                for source_quote, output_views in grounded
-            )
+        if not name or not evidence or not literal_name_is_present(evidence, name):
+            return False
+        return any(
+            literal_name_is_present(span, name) and exact_span_in_core(span, core_text)
+            for span in evidence_spans(evidence)
+            for core_text in grounded_cores
+            if literal_name_is_present(core_text, name)
         )
 
     def code_owned_names(entity: dict[str, Any]) -> set[str]:
         confirmed: list[str] = []
-        relationship = str(
-            entity.get("target_relationship")
-            or entity.get("relationship")
-            or ""
-        ).strip().casefold()
-        if (
-            entity.get("category") == "target"
-            and relationship == "exact_target"
-        ):
-            confirmed.extend(_target_aliases(profile, catalog))
-        confirmed.extend(
-            _profile_confirmed_names_for_entity(entity, profile)
+        relationship = (
+            str(entity.get("target_relationship") or entity.get("relationship") or "")
+            .strip()
+            .casefold()
         )
-        return {
-            identity_key(value)
-            for value in confirmed
-            if identity_key(value)
-        }
+        if entity.get("category") == "target" and relationship == "exact_target":
+            confirmed.extend(_target_aliases(profile, catalog))
+        confirmed.extend(_profile_confirmed_names_for_entity(entity, profile))
+        return {identity_key(value) for value in confirmed if identity_key(value)}
 
     errors: list[str] = []
     target_aliases = catalog.get("target_aliases")
@@ -12757,23 +12612,17 @@ def _validate_entity_catalog_leaf_evidence_binding(
                     and strictly_bound(alias, evidence)
                     for alias in aliases
                 )
-                canonical_bound = bool(
-                    canonical_is_owned and observed_owned_alias
-                )
+                canonical_bound = bool(canonical_is_owned and observed_owned_alias)
             if not canonical_bound:
-                errors.append(
-                    f"entities[{position}].canonical_name is not grounded"
-                )
+                errors.append(f"entities[{position}].canonical_name is not grounded")
             for alias_index, alias in enumerate(aliases):
                 if not strictly_bound(alias, evidence):
                     errors.append(
-                        f"entities[{position}].aliases[{alias_index}] "
-                        "is not grounded"
+                        f"entities[{position}].aliases[{alias_index}] is not grounded"
                     )
     if errors:
         raise OpenRouterError(
-            "Entity-catalog evidence binding failed: "
-            + "; ".join(errors)
+            "Entity-catalog evidence binding failed: " + "; ".join(errors)
         )
 
 
@@ -12801,6 +12650,7 @@ def _validated_recovered_entity_catalog_leaf(
     _validate_entity_catalog_leaf_evidence_binding(
         accepted,
         receipts,
+        expected_claims=claims,
         profile=profile,
     )
     return accepted
@@ -12891,9 +12741,7 @@ async def _validate_entity_catalog_recovery_epoch_binding(
         or isinstance(epoch_number, bool)
         or epoch_number < 1
     ):
-        raise OpenRouterError(
-            "Entity-catalog recovery checkpoint epoch is malformed"
-        )
+        raise OpenRouterError("Entity-catalog recovery checkpoint epoch is malformed")
     async with SessionLocal() as session:
         epoch = (
             await session.execute(
@@ -12919,26 +12767,19 @@ async def _validate_entity_catalog_recovery_epoch_binding(
     for key, actual in bindings.items():
         if str(checkpoint.get(key) or "") != str(actual or ""):
             raise OpenRouterError(
-                "Entity-catalog recovery checkpoint epoch binding mismatch: "
-                + key
+                "Entity-catalog recovery checkpoint epoch binding mismatch: " + key
             )
     if (
         plan_json is None
         or not epoch.plan_digest
         or stable_digest(plan_json) != str(epoch.plan_digest)
     ):
-        raise OpenRouterError(
-            "Entity-catalog recovery checkpoint plan digest mismatch"
-        )
+        raise OpenRouterError("Entity-catalog recovery checkpoint plan digest mismatch")
     recovery_contract = recovery_input.get("recovery")
     incident = (
-        epoch.input_json.get("incident")
-        if isinstance(epoch.input_json, dict)
-        else None
+        epoch.input_json.get("incident") if isinstance(epoch.input_json, dict) else None
     )
-    facts = (
-        incident.get("facts") if isinstance(incident, dict) else None
-    )
+    facts = incident.get("facts") if isinstance(incident, dict) else None
     if not isinstance(recovery_contract, dict) or not isinstance(facts, dict):
         raise OpenRouterError(
             "Entity-catalog recovery checkpoint provenance is incomplete"
@@ -12963,9 +12804,7 @@ async def _validate_entity_catalog_recovery_epoch_binding(
             )
     else:
         details = (
-            outcome.get("details")
-            if isinstance(outcome.get("details"), dict)
-            else {}
+            outcome.get("details") if isinstance(outcome.get("details"), dict) else {}
         )
         if (
             outcome.get("succeeded") is not True
@@ -12976,9 +12815,7 @@ async def _validate_entity_catalog_recovery_epoch_binding(
             or details.get("execution_attempt") != attempt
             or details.get("raw_source_unchanged") is not True
         ):
-            raise OpenRouterError(
-                "Entity-catalog recovery checkpoint outcome mismatch"
-            )
+            raise OpenRouterError("Entity-catalog recovery checkpoint outcome mismatch")
     return (
         str(epoch.status),
         DurableRecoveryPlan(
@@ -13021,23 +12858,18 @@ async def _validate_entity_catalog_recovery_checkpoint(
     checkpoint = copy.deepcopy(value)
     checkpoint_digest = str(checkpoint.pop("checkpoint_sha256", ""))
     if (
-        checkpoint.get("version")
-        != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        checkpoint.get("version") != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
         or not checkpoint_digest
         or stable_digest(checkpoint) != checkpoint_digest
     ):
-        raise OpenRouterError(
-            "Entity-catalog recovery checkpoint digest mismatch"
-        )
+        raise OpenRouterError("Entity-catalog recovery checkpoint digest mismatch")
     identity = _entity_catalog_recovery_checkpoint_identity(
         job=job,
         target=target,
     )
-    if (
-        checkpoint.get("identity") != identity
-        or str(checkpoint.get("identity_sha256") or "")
-        != stable_digest(identity)
-    ):
+    if checkpoint.get("identity") != identity or str(
+        checkpoint.get("identity_sha256") or ""
+    ) != stable_digest(identity):
         raise OpenRouterError(
             "Entity-catalog recovery checkpoint input binding mismatch"
         )
@@ -13050,15 +12882,10 @@ async def _validate_entity_catalog_recovery_checkpoint(
         or not isinstance(execution_attempt, int)
         or isinstance(execution_attempt, bool)
         or execution_attempt < 1
-        or execution_attempt
-        > ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+        or execution_attempt > ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
     ):
-        raise OpenRouterError(
-            "Entity-catalog recovery checkpoint attempt is malformed"
-        )
-    recovery_artifact_key = str(
-        checkpoint.get("recovery_artifact_key") or ""
-    )
+        raise OpenRouterError("Entity-catalog recovery checkpoint attempt is malformed")
+    recovery_artifact_key = str(checkpoint.get("recovery_artifact_key") or "")
     expected_recovery_key = (
         f"{job['artifact_key']}_recovery_e{epoch}_a{execution_attempt}"
     )
@@ -13086,8 +12913,7 @@ async def _validate_entity_catalog_recovery_checkpoint(
         recovery_artifact is None
         or recovery_artifact.status != "completed"
         or recovery_artifact.model != PROCESSING_MODEL
-        or recovery_artifact.prompt_version
-        != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        or recovery_artifact.prompt_version != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
         or not isinstance(recovery_input, dict)
         or stable_digest(recovery_input)
         != str(checkpoint.get("recovery_input_sha256") or "")
@@ -13103,8 +12929,7 @@ async def _validate_entity_catalog_recovery_checkpoint(
         recovery_input.get("target") != target
         or recovery_input.get("answers") != job["model_answers"]
         or not isinstance(recovery_contract, dict)
-        or recovery_contract.get("version")
-        != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        or recovery_contract.get("version") != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
         or recovery_contract.get("epoch") != epoch
         or recovery_contract.get("execution_attempt") != execution_attempt
         or str(recovery_contract.get("source_units_sha256") or "")
@@ -13134,12 +12959,10 @@ async def _validate_entity_catalog_recovery_checkpoint(
             str(item.get("_lr_unit_id") or "") for item in job["answers"]
         ],
     )
-    epoch_status, durable_plan = (
-        await _validate_entity_catalog_recovery_epoch_binding(
-            run_id,
-            checkpoint,
-            recovery_input=recovery_input,
-        )
+    epoch_status, durable_plan = await _validate_entity_catalog_recovery_epoch_binding(
+        run_id,
+        checkpoint,
+        recovery_input=recovery_input,
     )
     if epoch_status == "executing":
         await finish_recovery(
@@ -13148,9 +12971,7 @@ async def _validate_entity_catalog_recovery_checkpoint(
             before_digest=str(checkpoint["before_digest"]),
             after_digest=str(checkpoint["after_digest"]),
             details={
-                "failure_code": str(
-                    recovery_contract.get("failure_code") or ""
-                ),
+                "failure_code": str(recovery_contract.get("failure_code") or ""),
                 "accepted_artifact_key": recovery_artifact_key,
                 "execution_attempt": execution_attempt,
                 "raw_source_unchanged": True,
@@ -13224,10 +13045,12 @@ async def _recover_entity_catalog_chunk_contract(
         "artifact_key": base_artifact_key,
         "contract_error": str(contract_error),
     }
+    stage_key = _entity_catalog_recovery_stage_key(job)
+
     async def reserve_plan() -> Any:
         return await plan_durable_recovery(
             run_id,
-            stage_key=_entity_catalog_recovery_stage_key(job),
+            stage_key=stage_key,
             failure_class="repairable_provider_contract",
             failure_code=str(incident["failure_code"]),
             diagnostics=diagnostics,
@@ -13237,15 +13060,60 @@ async def _recover_entity_catalog_chunk_contract(
             stage_planner_call_limit=1,
         )
 
+    async def reserve_plan_or_safe_fallback() -> DurableRecoveryPlan:
+        try:
+            return await reserve_plan()
+        except (
+            RecoveryBudgetExceeded,
+            RecoveryDecisionRejected,
+            RecoveryPlannerUnavailable,
+        ) as planner_error:
+            # Fable is an optional decision layer with a hard paid-call cap.
+            # When it cannot produce an executable plan, this leaf has only
+            # one caller-owned safe action: repeat the exact immutable
+            # extraction under the same strict validator. The fallback cannot
+            # change raw data, scope or acceptance checks and receives its own
+            # durable model-free epoch, so it cannot create a hidden loop.
+            fallback_reason = (f"{type(planner_error).__name__}: {planner_error}")[
+                :1000
+            ]
+            return await plan_code_owned_recovery(
+                run_id,
+                stage_key=stage_key,
+                failure_class="repairable_provider_contract",
+                failure_code=str(incident["failure_code"]),
+                diagnostics=diagnostics,
+                facts=facts,
+                allowed_actions={ACTION_RETRY_WITH_GUIDANCE, ACTION_STOP},
+                permitted_artifact_keys={base_artifact_key},
+                fallback_reason=fallback_reason,
+                decision={
+                    "action": ACTION_RETRY_WITH_GUIDANCE,
+                    "rationale": (
+                        "Сильный планировщик недоступен; разрешён только "
+                        "узкий повтор неизменяемого leaf-контракта."
+                    ),
+                    "confidence": "high",
+                    "guidance": (
+                        "Повтори только извлечение этого leaf. Для каждой "
+                        "сущности сохрани собственную точную цитату из её "
+                        "grounded core; исходные ответы не изменяй."
+                    ),
+                    "target_answer_ids": [],
+                    "invalidate_artifact_keys": [],
+                    "acceptance_checks": sorted(required_retry_checks),
+                },
+            )
+
     try:
         if planner_lock is None:
-            plan = await reserve_plan()
+            plan = await reserve_plan_or_safe_fallback()
         else:
             # Several catalog leaves may fail together under asyncio.gather.
             # Serialize only the durable epoch reservation/provider planning
             # boundary; the cheaper leaf retries remain concurrent.
             async with planner_lock:
-                plan = await reserve_plan()
+                plan = await reserve_plan_or_safe_fallback()
     except (asyncio.CancelledError, RunLeaseLostError):
         raise
     except Exception as planner_error:
@@ -13269,9 +13137,7 @@ async def _recover_entity_catalog_chunk_contract(
             return attempt
         return await mark_recovery_executing(
             plan,
-            stage_execution_limit=(
-                ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
-            ),
+            stage_execution_limit=(ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS),
         )
 
     before_digest = stable_digest(
@@ -13283,9 +13149,7 @@ async def _recover_entity_catalog_chunk_contract(
     action = str(plan.decision.get("action") or "")
     requested_checks = set(plan.decision.get("acceptance_checks") or [])
     required_checks = (
-        {CHECK_CHECKPOINT_PRESERVED}
-        if action == ACTION_STOP
-        else required_retry_checks
+        {CHECK_CHECKPOINT_PRESERVED} if action == ACTION_STOP else required_retry_checks
     )
     missing_checks = sorted(required_checks - requested_checks)
     unsupported_checks = sorted(requested_checks - required_checks)
@@ -13311,8 +13175,7 @@ async def _recover_entity_catalog_chunk_contract(
             },
         )
         raise OrchestratorContractError(
-            "Entity-catalog recovery acceptance checks do not match its "
-            "executor"
+            "Entity-catalog recovery acceptance checks do not match its executor"
         )
     if action == ACTION_STOP:
         await reserve_or_resume_attempt()
@@ -13338,14 +13201,19 @@ async def _recover_entity_catalog_chunk_contract(
         + "\n\n"
         + "Это ограниченное восстановление ошибки строгого контракта. "
         "Не меняй смысл каталога и не исправляй исходные ответы. Для каждой "
-        "grounded_fact скопируй evidence_quote как непрерывную дословную "
-        "подстроку соответствующего core_claim.core_text. Если такого "
-        "свидетельства нет, верни explicit_no_fact с конкретной причиной. "
-        "Каждый target_aliases и alias оставляй только если само это имя "
-        "буквально присутствует в grounded evidence_quote, а evidence записи "
-        "содержит ту же цитату. canonical_name также должен быть буквальным; "
+        "grounded_fact скопируй один репрезентативный evidence_quote как "
+        "непрерывную дословную подстроку соответствующего "
+        "core_claim.core_text. Это решение уровня core, оно не обязано "
+        "перечислять все сущности внутри core. Для каждой сущности и каждого "
+        "alias отдельно включи в evidence собственную непрерывную дословную "
+        "цитату из того же grounded core, выделив её русскими кавычками «…». "
+        "Цитата должна содержать именно подтверждаемое имя. Если такого "
+        "свидетельства нет, удали имя; если в core вообще нет материального "
+        "факта, верни explicit_no_fact с конкретной причиной. Каждый "
+        "target_alias оставляй только при буквальном наличии в grounded core. "
+        "canonical_name также должен быть буквальным; "
         "исключение допустимо только для code-owned имени из профиля, если "
-        "его алиас той же сущности буквально подтверждён той же цитатой. "
+        "его алиас той же сущности подтверждён собственной дословной цитатой. "
         "Неподтверждённые имена удали. "
         "Подсказка оркестратора не отменяет эти правила."
     )
@@ -13362,28 +13230,21 @@ async def _recover_entity_catalog_chunk_contract(
                 "execution_attempt": attempt_number,
                 "failure_code": incident["failure_code"],
                 "failed_unit_id": incident["failed_unit_id"],
-                "failed_unit_ids": copy.deepcopy(
-                    incident.get("failed_unit_ids") or []
-                ),
+                "failed_unit_ids": copy.deepcopy(incident.get("failed_unit_ids") or []),
                 "binding_failures": copy.deepcopy(
                     incident.get("binding_failures") or []
                 ),
                 "source_units_sha256": source_digest,
                 "invalid_candidate_sha256": incident["candidate_sha256"],
-                "orchestrator_guidance": str(
-                    plan.decision.get("guidance") or ""
-                ),
+                "orchestrator_guidance": str(plan.decision.get("guidance") or ""),
                 "immutable_contract": (
                     "No source mutation; exact literal core evidence only."
                 ),
             },
         }
-        artifact_key = (
-            f"{base_artifact_key}_recovery_e{plan.epoch}_a{attempt_number}"
-        )
+        artifact_key = f"{base_artifact_key}_recovery_e{plan.epoch}_a{attempt_number}"
         schema_name = (
-            "aiv_entity_catalog_contract_recovery_"
-            f"e{plan.epoch}_a{attempt_number}"
+            f"aiv_entity_catalog_contract_recovery_e{plan.epoch}_a{attempt_number}"
         )
         return payload, artifact_key, schema_name
 
@@ -13453,9 +13314,7 @@ async def _recover_entity_catalog_chunk_contract(
             # same key.  Only an audited HTTP 200 response that reached a
             # complete final turn but violated the response contract has spent
             # the semantic attempt and may advance to the next bounded one.
-            if not _complete_entity_catalog_response_contract_failure(
-                processing_error
-            ):
+            if not _complete_entity_catalog_response_contract_failure(processing_error):
                 raise
             last_error = processing_error
             await _mark_completed_artifact_contract_failed(
@@ -13475,10 +13334,7 @@ async def _recover_entity_catalog_chunk_contract(
                     "failure_kind": "complete_response_contract",
                 }
             )
-            if (
-                attempt_number
-                >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
-            ):
+            if attempt_number >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS:
                 break
             continue
 
@@ -13504,10 +13360,7 @@ async def _recover_entity_catalog_chunk_contract(
             )
             if "ambiguous" in str(retry_error).casefold():
                 break
-            if (
-                attempt_number
-                >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
-            ):
+            if attempt_number >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS:
                 break
             continue
 
@@ -13548,18 +13401,14 @@ async def _recover_entity_catalog_chunk_contract(
                     "execution_attempt": attempt_number,
                     "source_units_sha256": source_digest,
                     "accepted_artifact_key": recovery_artifact_key,
-                    "checkpoint_sha256": checkpoint_output[
-                        "checkpoint_sha256"
-                    ],
+                    "checkpoint_sha256": checkpoint_output["checkpoint_sha256"],
                     "accepted_output_sha256": checkpoint_output[
                         "accepted_output_sha256"
                     ],
                     "recovery_output_sha256": checkpoint_output[
                         "recovery_output_sha256"
                     ],
-                    "recovery_input_sha256": checkpoint_output[
-                        "recovery_input_sha256"
-                    ],
+                    "recovery_input_sha256": checkpoint_output["recovery_input_sha256"],
                     "plan_digest": plan.plan_digest,
                 }
             },
@@ -13595,9 +13444,7 @@ async def _recover_entity_catalog_chunk_contract(
         details={
             "failure_code": incident["failure_code"],
             "attempt_failures": attempt_failures,
-            "raw_source_unchanged": (
-                stable_digest(job["answers"]) == source_digest
-            ),
+            "raw_source_unchanged": (stable_digest(job["answers"]) == source_digest),
         },
     )
     raise OpenRouterError(
@@ -13657,32 +13504,32 @@ Orion Suite может быть standalone, но общий alias suite треб
 этом окне, только если буквальное имя пересекает core; текст слева и справа
 нужен для понимания связи и не является вторым независимым свидетельством.
 Верни catalog и core_dispositions: ровно одно решение в исходном порядке для
-каждого answers[].core_claim. Если core содержит имя сущности, выбери
-grounded_fact, дословно скопируй пересекающую core цитату в evidence_quote и
-включи ту же цитату в evidence записи catalog. Если имени сущности в core нет,
-выбери explicit_no_fact, оставь evidence_quote пустым и конкретно опиши, что
-именно находится в core. Общие фразы «факты не найдены» запрещены. claim_id,
-unit_id и core_sha256 скопируй без изменений.
+каждого answers[].core_claim. core_disposition — решение уровня всего core, а
+не отдельной сущности. Если core содержит хотя бы одну извлекаемую сущность,
+выбери grounded_fact и дословно скопируй один репрезентативный непрерывный
+фрагмент core в evidence_quote; он не обязан перечислять все сущности этого
+core. Для каждой сущности и каждого alias отдельно включи в evidence
+собственную непрерывную дословную цитату из того же core и выдели её русскими
+кавычками «…»; цитата должна содержать именно подтверждаемое имя. Проза вокруг
+кавычек может пояснять классификацию, но сама доказательством не считается.
+Если имя нельзя подтвердить собственной дословной цитатой, не добавляй его.
+Если в core нет извлекаемых сущностей, выбери explicit_no_fact, оставь
+evidence_quote пустым и конкретно опиши, что именно находится в core. Общие
+фразы «факты не найдены» запрещены. claim_id, unit_id и core_sha256 скопируй
+без изменений.
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
+
     def model_answer(item: dict[str, Any]) -> dict[str, Any]:
         return {
-            **{
-                key: value
-                for key, value in item.items()
-                if not key.startswith("_lr_")
-            },
+            **{key: value for key, value in item.items() if not key.startswith("_lr_")},
             "unit_contract": {
                 "unit_id": item.get("_lr_unit_id"),
                 "unit_index": item.get("_lr_unit_index"),
                 "unit_count": item.get("_lr_unit_count"),
-                "core_start_in_context": item.get(
-                    "_lr_core_start_in_context"
-                ),
-                "core_end_in_context": item.get(
-                    "_lr_core_end_in_context"
-                ),
+                "core_start_in_context": item.get("_lr_core_start_in_context"),
+                "core_end_in_context": item.get("_lr_core_end_in_context"),
                 "core_sha256": item.get("_lr_unit_sha256"),
                 "context_sha256": item.get("_lr_context_sha256"),
             },
@@ -13862,6 +13709,7 @@ unit_id и core_sha256 скопируй без изменений.
             _validate_entity_catalog_leaf_evidence_binding(
                 catalog,
                 receipts,
+                expected_claims=claims,
                 profile=profile,
             )
             return _attach_core_decisions(
@@ -13944,9 +13792,7 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    expected_unit_ids = [
-        str(item.get("_lr_unit_id") or "") for item in answer_units
-    ]
+    expected_unit_ids = [str(item.get("_lr_unit_id") or "") for item in answer_units]
     expected_claims = _core_unit_claims(answer_units)
     leaf_catalogs = list(chunk_catalogs)
     all_decisions = _core_decisions_from_inputs(
@@ -14007,9 +13853,7 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
                 "partition_manifest": _long_response_manifest_pointer(
                     partition_manifests
                 ),
-                "complete_lineage": _long_response_lineage_pointer(
-                    complete_lineage
-                ),
+                "complete_lineage": _long_response_lineage_pointer(complete_lineage),
             }
         )
         if entity_catalog_request_bytes(final_payload) <= int(
@@ -14110,9 +13954,7 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
             digest = _stable_json_sha256(payload)[:16]
             lineage = _long_response_lineage(group)
             decisions = _core_decisions_for_unit_ids(lineage, decision_index)
-            artifact_key = (
-                f"entity_catalog_merge_{merge_level}_{group_index}_{digest}"
-            )
+            artifact_key = f"entity_catalog_merge_{merge_level}_{group_index}_{digest}"
             async with semaphore:
                 merged_group = await _processing_artifact(
                     run_id,
@@ -14120,8 +13962,7 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
                     artifact_key=artifact_key,
                     schema=ENTITY_CATALOG_SCHEMA,
                     schema_name=(
-                        f"aiv_entity_catalog_merge_{merge_level}_"
-                        f"{group_index}"
+                        f"aiv_entity_catalog_merge_{merge_level}_{group_index}"
                     ),
                     system=merge_system,
                     user_payload=payload,
@@ -14182,14 +14023,11 @@ def _annotation_matches_answer(
 ) -> bool:
     """Accept an annotation only when every provenance field is current."""
 
-    stored_input_sha256 = str(
-        annotation.get("_annotation_input_sha256") or ""
-    )
+    stored_input_sha256 = str(annotation.get("_annotation_input_sha256") or "")
     repair_provenance = annotation.get("_annotation_repair_provenance")
     repair_resume_match = bool(
         isinstance(repair_provenance, dict)
-        and repair_provenance.get("version")
-        == "analysis-critic-targeted-repair-v1"
+        and repair_provenance.get("version") == "analysis-critic-targeted-repair-v1"
         and repair_provenance.get("repair_annotation_input_sha256")
         == stored_input_sha256
         and repair_provenance.get("resume_annotation_input_sha256")
@@ -14201,10 +14039,7 @@ def _annotation_matches_answer(
         and annotation.get("_answer_sha256")
         == hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         and annotation.get("_answer_model") == answer_model
-        and (
-            stored_input_sha256 == annotation_input_sha256
-            or repair_resume_match
-        )
+        and (stored_input_sha256 == annotation_input_sha256 or repair_resume_match)
     )
 
 
@@ -14219,9 +14054,7 @@ async def _unannotated_answers(
         ModelAnswer.status == "completed",
     ]
     if target_answer_ids is not None:
-        answer_conditions.append(
-            ModelAnswer.id.in_(sorted(target_answer_ids))
-        )
+        answer_conditions.append(ModelAnswer.id.in_(sorted(target_answer_ids)))
     async with SessionLocal() as session:
         rows = (
             await session.execute(
@@ -14250,21 +14083,23 @@ async def _unannotated_answers(
             annotation_input_sha256=annotation_input_sha256,
         ):
             continue
-        output.append({
-            "answer_id": answer.id,
-            "mode": answer.mode,
-            "system": labels.get(answer.provider_key, answer.provider_key),
-            "answer_model": answer.model,
-            "answer_sha256": answer_sha256,
-            # Kept out of the provider payload; used only by the targeted
-            # executor for an all-or-nothing compare-and-swap after the paid
-            # request returns.
-            "_prior_annotation_sha256": stable_digest(stored or {}),
-            "scenario": prompt.text,
-            "scenario_role": prompt.role,
-            "intent_class": prompt.intent_class,
-            "answer": answer_text,
-        })
+        output.append(
+            {
+                "answer_id": answer.id,
+                "mode": answer.mode,
+                "system": labels.get(answer.provider_key, answer.provider_key),
+                "answer_model": answer.model,
+                "answer_sha256": answer_sha256,
+                # Kept out of the provider payload; used only by the targeted
+                # executor for an all-or-nothing compare-and-swap after the paid
+                # request returns.
+                "_prior_annotation_sha256": stable_digest(stored or {}),
+                "scenario": prompt.text,
+                "scenario_role": prompt.role,
+                "intent_class": prompt.intent_class,
+                "answer": answer_text,
+            }
+        )
     return output
 
 
@@ -14346,9 +14181,7 @@ async def _save_targeted_recovery_annotations(
                 )
             )
         locked = await session.execute(
-            update(Run)
-            .where(*run_conditions)
-            .values(execution_slot=Run.execution_slot)
+            update(Run).where(*run_conditions).values(execution_slot=Run.execution_slot)
         )
         if locked.rowcount != 1:
             await session.rollback()
@@ -14383,17 +14216,13 @@ async def _save_targeted_recovery_annotations(
             snapshot = pending_by_id[answer_id]
             current_raw = str(answer.response_text or "")
             current_annotation = (
-                annotation.annotation_json
-                if annotation is not None
-                else {}
+                annotation.annotation_json if annotation is not None else {}
             )
             unchanged = bool(
                 answer.status == "completed"
                 and current_raw.strip()
                 and answer.model == snapshot.get("answer_model")
-                and hashlib.sha256(
-                    current_raw.encode("utf-8")
-                ).hexdigest()
+                and hashlib.sha256(current_raw.encode("utf-8")).hexdigest()
                 == snapshot.get("answer_sha256")
                 and stable_digest(current_annotation or {})
                 == snapshot.get("_prior_annotation_sha256")
@@ -14417,21 +14246,14 @@ def _alias_is_present(answer_text: str, alias: str) -> bool:
     return bool(_alias_spans(answer_text, [alias]))
 
 
-_PORTFOLIO_MATCH_POLICIES = frozenset(
-    {"standalone", "requires_target_attribution"}
-)
-_PROFILE_PORTFOLIO_RELATIONSHIPS = frozenset(
-    {"owned_by", "operated_by", "offered_by"}
-)
+_PORTFOLIO_MATCH_POLICIES = frozenset({"standalone", "requires_target_attribution"})
+_PROFILE_PORTFOLIO_RELATIONSHIPS = frozenset({"owned_by", "operated_by", "offered_by"})
 
 
 def _catalog_alias_value(value: Any) -> str:
     if isinstance(value, dict):
         return str(
-            value.get("value")
-            or value.get("alias")
-            or value.get("text")
-            or ""
+            value.get("value") or value.get("alias") or value.get("text") or ""
         ).strip()
     return str(value or "").strip()
 
@@ -14439,14 +14261,9 @@ def _catalog_alias_value(value: Any) -> str:
 def _entity_alias_values(entity: dict[str, Any]) -> list[str]:
     values = [
         str(entity.get("canonical_name") or "").strip(),
-        *[
-            _catalog_alias_value(value)
-            for value in entity.get("aliases") or []
-        ],
+        *[_catalog_alias_value(value) for value in entity.get("aliases") or []],
     ]
-    return list(
-        dict.fromkeys(value for value in values if len(value) >= 2)
-    )
+    return list(dict.fromkeys(value for value in values if len(value) >= 2))
 
 
 def _portfolio_mention_policy(
@@ -14529,8 +14346,7 @@ def _bounded_edit_distance(left: str, right: str, limit: int) -> int:
                 min(
                     current[-1] + 1,
                     previous[right_index] + 1,
-                    previous[right_index - 1]
-                    + (left_char != right_char),
+                    previous[right_index - 1] + (left_char != right_char),
                 )
             )
             row_minimum = min(row_minimum, current[-1])
@@ -14612,11 +14428,9 @@ def _profile_name_confirms_contextual_alias(
         ):
             return True
         cross_script = bool(
-            re.search(r"[a-z]", alias_token)
-            and re.search(r"[а-я]", trusted_token)
+            re.search(r"[a-z]", alias_token) and re.search(r"[а-я]", trusted_token)
         ) or bool(
-            re.search(r"[а-я]", alias_token)
-            and re.search(r"[a-z]", trusted_token)
+            re.search(r"[а-я]", alias_token) and re.search(r"[a-z]", trusted_token)
         )
         if not cross_script:
             continue
@@ -14637,9 +14451,7 @@ def _entity_alias_entries(
 
     default_policy = _portfolio_mention_policy(entity, profile)
     canonical_name = str(entity.get("canonical_name") or "").strip()
-    candidates: list[tuple[str, str, bool]] = [
-        (canonical_name, default_policy, True)
-    ]
+    candidates: list[tuple[str, str, bool]] = [(canonical_name, default_policy, True)]
     for raw_alias in entity.get("aliases") or []:
         alias = _catalog_alias_value(raw_alias)
         policy = (
@@ -14659,15 +14471,11 @@ def _entity_alias_entries(
     if profile is not None and _catalog_marks_portfolio_entity(entity):
         trusted_names = _profile_confirmed_names_for_entity(entity, profile)
     trusted_normalized = {
-        value.casefold().replace("ё", "е").strip()
-        for value in trusted_names
+        value.casefold().replace("ё", "е").strip() for value in trusted_names
     }
     provenance_guarded = bool(
         _catalog_marks_portfolio_entity(entity)
-        and (
-            profile is not None
-            or "_profile_confirmed_match_aliases" in entity
-        )
+        and (profile is not None or "_profile_confirmed_match_aliases" in entity)
     )
 
     excluded_normalized = {
@@ -14705,13 +14513,9 @@ def _entity_alias_entries(
             # when the site's own profile independently confirms that alias
             # for this entity (for example ``DOOH`` or ``аналитика``).
             continue
-        if (
-            len(lexical_tokens) == 1
-            and any(
-                normalized
-                in re.findall(r"[a-zа-я0-9]+", excluded, re.UNICODE)
-                for excluded in excluded_normalized
-            )
+        if len(lexical_tokens) == 1 and any(
+            normalized in re.findall(r"[a-zа-я0-9]+", excluded, re.UNICODE)
+            for excluded in excluded_normalized
         ):
             continue
         if (
@@ -14724,10 +14528,7 @@ def _entity_alias_entries(
             # canonical product.  Only exact site-profile names may do so.
             policy = "requires_target_attribution"
         existing = entries.get(normalized)
-        if (
-            existing is None
-            or policy == "requires_target_attribution"
-        ):
+        if existing is None or policy == "requires_target_attribution":
             # Conflicting duplicate declarations resolve to the safer policy.
             entries[normalized] = (alias, policy)
     return list(entries.values())
@@ -14751,13 +14552,10 @@ def _target_aliases(
     for entity in profile.get("entity_scope") or []:
         if not isinstance(entity, dict):
             continue
-        relationship = str(
-            entity.get("relationship") or ""
-        ).casefold()
+        relationship = str(entity.get("relationship") or "").casefold()
         if (
             relationship != "self"
-            or str(entity.get("entity_type") or "").casefold()
-            != "primary_brand"
+            or str(entity.get("entity_type") or "").casefold() != "primary_brand"
             or entity.get("commercially_relevant") is not True
             or str(entity.get("confidence") or "").casefold() == "low"
         ):
@@ -14765,18 +14563,11 @@ def _target_aliases(
         aliases.extend(
             [
                 str(entity.get("canonical_name") or ""),
-                *[
-                    str(value or "")
-                    for value in entity.get("aliases") or []
-                ],
+                *[str(value or "") for value in entity.get("aliases") or []],
             ]
         )
     return list(
-        dict.fromkeys(
-            alias.strip()
-            for alias in aliases
-            if len(alias.strip()) >= 2
-        )
+        dict.fromkeys(alias.strip() for alias in aliases if len(alias.strip()) >= 2)
     )
 
 
@@ -14810,18 +14601,11 @@ def _attribution_owner_aliases(
         aliases.extend(
             [
                 str(scoped.get("canonical_name") or ""),
-                *[
-                    str(value or "")
-                    for value in scoped.get("aliases") or []
-                ],
+                *[str(value or "") for value in scoped.get("aliases") or []],
             ]
         )
     return list(
-        dict.fromkeys(
-            alias.strip()
-            for alias in aliases
-            if len(alias.strip()) >= 2
-        )
+        dict.fromkeys(alias.strip() for alias in aliases if len(alias.strip()) >= 2)
     )
 
 
@@ -14840,9 +14624,7 @@ def _entity_attribution_aliases(
     """
 
     direct = _target_aliases(profile, catalog)
-    direct_keys = {
-        value.casefold().replace("ё", "е").strip() for value in direct
-    }
+    direct_keys = {value.casefold().replace("ё", "е").strip() for value in direct}
     # The answer-derived alias list is not authoritative for ownership.  A
     # catalog model could otherwise attach ``MR Group`` to any confirmed JOIS
     # feature and make a sibling project's claim look target-owned.  Only the
@@ -14888,11 +14670,11 @@ def _catalog_marks_portfolio_entity(entity: dict[str, Any]) -> bool:
         or entity.get("commercially_relevant", True) is not True
     ):
         return False
-    relationship = str(
-        entity.get("target_relationship")
-        or entity.get("relationship")
-        or ""
-    ).strip().casefold()
+    relationship = (
+        str(entity.get("target_relationship") or entity.get("relationship") or "")
+        .strip()
+        .casefold()
+    )
     return relationship in {
         "portfolio_entity",
         *_PROFILE_PORTFOLIO_RELATIONSHIPS,
@@ -14915,12 +14697,7 @@ def _profile_confirmed_names_for_entity(
         return []
 
     def identity_text(value: str) -> str:
-        return (
-            unicodedata.normalize("NFKC", value)
-            .casefold()
-            .replace("ё", "е")
-            .strip()
-        )
+        return unicodedata.normalize("NFKC", value).casefold().replace("ё", "е").strip()
 
     def identity_tokens(value: str) -> list[str]:
         return [
@@ -15006,10 +14783,7 @@ def _profile_confirmed_names_for_entity(
             continue
         scoped_names = [
             str(scoped.get("canonical_name") or "").strip(),
-            *[
-                str(value or "").strip()
-                for value in scoped.get("aliases") or []
-            ],
+            *[str(value or "").strip() for value in scoped.get("aliases") or []],
         ]
         if any(canonical_matches(value) for value in scoped_names if value):
             confirmed.extend(scoped_names)
@@ -15043,24 +14817,16 @@ def _scoped_entity_resolution_priority(entity: dict[str, Any]) -> int:
     """
 
     relationship = str(
-        entity.get("target_relationship")
-        or entity.get("relationship")
-        or ""
+        entity.get("target_relationship") or entity.get("relationship") or ""
     ).casefold()
-    if (
-        entity.get("category") == "target"
-        and relationship in {"exact_target", "self"}
-    ):
+    if entity.get("category") == "target" and relationship in {"exact_target", "self"}:
         return 40
     if (
         _catalog_marks_portfolio_entity(entity)
         and entity.get("_profile_membership_confirmed") is True
     ):
         return 30
-    if (
-        entity.get("category") == "competitor"
-        or relationship == "competitor"
-    ):
+    if entity.get("category") == "competitor" or relationship == "competitor":
         return 20
     if entity.get("category") == "other" or relationship == "unrelated":
         return 10
@@ -15147,15 +14913,13 @@ def _alias_spans(answer_text: str, aliases: list[str]) -> list[tuple[int, int]]:
             token_start = start
             while (
                 token_start > 0
-                and normalized_text[token_start - 1]
-                not in " \t\r\n<>[](){}\"'«»“”"
+                and normalized_text[token_start - 1] not in " \t\r\n<>[](){}\"'«»“”"
             ):
                 token_start -= 1
             token_end = end
             while (
                 token_end < len(normalized_text)
-                and normalized_text[token_end]
-                not in " \t\r\n<>[](){}\"'«»“”"
+                and normalized_text[token_end] not in " \t\r\n<>[](){}\"'«»“”"
             ):
                 token_end += 1
             token = normalized_text[token_start:token_end].strip(".,;:")
@@ -15259,9 +15023,7 @@ def _contextual_alias_spans(
                     if base.endswith(ending) and len(base) - len(ending) >= 5:
                         base = base[: -len(ending)]
                         break
-                pattern_parts.append(
-                    re.escape(base) + _RUSSIAN_INFLECTION_PATTERN
-                )
+                pattern_parts.append(re.escape(base) + _RUSSIAN_INFLECTION_PATTERN)
                 inflected = True
             else:
                 pattern_parts.append(re.escape(token))
@@ -15360,18 +15122,14 @@ def _allowlisted_service_form_spans(
     pattern_parts: list[str] = []
     cursor = 0
     for token_match in token_matches:
-        pattern_parts.append(
-            re.escape(normalized_alias[cursor : token_match.start()])
-        )
+        pattern_parts.append(re.escape(normalized_alias[cursor : token_match.start()]))
         token = token_match.group(0)
         family = _SAFE_SERVICE_FORM_FAMILY_BY_TOKEN.get(token)
         if family is None:
             pattern_parts.append(re.escape(token))
         else:
             variants = sorted(family, key=lambda value: (-len(value), value))
-            pattern_parts.append(
-                "(?:" + "|".join(map(re.escape, variants)) + ")"
-            )
+            pattern_parts.append("(?:" + "|".join(map(re.escape, variants)) + ")")
         cursor = token_match.end()
     pattern_parts.append(re.escape(normalized_alias[cursor:]))
     pattern = "".join(pattern_parts)
@@ -15585,22 +15343,14 @@ def _structured_field_has_competing_owner(
                 re.UNICODE,
             )
         )
-        if (
-            owner_label is not None
-            and not _structured_label_starts_field(line_prefix)
-        ):
+        if owner_label is not None and not _structured_label_starts_field(line_prefix):
             label = owner_label.group(1).strip()
             normalized_label = label.casefold().replace("ё", "е")
             if (
                 not _markdown_colon_label_is_field(label)
-                and _STRUCTURED_ATTRIBUTION_LABEL.fullmatch(
-                    normalized_label
-                ) is None
+                and _STRUCTURED_ATTRIBUTION_LABEL.fullmatch(normalized_label) is None
                 and normalized_label not in generic_owners
-                and not any(
-                    _alias_is_present(label, alias)
-                    for alias in target_aliases
-                )
+                and not any(_alias_is_present(label, alias) for alias in target_aliases)
             ):
                 # ``- ПИК: White Box доступен`` is a competitor-owned claim,
                 # even when it sits directly below a ``### JOIS`` heading.
@@ -15629,9 +15379,7 @@ def _structured_field_has_competing_owner(
         )
         if postfix_owner is not None:
             owner = postfix_owner.group(1).strip()
-            if not any(
-                _alias_is_present(owner, alias) for alias in target_aliases
-            ):
+            if not any(_alias_is_present(owner, alias) for alias in target_aliases):
                 return True
         _raw_start, raw_end = _attribution_claim_bounds(
             value,
@@ -15716,9 +15464,8 @@ def _structured_field_mentions_entity(
                 target_aliases,
             ):
                 return True
-            if (
-                segment_index != len(segments) - 1
-                or not _structured_separator_only(field_value)
+            if segment_index != len(segments) - 1 or not _structured_separator_only(
+                field_value
             ):
                 continue
             continuation_value = re.split(
@@ -15743,8 +15490,7 @@ def _structured_field_mentions_entity(
             continue
         if field_open and _STRUCTURED_FIELD_CONTINUATION.match(segment):
             if any(
-                _contextual_alias_is_present(segment, alias)
-                for alias in entity_aliases
+                _contextual_alias_is_present(segment, alias) for alias in entity_aliases
             ) and not _structured_field_has_competing_owner(
                 segment,
                 entity_aliases,
@@ -15846,14 +15592,10 @@ def _has_structured_target_attribution(
                     owner_line,
                     [target_alias],
                 ):
-                    if not _structured_owner_prefix_only(
-                        owner_line[:target_start]
-                    ):
+                    if not _structured_owner_prefix_only(owner_line[:target_start]):
                         continue
                     owner_tail = owner_line[target_end:]
-                    inline_label = _STRUCTURED_ATTRIBUTION_LABEL.search(
-                        owner_tail
-                    )
+                    inline_label = _STRUCTURED_ATTRIBUTION_LABEL.search(owner_tail)
                     if inline_label is not None:
                         if not _structured_owner_separator_only(
                             owner_tail[: inline_label.start()],
@@ -15892,8 +15634,7 @@ def _has_structured_target_attribution(
                         ):
                             return True
                         if (
-                            _STRUCTURED_ATTRIBUTION_LABEL.search(candidate)
-                            is not None
+                            _STRUCTURED_ATTRIBUTION_LABEL.search(candidate) is not None
                             or _STRUCTURED_ANY_FIELD.match(candidate) is not None
                             or re.match(r"^[\s]*[-•·]", candidate) is not None
                             or _structured_separator_only(candidate)
@@ -16022,11 +15763,7 @@ def _markdown_heading_signature(line: str) -> tuple[str, int] | None:
         # is a field inside the current card, not a new sibling card.
         if bold_heading.group(1).strip().endswith(":"):
             label = bold_heading.group(1).strip()[:-1].strip()
-            return (
-                None
-                if _markdown_colon_label_is_field(label)
-                else ("colon", 0)
-            )
+            return None if _markdown_colon_label_is_field(label) else ("colon", 0)
         return "bold", 0
     bold_list_heading = _MARKDOWN_BOLD_LIST_HEADING.match(line)
     if bold_list_heading is not None:
@@ -16052,11 +15789,7 @@ def _markdown_heading_signature(line: str) -> tuple[str, int] | None:
         and len(stripped.split()) <= 10
         and re.search(r"[.!?;:]$", stripped) is None
         and re.search(r"[A-Za-zА-Яа-яЁё]", stripped) is not None
-        and (
-            stripped[0].isupper()
-            or stripped[0].isdigit()
-            or stripped.isupper()
-        )
+        and (stripped[0].isupper() or stripped[0].isdigit() or stripped.isupper())
     ):
         return "plain", 0
     return None
@@ -16164,9 +15897,7 @@ def _relation_has_competing_owner(
             owner = match.group(1).strip()
             if owner in generic_owners:
                 continue
-            if not any(
-                _alias_is_present(owner, alias) for alias in allowed_aliases
-            ):
+            if not any(_alias_is_present(owner, alias) for alias in allowed_aliases):
                 return True
     return False
 
@@ -16208,10 +15939,7 @@ def _has_markdown_scoped_target_attribution(
             )
             owner_signature = _markdown_heading_signature(owner_line)
             owner_has_explicit_markdown_scope = bool(
-                (
-                    owner_signature is not None
-                    and owner_signature[0] != "plain"
-                )
+                (owner_signature is not None and owner_signature[0] != "plain")
                 or re.match(
                     r"^\s*(?:#{1,6}\s+|[-*•]\s+|\*\*)",
                     owner_line,
@@ -16261,8 +15989,7 @@ def _has_markdown_scoped_target_attribution(
                                     is not None
                                 )
                                 or (
-                                    re.match(r"^\s*[-*•]", owner_line)
-                                    is not None
+                                    re.match(r"^\s*[-*•]", owner_line) is not None
                                     and re.search(
                                         r"(?:в\s+продаже|есть|доступ\w*|"
                                         r"представлен\w*|предлага\w*|"
@@ -16278,15 +16005,12 @@ def _has_markdown_scoped_target_attribution(
                             return True
                     elif entity_end <= target_start:
                         relation = normalized_line[entity_end:target_start]
-                        if (
-                            not _relation_has_competing_owner(
-                                relation,
-                                target_aliases,
-                            )
-                            and _gap_has_attribution_cue(
-                                relation,
-                                target_first=False,
-                            )
+                        if not _relation_has_competing_owner(
+                            relation,
+                            target_aliases,
+                        ) and _gap_has_attribution_cue(
+                            relation,
+                            target_first=False,
                         ):
                             return True
 
@@ -16320,9 +16044,7 @@ def _has_markdown_scoped_target_attribution(
                 )
                 if not claim_entity_aliases:
                     continue
-                candidate = "\n".join(
-                    lines[owner_index : claim_index + 1]
-                ).strip()
+                candidate = "\n".join(lines[owner_index : claim_index + 1]).strip()
                 if (
                     candidate
                     and not _structured_field_has_competing_owner(
@@ -16351,12 +16073,11 @@ def _has_markdown_scoped_target_attribution(
             claim_line = lines[claim_index]
             if _markdown_peer_scope_starts(claim_line, signature):
                 break
-            if (
-                _MARKDOWN_OWNER_FIELD.search(claim_line) is not None
-                and not _markdown_owner_field_matches(
-                    claim_line,
-                    known_owners,
-                )
+            if _MARKDOWN_OWNER_FIELD.search(
+                claim_line
+            ) is not None and not _markdown_owner_field_matches(
+                claim_line,
+                known_owners,
             ):
                 break
             claim_entity_aliases = _attribution_entity_aliases_in_text(
@@ -16365,12 +16086,9 @@ def _has_markdown_scoped_target_attribution(
             )
             if not claim_entity_aliases:
                 continue
-            if (
-                signature[0] == "plain"
-                and not _contextual_alias_spans(
-                    claim_line,
-                    entity_aliases,
-                )
+            if signature[0] == "plain" and not _contextual_alias_spans(
+                claim_line,
+                entity_aliases,
             ):
                 # Derivational service forms are deliberately narrower than
                 # ordinary exact aliases: a bare prose line is not a proven
@@ -16400,8 +16118,7 @@ def _has_markdown_scoped_target_attribution(
             )
             parent_label = _markdown_colon_label(parent_item)
             parent_is_field = bool(
-                parent_label
-                and _markdown_colon_label_is_field(parent_label)
+                parent_label and _markdown_colon_label_is_field(parent_label)
             )
             if (
                 parent_item
@@ -16707,8 +16424,7 @@ def _scope_qualification_targets_other(
     ):
         scoped_value = match.group(1).strip()
         if not any(
-            _alias_is_present(scoped_value, alias)
-            for alias in direct_target_aliases
+            _alias_is_present(scoped_value, alias) for alias in direct_target_aliases
         ):
             return True
     return False
@@ -16812,8 +16528,7 @@ def _evidence_restricts_claim_to_other_scope(
         ):
             bound_scope = binding.group(1).strip()
             if not any(
-                _alias_is_present(bound_scope, alias)
-                for alias in direct_target_aliases
+                _alias_is_present(bound_scope, alias) for alias in direct_target_aliases
             ):
                 return True
 
@@ -16917,8 +16632,7 @@ def _entity_local_claim_context(
         + [
             position + 1
             for mark in ".!?;"
-            if (position := answer_text.rfind(mark, line_start, entity_start))
-            >= 0
+            if (position := answer_text.rfind(mark, line_start, entity_start)) >= 0
         ]
     )
     clause_ends = [
@@ -16932,10 +16646,7 @@ def _entity_local_claim_context(
     def is_negative_qualification(value: str) -> bool:
         normalized = _normalized_evidence_text(value)
         direct_negative = bool(
-            any(
-                _alias_is_present(normalized, alias)
-                for alias in direct_target_aliases
-            )
+            any(_alias_is_present(normalized, alias) for alias in direct_target_aliases)
             and re.search(
                 r"\b(?:не|нет|недоступ\w*|отсутств\w*|"
                 r"исключ\w*|кроме|не\s+распространя\w*)\b",
@@ -16948,12 +16659,15 @@ def _entity_local_claim_context(
             entity_aliases,
             direct_target_aliases,
         )
-        contrast_or_exclusive = re.search(
-            r"\b(?:но|однако|только|лишь|исключительно|"
-            r"эксклюзив\w*|принадлеж\w*|разработ\w*|создан\w*)\b",
-            normalized,
-            re.UNICODE,
-        ) is not None
+        contrast_or_exclusive = (
+            re.search(
+                r"\b(?:но|однако|только|лишь|исключительно|"
+                r"эксклюзив\w*|принадлеж\w*|разработ\w*|создан\w*)\b",
+                normalized,
+                re.UNICODE,
+            )
+            is not None
+        )
         return bool(
             direct_negative
             or _scope_qualification_targets_other(
@@ -17068,24 +16782,18 @@ def _attribution_pair_crosses_scope_boundary(
             line,
             target_aliases,
         )
-        if (
-            _markdown_heading_signature(line) is not None
-            and not line_mentions_target
-        ):
+        if _markdown_heading_signature(line) is not None and not line_mentions_target:
             return True
-        if (
-            _MARKDOWN_OWNER_FIELD.search(line) is not None
-            and not _markdown_owner_field_matches(line, target_aliases)
-        ):
+        if _MARKDOWN_OWNER_FIELD.search(
+            line
+        ) is not None and not _markdown_owner_field_matches(line, target_aliases):
             return True
 
         line_indent = _markdown_list_item_indent(line)
         if line_indent is None or line_mentions_target:
             continue
         label = _markdown_colon_label(line)
-        is_field = bool(
-            label and _markdown_colon_label_is_field(label)
-        )
+        is_field = bool(label and _markdown_colon_label_is_field(label))
         if is_field:
             continue
         if target_indent is not None and line_indent <= target_indent:
@@ -17163,10 +16871,7 @@ def _attribution_pair_is_disqualified(
             direct_target_aliases,
             entity_aliases,
         )
-        or (
-            competing_owner
-            and (not direct_binding or later_competing_qualification)
-        )
+        or (competing_owner and (not direct_binding or later_competing_qualification))
     )
 
 
@@ -17237,11 +16942,7 @@ def _literal_target_attribution_evidence(
             else:
                 ends.add(line_end)
                 next_line_end = answer_text.find("\n", line_end + 1)
-                ends.add(
-                    text_length
-                    if next_line_end < 0
-                    else next_line_end
-                )
+                ends.add(text_length if next_line_end < 0 else next_line_end)
 
             for start in starts:
                 for end in ends:
@@ -17434,8 +17135,7 @@ def _reconcile_annotation(
         if isinstance(value, dict)
     ]
     existing_names = {
-        str(value.get("canonical_name") or "").casefold()
-        for value in mentions
+        str(value.get("canonical_name") or "").casefold() for value in mentions
     }
     existing_mentions = {
         str(value.get("canonical_name") or "").casefold(): value
@@ -17458,9 +17158,8 @@ def _reconcile_annotation(
             direct_aliases,
         )
         is_portfolio_candidate = _catalog_marks_portfolio_entity(entity)
-        if (
-            is_portfolio_candidate
-            and not _profile_confirms_portfolio_entity(entity, profile)
+        if is_portfolio_candidate and not _profile_confirms_portfolio_entity(
+            entity, profile
         ):
             continue
         matching_aliases = [
@@ -17560,43 +17259,39 @@ def _reconcile_annotation(
     for mention in mentions:
         if mention.get("attributed_to_target") is not True:
             continue
-        entity = entities_by_name.get(
-            str(mention.get("canonical_name") or "").casefold()
-        ) or {}
+        entity = (
+            entities_by_name.get(str(mention.get("canonical_name") or "").casefold())
+            or {}
+        )
         attribution_aliases = entity_attribution_aliases.get(
             str(entity.get("canonical_name") or "").casefold(),
             direct_aliases,
         )
         relationship = str(
-            entity.get("target_relationship")
-            or entity.get("relationship")
-            or ""
+            entity.get("target_relationship") or entity.get("relationship") or ""
         ).casefold()
-        is_exact_target = (
-            entity.get("category") == "target"
-            and relationship in {"exact_target", "self"}
-        )
+        is_exact_target = entity.get("category") == "target" and relationship in {
+            "exact_target",
+            "self",
+        }
         if is_exact_target:
             continue
-        if (
-            not _catalog_marks_portfolio_entity(entity)
-            or not _profile_confirms_portfolio_entity(entity, profile)
-        ):
+        if not _catalog_marks_portfolio_entity(
+            entity
+        ) or not _profile_confirms_portfolio_entity(entity, profile):
             mention["attributed_to_target"] = False
             reconciliation_notes.append(
                 "Снята атрибуция сущности вне подтверждённого портфеля: "
                 f"{mention.get('canonical_name')}."
             )
             continue
-        if (
-            _portfolio_entity_is_grounded(
-                answer_text,
-                entity,
-                attribution_aliases,
-                mention,
-                direct_target_aliases=direct_aliases,
-                confirmed_owner_aliases=confirmed_owner_aliases,
-            )
+        if _portfolio_entity_is_grounded(
+            answer_text,
+            entity,
+            attribution_aliases,
+            mention,
+            direct_target_aliases=direct_aliases,
+            confirmed_owner_aliases=confirmed_owner_aliases,
         ):
             continue
         contextual_aliases = [
@@ -17653,9 +17348,7 @@ def _reconcile_annotation(
         alias_entries = _entity_alias_entries(
             entity,
             profile,
-            excluded_aliases=(
-                attribution_aliases if is_portfolio_candidate else []
-            ),
+            excluded_aliases=(attribution_aliases if is_portfolio_candidate else []),
         )
         matching_alias_entries = [
             (alias, policy)
@@ -17768,9 +17461,7 @@ def _reconcile_annotation(
             if isinstance(entity, dict)
             and entity.get("category") == "target"
             and str(
-                entity.get("target_relationship")
-                or entity.get("relationship")
-                or ""
+                entity.get("target_relationship") or entity.get("relationship") or ""
             ).casefold()
             in {"exact_target", "self"}
         }
@@ -17784,8 +17475,7 @@ def _reconcile_annotation(
             evidence
             for evidence in reconciled.get("evidence") or []
             if not any(
-                _alias_is_present(str(evidence), alias)
-                for alias in direct_aliases
+                _alias_is_present(str(evidence), alias) for alias in direct_aliases
             )
         ]
 
@@ -17820,10 +17510,7 @@ def _reconcile_annotation(
                     [
                         *[
                             str(value)
-                            for value in brand_answer.get(
-                                "supported_facets"
-                            )
-                            or []
+                            for value in brand_answer.get("supported_facets") or []
                             if value
                         ],
                         "offering",
@@ -17836,9 +17523,7 @@ def _reconcile_annotation(
                 "directness": "partial",
                 "specificity": "specific",
                 "supported_facets": supported_facets,
-                "contradictions": list(
-                    brand_answer.get("contradictions") or []
-                ),
+                "contradictions": list(brand_answer.get("contradictions") or []),
             }
             reconciliation_notes.append(
                 "Исправлен недопустимый not_applicable в брендовом "
@@ -17898,16 +17583,12 @@ def _merge_partitioned_annotations(
     """Deterministically reduce complete leaf annotations for one raw answer."""
 
     if not parts:
-        raise OpenRouterError(
-            f"No annotation units returned for answer_id {answer_id}"
-        )
+        raise OpenRouterError(f"No annotation units returned for answer_id {answer_id}")
 
     def unique_strings(values: list[Any]) -> list[str]:
         return list(
             dict.fromkeys(
-                text
-                for value in values
-                if (text := str(value or "").strip())
+                text for value in values if (text := str(value or "").strip())
             )
         )
 
@@ -17935,11 +17616,7 @@ def _merge_partitioned_annotations(
         target_role = "absent"
 
     sentiments = unique_strings(
-        [
-            part.get("sentiment")
-            for part in parts
-            if part.get("sentiment") != "unknown"
-        ]
+        [part.get("sentiment") for part in parts if part.get("sentiment") != "unknown"]
     )
     sentiment = (
         "unknown"
@@ -17988,10 +17665,7 @@ def _merge_partitioned_annotations(
     }
     brand_answer = {
         "directness": max(
-            (
-                str(item.get("directness") or "not_applicable")
-                for item in brand_answers
-            ),
+            (str(item.get("directness") or "not_applicable") for item in brand_answers),
             key=lambda value: directness_priority.get(value, 0),
             default="not_applicable",
         ),
@@ -18031,11 +17705,7 @@ def _merge_partitioned_annotations(
             [value for part in parts for value in part.get("evidence") or []]
         ),
         "uncertainties": unique_strings(
-            [
-                value
-                for part in parts
-                for value in part.get("uncertainties") or []
-            ]
+            [value for part in parts for value in part.get("uncertainties") or []]
         ),
     }
 
@@ -18209,8 +17879,7 @@ def _annotation_context_records(
             {
                 **identity,
                 "record_id": (
-                    f"{kind}:{field}:{index}:"
-                    f"{_stable_json_sha256(identity)[:20]}"
+                    f"{kind}:{field}:{index}:{_stable_json_sha256(identity)[:20]}"
                 ),
                 "value": copy.deepcopy(value),
             }
@@ -18329,17 +17998,10 @@ def _annotation_selected_context_records(
         if any(_alias_is_present(answer_text, value) for value in strings):
             return True
         if brand_diagnostic and kind.startswith("profile_"):
-            return any(
-                answer_tokens & material_tokens(value)
-                for value in strings
-            )
+            return any(answer_tokens & material_tokens(value) for value in strings)
         return False
 
-    selected = [
-        record
-        for record in records
-        if is_relevant(record)
-    ]
+    selected = [record for record in records if is_relevant(record)]
     return selected, (
         "identity_plus_material_relevance_for_brand_diagnostic"
         if brand_diagnostic
@@ -18392,12 +18054,8 @@ def _annotation_context_payload(
                     "fragment_index": record.get("fragment_index"),
                     "fragment_count": record.get("fragment_count"),
                     "fragment_sha256": record.get("value_sha256"),
-                    "core_start_in_context": record.get(
-                        "core_start_in_context"
-                    ),
-                    "core_end_in_context": record.get(
-                        "core_end_in_context"
-                    ),
+                    "core_start_in_context": record.get("core_start_in_context"),
+                    "core_end_in_context": record.get("core_end_in_context"),
                     "core_sha256": record.get("core_sha256"),
                     "context_sha256": record.get("context_sha256"),
                     "ownership_rule": record.get("ownership_rule"),
@@ -18417,9 +18075,7 @@ def _annotation_context_payload(
     )
     selected_catalog_names: set[str] = set()
     selected_catalog_entities = [
-        entity
-        for entity in catalog_entities
-        if isinstance(entity, dict)
+        entity for entity in catalog_entities if isinstance(entity, dict)
     ]
     selected_catalog_entities.extend(
         value
@@ -18526,9 +18182,7 @@ def _annotation_split_oversized_record(
         target_chars=target_chars,
     )
     if "".join(unit.text for unit in units) != serialized:
-        raise OpenRouterError(
-            "Annotation context partition changed the source record"
-        )
+        raise OpenRouterError("Annotation context partition changed the source record")
     output: list[dict[str, Any]] = []
     for unit in units:
         # Semantic overlap keeps a name or relationship intact at a shard
@@ -18573,9 +18227,7 @@ async def _annotate_answers(
         normalized_target_ids = {
             value
             for value in target_answer_ids
-            if isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
         }
         if normalized_target_ids != target_answer_ids or not normalized_target_ids:
             raise OpenRouterError(
@@ -18652,7 +18304,9 @@ context_provenance описывает code-owned subset/shard полного а�
 {LIVE_RUSSIAN_RULES}
 """.strip()
     if repair_mode == "analysis_critic_targeted_v1":
-        system += "\n\n" + """
+        system += (
+            "\n\n"
+            + """
 
 Режим узкого восстановления после critic gate:
 - размечай только переданные answer_id; другие ответы не входят в запрос и не
@@ -18669,9 +18323,8 @@ context_provenance описывает code-owned subset/shard полного а�
 - если непрерывного доказательного блока нет, сохрани
   attributed_to_target=false. Не синтезируй цитату.
 """.strip()
-    pending_by_source_id = {
-        int(item["answer_id"]): item for item in pending
-    }
+        )
+    pending_by_source_id = {int(item["answer_id"]): item for item in pending}
     partition_target_aliases = _target_aliases(profile, catalog)
     all_context_records = _annotation_context_records(profile, catalog)
     full_alias_map = _entity_attribution_alias_map(profile, catalog)
@@ -18708,9 +18361,7 @@ context_provenance описывает code-owned subset/shard полного а�
         minimum_requests_fit = True
         for preflight_index, item in enumerate(unit_pending, start=1):
             preflight_item = dict(item)
-            preflight_item["_lr_original_answer_id"] = int(
-                preflight_item["answer_id"]
-            )
+            preflight_item["_lr_original_answer_id"] = int(preflight_item["answer_id"])
             preflight_item["answer_id"] = -preflight_index
             minimal_payload = _annotation_context_payload(
                 profile=profile,
@@ -18726,9 +18377,7 @@ context_provenance описывает code-owned subset/shard полного а�
                 shard_index=0,
                 shard_count=1,
             )
-            if annotation_request_bytes(minimal_payload) > (
-                annotation_window_bytes
-            ):
+            if annotation_request_bytes(minimal_payload) > (annotation_window_bytes):
                 minimum_requests_fit = False
                 break
         if minimum_requests_fit:
@@ -18744,10 +18393,13 @@ context_provenance описывает code-owned subset/shard полного а�
         item["_lr_original_answer_id"] = int(item["answer_id"])
         item["answer_id"] = -synthetic_index
     batch_jobs: list[dict[str, Any]] = []
-    next_shard_answer_id = min(
-        (int(item["answer_id"]) for item in unit_pending),
-        default=0,
-    ) - 1
+    next_shard_answer_id = (
+        min(
+            (int(item["answer_id"]) for item in unit_pending),
+            default=0,
+        )
+        - 1
+    )
 
     def append_job(
         batch: list[dict[str, Any]],
@@ -18809,10 +18461,7 @@ context_provenance описывает code-owned subset/shard полного а�
                 "request_to_unit": request_to_unit,
                 "unit_ids": sorted(set(request_to_unit.values())),
                 "source_answer_ids": sorted(
-                    {
-                        int(item["_lr_original_answer_id"])
-                        for item in batch
-                    }
+                    {int(item["_lr_original_answer_id"]) for item in batch}
                 ),
                 "artifact_key": f"annotations_{digest}_{ANNOTATION_VERSION}",
                 "schema_name": f"aiv_annotations_{digest}",
@@ -18872,9 +18521,7 @@ context_provenance описывает code-owned subset/shard полного а�
                 shard_index=0,
                 shard_count=max(1, len(selected_records)),
             )
-            if annotation_request_bytes(single_payload) <= (
-                annotation_window_bytes
-            ):
+            if annotation_request_bytes(single_payload) <= (annotation_window_bytes):
                 expanded_records.append(record)
             else:
                 fragment_target_chars = 8_000
@@ -18984,8 +18631,7 @@ context_provenance описывает code-owned subset/shard полного а�
             shard_count=1,
         )
         if current_batch and (
-            annotation_request_bytes(trial_payload)
-            > annotation_window_bytes
+            annotation_request_bytes(trial_payload) > annotation_window_bytes
         ):
             plan_batch(current_batch)
             current_batch = [item]
@@ -19026,17 +18672,13 @@ context_provenance описывает code-owned subset/shard полного а�
     ]
     context_parts_by_unit: dict[int, list[dict[str, Any]]] = defaultdict(list)
     expected_context_parts = Counter(
-        unit_id
-        for job in batch_jobs
-        for unit_id in job["unit_ids"]
+        unit_id for job in batch_jobs for unit_id in job["unit_ids"]
     )
     remaining_context_jobs = Counter(expected_context_parts)
     processed_units: set[int] = set()
     failed_unit_ids: set[int] = set()
     failed_source_ids: set[int] = set()
-    unit_by_synthetic_id = {
-        int(item["answer_id"]): item for item in unit_pending
-    }
+    unit_by_synthetic_id = {int(item["answer_id"]): item for item in unit_pending}
     try:
         # LLM requests run concurrently. Nothing is reduced or persisted for
         # a source answer until every code-owned unit has returned exactly once.
@@ -19056,8 +18698,7 @@ context_provenance описывает code-owned subset/shard полного а�
                 returned = [
                     item
                     for item in result.get("answers") or []
-                    if isinstance(item, dict)
-                    and isinstance(item.get("answer_id"), int)
+                    if isinstance(item, dict) and isinstance(item.get("answer_id"), int)
                 ]
                 returned_ids = [int(item["answer_id"]) for item in returned]
                 if Counter(returned_ids) != Counter(answer_ids):
@@ -19087,8 +18728,7 @@ context_provenance описывает code-owned subset/shard полного а�
                 stage="knowledge_gap",
                 percent=73 + round(ratio * 7),
                 detail=(
-                    "Размечаем упоминания, позиции и контекст: "
-                    f"{round(ratio * 100)}%."
+                    f"Размечаем упоминания, позиции и контекст: {round(ratio * 100)}%."
                 ),
                 eta_seconds=max(180, int(420 * (1 - ratio))),
             )
@@ -19098,9 +18738,7 @@ context_provenance описывает code-owned subset/shard полного а�
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    parts_by_source_id: dict[int, list[tuple[int, dict[str, Any]]]] = (
-        defaultdict(list)
-    )
+    parts_by_source_id: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     for unit_id, unit in unit_by_synthetic_id.items():
         source_id = int(unit["_lr_original_answer_id"])
         context_parts = context_parts_by_unit.get(unit_id, [])
@@ -19284,9 +18922,8 @@ def _row_has_completed_raw(row: dict[str, Any]) -> bool:
     # Persisted metric rows always carry answer_text. Keeping omitted text
     # compatible here makes the pure metric helper usable with synthetic rows;
     # an explicitly empty persisted value still fails closed.
-    has_nonempty_raw = (
-        "answer_text" not in row
-        or bool(str(row.get("answer_text") or "").strip())
+    has_nonempty_raw = "answer_text" not in row or bool(
+        str(row.get("answer_text") or "").strip()
     )
     return bool(
         row.get("status", "completed") == "completed"
@@ -19301,12 +18938,10 @@ def _slice_evidence_state(
     source_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     observational = sum(
-        row.get("metric_evidence_state") == "legacy_observational"
-        for row in valid_rows
+        row.get("metric_evidence_state") == "legacy_observational" for row in valid_rows
     )
     strictly_attested = sum(
-        row.get("metric_evidence_state", "strict_verified")
-        == "strict_verified"
+        row.get("metric_evidence_state", "strict_verified") == "strict_verified"
         for row in valid_rows
     )
     legacy_retrieval_confirmed = sum(
@@ -19393,9 +19028,7 @@ def _visibility_slice(
     ]
     annotated = len(annotated_rows)
     valid_rows = [
-        row
-        for row in annotated_rows
-        if row["annotation"].get("valid") is True
+        row for row in annotated_rows if row["annotation"].get("valid") is True
     ]
     valid = len(valid_rows)
     evidence_state = _slice_evidence_state(valid_rows, source_rows=selected)
@@ -19421,9 +19054,7 @@ def _visibility_slice(
             "annotated_answers": annotated,
             "valid_answers": valid,
             "coverage_rate": (
-                _rate(valid, expected)
-                if completed or annotated
-                else None
+                _rate(valid, expected) if completed or annotated else None
             ),
             "data_state": "unavailable",
             "state": "unknown",
@@ -19460,14 +19091,13 @@ def _visibility_slice(
                 continue
             canonical = str(mention.get("canonical_name") or "").casefold()
             entity = (entity_catalog or {}).get(canonical) or {}
-            if (
-                not _is_portfolio_target_entity(entity)
-                or not _portfolio_entity_is_grounded(
-                    str(row.get("answer_text") or ""),
-                    entity,
-                    target_aliases or [],
-                    mention,
-                )
+            if not _is_portfolio_target_entity(
+                entity
+            ) or not _portfolio_entity_is_grounded(
+                str(row.get("answer_text") or ""),
+                entity,
+                target_aliases or [],
+                mention,
             ):
                 continue
             mentioned = True
@@ -19494,12 +19124,8 @@ def _visibility_slice(
         mentioned and isinstance(position, int) and position <= 3
         for mentioned, position, _role in outcomes
     )
-    recommended = sum(
-        role == "recommended" for _mentioned, _position, role in outcomes
-    )
-    conditional = sum(
-        role == "conditional" for _mentioned, _position, role in outcomes
-    )
+    recommended = sum(role == "recommended" for _mentioned, _position, role in outcomes)
+    conditional = sum(role == "conditional" for _mentioned, _position, role in outcomes)
     mention_rate = _rate(mentions, denominator)
     # A known absence is a valid non-top-3 outcome. A literal mention whose
     # global ordinal became unknowable after long-answer partitioning is not.
@@ -19507,9 +19133,7 @@ def _visibility_slice(
     recommendation_rate = _rate(recommended, denominator)
     score = (
         round(
-            0.25 * mention_rate
-            + 0.35 * top3_rate
-            + 0.40 * recommendation_rate,
+            0.25 * mention_rate + 0.35 * top3_rate + 0.40 * recommendation_rate,
             1,
         )
         if None not in (mention_rate, top3_rate, recommendation_rate)
@@ -19524,20 +19148,17 @@ def _visibility_slice(
                     continue
                 canonical = str(mention.get("canonical_name") or "").casefold()
                 entity = (entity_catalog or {}).get(canonical) or {}
-                if (
-                    not _is_portfolio_target_entity(entity)
-                    or not _portfolio_entity_is_grounded(
-                        str(row.get("answer_text") or ""),
-                        entity,
-                        target_aliases or [],
-                        mention,
-                    )
+                if not _is_portfolio_target_entity(
+                    entity
+                ) or not _portfolio_entity_is_grounded(
+                    str(row.get("answer_text") or ""),
+                    entity,
+                    target_aliases or [],
+                    mention,
                 ):
                     continue
                 display_name = str(
-                    entity.get("canonical_name")
-                    or mention.get("canonical_name")
-                    or ""
+                    entity.get("canonical_name") or mention.get("canonical_name") or ""
                 ).strip()
                 if display_name:
                     answer_entities.add(display_name)
@@ -19557,11 +19178,7 @@ def _visibility_slice(
         "completed_answers": completed,
         "annotated_answers": annotated,
         "valid_answers": valid,
-        "coverage_rate": (
-            _rate(valid, expected)
-            if completed or annotated
-            else None
-        ),
+        "coverage_rate": (_rate(valid, expected) if completed or annotated else None),
         "data_state": (
             "complete"
             if expected
@@ -19633,9 +19250,7 @@ async def _metric_rows(
             prompt_text=prompt.text,
             legacy_allowed=legacy_contract["eligible"],
         )
-        observation_attested, observation_state = _panel_observation_state(
-            answer
-        )
+        observation_attested, observation_state = _panel_observation_state(answer)
         annotation_is_current = bool(
             answer.status == "completed"
             and answer_text.strip()
@@ -19668,50 +19283,47 @@ async def _metric_rows(
             and observation_attested
             and metric_access["context_eligible"]
         )
-        output.append({
-            "answer_id": answer.id,
-            "mode": answer.mode,
-            "provider_key": answer.provider_key,
-            "prompt_id": prompt.id,
-            "prompt_key": prompt.prompt_key,
-            "scenario": prompt.text,
-            "intent_class": prompt.intent_class,
-            "role": prompt.role,
-            "status": answer.status,
-            "model": answer.model,
-            "citations_count": len(answer.citations_json or []),
-            "answer_text": answer_text,
-            "web_attested": web_attested,
-            "web_attestation_reason": web_attestation_reason,
-            "observation_state": observation_state,
-            "panel_evidence_version": (
-                LEGACY_PANEL_EVIDENCE_VERSION
-                if web_attestation_reason.startswith("legacy_")
-                else WEB_ATTESTATION_VERSION
-            ),
-            "panel_evidence_sha256": _panel_evidence_sha256(
-                answer,
-                reason=web_attestation_reason,
-                legacy_contract=legacy_contract,
-            ),
-            "metric_eligible": metric_eligible,
-            "context_eligible": context_eligible,
-            "metric_evidence_state": metric_access[
-                "metric_evidence_state"
-            ],
-            "metric_limitation": metric_access["metric_limitation"],
-            "annotation": stored if annotation_is_current else {},
-            "annotation_state": (
-                "current"
-                if annotation_is_current
-                else "ineligible"
-                if (
-                    answer.status != "completed"
-                    or not answer_text.strip()
-                )
-                else "missing_or_stale"
-            ),
-        })
+        output.append(
+            {
+                "answer_id": answer.id,
+                "mode": answer.mode,
+                "provider_key": answer.provider_key,
+                "prompt_id": prompt.id,
+                "prompt_key": prompt.prompt_key,
+                "scenario": prompt.text,
+                "intent_class": prompt.intent_class,
+                "role": prompt.role,
+                "status": answer.status,
+                "model": answer.model,
+                "citations_count": len(answer.citations_json or []),
+                "answer_text": answer_text,
+                "web_attested": web_attested,
+                "web_attestation_reason": web_attestation_reason,
+                "observation_state": observation_state,
+                "panel_evidence_version": (
+                    LEGACY_PANEL_EVIDENCE_VERSION
+                    if web_attestation_reason.startswith("legacy_")
+                    else WEB_ATTESTATION_VERSION
+                ),
+                "panel_evidence_sha256": _panel_evidence_sha256(
+                    answer,
+                    reason=web_attestation_reason,
+                    legacy_contract=legacy_contract,
+                ),
+                "metric_eligible": metric_eligible,
+                "context_eligible": context_eligible,
+                "metric_evidence_state": metric_access["metric_evidence_state"],
+                "metric_limitation": metric_access["metric_limitation"],
+                "annotation": stored if annotation_is_current else {},
+                "annotation_state": (
+                    "current"
+                    if annotation_is_current
+                    else "ineligible"
+                    if (answer.status != "completed" or not answer_text.strip())
+                    else "missing_or_stale"
+                ),
+            }
+        )
     return output
 
 
@@ -19750,9 +19362,7 @@ async def _expected_corpus_cells(
     for prompt in prompts:
         for mode in ("web", "memory"):
             for panel in panel_models():
-                configured_model = (
-                    panel.model if mode == "web" else panel.memory_model
-                )
+                configured_model = panel.model if mode == "web" else panel.memory_model
                 if configured_model is None:
                     continue
                 model = persisted_models.get(
@@ -19846,9 +19456,7 @@ def _brand_knowledge_slice(
     ]
     annotated = len(annotated_rows)
     valid_rows = [
-        row
-        for row in annotated_rows
-        if row["annotation"].get("valid") is True
+        row for row in annotated_rows if row["annotation"].get("valid") is True
     ]
     valid = len(valid_rows)
     evidence_state = _slice_evidence_state(valid_rows, source_rows=selected)
@@ -19869,10 +19477,11 @@ def _brand_knowledge_slice(
             continue
         specificity = str(brand_answer.get("specificity") or "none")
         directness = str(brand_answer.get("directness") or "refusal")
-        if (
-            directness in {"direct", "partial"}
-            and specificity in {"specific", "generic", "contradictory"}
-        ):
+        if directness in {"direct", "partial"} and specificity in {
+            "specific",
+            "generic",
+            "contradictory",
+        }:
             answer_count += 1
         if specificity == "specific":
             specific_count += 1
@@ -19896,11 +19505,7 @@ def _brand_knowledge_slice(
         "completed_answers": completed,
         "annotated_answers": annotated,
         "valid_answers": valid,
-        "coverage_rate": (
-            _rate(valid, expected)
-            if completed or annotated
-            else None
-        ),
+        "coverage_rate": (_rate(valid, expected) if completed or annotated else None),
         "data_state": (
             "complete"
             if expected
@@ -19967,20 +19572,16 @@ def _compute_metrics(
                 normalized,
                 profile,
             )
-            normalized["_attribution_aliases"] = (
-                _entity_attribution_aliases(
-                    profile,
-                    scoped_catalog,
-                    normalized,
-                )
+            normalized["_attribution_aliases"] = _entity_attribution_aliases(
+                profile,
+                scoped_catalog,
+                normalized,
             )
             normalized["_direct_target_aliases"] = target_aliases
-            normalized["_confirmed_owner_aliases"] = (
-                confirmed_owner_aliases
-            )
-        entity_catalog[
-            str(normalized.get("canonical_name") or "").casefold()
-        ] = normalized
+            normalized["_confirmed_owner_aliases"] = confirmed_owner_aliases
+        entity_catalog[str(normalized.get("canonical_name") or "").casefold()] = (
+            normalized
+        )
     confirmed_portfolio_entities = [
         entity
         for entity in entity_catalog.values()
@@ -20108,9 +19709,7 @@ def _compute_metrics(
         for mention in annotation.get("entity_mentions") or []:
             canonical = str(mention.get("canonical_name") or "").strip()
             entity = entity_catalog.get(canonical.casefold()) or {}
-            normalized_name = str(
-                entity.get("canonical_name") or canonical
-            ).strip()
+            normalized_name = str(entity.get("canonical_name") or canonical).strip()
             normalized_key = normalized_name.casefold()
             if (
                 normalized_name
@@ -20187,21 +19786,18 @@ def _compute_metrics(
             sentiments[str(annotation.get("sentiment"))] += 1
     known_sentiments = sum(sentiments.values())
     sentiment = {
-        key: _rate(value, known_sentiments)
-        for key, value in sentiments.items()
+        key: _rate(value, known_sentiments) for key, value in sentiments.items()
     }
 
     expected_web_keys = {
         (row["provider_key"], row["prompt_id"])
         for row in rows
-        if row["mode"] == "web"
-        and row["role"] == "unbranded_discovery"
+        if row["mode"] == "web" and row["role"] == "unbranded_discovery"
     }
     expected_memory_keys = {
         (row["provider_key"], row["prompt_id"])
         for row in rows
-        if row["mode"] == "memory"
-        and row["role"] == "unbranded_discovery"
+        if row["mode"] == "memory" and row["role"] == "unbranded_discovery"
     }
     expected_paired_keys = expected_web_keys & expected_memory_keys
     web_keys = {
@@ -20230,9 +19826,7 @@ def _compute_metrics(
     )
     paired_coverage_rate = _rate(completed_pair_count, expected_pair_count)
     paired_rows = [
-        row
-        for row in rows
-        if (row["provider_key"], row["prompt_id"]) in paired_keys
+        row for row in rows if (row["provider_key"], row["prompt_id"]) in paired_keys
     ]
     paired_parent_web = _visibility_slice(
         paired_rows,
@@ -20320,16 +19914,14 @@ def _compute_metrics(
     raw_completed_answers = sum(
         row.get("status", "completed") == "completed"
         and (
-            "answer_text" not in row
-            or bool(str(row.get("answer_text") or "").strip())
+            "answer_text" not in row or bool(str(row.get("answer_text") or "").strip())
         )
         for row in rows
     )
     completed_annotations = sum(
         row.get("status", "completed") == "completed"
         and (
-            "answer_text" not in row
-            or bool(str(row.get("answer_text") or "").strip())
+            "answer_text" not in row or bool(str(row.get("answer_text") or "").strip())
         )
         and bool(row.get("annotation"))
         for row in rows
@@ -20349,13 +19941,13 @@ def _compute_metrics(
     context_eligible_answers = sum(
         row.get("status", "completed") == "completed"
         and (
-            "answer_text" not in row
-            or bool(str(row.get("answer_text") or "").strip())
+            "answer_text" not in row or bool(str(row.get("answer_text") or "").strip())
         )
         and row.get(
             "context_eligible",
             row.get("metric_eligible", True),
-        ) is not False
+        )
+        is not False
         for row in rows
     )
     valid_annotations = sum(
@@ -20365,8 +19957,7 @@ def _compute_metrics(
     )
     expected_answers = len(rows)
     evidence_reasons = Counter(
-        str(row.get("web_attestation_reason") or "unknown")
-        for row in rows
+        str(row.get("web_attestation_reason") or "unknown") for row in rows
     )
     quality_state = (
         "good"
@@ -20398,9 +19989,7 @@ def _compute_metrics(
                 candidate_portfolio_count - confirmed_portfolio_count,
             ),
             "reason": (
-                None
-                if portfolio_scope_available
-                else "target_portfolio_unconfirmed"
+                None if portfolio_scope_available else "target_portfolio_unconfirmed"
             ),
         },
         "brand_knowledge": {
@@ -20522,13 +20111,9 @@ def _compute_metrics(
             "completed_answers": raw_completed_answers,
             "annotated_answers": completed_annotations,
             "metric_eligible_answers": metric_eligible_answers,
-            "metric_ineligible_answers": (
-                expected_answers - metric_eligible_answers
-            ),
+            "metric_ineligible_answers": (expected_answers - metric_eligible_answers),
             "context_eligible_answers": context_eligible_answers,
-            "context_withheld_answers": (
-                expected_answers - context_eligible_answers
-            ),
+            "context_withheld_answers": (expected_answers - context_eligible_answers),
             "legacy_observational_answers": observational_metric_answers,
             "provider_limited_answers": provider_limited_answers,
             "valid_answers": valid_annotations,
@@ -20683,15 +20268,11 @@ def _final_corpus_manifest(
 
     for row in rows:
         annotation = (
-            row.get("annotation")
-            if isinstance(row.get("annotation"), dict)
-            else {}
+            row.get("annotation") if isinstance(row.get("annotation"), dict) else {}
         )
         raw_answer = str(row.get("answer_text") or "")
         raw_sha256 = hashlib.sha256(raw_answer.encode("utf-8")).hexdigest()
-        annotation_input_sha256 = str(
-            annotation.get("_annotation_input_sha256") or ""
-        )
+        annotation_input_sha256 = str(annotation.get("_annotation_input_sha256") or "")
         annotation_provenance = {
             "annotation_version": annotation.get("_annotation_version"),
             "answer_sha256": annotation.get("_answer_sha256"),
@@ -20708,9 +20289,7 @@ def _final_corpus_manifest(
             "raw_answer_sha256": raw_sha256,
             "annotation_sha256": _stable_json_sha256(annotation),
             "annotation_input_sha256": annotation_input_sha256,
-            "annotation_provenance_sha256": _stable_json_sha256(
-                annotation_provenance
-            ),
+            "annotation_provenance_sha256": _stable_json_sha256(annotation_provenance),
         }
         observed.append(item)
         observed_by_key[_corpus_cell_key(item)].append(item)
@@ -20787,15 +20366,19 @@ def _final_corpus_manifest(
         for key, items in sorted(observed_by_key.items())
         if len(items) > 1
     ]
-    complete = bool(normalized_expected) and not any(
-        (
-            missing_cells,
-            unexpected_cells,
-            duplicate_expected_cells,
-            duplicate_cells,
-            invalid_cells,
+    complete = (
+        bool(normalized_expected)
+        and not any(
+            (
+                missing_cells,
+                unexpected_cells,
+                duplicate_expected_cells,
+                duplicate_cells,
+                invalid_cells,
+            )
         )
-    ) and len(observed) == len(normalized_expected)
+        and len(observed) == len(normalized_expected)
+    )
     digest_input = {
         "version": FINAL_CORPUS_MANIFEST_VERSION,
         "expected_cells": normalized_expected,
@@ -20818,9 +20401,7 @@ def _final_corpus_manifest(
         ],
         "expected_cells_sha256": _stable_json_sha256(normalized_expected),
         "observed_cells_sha256": _stable_json_sha256(observed),
-        "critic_rows_sha256": _stable_json_sha256(
-            _critic_row_provenance(rows)
-        ),
+        "critic_rows_sha256": _stable_json_sha256(_critic_row_provenance(rows)),
         "digest": _stable_json_sha256(digest_input),
     }
 
@@ -20849,8 +20430,7 @@ def _critic_policy_guidance(policy_history: list[dict[str, Any]]) -> str:
     return "\n\n".join(
         str(step.get("annotation_guidance") or "").strip()
         for step in policy_history
-        if isinstance(step, dict)
-        and str(step.get("annotation_guidance") or "").strip()
+        if isinstance(step, dict) and str(step.get("annotation_guidance") or "").strip()
     )
 
 
@@ -20860,9 +20440,7 @@ def _deterministic_metric_warnings(
     """Surface suspicious shapes for the critic without declaring them errors."""
 
     providers = [
-        item
-        for item in metrics.get("providers") or []
-        if isinstance(item, dict)
+        item for item in metrics.get("providers") or [] if isinstance(item, dict)
     ]
     identical_scopes: list[str] = []
     parent_rates: list[float] = []
@@ -20906,9 +20484,7 @@ def _deterministic_metric_warnings(
                     "Все доступные системы дали одинаковую долю обнаружения "
                     "материнского бренда."
                 ),
-                "providers": [
-                    str(item.get("name") or "") for item in providers
-                ],
+                "providers": [str(item.get("name") or "") for item in providers],
             }
         )
     if len(portfolio_rates) >= 4 and len(set(portfolio_rates)) == 1:
@@ -20917,12 +20493,9 @@ def _deterministic_metric_warnings(
                 "code": "provider_uniformity",
                 "severity": "observation",
                 "finding": (
-                    "Все доступные системы дали одинаковую долю обнаружения "
-                    "портфеля."
+                    "Все доступные системы дали одинаковую долю обнаружения портфеля."
                 ),
-                "providers": [
-                    str(item.get("name") or "") for item in providers
-                ],
+                "providers": [str(item.get("name") or "") for item in providers],
             }
         )
     return warnings
@@ -20972,9 +20545,7 @@ def _deterministic_annotation_warnings(
                 or mention.get("attributed_to_target") is not True
             ):
                 continue
-            canonical = str(
-                mention.get("canonical_name") or ""
-            ).casefold()
+            canonical = str(mention.get("canonical_name") or "").casefold()
             entity = entities.get(canonical) or {}
             if (
                 not _catalog_marks_portfolio_entity(entity)
@@ -21060,14 +20631,12 @@ def _critic_raw_sample_class(row: dict[str, Any]) -> str:
     if (
         annotation.get("target_mentioned") is True
         or any(
-            isinstance(mention, dict)
-            and mention.get("attributed_to_target") is True
+            isinstance(mention, dict) and mention.get("attributed_to_target") is True
             for mention in annotation.get("entity_mentions") or []
         )
         or (
             isinstance(annotation.get("brand_answer"), dict)
-            and annotation["brand_answer"].get("specificity")
-            in {"specific", "generic"}
+            and annotation["brand_answer"].get("specificity") in {"specific", "generic"}
         )
     ):
         return "positive"
@@ -21112,10 +20681,7 @@ def _critic_selected_raw_answer_ids(
         len(str(rows_by_id[answer_id].get("answer_text") or ""))
         for answer_id in mandatory_ids & rows_by_id.keys()
     )
-    if (
-        missing_mandatory_ids
-        or empty_mandatory_ids
-    ):
+    if missing_mandatory_ids or empty_mandatory_ids:
         raise OrchestratorContractError(
             "Mandatory final-critic raw evidence is unavailable: "
             f"missing={missing_mandatory_ids}, "
@@ -21134,8 +20700,7 @@ def _critic_selected_raw_answer_ids(
     leakage_provider_keys = {
         labels_to_keys.get(str(provider))
         for warning in warnings
-        if isinstance(warning, dict)
-        and warning.get("code") == "scope_leakage"
+        if isinstance(warning, dict) and warning.get("code") == "scope_leakage"
         for provider in warning.get("providers") or []
     }
     leakage_provider_keys.discard(None)
@@ -21163,11 +20728,7 @@ def _critic_selected_raw_answer_ids(
     omitted_mandatory_ids = sorted(mandatory_ids - selected)
     missing_warning_ids = sorted(
         (referenced_warning_ids - rows_by_id.keys())
-        | {
-            answer_id
-            for answer_id in warning_ids
-            if answer_id not in selected
-        }
+        | {answer_id for answer_id in warning_ids if answer_id not in selected}
     )
     if omitted_mandatory_ids:
         raise OrchestratorContractError(
@@ -21175,8 +20736,7 @@ def _critic_selected_raw_answer_ids(
             + ", ".join(str(value) for value in omitted_mandatory_ids)
         )
     selected_classes = Counter(
-        _critic_raw_sample_class(rows_by_id[answer_id])
-        for answer_id in selected
+        _critic_raw_sample_class(rows_by_id[answer_id]) for answer_id in selected
     )
     return selected, {
         "strategy": "complete_raw_corpus_v4",
@@ -21309,9 +20869,7 @@ def _critic_payload(
                 "annotation_state": row.get("annotation_state"),
                 "metric_eligible": row.get("metric_eligible"),
                 "context_eligible": row.get("context_eligible"),
-                "metric_evidence_state": row.get(
-                    "metric_evidence_state"
-                ),
+                "metric_evidence_state": row.get("metric_evidence_state"),
                 "metric_limitation": row.get("metric_limitation"),
                 "panel_evidence_version": row.get("panel_evidence_version"),
                 "panel_evidence_reason": row.get("web_attestation_reason"),
@@ -21321,15 +20879,11 @@ def _critic_payload(
                     str(row.get("answer_text") or "").encode("utf-8")
                 ).hexdigest(),
                 "raw_answer_included": row.get("answer_id") in raw_answer_ids,
-                "raw_answer_char_count": len(
-                    str(row.get("answer_text") or "")
-                ),
+                "raw_answer_char_count": len(str(row.get("answer_text") or "")),
                 "raw_answer_manifest": raw_manifests.get(
                     int(row.get("answer_id") or 0)
                 ),
-                "raw_answer_truncated": bool(
-                    False
-                ),
+                "raw_answer_truncated": bool(False),
                 "raw_answer_omission_reason": (
                     None
                     if row.get("answer_id") in raw_answer_ids
@@ -21341,9 +20895,7 @@ def _critic_payload(
                     else ""
                 ),
                 "raw_answer_partition": (
-                    (row.get("annotation") or {}).get(
-                        "_long_response_partition"
-                    )
+                    (row.get("annotation") or {}).get("_long_response_partition")
                     if isinstance(row.get("annotation"), dict)
                     else None
                 ),
@@ -21389,9 +20941,7 @@ def _scope_leakage_warning_machine_resolved(
     )
     entities: dict[str, dict[str, Any]] = {}
     for raw_entity in scoped_catalog.get("entities") or []:
-        if not isinstance(raw_entity, dict) or not raw_entity.get(
-            "canonical_name"
-        ):
+        if not isinstance(raw_entity, dict) or not raw_entity.get("canonical_name"):
             continue
         entity = dict(raw_entity)
         if _catalog_marks_portfolio_entity(entity):
@@ -21409,18 +20959,14 @@ def _scope_leakage_warning_machine_resolved(
             )
             entity["_direct_target_aliases"] = target_aliases
             entity["_confirmed_owner_aliases"] = confirmed_owner_aliases
-        entities[
-            str(entity.get("canonical_name") or "").casefold()
-        ] = entity
+        entities[str(entity.get("canonical_name") or "").casefold()] = entity
 
     provider_metrics = {
         str(item.get("name") or ""): item
         for item in metrics.get("providers") or []
         if isinstance(item, dict) and item.get("name")
     }
-    provider_keys = {
-        model.label: model.key for model in panel_models()
-    }
+    provider_keys = {model.label: model.key for model in panel_models()}
     for provider_name in providers:
         if not isinstance(provider_name, str) or not provider_name.strip():
             return False
@@ -21438,10 +20984,7 @@ def _scope_leakage_warning_machine_resolved(
         ]
         if not selected:
             return False
-        if any(
-            item.get("raw_answer_truncated") is True
-            for item in selected
-        ):
+        if any(item.get("raw_answer_truncated") is True for item in selected):
             return False
         completed_rows = [
             item
@@ -21472,25 +21015,24 @@ def _scope_leakage_warning_machine_resolved(
             annotation = item["annotation"]
             if annotation.get("target_mentioned") is True:
                 if not any(
-                    _alias_is_present(raw_answer, alias)
-                    for alias in target_aliases
+                    _alias_is_present(raw_answer, alias) for alias in target_aliases
                 ):
                     return False
                 parent_ids.add(answer_id)
             for mention in annotation.get("entity_mentions") or []:
                 if not isinstance(mention, dict):
                     continue
-                entity = entities.get(
-                    str(mention.get("canonical_name") or "").casefold()
-                ) or {}
-                if (
-                    _is_portfolio_target_entity(entity)
-                    and _portfolio_entity_is_grounded(
-                        raw_answer,
-                        entity,
-                        target_aliases,
-                        mention,
-                    )
+                entity = (
+                    entities.get(str(mention.get("canonical_name") or "").casefold())
+                    or {}
+                )
+                if _is_portfolio_target_entity(
+                    entity
+                ) and _portfolio_entity_is_grounded(
+                    raw_answer,
+                    entity,
+                    target_aliases,
+                    mention,
                 ):
                     portfolio_ids.add(answer_id)
                     break
@@ -21498,8 +21040,7 @@ def _scope_leakage_warning_machine_resolved(
         parent_metric = provider_metric.get("parent_discovery") or {}
         portfolio_metric = provider_metric.get("portfolio_capture") or {}
         if not all(
-            isinstance(item, dict)
-            for item in (parent_metric, portfolio_metric)
+            isinstance(item, dict) for item in (parent_metric, portfolio_metric)
         ):
             return False
         expected_count = len(selected)
@@ -21521,11 +21062,9 @@ def _scope_leakage_warning_machine_resolved(
                 or metric.get("completed_answers") != completed_count
                 or metric.get("annotated_answers") != completed_count
                 or metric.get("valid_answers") != completed_count
-                or metric.get("coverage_rate")
-                != _rate(completed_count, expected_count)
+                or metric.get("coverage_rate") != _rate(completed_count, expected_count)
                 or metric.get("mention_count") != len(hit_ids)
-                or metric.get("mention_rate")
-                != _rate(len(hit_ids), completed_count)
+                or metric.get("mention_rate") != _rate(len(hit_ids), completed_count)
             ):
                 return False
     return True
@@ -21586,8 +21125,7 @@ def _critic_review_errors(
         errors.append("acceptance_checks must be a list")
         acceptance_checks = []
     elif any(
-        not isinstance(check, str) or not check.strip()
-        for check in acceptance_checks
+        not isinstance(check, str) or not check.strip() for check in acceptance_checks
     ):
         errors.append("acceptance_checks must contain non-empty strings")
 
@@ -21615,25 +21153,23 @@ def _critic_review_errors(
             "observation",
         }:
             errors.append(f"anomaly {index} has invalid severity")
-        if not isinstance(anomaly.get("finding"), str) or not str(
-            anomaly.get("finding") or ""
-        ).strip():
+        if (
+            not isinstance(anomaly.get("finding"), str)
+            or not str(anomaly.get("finding") or "").strip()
+        ):
             errors.append(f"anomaly {index} has invalid finding")
         if not isinstance(anomaly.get("answer_ids"), list) or any(
-            not isinstance(value, int)
-            for value in anomaly.get("answer_ids") or []
+            not isinstance(value, int) for value in anomaly.get("answer_ids") or []
         ):
             errors.append(f"anomaly {index} has invalid answer_ids")
         if not isinstance(anomaly.get("entities"), list) or any(
-            not isinstance(value, str)
-            for value in anomaly.get("entities") or []
+            not isinstance(value, str) for value in anomaly.get("entities") or []
         ):
             errors.append(f"anomaly {index} has invalid entities")
     truncated_answer_ids = [
         item.get("answer_id")
         for item in (payload or {}).get("answers") or []
-        if isinstance(item, dict)
-        and item.get("raw_answer_truncated") is True
+        if isinstance(item, dict) and item.get("raw_answer_truncated") is True
     ]
     if truncated_answer_ids and verdict != "block":
         errors.append(
@@ -21797,9 +21333,7 @@ def _critic_review_validation_errors(
         valid_answer_ids=valid_answer_ids,
     )
     if not applied:
-        errors.append(
-            "revise contains no safely applicable policy adjustments"
-        )
+        errors.append("revise contains no safely applicable policy adjustments")
     return errors
 
 
@@ -21817,14 +21351,12 @@ def _deterministic_critic_fallback_review(
     material_anomalies = [
         item
         for item in anomalies or []
-        if isinstance(item, dict)
-        and item.get("severity") in {"critical", "important"}
+        if isinstance(item, dict) and item.get("severity") in {"critical", "important"}
     ]
     observations_are_bounded = bool(
         isinstance(anomalies, list)
         and all(
-            isinstance(item, dict)
-            and item.get("severity") == "observation"
+            isinstance(item, dict) and item.get("severity") == "observation"
             for item in anomalies
         )
     )
@@ -21834,9 +21366,7 @@ def _deterministic_critic_fallback_review(
         if isinstance(warning, dict)
         and warning.get("severity") in {"critical", "important"}
     ]
-    warning_codes = [
-        str(warning.get("code") or "") for warning in material_warnings
-    ]
+    warning_codes = [str(warning.get("code") or "") for warning in material_warnings]
     warnings_are_resolved = bool(
         len(warning_codes) == len(set(warning_codes))
         and all(
@@ -21845,8 +21375,7 @@ def _deterministic_critic_fallback_review(
         )
     )
     has_truncated_raw = any(
-        isinstance(item, dict)
-        and item.get("raw_answer_truncated") is True
+        isinstance(item, dict) and item.get("raw_answer_truncated") is True
         for item in payload.get("answers") or []
     )
     safe_pass = bool(
@@ -21939,9 +21468,7 @@ def _validated_critic_usage(
 
     output = dict(usage or {})
     contract = output.get("_aiv_critic_contract")
-    normalized_contract = (
-        dict(contract) if isinstance(contract, dict) else {}
-    )
+    normalized_contract = dict(contract) if isinstance(contract, dict) else {}
     normalized_contract["semantic_verdict_status"] = "validated"
     normalized_contract["semantic_validation_owner"] = validation_owner
     output["_aiv_critic_contract"] = normalized_contract
@@ -21958,9 +21485,7 @@ def _critic_review_cache_status(
     verdict = str(review.get("verdict") or "")
     fallback = review.get("fallback")
     fallback_kind = (
-        str(fallback.get("kind") or "")
-        if isinstance(fallback, dict)
-        else ""
+        str(fallback.get("kind") or "") if isinstance(fallback, dict) else ""
     )
     if fallback_kind:
         if (
@@ -22012,9 +21537,7 @@ async def _persist_critic_transport_event(
     if not isinstance(usage, dict):
         raise OpenRouterError("Critic physical-post usage is invalid")
     status = str(event.get("status") or "")
-    artifact_key = (
-        f"acr{iteration}_post_{transport_key[:16]}_{event_sha256[:32]}"
-    )
+    artifact_key = f"acr{iteration}_post_{transport_key[:16]}_{event_sha256[:32]}"
     event_input = {
         "version": PHYSICAL_POST_AUDIT_VERSION,
         "transport_key": transport_key,
@@ -22044,9 +21567,7 @@ async def _persist_critic_transport_event(
                 usage_json=copy.deepcopy(usage),
                 error_message=error_message,
             )
-            .on_conflict_do_nothing(
-                index_elements=("run_id", "artifact_key")
-            )
+            .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
         )
         await assert_run_lease(run_id)
         await session.commit()
@@ -22074,9 +21595,7 @@ async def _persist_critic_transport_event(
         "usage": copy.deepcopy(existing.usage_json),
     }
     if _stable_json_sha256(existing_event) != event_sha256:
-        raise OpenRouterError(
-            "Critic physical-post append-only key mutation detected"
-        )
+        raise OpenRouterError("Critic physical-post append-only key mutation detected")
 
 
 async def _load_critic_transport_event(
@@ -22122,19 +21641,13 @@ async def _load_critic_transport_event(
             "raw_text": row.raw_text,
             "usage": copy.deepcopy(row.usage_json),
         }
-        if (
-            row.input_json.get("transport_key") != transport_key
-            or row.input_json.get("event_sha256")
-            != _stable_json_sha256(event)
-        ):
-            raise OpenRouterError(
-                "Stored critic physical receipt identity is invalid"
-            )
+        if row.input_json.get("transport_key") != transport_key or row.input_json.get(
+            "event_sha256"
+        ) != _stable_json_sha256(event):
+            raise OpenRouterError("Stored critic physical receipt identity is invalid")
         if event.get("status") == "accepted":
             if row.status != "completed" or not isinstance(row.raw_text, str):
-                raise OpenRouterError(
-                    "Accepted critic physical receipt is incomplete"
-                )
+                raise OpenRouterError("Accepted critic physical receipt is incomplete")
             accepted.append(event)
     if not accepted:
         return None
@@ -22278,8 +21791,7 @@ async def _analysis_critic_repair_artifact(
         )
         if errors:
             raise OpenRouterError(
-                "Analysis critic repair is inconsistent: "
-                + "; ".join(errors)
+                "Analysis critic repair is inconsistent: " + "; ".join(errors)
             )
         usage = _validated_critic_usage(usage)
     except Exception as exc:
@@ -22407,9 +21919,7 @@ async def _analysis_critic_artifact(
                     stage_key="knowledge_gap",
                     artifact_key=artifact_key,
                     status=(
-                        "completed"
-                        if terminal_status == "completed"
-                        else "failed"
+                        "completed" if terminal_status == "completed" else "failed"
                     ),
                     model=CRITIC_MODEL,
                     prompt_version=CRITIC_CALL_AUDIT_VERSION,
@@ -22427,9 +21937,7 @@ async def _analysis_critic_artifact(
                         else None
                     ),
                 )
-                .on_conflict_do_nothing(
-                    index_elements=("run_id", "artifact_key")
-                )
+                .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
             )
             await assert_run_lease(run_id)
             await session.commit()
@@ -22447,9 +21955,7 @@ async def _analysis_critic_artifact(
                     )
                 ).scalar_one_or_none()
             if existing is None:
-                raise OpenRouterError(
-                    "Critic call-audit conflict has no stored record"
-                )
+                raise OpenRouterError("Critic call-audit conflict has no stored record")
             existing_event = {
                 **(
                     copy.deepcopy(existing.output_json)
@@ -22460,9 +21966,7 @@ async def _analysis_critic_artifact(
                 "raw_text": str(existing.raw_text or ""),
                 "usage": copy.deepcopy(existing.usage_json or {}),
             }
-            if _stable_json_sha256(existing_event) != _stable_json_sha256(
-                event
-            ):
+            if _stable_json_sha256(existing_event) != _stable_json_sha256(event):
                 raise OpenRouterError(
                     "Critic call-audit append-only key mutation detected"
                 )
@@ -22478,10 +21982,7 @@ async def _analysis_critic_artifact(
             raise OpenRouterError("Critic lookup logical key is invalid")
         if re.fullmatch(r"[a-z0-9_]+", kind) is None:
             raise OpenRouterError("Critic lookup kind is invalid")
-        lookup_key = (
-            f"analysis_critic_r{iteration}_call_{kind}_"
-            f"{logical_key[:32]}"
-        )
+        lookup_key = f"analysis_critic_r{iteration}_call_{kind}_{logical_key[:32]}"
         await assert_run_lease(run_id)
         async with SessionLocal() as session:
             artifact = (
@@ -22495,17 +21996,11 @@ async def _analysis_critic_artifact(
         if artifact is None or artifact.status != "completed":
             return None
         if not isinstance(artifact.output_json, dict):
-            raise OpenRouterError(
-                "Completed critic call-audit record has no metadata"
-            )
+            raise OpenRouterError("Completed critic call-audit record has no metadata")
         if not isinstance(artifact.input_json, dict):
-            raise OpenRouterError(
-                "Completed critic call-audit record has no input"
-            )
+            raise OpenRouterError("Completed critic call-audit record has no input")
         if not isinstance(artifact.usage_json, dict):
-            raise OpenRouterError(
-                "Completed critic call-audit record has no usage"
-            )
+            raise OpenRouterError("Completed critic call-audit record has no usage")
         return {
             **copy.deepcopy(artifact.output_json),
             "input": copy.deepcopy(artifact.input_json),
@@ -22554,9 +22049,7 @@ async def _analysis_critic_artifact(
                     + "; ".join(errors)
                 )
             prior_attempts = (
-                usage.get("_aiv_critic_attempts")
-                if isinstance(usage, dict)
-                else None
+                usage.get("_aiv_critic_attempts") if isinstance(usage, dict) else None
             )
             if isinstance(prior_attempts, list) and prior_attempts:
                 # review_analysis() already spent the one allowed compact
@@ -22663,9 +22156,7 @@ def _require_alias_attribution(
     entity: dict[str, Any],
     alias_to_tighten: str,
 ) -> bool:
-    normalized_target = (
-        alias_to_tighten.casefold().replace("ё", "е").strip()
-    )
+    normalized_target = alias_to_tighten.casefold().replace("ё", "е").strip()
     if not normalized_target:
         return False
     canonical = str(entity.get("canonical_name") or "").strip()
@@ -22741,14 +22232,12 @@ def _apply_critic_policy(
             changed = _catalog_marks_portfolio_entity(entity)
         elif action == "require_literal_brand_knowledge_evidence":
             relationship = str(
-                entity.get("target_relationship")
-                or entity.get("relationship")
-                or ""
+                entity.get("target_relationship") or entity.get("relationship") or ""
             ).casefold()
-            changed = (
-                entity.get("category") == "target"
-                and relationship in {"exact_target", "self"}
-            )
+            changed = entity.get("category") == "target" and relationship in {
+                "exact_target",
+                "self",
+            }
         if changed:
             applied.append(
                 {
@@ -22771,33 +22260,26 @@ def _apply_critic_policy(
                     else (
                         (
                             "для ответов "
-                            + ", ".join(
-                                str(value)
-                                for value in item["answer_ids"]
-                            )
+                            + ", ".join(str(value) for value in item["answer_ids"])
                             + " заново проверить brand_answer по буквальным "
                             "фактам о целевом бренде; specific допустим "
                             "только для конкретных фактов, согласующихся "
                             "с site_profile или entity_catalog"
                         )
-                        if item["action"]
-                        == "require_literal_brand_knowledge_evidence"
-                        else
-                        (
+                        if item["action"] == "require_literal_brand_knowledge_evidence"
+                        else (
                             "при явной связи в raw-ответе скопировать один "
                             "точный непрерывный фрагмент с разрешённым "
                             "владельцем, услугой и словами связи, сохранив "
                             "Markdown и регистр; иначе не атрибутировать"
                         )
-                        if item["action"]
-                        == "require_literal_attribution_evidence"
+                        if item["action"] == "require_literal_attribution_evidence"
                         else (
                             "требовать явную буквальную атрибуцию для алиаса "
                             f"«{item['alias']}»"
                             if item["action"] == "require_alias_attribution"
                             else (
-                                "требовать явную буквальную атрибуцию "
-                                "целевому бренду"
+                                "требовать явную буквальную атрибуцию целевому бренду"
                             )
                         )
                     )
@@ -22884,16 +22366,15 @@ def _critic_issue_answer_ids(
 
     issue_ids: set[int] = set()
     for anomaly in review.get("anomalies") or []:
-        if (
-            not isinstance(anomaly, dict)
-            or anomaly.get("severity") not in {"critical", "important"}
-        ):
+        if not isinstance(anomaly, dict) or anomaly.get("severity") not in {
+            "critical",
+            "important",
+        }:
             continue
         issue_ids.update(
             value
             for value in anomaly.get("answer_ids") or []
-            if isinstance(value, int)
-            and not isinstance(value, bool)
+            if isinstance(value, int) and not isinstance(value, bool)
         )
     # A real bounded revise may carry the concrete repair rows primarily in
     # validated policy_adjustments.  They are part of the critic contract and
@@ -22904,8 +22385,7 @@ def _critic_issue_answer_ids(
         issue_ids.update(
             value
             for value in adjustment.get("answer_ids") or []
-            if isinstance(value, int)
-            and not isinstance(value, bool)
+            if isinstance(value, int) and not isinstance(value, bool)
         )
     return issue_ids & valid_answer_ids
 
@@ -23001,11 +22481,8 @@ async def _terminal_analysis_critic_recovery_reason(
                     select(RecoveryEpoch)
                     .where(
                         RecoveryEpoch.run_id == run_id,
-                        RecoveryEpoch.stage_key
-                        == ANALYSIS_CRITIC_RECOVERY_STAGE,
-                        RecoveryEpoch.status.in_(
-                            ("failed", "no_progress", "blocked")
-                        ),
+                        RecoveryEpoch.stage_key == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                        RecoveryEpoch.status.in_(("failed", "no_progress", "blocked")),
                     )
                     .order_by(RecoveryEpoch.epoch.desc())
                 )
@@ -23015,11 +22492,7 @@ async def _terminal_analysis_critic_recovery_reason(
         )
     for row in rows:
         outcome = row.outcome_json or {}
-        details = (
-            outcome.get("details")
-            if isinstance(outcome, dict)
-            else None
-        )
+        details = outcome.get("details") if isinstance(outcome, dict) else None
         if not isinstance(details, dict):
             continue
         if (
@@ -23053,8 +22526,7 @@ async def _successful_analysis_critic_recovery_gate(
                     select(RecoveryEpoch)
                     .where(
                         RecoveryEpoch.run_id == run_id,
-                        RecoveryEpoch.stage_key
-                        == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                        RecoveryEpoch.stage_key == ANALYSIS_CRITIC_RECOVERY_STAGE,
                         RecoveryEpoch.status == "succeeded",
                     )
                     .order_by(RecoveryEpoch.epoch.desc())
@@ -23081,10 +22553,7 @@ async def _successful_analysis_critic_recovery_gate(
                     RunArtifact.artifact_key
                     == (
                         "analysis_critic_r"
-                        + str(
-                            MAX_CRITIC_ITERATIONS
-                            + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
-                        )
+                        + str(MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS)
                     ),
                 )
             )
@@ -23111,16 +22580,11 @@ async def _successful_analysis_critic_recovery_gate(
     matching_epoch: RecoveryEpoch | None = None
     for epoch in epochs:
         outcome = epoch.outcome_json or {}
-        details = (
-            outcome.get("details")
-            if isinstance(outcome, dict)
-            else None
-        )
+        details = outcome.get("details") if isinstance(outcome, dict) else None
         plan_json = epoch.plan_json
         if (
             not isinstance(plan_json, dict)
-            or plan_json.get("action")
-            != ACTION_TARGETED_ANNOTATION_REPAIR
+            or plan_json.get("action") != ACTION_TARGETED_ANNOTATION_REPAIR
             or epoch.plan_digest != stable_digest(plan_json)
         ):
             continue
@@ -23133,16 +22597,14 @@ async def _successful_analysis_critic_recovery_gate(
             step
             for step in policy_history
             if isinstance(step, dict)
-            and step.get("kind")
-            == "orchestrated_targeted_annotation_repair"
+            and step.get("kind") == "orchestrated_targeted_annotation_repair"
         ]
         if not recovery_steps:
             continue
         recovery_step = recovery_steps[-1]
         if (
             recovery_step.get("orchestrator_epoch") != epoch.epoch
-            or set(recovery_step.get("target_answer_ids") or [])
-            != planned_ids
+            or set(recovery_step.get("target_answer_ids") or []) != planned_ids
         ):
             continue
         repaired_rows = {
@@ -23174,10 +22636,8 @@ async def _successful_analysis_critic_recovery_gate(
             isinstance(details, dict)
             and outcome.get("succeeded") is True
             and outcome.get("after_digest") == state_digest
-            and details.get("successful_analysis_state_digest")
-            == state_digest
-            and details.get("successful_gate_sha256")
-            == stable_digest(gate)
+            and details.get("successful_analysis_state_digest") == state_digest
+            and details.get("successful_gate_sha256") == stable_digest(gate)
         ):
             matching_epoch = epoch
             break
@@ -23199,17 +22659,14 @@ async def _successful_analysis_critic_recovery_gate(
         ),
     )
     artifact_input = (
-        artifact.input_json
-        if isinstance(artifact.input_json, dict)
-        else {}
+        artifact.input_json if isinstance(artifact.input_json, dict) else {}
     )
     recovery_step = next(
         (
             step
             for step in reversed(policy_history)
             if isinstance(step, dict)
-            and step.get("kind")
-            == "orchestrated_targeted_annotation_repair"
+            and step.get("kind") == "orchestrated_targeted_annotation_repair"
         ),
         None,
     )
@@ -23266,8 +22723,7 @@ async def _successful_analysis_critic_recovery_gate(
         or gate.get("metrics_sha256") != provenance["metrics_sha256"]
         or gate.get("corpus_manifest") != corpus_manifest
         or artifact_input.get("provenance") != provenance
-        or artifact_input.get("corpus_manifest_digest")
-        != corpus_manifest["digest"]
+        or artifact_input.get("corpus_manifest_digest") != corpus_manifest["digest"]
         or artifact_input.get("iteration") != gate.get("iteration")
     ):
         return None
@@ -23295,17 +22751,20 @@ async def _resume_executing_analysis_critic_recovery(
 
     async with SessionLocal() as session:
         epoch = (
-            await session.execute(
-                select(RecoveryEpoch)
-                .where(
-                    RecoveryEpoch.run_id == run_id,
-                    RecoveryEpoch.stage_key
-                    == ANALYSIS_CRITIC_RECOVERY_STAGE,
-                    RecoveryEpoch.status == "executing",
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.stage_key == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                        RecoveryEpoch.status == "executing",
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
                 )
-                .order_by(RecoveryEpoch.epoch.desc())
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         final_artifact = (
             await session.execute(
                 select(RunArtifact).where(
@@ -23313,10 +22772,7 @@ async def _resume_executing_analysis_critic_recovery(
                     RunArtifact.artifact_key
                     == (
                         "analysis_critic_r"
-                        + str(
-                            MAX_CRITIC_ITERATIONS
-                            + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
-                        )
+                        + str(MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS)
                     ),
                 )
             )
@@ -23335,8 +22791,7 @@ async def _resume_executing_analysis_critic_recovery(
     plan_json = epoch.plan_json
     if (
         not isinstance(plan_json, dict)
-        or plan_json.get("action")
-        != ACTION_TARGETED_ANNOTATION_REPAIR
+        or plan_json.get("action") != ACTION_TARGETED_ANNOTATION_REPAIR
         or epoch.plan_digest != stable_digest(plan_json)
     ):
         raise _AnalysisCriticRecoveryBlocked(
@@ -23362,13 +22817,9 @@ async def _resume_executing_analysis_critic_recovery(
             "Executing analysis recovery has no exact single-attempt reservation"
         )
     incident = (
-        epoch.input_json.get("incident")
-        if isinstance(epoch.input_json, dict)
-        else None
+        epoch.input_json.get("incident") if isinstance(epoch.input_json, dict) else None
     )
-    facts = (
-        incident.get("facts") if isinstance(incident, dict) else None
-    )
+    facts = incident.get("facts") if isinstance(incident, dict) else None
     if not isinstance(facts, dict):
         raise _AnalysisCriticRecoveryBlocked(
             "Executing analysis recovery is missing immutable facts"
@@ -23404,10 +22855,8 @@ async def _resume_executing_analysis_critic_recovery(
         if (
             not isinstance(provenance, dict)
             or provenance.get("orchestrator_epoch") != epoch.epoch
-            or provenance.get("orchestrator_plan_digest")
-            != epoch.plan_digest
-            or set(provenance.get("target_answer_ids") or [])
-            != target_answer_ids
+            or provenance.get("orchestrator_plan_digest") != epoch.plan_digest
+            or set(provenance.get("target_answer_ids") or []) != target_answer_ids
             or not isinstance(
                 provenance.get("recovery_policy_step"),
                 dict,
@@ -23416,17 +22865,13 @@ async def _resume_executing_analysis_critic_recovery(
             raise _AnalysisCriticRecoveryBlocked(
                 "Executing recovery annotation provenance is not exact"
             )
-        policy_steps.append(
-            copy.deepcopy(provenance["recovery_policy_step"])
-        )
+        policy_steps.append(copy.deepcopy(provenance["recovery_policy_step"]))
     recovery_policy_step = policy_steps[0]
     if (
         any(step != recovery_policy_step for step in policy_steps[1:])
-        or recovery_policy_step.get("kind")
-        != "orchestrated_targeted_annotation_repair"
+        or recovery_policy_step.get("kind") != "orchestrated_targeted_annotation_repair"
         or recovery_policy_step.get("orchestrator_epoch") != epoch.epoch
-        or set(recovery_policy_step.get("target_answer_ids") or [])
-        != target_answer_ids
+        or set(recovery_policy_step.get("target_answer_ids") or []) != target_answer_ids
         or recovery_policy_step.get("raw_corpus_sha256") != raw_digest
     ):
         raise _AnalysisCriticRecoveryBlocked(
@@ -23441,9 +22886,7 @@ async def _resume_executing_analysis_critic_recovery(
         *copy.deepcopy(prior_policy_history),
         recovery_policy_step,
     ]
-    final_iteration = (
-        MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
-    )
+    final_iteration = MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
     final_payload = _critic_payload(
         profile=profile,
         catalog=catalog,
@@ -23541,8 +22984,7 @@ async def _resume_executing_analysis_critic_recovery(
             )
         if final_artifact is None and exact_gate_without_primary:
             raise OpenRouterError(
-                "Analysis critic gate exists without its exact primary r3 "
-                "artifact"
+                "Analysis critic gate exists without its exact primary r3 artifact"
             )
         if final_artifact is None:
             final_review = await _analysis_critic_artifact(
@@ -23564,9 +23006,7 @@ async def _resume_executing_analysis_critic_recovery(
                     "or does not match the recovered state"
                 )
             if not isinstance(final_artifact.output_json, dict):
-                raise OpenRouterError(
-                    "Final recovery critic artifact has no decision"
-                )
+                raise OpenRouterError("Final recovery critic artifact has no decision")
             final_review = copy.deepcopy(final_artifact.output_json)
             validation_errors = _critic_review_validation_errors(
                 final_review,
@@ -23578,9 +23018,8 @@ async def _resume_executing_analysis_critic_recovery(
                     + "; ".join(validation_errors)
                 )
         fallback = final_review.get("fallback")
-        if (
-            final_review.get("verdict") != "pass"
-            or (isinstance(fallback, dict) and fallback.get("kind"))
+        if final_review.get("verdict") != "pass" or (
+            isinstance(fallback, dict) and fallback.get("kind")
         ):
             raise OpenRouterError(
                 "Independent final critic did not pass resumed recovery: "
@@ -23688,12 +23127,10 @@ async def _recover_analysis_critic_exhaustion(
     # change: that would invalidate every other row.  Literal-evidence and
     # brand-knowledge adjustments leave the scoped catalog unchanged and are
     # converted to code-owned guidance for the selected rows.
-    proposed_catalog, applied_adjustments, critic_guidance = (
-        _apply_critic_policy(
-            catalog,
-            review,
-            valid_answer_ids=valid_answer_ids,
-        )
+    proposed_catalog, applied_adjustments, critic_guidance = _apply_critic_policy(
+        catalog,
+        review,
+        valid_answer_ids=valid_answer_ids,
     )
     if stable_digest(proposed_catalog) != stable_digest(catalog):
         raise OrchestratorContractError(
@@ -23715,10 +23152,7 @@ async def _recover_analysis_critic_exhaustion(
         for row in rows
         if row.get("answer_id") in issue_answer_ids
     ]
-    if {
-        int(item["answer_id"])
-        for item in issue_rows
-    } != issue_answer_ids:
+    if {int(item["answer_id"]) for item in issue_rows} != issue_answer_ids:
         raise OrchestratorContractError(
             "Analysis critic recovery issue rows are incomplete"
         )
@@ -23776,20 +23210,59 @@ async def _recover_analysis_critic_exhaustion(
             "stop_acceptance_checks": [CHECK_CHECKPOINT_PRESERVED],
         },
     }
-    plan = await plan_durable_recovery(
-        run_id,
-        stage_key=ANALYSIS_CRITIC_RECOVERY_STAGE,
-        failure_class="repairable_semantic",
-        failure_code="analysis_critic_non_convergent",
-        diagnostics=diagnostics,
-        facts=facts,
-        allowed_actions={
-            ACTION_TARGETED_ANNOTATION_REPAIR,
-            ACTION_STOP,
-        },
-        permitted_answer_ids=issue_answer_ids,
-        stage_planner_call_limit=1,
-    )
+    recovery_actions = {
+        ACTION_TARGETED_ANNOTATION_REPAIR,
+        ACTION_STOP,
+    }
+    try:
+        plan = await plan_durable_recovery(
+            run_id,
+            stage_key=ANALYSIS_CRITIC_RECOVERY_STAGE,
+            failure_class="repairable_semantic",
+            failure_code="analysis_critic_non_convergent",
+            diagnostics=diagnostics,
+            facts=facts,
+            allowed_actions=recovery_actions,
+            permitted_answer_ids=issue_answer_ids,
+            stage_planner_call_limit=1,
+        )
+    except (
+        RecoveryBudgetExceeded,
+        RecoveryDecisionRejected,
+        RecoveryPlannerUnavailable,
+    ) as planner_error:
+        plan = await plan_code_owned_recovery(
+            run_id,
+            stage_key=ANALYSIS_CRITIC_RECOVERY_STAGE,
+            failure_class="repairable_semantic",
+            failure_code="analysis_critic_non_convergent",
+            diagnostics=diagnostics,
+            facts=facts,
+            allowed_actions=recovery_actions,
+            permitted_answer_ids=issue_answer_ids,
+            fallback_reason=(f"{type(planner_error).__name__}: {planner_error}")[:1000],
+            decision={
+                "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+                "rationale": (
+                    "Критик уже локализовал проблемные ответы; повторяется "
+                    "только их разметка с неизменным raw и полным critic gate."
+                ),
+                "confidence": "high",
+                "guidance": (
+                    "Повторно разметь только перечисленные critic issue rows. "
+                    "Не изменяй raw-ответы, каталог сущностей или методику метрик."
+                ),
+                "target_answer_ids": sorted(issue_answer_ids),
+                "invalidate_artifact_keys": [],
+                "acceptance_checks": sorted(
+                    {
+                        CHECK_RAW_CORPUS_UNCHANGED,
+                        CHECK_DERIVED_METRICS_RECOMPUTED,
+                        CHECK_CRITIC_GATE_PASSED,
+                    }
+                ),
+            },
+        )
     await mark_recovery_executing(plan, stage_execution_limit=1)
 
     action = str(plan.decision.get("action") or "")
@@ -23826,8 +23299,7 @@ async def _recover_analysis_critic_exhaustion(
             },
         )
         raise OrchestratorContractError(
-            "Analysis critic recovery acceptance checks do not match the "
-            "executor"
+            "Analysis critic recovery acceptance checks do not match the executor"
         )
     if action == ACTION_STOP:
         await finish_recovery(
@@ -23842,10 +23314,7 @@ async def _recover_analysis_critic_exhaustion(
             },
         )
         raise OpenRouterError(
-            str(
-                plan.decision.get("rationale")
-                or "Analysis critic recovery stopped"
-            )
+            str(plan.decision.get("rationale") or "Analysis critic recovery stopped")
         )
     if action != ACTION_TARGETED_ANNOTATION_REPAIR:
         await finish_recovery(
@@ -23935,9 +23404,7 @@ async def _recover_analysis_critic_exhaustion(
         "orchestrator_plan_digest": plan.plan_digest,
         "target_answer_ids": sorted(target_answer_ids),
         "repair_annotation_input_sha256": repair_annotation_digest,
-        "resume_annotation_input_sha256": (
-            resume_annotation_input_sha256
-        ),
+        "resume_annotation_input_sha256": (resume_annotation_input_sha256),
         "guidance_sha256": hashlib.sha256(
             targeted_guidance.encode("utf-8")
         ).hexdigest(),
@@ -23953,9 +23420,7 @@ async def _recover_analysis_critic_exhaustion(
     gate_rows = rows
     gate_metrics = metrics
     gate_policy_history = policy_history
-    final_iteration = (
-        MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
-    )
+    final_iteration = MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
     targeted_annotation_started = False
     try:
         targeted_annotation_started = True
@@ -23966,9 +23431,7 @@ async def _recover_analysis_critic_exhaustion(
             research_guidance=targeted_guidance,
             target_answer_ids=target_answer_ids,
             repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
-            annotation_repair_provenance=(
-                annotation_repair_provenance
-            ),
+            annotation_repair_provenance=(annotation_repair_provenance),
             # One recovery execution gets one annotation pass.  A partial
             # result fails closed instead of starting the normal completion
             # retry recursively.
@@ -23977,9 +23440,7 @@ async def _recover_analysis_critic_exhaustion(
         recovered_rows = await _metric_rows(
             run_id,
             annotation_input_sha256=resume_annotation_input_sha256,
-            annotation_input_sha256_by_answer_id=(
-                expected_annotation_digests
-            ),
+            annotation_input_sha256_by_answer_id=(expected_annotation_digests),
         )
         recovered_metrics = _compute_metrics(
             recovered_rows,
@@ -24029,9 +23490,8 @@ async def _recover_analysis_critic_exhaustion(
             recovery_final=True,
         )
         fallback = final_review.get("fallback")
-        if (
-            final_review.get("verdict") != "pass"
-            or (isinstance(fallback, dict) and fallback.get("kind"))
+        if final_review.get("verdict") != "pass" or (
+            isinstance(fallback, dict) and fallback.get("kind")
         ):
             raise OpenRouterError(
                 "Independent final critic did not pass the targeted recovery: "
@@ -24065,12 +23525,8 @@ async def _recover_analysis_critic_exhaustion(
             try:
                 persisted_rows = await _metric_rows(
                     run_id,
-                    annotation_input_sha256=(
-                        resume_annotation_input_sha256
-                    ),
-                    annotation_input_sha256_by_answer_id=(
-                        expected_annotation_digests
-                    ),
+                    annotation_input_sha256=(resume_annotation_input_sha256),
+                    annotation_input_sha256_by_answer_id=(expected_annotation_digests),
                 )
                 persisted_metrics = _compute_metrics(
                     persisted_rows,
@@ -24111,9 +23567,7 @@ async def _recover_analysis_critic_exhaustion(
                 run_id,
                 passed=False,
                 iteration=(
-                    final_iteration
-                    if gate_rows is not rows
-                    else MAX_CRITIC_ITERATIONS
+                    final_iteration if gate_rows is not rows else MAX_CRITIC_ITERATIONS
                 ),
                 profile=profile,
                 catalog=catalog,
@@ -24122,8 +23576,7 @@ async def _recover_analysis_critic_exhaustion(
                 policy_history=gate_policy_history,
                 reason=(
                     "Ограниченное восстановление не прошло независимый "
-                    "финальный контроль: "
-                    + str(exc)
+                    "финальный контроль: " + str(exc)
                 ),
                 expected_corpus_cells=expected_corpus_cells,
             )
@@ -24238,8 +23691,7 @@ async def _run_analysis_critic_loop(
     if terminal_reason is not None:
         raise OpenRouterError(
             "Analysis critic recovery is terminal for the current analysis "
-            "state: "
-            + terminal_reason
+            "state: " + terminal_reason
         )
 
     for iteration in range(1, MAX_CRITIC_ITERATIONS + 1):
@@ -24283,8 +23735,7 @@ async def _run_analysis_critic_loop(
 
         if verdict == "block" or iteration >= MAX_CRITIC_ITERATIONS:
             reason = str(
-                review.get("summary")
-                or "Критик не подтвердил корректность аналитики."
+                review.get("summary") or "Критик не подтвердил корректность аналитики."
             )
             if (
                 iteration >= MAX_CRITIC_ITERATIONS
@@ -24302,9 +23753,7 @@ async def _run_analysis_critic_loop(
                         policy_history=policy_history,
                         accumulated_guidance=accumulated_guidance,
                         valid_answer_ids=valid_answer_ids,
-                        resume_annotation_input_sha256=(
-                            resume_annotation_input_sha256
-                        ),
+                        resume_annotation_input_sha256=(resume_annotation_input_sha256),
                         expected_corpus_cells=expected_corpus_cells,
                     )
                 except RunLeaseLostError:
@@ -24440,9 +23889,7 @@ async def _evidence_sample(run_id: str) -> list[dict[str, Any]]:
                 "role": prompt.role,
                 "target_role": annotation.annotation_json.get("target_role"),
                 "sentiment": annotation.annotation_json.get("sentiment"),
-                "evidence": list(
-                    annotation.annotation_json.get("evidence") or []
-                ),
+                "evidence": list(annotation.annotation_json.get("evidence") or []),
                 "uncertainties": list(
                     annotation.annotation_json.get("uncertainties") or []
                 ),
@@ -24463,8 +23910,7 @@ def _full_answer_corpus_item(
     labels = {model.key: model.label for model in panel_models()}
     annotation_json = (
         annotation.annotation_json
-        if annotation is not None
-        and isinstance(annotation.annotation_json, dict)
+        if annotation is not None and isinstance(annotation.annotation_json, dict)
         else {}
     )
     answer_text = str(answer.response_text or "")
@@ -24486,9 +23932,7 @@ def _full_answer_corpus_item(
         ),
         observation_state=observation_state,
     )
-    answer_complete = bool(
-        answer.status == "completed" and answer_text.strip()
-    )
+    answer_complete = bool(answer.status == "completed" and answer_text.strip())
     return {
         "answer_id": answer.id,
         "prompt_id": prompt.id,
@@ -24540,9 +23984,7 @@ def _full_answer_corpus_item(
             "annotation_version": annotation_json.get("_annotation_version"),
             "annotation_answer_sha256": annotation_json.get("_answer_sha256"),
             "annotation_answer_model": annotation_json.get("_answer_model"),
-            "annotation_input_sha256": annotation_json.get(
-                "_annotation_input_sha256"
-            ),
+            "annotation_input_sha256": annotation_json.get("_annotation_input_sha256"),
             "panel_contract": (
                 panel_contract if isinstance(panel_contract, dict) else None
             ),
@@ -24551,9 +23993,7 @@ def _full_answer_corpus_item(
 
 
 def _rows_from_full_answer_models(
-    rows: list[
-        tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation | None]
-    ],
+    rows: list[tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation | None]],
     *,
     legacy_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -24561,8 +24001,7 @@ def _rows_from_full_answer_models(
     for answer, prompt, annotation in rows:
         annotation_json = (
             annotation.annotation_json
-            if annotation is not None
-            and isinstance(annotation.annotation_json, dict)
+            if annotation is not None and isinstance(annotation.annotation_json, dict)
             else {}
         )
         answer_text = str(answer.response_text or "")
@@ -24589,9 +24028,7 @@ def _rows_from_full_answer_models(
             prompt_text=prompt.text,
             legacy_allowed=legacy_context["eligible"],
         )
-        observation_attested, observation_state = _panel_observation_state(
-            answer
-        )
+        observation_attested, observation_state = _panel_observation_state(answer)
         metric_access = _panel_metric_access(
             answer,
             transport_attested=web_attested,
@@ -24602,9 +24039,7 @@ def _rows_from_full_answer_models(
             ),
             observation_state=observation_state,
         )
-        answer_complete = bool(
-            answer.status == "completed" and answer_text.strip()
-        )
+        answer_complete = bool(answer.status == "completed" and answer_text.strip())
         output.append(
             {
                 "answer_id": answer.id,
@@ -24641,14 +24076,10 @@ def _rows_from_full_answer_models(
                     and observation_attested
                     and metric_access["context_eligible"]
                 ),
-                "metric_evidence_state": metric_access[
-                    "metric_evidence_state"
-                ],
+                "metric_evidence_state": metric_access["metric_evidence_state"],
                 "metric_limitation": metric_access["metric_limitation"],
                 "observation_state": observation_state,
-                "annotation": (
-                    annotation_json if annotation_is_current else {}
-                ),
+                "annotation": (annotation_json if annotation_is_current else {}),
                 "annotation_state": (
                     "current"
                     if annotation_is_current
@@ -24662,9 +24093,7 @@ def _rows_from_full_answer_models(
 
 
 def _full_answer_corpus_items(
-    rows: list[
-        tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation | None]
-    ],
+    rows: list[tuple[ModelAnswer, VisibilityPrompt, AnswerAnnotation | None]],
     *,
     legacy_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -24691,19 +24120,20 @@ def _full_answer_corpus_items(
 
 def _selection_dimension_values(item: dict[str, Any]) -> dict[str, str]:
     annotation = (
-        item.get("annotation")
-        if isinstance(item.get("annotation"), dict)
-        else {}
+        item.get("annotation") if isinstance(item.get("annotation"), dict) else {}
     )
     panel_evidence = (
         item.get("panel_evidence")
         if isinstance(item.get("panel_evidence"), dict)
         else {}
     )
-    context_eligible = item.get(
-        "context_eligible",
-        item.get("metric_eligible", True),
-    ) is not False
+    context_eligible = (
+        item.get(
+            "context_eligible",
+            item.get("metric_eligible", True),
+        )
+        is not False
+    )
     context_access = (
         "metadata_only"
         if not context_eligible
@@ -24747,10 +24177,7 @@ def _selection_coverage(items: list[dict[str, Any]]) -> dict[str, list[str]]:
     for item in items:
         for dimension, value in _selection_dimension_values(item).items():
             coverage[dimension].add(value)
-    return {
-        dimension: sorted(values)
-        for dimension, values in sorted(coverage.items())
-    }
+    return {dimension: sorted(values) for dimension, values in sorted(coverage.items())}
 
 
 def _selection_features(item: dict[str, Any]) -> set[tuple[str, str]]:
@@ -24759,14 +24186,10 @@ def _selection_features(item: dict[str, Any]) -> set[tuple[str, str]]:
 
 def _selection_item_signature(item: dict[str, Any]) -> dict[str, Any]:
     annotation = (
-        item.get("annotation")
-        if isinstance(item.get("annotation"), dict)
-        else {}
+        item.get("annotation") if isinstance(item.get("annotation"), dict) else {}
     )
     provenance = (
-        item.get("provenance")
-        if isinstance(item.get("provenance"), dict)
-        else {}
+        item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
     )
     panel_evidence = (
         item.get("panel_evidence")
@@ -24784,8 +24207,7 @@ def _selection_item_signature(item: dict[str, Any]) -> dict[str, Any]:
             or hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         ),
         "annotation_sha256": (
-            provenance.get("annotation_sha256")
-            or _stable_json_sha256(annotation)
+            provenance.get("annotation_sha256") or _stable_json_sha256(annotation)
         ),
         "panel_evidence_sha256": panel_evidence.get("sha256"),
         "metric_eligible": item.get("metric_eligible"),
@@ -24804,10 +24226,13 @@ def _final_model_answer_context_item(item: dict[str, Any]) -> dict[str, Any]:
 
     context = copy.deepcopy(item)
     requested_mode = str(context.get("mode") or "unknown")
-    context_eligible = context.get(
-        "context_eligible",
-        context.get("metric_eligible", True),
-    ) is not False
+    context_eligible = (
+        context.get(
+            "context_eligible",
+            context.get("metric_eligible", True),
+        )
+        is not False
+    )
     context["requested_mode"] = requested_mode
     context["verified_mode"] = requested_mode if context_eligible else None
     context["context_access"] = (
@@ -24869,15 +24294,13 @@ def _select_final_answer_context(
     )
     if max_answers is None:
         selected_context = [
-            _final_model_answer_context_item(item)
-            for item in ordered_answers
+            _final_model_answer_context_item(item) for item in ordered_answers
         ]
         observed_features = set().union(
             *(_selection_features(item) for item in ordered_answers)
         )
         selected_full_text_count = sum(
-            item.get("context_access") == "full_text"
-            for item in selected_context
+            item.get("context_access") == "full_text" for item in selected_context
         )
         selected_limited_prefix_count = sum(
             item.get("context_access") == "provider_limited_prefix"
@@ -24887,9 +24310,7 @@ def _select_final_answer_context(
             "version": FINAL_CONTEXT_SELECTION_VERSION,
             "policy": "complete_attested_corpus_no_local_cap_v1",
             "full_corpus_digest": corpus_manifest.get("digest"),
-            "full_corpus_critic_rows_sha256": corpus_manifest.get(
-                "critic_rows_sha256"
-            ),
+            "full_corpus_critic_rows_sha256": corpus_manifest.get("critic_rows_sha256"),
             "max_answers": None,
             "selected_count": len(ordered_answers),
             "selected_full_text_count": selected_full_text_count,
@@ -24917,20 +24338,14 @@ def _select_final_answer_context(
         }
 
     indexed = list(enumerate(ordered_answers))
-    all_features = set().union(
-        *(_selection_features(item) for _, item in indexed)
-    )
+    all_features = set().union(*(_selection_features(item) for _, item in indexed))
     ordered_features = sorted(all_features)
     feature_bits = {
-        feature: 1 << index
-        for index, feature in enumerate(ordered_features)
+        feature: 1 << index for index, feature in enumerate(ordered_features)
     }
     all_features_mask = (1 << len(ordered_features)) - 1
     item_masks = {
-        index: sum(
-            feature_bits[feature]
-            for feature in _selection_features(item)
-        )
+        index: sum(feature_bits[feature] for feature in _selection_features(item))
         for index, item in indexed
     }
     item_serialized_bytes = {
@@ -24939,10 +24354,7 @@ def _select_final_answer_context(
     }
 
     provider_mode_count = len(
-        {
-            _selection_dimension_values(item)["provider_mode"]
-            for item in ordered_answers
-        }
+        {_selection_dimension_values(item)["provider_mode"] for item in ordered_answers}
     )
     if provider_mode_count > max_answers:
         raise OpenRouterError(
@@ -24952,8 +24364,7 @@ def _select_final_answer_context(
 
     def selection_signature(indexes: tuple[int, ...]) -> tuple[int, ...]:
         return tuple(
-            int(ordered_answers[index].get("answer_id") or 0)
-            for index in indexes
+            int(ordered_answers[index].get("answer_id") or 0) for index in indexes
         )
 
     # Equal or strictly dominated masks can never improve coverage, byte cost
@@ -25032,18 +24443,12 @@ def _select_final_answer_context(
         greedy_selected = (*greedy_selected, index)
 
     best_key: tuple[int, int, tuple[int, ...]] = (
-        (
-            greedy_cost
-            if greedy_mask == all_features_mask
-            else 10**30
-        ),
+        (greedy_cost if greedy_mask == all_features_mask else 10**30),
         len(greedy_selected),
         selection_signature(tuple(sorted(greedy_selected))),
     )
     best_selected: tuple[int, ...] = (
-        tuple(sorted(greedy_selected))
-        if greedy_mask == all_features_mask
-        else ()
+        tuple(sorted(greedy_selected)) if greedy_mask == all_features_mask else ()
     )
     visited_cost: dict[tuple[int, int], int] = {}
 
@@ -25153,8 +24558,7 @@ def _select_final_answer_context(
         _final_model_answer_context_item(item) for item in selected_answers
     ]
     selected_full_text_count = sum(
-        item.get("context_access") == "full_text"
-        for item in selected_context
+        item.get("context_access") == "full_text" for item in selected_context
     )
     selected_limited_prefix_count = sum(
         item.get("context_access") == "provider_limited_prefix"
@@ -25177,9 +24581,7 @@ def _select_final_answer_context(
     manifest_core = {
         "version": FINAL_CONTEXT_SELECTION_VERSION,
         "full_corpus_digest": corpus_manifest.get("digest"),
-        "full_corpus_critic_rows_sha256": corpus_manifest.get(
-            "critic_rows_sha256"
-        ),
+        "full_corpus_critic_rows_sha256": corpus_manifest.get("critic_rows_sha256"),
         "max_answers": max_answers,
         "selected_count": len(selected_answers),
         "selected_full_text_count": selected_full_text_count,
@@ -25268,8 +24670,7 @@ async def _full_answer_context(
         mismatch_reasons.append("corpus_incomplete")
     if mismatch_reasons:
         raise OpenRouterError(
-            "Final answer corpus failed closed: "
-            + ", ".join(mismatch_reasons)
+            "Final answer corpus failed closed: " + ", ".join(mismatch_reasons)
         )
 
     return {
@@ -25347,6 +24748,7 @@ def _build_public_report(
     brand_knowledge_public = copy.deepcopy(metrics["brand_knowledge"])
     providers_public = copy.deepcopy(metrics["providers"])
     if memory_observational:
+
         def withhold_observational_facets(slice_data: Any) -> None:
             if not isinstance(slice_data, dict):
                 return
@@ -25362,9 +24764,7 @@ def _build_public_report(
                 continue
             provider_knowledge = provider.get("brand_knowledge")
             if isinstance(provider_knowledge, dict):
-                withhold_observational_facets(
-                    provider_knowledge.get("memory")
-                )
+                withhold_observational_facets(provider_knowledge.get("memory"))
     portfolio_scope = metrics.get("portfolio_scope")
     if not isinstance(portfolio_scope, dict):
         portfolio_scope = {}
@@ -25388,19 +24788,13 @@ def _build_public_report(
         "target_portfolio_unconfirmed"
         if portfolio_scope_unavailable
         else (
-            None
-            if model_consistency_available
-            else "insufficient_valid_provider_data"
+            None if model_consistency_available else "insufficient_valid_provider_data"
         )
     )
     model_consistency_public = {
         "value": model_consistency_value,
-        "data_state": (
-            "complete" if model_consistency_available else "unavailable"
-        ),
-        "state": (
-            "available" if model_consistency_available else "unknown"
-        ),
+        "data_state": ("complete" if model_consistency_available else "unavailable"),
+        "state": ("available" if model_consistency_available else "unknown"),
         "unavailable_reason": model_consistency_reason,
     }
     methodology_modes = [
@@ -25489,9 +24883,7 @@ def _build_public_report(
                     if portfolio_scope_unavailable
                     else portfolio_web.get("state")
                 ),
-                "unavailable_reason": portfolio_web.get(
-                    "unavailable_reason"
-                ),
+                "unavailable_reason": portfolio_web.get("unavailable_reason"),
                 "data_state": portfolio_web.get("data_state"),
             },
             "brand_knowledge": {
@@ -25503,9 +24895,7 @@ def _build_public_report(
                     else "Конкретные знания без веба"
                 ),
                 "state": metrics["brand_knowledge"]["memory"].get("state"),
-                "data_state": metrics["brand_knowledge"]["memory"].get(
-                    "data_state"
-                ),
+                "data_state": metrics["brand_knowledge"]["memory"].get("data_state"),
                 "evidence_state": metrics["brand_knowledge"]["memory"].get(
                     "evidence_state"
                 ),
@@ -25568,15 +24958,13 @@ def _build_public_report(
             "note": metrics["metric_note"],
             "offline_limit": (
                 (
-                    (
-                        f"{CANONICAL_OBSERVATIONAL_MEMORY_LIMITATION} "
-                        "Perplexity в этот срез не входит."
-                        if memory_observational
-                        else (
-                            "Perplexity не входит в сравнение памяти: её "
-                            "доступный поисковый режим нельзя честно "
-                            "отключить."
-                        )
+                    f"{CANONICAL_OBSERVATIONAL_MEMORY_LIMITATION} "
+                    "Perplexity в этот срез не входит."
+                    if memory_observational
+                    else (
+                        "Perplexity не входит в сравнение памяти: её "
+                        "доступный поисковый режим нельзя честно "
+                        "отключить."
                     )
                 )
                 if memory_available
@@ -25641,9 +25029,7 @@ def _validate_final_report(report: dict[str, Any]) -> list[str]:
     sections = report.get("sections")
     actions = report.get("actions")
     if "illustrations" in report:
-        errors.append(
-            "Концепции иллюстраций не должны входить в аналитический отчёт."
-        )
+        errors.append("Концепции иллюстраций не должны входить в аналитический отчёт.")
     if not isinstance(sections, list) or not sections:
         errors.append("В отчёте должен быть хотя бы один содержательный раздел.")
     if not isinstance(actions, list) or not actions:
@@ -25661,11 +25047,7 @@ def _final_report_semantic_review_payload(
     availability_contract = metric_availability_contract(public_report)
     for item in availability_contract:
         path = str(item.get("path") or "/")
-        item["path"] = (
-            "/report_data"
-            if path == "/"
-            else f"/report_data{path}"
-        )
+        item["path"] = "/report_data" if path == "/" else f"/report_data{path}"
     evidence_document = {
         "report_data": public_report,
         # Keep exact state/path rows inside the lossless evidence input.  A
@@ -25733,10 +25115,7 @@ async def _persist_final_semantic_physical_event(
         raise OpenRouterError("Semantic physical-post status is invalid")
     event_copy = copy.deepcopy(event)
     event_sha256 = _stable_json_sha256(event_copy)
-    artifact_key = (
-        f"frsg_a{attempt}_post_{request_sha256[:16]}_"
-        f"{event_sha256[:32]}"
-    )
+    artifact_key = f"frsg_a{attempt}_post_{request_sha256[:16]}_{event_sha256[:32]}"
     raw_text = event_copy.pop("raw_text", None)
     usage = event_copy.pop("usage", None)
     if raw_text is not None and not isinstance(raw_text, str):
@@ -25772,9 +25151,7 @@ async def _persist_final_semantic_physical_event(
                 usage_json=copy.deepcopy(usage),
                 error_message=error_message,
             )
-            .on_conflict_do_nothing(
-                index_elements=("run_id", "artifact_key")
-            )
+            .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
         )
         await assert_run_lease(run_id)
         await session.commit()
@@ -25834,9 +25211,7 @@ async def _persist_final_semantic_audit_event(
     if kind_key is None:
         raise OpenRouterError("Unknown semantic checkpoint event kind")
     candidate_sha256 = str(event.get("candidate_sha256") or "")
-    manifest_sha256 = str(
-        event.get("source_part_receipts_sha256") or ""
-    )
+    manifest_sha256 = str(event.get("source_part_receipts_sha256") or "")
     if re.fullmatch(r"[0-9a-f]{64}", candidate_sha256) is None:
         raise OpenRouterError("Semantic checkpoint candidate digest is invalid")
     if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
@@ -25844,8 +25219,7 @@ async def _persist_final_semantic_audit_event(
     event_copy = copy.deepcopy(event)
     event_sha256 = _stable_json_sha256(event_copy)
     artifact_key = (
-        f"frsg_a{attempt}_{kind_key}_{candidate_sha256[:12]}_"
-        f"{event_sha256[:32]}"
+        f"frsg_a{attempt}_{kind_key}_{candidate_sha256[:12]}_{event_sha256[:32]}"
     )
     raw_text = event_copy.pop("raw_text", None)
     usage = event_copy.pop("usage", None)
@@ -25877,9 +25251,7 @@ async def _persist_final_semantic_audit_event(
                 raw_text=raw_text,
                 usage_json=copy.deepcopy(usage),
             )
-            .on_conflict_do_nothing(
-                index_elements=("run_id", "artifact_key")
-            )
+            .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
         )
         await assert_run_lease(run_id)
         await session.commit()
@@ -25913,9 +25285,7 @@ async def _persist_final_semantic_audit_event(
         existing.input_json != event_input
         or _stable_json_sha256(existing_event) != event_sha256
     ):
-        raise OpenRouterError(
-            "Semantic checkpoint append-only key mutation detected"
-        )
+        raise OpenRouterError("Semantic checkpoint append-only key mutation detected")
 
 
 async def _load_final_semantic_part_checkpoint(
@@ -25957,14 +25327,10 @@ async def _load_final_semantic_part_checkpoint(
             "raw_text": str(row.raw_text or ""),
             "usage": copy.deepcopy(row.usage_json),
         }
-        if (
-            event.get("kind") != "semantic_part_accepted"
-            or row.input_json.get("event_sha256")
-            != _stable_json_sha256(event)
-        ):
-            raise OpenRouterError(
-                "Stored semantic part checkpoint digest is invalid"
-            )
+        if event.get("kind") != "semantic_part_accepted" or row.input_json.get(
+            "event_sha256"
+        ) != _stable_json_sha256(event):
+            raise OpenRouterError("Stored semantic part checkpoint digest is invalid")
         events.append(event)
     if not events:
         return None
@@ -26031,8 +25397,7 @@ async def _load_final_semantic_physical_result(
             "usage": copy.deepcopy(row.usage_json),
         }
         if (
-            row.input_json.get("event_sha256")
-            != _stable_json_sha256(event)
+            row.input_json.get("event_sha256") != _stable_json_sha256(event)
             or event.get("request_sha256") != request_sha256
             or event.get("request_payload") != request_payload
         ):
@@ -26049,8 +25414,7 @@ async def _load_final_semantic_physical_result(
         return None
     if len(accepted) != 1:
         raise OpenRouterError(
-            "Multiple accepted semantic physical receipts exist for one "
-            "exact request"
+            "Multiple accepted semantic physical receipts exist for one exact request"
         )
     row, _event = accepted[0]
     return SimpleNamespace(
@@ -26091,9 +25455,7 @@ async def _bounded_semantic_model_evidence_context(
         payload=evidence_document,
         system=REPORT_SEMANTIC_REVIEW_SYSTEM,
         target_model=REPORT_SEMANTIC_MODEL,
-        artifact_namespace=(
-            f"{artifact_namespace}_semantic_input_a{attempt}"
-        ),
+        artifact_namespace=(f"{artifact_namespace}_semantic_input_a{attempt}"),
         prompt_version=REPORT_SEMANTIC_GATE_VERSION,
         final_request_utf8_bytes=request_bytes,
     )
@@ -26121,21 +25483,20 @@ async def _final_report_semantic_review_artifact(
         selected_answer_context=selected_answer_context,
         answer_selection_manifest=answer_selection_manifest,
     )
-    model_evidence_context, semantic_input_plan = (
-        await _bounded_semantic_model_evidence_context(
-            run_id,
-            review_input=review_input,
-            attempt=attempt,
-            artifact_namespace=artifact_namespace,
-        )
+    (
+        model_evidence_context,
+        semantic_input_plan,
+    ) = await _bounded_semantic_model_evidence_context(
+        run_id,
+        review_input=review_input,
+        attempt=attempt,
+        artifact_namespace=artifact_namespace,
     )
     review_input["model_evidence_context"] = model_evidence_context
     await _save_artifact(
         run_id,
         stage_key="report",
-        artifact_key=(
-            f"{artifact_namespace}_input_preflight_a{attempt}"
-        ),
+        artifact_key=(f"{artifact_namespace}_input_preflight_a{attempt}"),
         status="completed",
         model=REPORT_SEMANTIC_MODEL,
         input_json={
@@ -26232,8 +25593,7 @@ async def _final_report_semantic_review_artifact(
         )
         if review_errors:
             raise OpenRouterError(
-                "Final report semantic review is invalid: "
-                + "; ".join(review_errors)
+                "Final report semantic review is invalid: " + "; ".join(review_errors)
             )
         await _save_artifact(
             run_id,
@@ -26251,9 +25611,7 @@ async def _final_report_semantic_review_artifact(
     except Exception as exc:
         failed_result = getattr(exc, "result", None)
         if raw_text is None:
-            raw_text = (
-                str(getattr(failed_result, "text", "") or "") or None
-            )
+            raw_text = str(getattr(failed_result, "text", "") or "") or None
         if usage is None and isinstance(
             getattr(failed_result, "usage", None),
             dict,
@@ -26425,8 +25783,7 @@ def _validate_illustration_concepts(
         "web_memory_gap",
     ]
     actual_roles = [
-        item.get("role") if isinstance(item, dict) else None
-        for item in illustrations
+        item.get("role") if isinstance(item, dict) else None for item in illustrations
     ]
     if actual_roles != expected_roles:
         errors.append(
@@ -26477,8 +25834,7 @@ def _validate_illustration_concepts(
                 enforce_report_contract=False,
             )
             errors.extend(
-                f"Концепция № {sequence}: {error}"
-                for error in semantic_errors
+                f"Концепция № {sequence}: {error}" for error in semantic_errors
             )
         paths = item.get("evidence_paths")
         if not isinstance(paths, list) or not paths:
@@ -26489,8 +25845,7 @@ def _validate_illustration_concepts(
         for path in paths or []:
             roots = allowed_roots.get(role, ())
             path_allowed = isinstance(path, str) and any(
-                path == root.rstrip("/") or path.startswith(root)
-                for root in roots
+                path == root.rstrip("/") or path.startswith(root) for root in roots
             )
             if not path_allowed:
                 errors.append(
@@ -26525,9 +25880,7 @@ def _validate_illustration_concepts(
                 "diversity_move",
             )
         ):
-            errors.append(
-                f"В концепции № {sequence} не заполнен творческий бриф."
-            )
+            errors.append(f"В концепции № {sequence} не заполнен творческий бриф.")
         elif str(brief["visual_thesis"]).casefold().strip() in visual_theses:
             errors.append(
                 f"Концепция № {sequence} повторяет визуальную идею другой иллюстрации."
@@ -26663,9 +26016,7 @@ def _final_input_domain_context(
                     "answer_index": index,
                     "answer_id": answer.get("answer_id"),
                     "prompt_id": answer.get("prompt_id"),
-                    "raw_answer_sha256": provenance.get(
-                        "raw_answer_sha256"
-                    ),
+                    "raw_answer_sha256": provenance.get("raw_answer_sha256"),
                 }
                 context_id = "answer-" + _stable_json_sha256(signature)[:24]
                 context = {
@@ -26679,16 +26030,12 @@ def _final_input_domain_context(
                     "prompt_key": answer.get("prompt_key"),
                     "provider_key": answer.get("provider_key"),
                     "model": answer.get("model"),
-                    "requested_mode": answer.get(
-                        "requested_mode", answer.get("mode")
-                    ),
+                    "requested_mode": answer.get("requested_mode", answer.get("mode")),
                     "verified_mode": answer.get("verified_mode"),
                     "context_access": answer.get("context_access"),
                     "metric_eligible": answer.get("metric_eligible"),
                     "context_eligible": answer.get("context_eligible"),
-                    "metric_evidence_state": answer.get(
-                        "metric_evidence_state"
-                    ),
+                    "metric_evidence_state": answer.get("metric_evidence_state"),
                     "intent_class": answer.get("intent_class"),
                     "scenario_role": answer.get("scenario_role"),
                     "annotation_valid": annotation.get("valid"),
@@ -26705,9 +26052,7 @@ def _final_input_domain_context(
                         "citations": f"{prefix}/citations",
                     },
                 }
-                context["domain_context_sha256"] = _stable_json_sha256(
-                    context
-                )
+                context["domain_context_sha256"] = _stable_json_sha256(context)
                 return context
 
     path_parts = [part for part in source_path.split("/") if part]
@@ -26836,11 +26181,7 @@ def _flatten_final_input_payload(
         "source_unit_count": len(units),
         "source_unit_ids_sha256": _stable_json_sha256(unit_ids),
         "source_units": [
-            {
-                key: value
-                for key, value in unit.items()
-                if key != "context_value"
-            }
+            {key: value for key, value in unit.items() if key != "context_value"}
             for unit in units
         ],
     }
@@ -26896,14 +26237,10 @@ def _final_input_claim_ledger(
         claims, manifest = build_claim_ledger(
             core_value,
             document_id=f"{unit_id}:claims",
-            target_fragment_utf8_bytes=(
-                FINAL_INPUT_CLAIM_FRAGMENT_UTF8_BYTES
-            ),
+            target_fragment_utf8_bytes=(FINAL_INPUT_CLAIM_FRAGMENT_UTF8_BYTES),
         )
         if reconstruct_claim_ledger(claims, manifest) != core_value:
-            raise OpenRouterError(
-                "Final input claim ledger changed a source-unit core"
-            )
+            raise OpenRouterError("Final input claim ledger changed a source-unit core")
         unit_claim_ids: list[str] = []
         for claim in claims:
             if claim.claim_id in claims_by_id:
@@ -26919,16 +26256,10 @@ def _final_input_claim_ledger(
                     "source_path": source_path,
                     "source_core_start_char": unit.get("core_start_char"),
                     "source_core_end_char": unit.get("core_end_char"),
-                    "analysis_dimension": domain_context[
-                        "analysis_dimension"
-                    ],
-                    "domain_context_id": domain_context[
-                        "domain_context_id"
-                    ],
+                    "analysis_dimension": domain_context["analysis_dimension"],
+                    "domain_context_id": domain_context["domain_context_id"],
                     "domain_context": copy.deepcopy(domain_context),
-                    "domain_context_sha256": domain_context[
-                        "domain_context_sha256"
-                    ],
+                    "domain_context_sha256": domain_context["domain_context_sha256"],
                     "semantic_contract": (
                         "exact_excerpt_and_lineage_only_not_semantic_proof"
                     ),
@@ -26970,8 +26301,7 @@ def _validate_final_domain_context(value: Any) -> dict[str, Any]:
         not isinstance(expected_sha256, str)
         or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
         or _stable_json_sha256(context) != expected_sha256
-        or context.get("analysis_dimension")
-        not in FINAL_ANALYSIS_DIMENSIONS
+        or context.get("analysis_dimension") not in FINAL_ANALYSIS_DIMENSIONS
         or not isinstance(context.get("domain_context_id"), str)
         or not str(context.get("domain_context_id") or "")
     ):
@@ -27006,9 +26336,7 @@ def _final_answer_accounting_manifest(
             )
         seen_claim_ids.add(claim_id)
         _validate_final_domain_context(row.get("domain_context"))
-        match = _FINAL_ANSWER_SOURCE_PATH.match(
-            str(row.get("source_path") or "")
-        )
+        match = _FINAL_ANSWER_SOURCE_PATH.match(str(row.get("source_path") or ""))
         if match:
             index = int(match.group("index"))
             if index >= len(answers):
@@ -27024,11 +26352,7 @@ def _final_answer_accounting_manifest(
         source_path: str,
     ) -> list[dict[str, Any]]:
         return sorted(
-            (
-                row
-                for row in rows
-                if row.get("source_path") == source_path
-            ),
+            (row for row in rows if row.get("source_path") == source_path),
             key=lambda row: (
                 int(row.get("source_core_start_char") or 0),
                 int(row.get("source_utf8_offset") or 0),
@@ -27046,12 +26370,8 @@ def _final_answer_accounting_manifest(
             )
         rows = claims_by_answer.get(index, [])
         if not rows:
-            raise OpenRouterError(
-                f"Final selected answer {index} has no exact claims"
-            )
-        context_ids = {
-            str(row.get("domain_context_id") or "") for row in rows
-        }
+            raise OpenRouterError(f"Final selected answer {index} has no exact claims")
+        context_ids = {str(row.get("domain_context_id") or "") for row in rows}
         if len(context_ids) != 1 or "" in context_ids:
             raise OpenRouterError(
                 "Final selected answer claims lost their shared join key"
@@ -27060,9 +26380,7 @@ def _final_answer_accounting_manifest(
         raw_rows = rows_for_path(rows, f"{prefix}/answer_text")
         prompt_rows = rows_for_path(rows, f"{prefix}/scenario")
         raw_text_present = "answer_text" in answer
-        reconstructed_raw = "".join(
-            str(row.get("excerpt") or "") for row in raw_rows
-        )
+        reconstructed_raw = "".join(str(row.get("excerpt") or "") for row in raw_rows)
         reconstructed_prompt = "".join(
             str(row.get("excerpt") or "") for row in prompt_rows
         )
@@ -27097,9 +26415,7 @@ def _final_answer_accounting_manifest(
             raw_disposition = "analyzed_exactly_once"
         else:
             raw_sha256 = (
-                expected_raw_sha256
-                if isinstance(expected_raw_sha256, str)
-                else None
+                expected_raw_sha256 if isinstance(expected_raw_sha256, str) else None
             )
             raw_disposition = "withheld_unattested_metadata_only"
         row_claim_ids = [str(row["claim_id"]) for row in rows]
@@ -27113,9 +26429,7 @@ def _final_answer_accounting_manifest(
                 "prompt_id": answer.get("prompt_id"),
                 "domain_context_id": next(iter(context_ids)),
                 "provider_key": answer.get("provider_key"),
-                "requested_mode": answer.get(
-                    "requested_mode", answer.get("mode")
-                ),
+                "requested_mode": answer.get("requested_mode", answer.get("mode")),
                 "verified_mode": answer.get("verified_mode"),
                 "intent_class": answer.get("intent_class"),
                 "scenario_role": answer.get("scenario_role"),
@@ -27123,18 +26437,12 @@ def _final_answer_accounting_manifest(
                 "raw_disposition": raw_disposition,
                 "raw_answer_sha256": raw_sha256,
                 "raw_answer_utf8_bytes": (
-                    len(reconstructed_raw.encode("utf-8"))
-                    if raw_text_present
-                    else None
+                    len(reconstructed_raw.encode("utf-8")) if raw_text_present else None
                 ),
                 "raw_claim_count": len(row_raw_claim_ids),
-                "raw_claim_ids_sha256": _stable_json_sha256(
-                    row_raw_claim_ids
-                ),
+                "raw_claim_ids_sha256": _stable_json_sha256(row_raw_claim_ids),
                 "prompt_sha256": (
-                    text_sha256(reconstructed_prompt)
-                    if "scenario" in answer
-                    else None
+                    text_sha256(reconstructed_prompt) if "scenario" in answer else None
                 ),
                 "prompt_claim_count": len(prompt_rows),
                 "all_claim_count": len(row_claim_ids),
@@ -27143,35 +26451,26 @@ def _final_answer_accounting_manifest(
         )
 
     if len(answer_claim_ids) != len(set(answer_claim_ids)):
-        raise OpenRouterError(
-            "Final answer accounting assigned a claim more than once"
-        )
+        raise OpenRouterError("Final answer accounting assigned a claim more than once")
     manifest = {
         "version": FINAL_ANSWER_ACCOUNTING_VERSION,
         "answer_count": len(answers),
         "accounted_answer_count": len(answer_rows),
         "raw_text_answer_count": sum(
-            row["raw_disposition"] == "analyzed_exactly_once"
-            for row in answer_rows
+            row["raw_disposition"] == "analyzed_exactly_once" for row in answer_rows
         ),
         "metadata_only_answer_count": sum(
-            row["raw_disposition"]
-            == "withheld_unattested_metadata_only"
+            row["raw_disposition"] == "withheld_unattested_metadata_only"
             for row in answer_rows
         ),
         "answer_claim_count": len(answer_claim_ids),
         "answer_claim_ids_sha256": _stable_json_sha256(answer_claim_ids),
         "raw_answer_claim_count": len(raw_answer_claim_ids),
-        "raw_answer_claim_ids_sha256": _stable_json_sha256(
-            raw_answer_claim_ids
-        ),
+        "raw_answer_claim_ids_sha256": _stable_json_sha256(raw_answer_claim_ids),
         "non_answer_claim_count": len(non_answer_claim_ids),
-        "non_answer_claim_ids_sha256": _stable_json_sha256(
-            non_answer_claim_ids
-        ),
+        "non_answer_claim_ids_sha256": _stable_json_sha256(non_answer_claim_ids),
         "claim_assignment_complete": (
-            len(answer_claim_ids) + len(non_answer_claim_ids)
-            == len(claim_rows)
+            len(answer_claim_ids) + len(non_answer_claim_ids) == len(claim_rows)
         ),
         "raw_reconstruction_complete": True,
         "answer_rows": answer_rows,
@@ -27241,9 +26540,7 @@ def _final_direct_answer_accounting_manifest(
             "prompt_id": answer.get("prompt_id"),
             "domain_context_id": context_id,
             "provider_key": answer.get("provider_key"),
-            "requested_mode": answer.get(
-                "requested_mode", answer.get("mode")
-            ),
+            "requested_mode": answer.get("requested_mode", answer.get("mode")),
             "verified_mode": answer.get("verified_mode"),
             "intent_class": answer.get("intent_class"),
             "scenario_role": answer.get("scenario_role"),
@@ -27259,13 +26556,9 @@ def _final_direct_answer_accounting_manifest(
                 len(raw_text.encode("utf-8")) if raw_present else None
             ),
             "prompt_source_path": f"{prefix}/scenario",
-            "prompt_sha256": (
-                text_sha256(prompt_text) if prompt_present else None
-            ),
+            "prompt_sha256": (text_sha256(prompt_text) if prompt_present else None),
             "prompt_utf8_bytes": (
-                len(prompt_text.encode("utf-8"))
-                if prompt_present
-                else None
+                len(prompt_text.encode("utf-8")) if prompt_present else None
             ),
         }
         row_commitment = _stable_json_sha256(row)
@@ -27279,13 +26572,11 @@ def _final_direct_answer_accounting_manifest(
         "answer_count": len(answers),
         "accounted_answer_count": len(rows),
         "raw_text_answer_count": sum(
-            row["raw_disposition"]
-            == "present_once_in_direct_request_payload"
+            row["raw_disposition"] == "present_once_in_direct_request_payload"
             for row in rows
         ),
         "metadata_only_answer_count": sum(
-            row["raw_disposition"]
-            == "withheld_unattested_metadata_only"
+            row["raw_disposition"] == "withheld_unattested_metadata_only"
             for row in rows
         ),
         "request_payload_occurrences_per_raw_answer": 1,
@@ -27326,11 +26617,7 @@ def _structured_provider_request_utf8_bytes(
         "temperature": temperature,
     }
     maximum = model_envelope.get("max_completion_tokens")
-    if (
-        isinstance(maximum, int)
-        and not isinstance(maximum, bool)
-        and maximum > 0
-    ):
+    if isinstance(maximum, int) and not isinstance(maximum, bool) and maximum > 0:
         request["max_completion_tokens"] = maximum
     policy_fields, _request_policy = web_request_policy(
         model=model,
@@ -27413,10 +26700,7 @@ def _pack_final_evidence_packets(
         # is larger than its own request window.  Keep that singleton as a
         # group so the caller can terminate with the deterministic code-owned
         # union instead of dropping evidence or failing a resumable run.
-        if (
-            len(current) > 1
-            and request_utf8_bytes(group_index, current) > window_bytes
-        ):
+        if len(current) > 1 and request_utf8_bytes(group_index, current) > window_bytes:
             raise OpenRouterError(
                 "A multi-packet final evidence group exceeds its reducer "
                 "request window after exact wrapper, system and schema "
@@ -27567,10 +26851,7 @@ def _final_input_deterministic_passthrough(
         )
         if not protect:
             continue
-        if (
-            int(unit.get("unit_count") or 0) != 1
-            or unit.get("unit_index") != 0
-        ):
+        if int(unit.get("unit_count") or 0) != 1 or unit.get("unit_index") != 0:
             raise OpenRouterError(
                 "Final input passthrough scalar was unexpectedly partitioned"
             )
@@ -27578,19 +26859,13 @@ def _final_input_deterministic_passthrough(
             raise OpenRouterError(
                 "Final input passthrough contains a duplicate source path"
             )
-        if text_sha256(core_value) != str(
-            unit.get("source_value_sha256") or ""
-        ):
+        if text_sha256(core_value) != str(unit.get("source_value_sha256") or ""):
             raise OpenRouterError(
                 "Final input passthrough scalar failed its source digest"
             )
         seen_paths.add(source_path)
         try:
-            value = (
-                core_value
-                if value_type == "string"
-                else json.loads(core_value)
-            )
+            value = core_value if value_type == "string" else json.loads(core_value)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise OpenRouterError(
                 "Final input passthrough scalar is not valid JSON"
@@ -27610,9 +26885,7 @@ def _final_input_deterministic_passthrough(
                     if value_type == "string"
                     else core_value
                 ),
-                "source_value_sha256": str(
-                    unit.get("source_value_sha256") or ""
-                ),
+                "source_value_sha256": str(unit.get("source_value_sha256") or ""),
             }
         )
     return passthrough
@@ -27638,25 +26911,21 @@ def _normalize_final_evidence_packet(
             not isinstance(paths, list)
             or not paths
             or any(
-                not isinstance(path, str) or path not in allowed_paths
-                for path in paths
+                not isinstance(path, str) or path not in allowed_paths for path in paths
             )
         ):
             raise OpenRouterError(
                 "Final evidence observation references an unknown source path"
             )
         if len(paths) != len(set(paths)):
-            raise OpenRouterError(
-                "Final evidence observation repeats a source path"
-            )
+            raise OpenRouterError("Final evidence observation repeats a source path")
         observation["source_paths"] = list(dict.fromkeys(paths))
         unit_ids = observation.get("source_unit_ids")
         if (
             not isinstance(unit_ids, list)
             or not unit_ids
             or any(
-                not isinstance(unit_id, str)
-                or unit_id not in allowed_unit_ids
+                not isinstance(unit_id, str) or unit_id not in allowed_unit_ids
                 for unit_id in unit_ids
             )
         ):
@@ -27664,34 +26933,28 @@ def _normalize_final_evidence_packet(
                 "Final evidence observation references an unknown source unit"
             )
         if len(unit_ids) != len(set(unit_ids)):
-            raise OpenRouterError(
-                "Final evidence observation repeats a source unit"
-            )
+            raise OpenRouterError("Final evidence observation repeats a source unit")
         observation["source_unit_ids"] = list(dict.fromkeys(unit_ids))
         expected_paths = {
-            allowed_unit_paths[unit_id]
-            for unit_id in observation["source_unit_ids"]
+            allowed_unit_paths[unit_id] for unit_id in observation["source_unit_ids"]
         }
         if set(observation["source_paths"]) != expected_paths:
             raise OpenRouterError(
-                "Final evidence observation mismatches its code-owned "
-                "source unit paths"
+                "Final evidence observation mismatches its code-owned source unit paths"
             )
         observed_unit_ids.update(observation["source_unit_ids"])
         if allowed_claims is not None:
             statement = observation.get("statement")
             if not isinstance(statement, str) or not statement.strip():
                 raise OpenRouterError(
-                    "Final evidence observation omitted its claim-specific "
-                    "statement"
+                    "Final evidence observation omitted its claim-specific statement"
                 )
             claim_ids = observation.get("source_claim_ids")
             if (
                 not isinstance(claim_ids, list)
                 or not claim_ids
                 or any(
-                    not isinstance(claim_id, str)
-                    or claim_id not in allowed_claims
+                    not isinstance(claim_id, str) or claim_id not in allowed_claims
                     for claim_id in claim_ids
                 )
             ):
@@ -27706,9 +26969,7 @@ def _normalize_final_evidence_packet(
                 )
             claim_id = str(claim_ids[0])
             claim = allowed_claims[claim_id]
-            domain_context = _validate_final_domain_context(
-                claim.get("domain_context")
-            )
+            domain_context = _validate_final_domain_context(claim.get("domain_context"))
             claim_unit_id = str(claim["source_unit_id"])
             claim_source_path = str(claim["source_path"])
             if observation["source_unit_ids"] != [claim_unit_id]:
@@ -27730,17 +26991,12 @@ def _normalize_final_evidence_packet(
                 )
             if not evidence_excerpt and claim_excerpt:
                 raise OpenRouterError(
-                    "Final evidence observation omitted its exact source "
-                    "claim excerpt"
+                    "Final evidence observation omitted its exact source claim excerpt"
                 )
             exact_values = observation.get("exact_values")
-            if (
-                not isinstance(exact_values, list)
-                or any(
-                    not isinstance(value, str)
-                    or value not in claim_excerpt
-                    for value in exact_values
-                )
+            if not isinstance(exact_values, list) or any(
+                not isinstance(value, str) or value not in claim_excerpt
+                for value in exact_values
             ):
                 raise OpenRouterError(
                     "Final evidence observation invented an exact value"
@@ -27750,8 +27006,7 @@ def _normalize_final_evidence_packet(
                 source_texts=[claim_excerpt],
             ):
                 raise OpenRouterError(
-                    "Final evidence observation invented an exact literal "
-                    "or state"
+                    "Final evidence observation invented an exact literal or state"
                 )
             # Keep a one-to-one semantic receipt for every exact source claim.
             # The complete excerpt remains byte-exact in the code-owned claim
@@ -27759,12 +27014,8 @@ def _normalize_final_evidence_packet(
             # concise grounded quote without allowing it to stand in for any
             # other claim.
             observation["source_claim_ids"] = [claim_id]
-            observation["analysis_dimension"] = domain_context[
-                "analysis_dimension"
-            ]
-            observation["domain_context_id"] = domain_context[
-                "domain_context_id"
-            ]
+            observation["analysis_dimension"] = domain_context["analysis_dimension"]
+            observation["domain_context_id"] = domain_context["domain_context_id"]
             observed_claim_ids.append(claim_id)
     coverage = output.get("unit_coverage")
     if not isinstance(coverage, list):
@@ -27791,17 +27042,13 @@ def _normalize_final_evidence_packet(
                 "Final evidence packet coverage has an invalid disposition"
             )
         if not isinstance(rationale, str) or not rationale.strip():
-            raise OpenRouterError(
-                "Final evidence packet coverage has no rationale"
-            )
+            raise OpenRouterError("Final evidence packet coverage has no rationale")
         coverage_ids.append(unit_id)
-    if (
-        len(coverage_ids) != len(coverage)
-        or Counter(coverage_ids) != Counter(allowed_unit_ids)
+    if len(coverage_ids) != len(coverage) or Counter(coverage_ids) != Counter(
+        allowed_unit_ids
     ):
         raise OpenRouterError(
-            "Final evidence packet does not account for every source unit "
-            "exactly once"
+            "Final evidence packet does not account for every source unit exactly once"
         )
     if observed_unit_ids != allowed_unit_ids:
         missing = sorted(allowed_unit_ids - observed_unit_ids)
@@ -27811,9 +27058,7 @@ def _normalize_final_evidence_packet(
         )
     if allowed_claims is not None:
         if Counter(observed_claim_ids) != Counter(allowed_claims.keys()):
-            missing_claims = sorted(
-                set(allowed_claims) - set(observed_claim_ids)
-            )
+            missing_claims = sorted(set(allowed_claims) - set(observed_claim_ids))
             repeated_claims = sorted(
                 claim_id
                 for claim_id, count in Counter(observed_claim_ids).items()
@@ -27826,9 +27071,7 @@ def _normalize_final_evidence_packet(
             )
         coverage = output.get("claim_coverage")
         if not isinstance(coverage, list):
-            raise OpenRouterError(
-                "Final evidence packet has no claim coverage"
-            )
+            raise OpenRouterError("Final evidence packet has no claim coverage")
         for item in coverage:
             if not isinstance(item, dict):
                 raise OpenRouterError(
@@ -27842,9 +27085,10 @@ def _normalize_final_evidence_packet(
                 raise OpenRouterError(
                     "Final evidence packet has an invalid claim disposition"
                 )
-            if not isinstance(item.get("rationale"), str) or not str(
-                item.get("rationale")
-            ).strip():
+            if (
+                not isinstance(item.get("rationale"), str)
+                or not str(item.get("rationale")).strip()
+            ):
                 raise OpenRouterError(
                     "Final evidence packet claim coverage has no rationale"
                 )
@@ -27885,8 +27129,7 @@ def _preserve_final_evidence_reduction(
     # ids remain listed. Preserve the validated child rows byte-for-byte and
     # use reducer output only for non-evidence synthesis fields below.
     claim_bound = any(
-        "source_claim_ids" in observation
-        for observation in input_observations
+        "source_claim_ids" in observation for observation in input_observations
     )
     if claim_bound:
         claim_observation_by_id: dict[str, dict[str, Any]] = {}
@@ -27923,12 +27166,10 @@ def _preserve_final_evidence_reduction(
                 merged_claim_ids.append(str(claim_ids[0]))
             if Counter(merged_claim_ids) != Counter(ordered_claim_ids):
                 raise OpenRouterError(
-                    "Final evidence reducer changed atomic source-claim "
-                    "coverage"
+                    "Final evidence reducer changed atomic source-claim coverage"
                 )
         observations = [
-            claim_observation_by_id[claim_id]
-            for claim_id in ordered_claim_ids
+            claim_observation_by_id[claim_id] for claim_id in ordered_claim_ids
         ]
     else:
         observations = [
@@ -27972,8 +27213,7 @@ def _preserve_final_evidence_reduction(
             if claim_id:
                 claim_coverage_by_id[claim_id] = copy.deepcopy(item)
     output["claim_coverage"] = [
-        claim_coverage_by_id[claim_id]
-        for claim_id in sorted(claim_coverage_by_id)
+        claim_coverage_by_id[claim_id] for claim_id in sorted(claim_coverage_by_id)
     ]
     return output
 
@@ -28069,9 +27309,7 @@ def _compact_final_evidence_model_payload(
         if not isinstance(claim_ids, list) or any(
             claim_id not in claim_index_by_id for claim_id in claim_ids
         ):
-            raise OpenRouterError(
-                "Final compact observation has invalid claim lineage"
-            )
+            raise OpenRouterError("Final compact observation has invalid claim lineage")
         observation_rows.append(
             [
                 intern(observation.get("category")),
@@ -28092,9 +27330,7 @@ def _compact_final_evidence_model_payload(
             raise OpenRouterError("Final compact ledger has invalid coverage")
         unit_id = str(item.get("source_unit_id") or "")
         if unit_id not in unit_index_by_id:
-            raise OpenRouterError(
-                "Final compact coverage has invalid source lineage"
-            )
+            raise OpenRouterError("Final compact coverage has invalid source lineage")
         coverage_rows.append(
             [
                 unit_index_by_id[unit_id],
@@ -28106,14 +27342,10 @@ def _compact_final_evidence_model_payload(
     claim_coverage_rows: list[list[Any]] = []
     for item in evidence.get("claim_coverage") or []:
         if not isinstance(item, dict):
-            raise OpenRouterError(
-                "Final compact ledger has invalid claim coverage"
-            )
+            raise OpenRouterError("Final compact ledger has invalid claim coverage")
         claim_id = str(item.get("claim_id") or "")
         if claim_id not in claim_index_by_id:
-            raise OpenRouterError(
-                "Final compact claim coverage has invalid lineage"
-            )
+            raise OpenRouterError("Final compact claim coverage has invalid lineage")
         claim_coverage_rows.append(
             [
                 claim_index_by_id[claim_id],
@@ -28250,13 +27482,10 @@ def _final_root_literal_tokens(value: Any) -> list[str]:
         ordered.extend(match.group(0) for match in pattern.finditer(text))
     for match in _FINAL_ROOT_RARE_LITERAL.finditer(text):
         token = match.group(0).rstrip(".,:;/+@-")
-        if (
-            len(token) >= 6
-            and (
+        if len(token) >= 6 and (
             any(character.isdigit() for character in token)
             or any(character in "._:/+@-" for character in token)
             or token.isupper()
-            )
         ):
             ordered.append(token)
     return list(dict.fromkeys(ordered))
@@ -28372,18 +27601,14 @@ def _final_report_claim_visibility_clauses(
     if not excerpt:
         return []
     clauses = [
-        value
-        for value in re.split(r"(?<=[.!?;:])\s+|\n+", excerpt)
-        if value.strip()
+        value for value in re.split(r"(?<=[.!?;:])\s+|\n+", excerpt) if value.strip()
     ] or [excerpt]
     visibility: list[dict[str, Any]] = []
     for clause_index, clause in enumerate(clauses):
         fragments, _manifest = build_claim_ledger(
             clause,
             document_id=(
-                "final-visible-clause:"
-                + text_sha256(excerpt)[:20]
-                + f":{clause_index}"
+                "final-visible-clause:" + text_sha256(excerpt)[:20] + f":{clause_index}"
             ),
             target_fragment_utf8_bytes=768,
         )
@@ -28402,9 +27627,7 @@ def _final_report_claim_visibility_clauses(
                 # Generic availability states remain meaningful only when the
                 # clause has no more specific subject/outcome anchor.  Rare
                 # ids, URLs, numbers and named markers are always retained.
-                if literal.casefold() not in (
-                    _FINAL_REPORT_GENERIC_VISIBILITY_TOKENS
-                ):
+                if literal.casefold() not in (_FINAL_REPORT_GENERIC_VISIBILITY_TOKENS):
                     add_anchor(literal)
             material_tokens = [
                 token
@@ -28475,37 +27698,28 @@ def _normalize_final_root_summary_packet(
     output = copy.deepcopy(packet)
     allowed_node_ids = set(allowed_node_text)
     fact_bindings_by_node = (
-        {
-            node_id: [] for node_id in allowed_node_ids
-        }
+        {node_id: [] for node_id in allowed_node_ids}
         if allowed_node_fact_bindings is None
         else allowed_node_fact_bindings
     )
     if set(fact_bindings_by_node) != allowed_node_ids:
-        raise OpenRouterError(
-            "Bounded root fact ledger mismatches its child-node set"
-        )
+        raise OpenRouterError("Bounded root fact ledger mismatches its child-node set")
     observed_node_ids: list[str] = []
     observations = output.get("observations")
     if not isinstance(observations, list):
         raise OpenRouterError("Bounded root packet has no observations")
     for observation in observations:
         if not isinstance(observation, dict):
-            raise OpenRouterError(
-                "Bounded root observation is not an object"
-            )
+            raise OpenRouterError("Bounded root observation is not an object")
         statement = observation.get("statement")
         if not isinstance(statement, str) or not statement.strip():
-            raise OpenRouterError(
-                "Bounded root observation has no factual statement"
-            )
+            raise OpenRouterError("Bounded root observation has no factual statement")
         node_ids = observation.get("source_node_ids")
         if (
             not isinstance(node_ids, list)
             or len(node_ids) != 1
             or any(
-                not isinstance(node_id, str)
-                or node_id not in allowed_node_ids
+                not isinstance(node_id, str) or node_id not in allowed_node_ids
                 for node_id in node_ids
             )
             or len(node_ids) != len(set(node_ids))
@@ -28515,9 +27729,7 @@ def _normalize_final_root_summary_packet(
                 "node; cross-child fact binding is forbidden"
             )
         referenced_text = [allowed_node_text[node_id] for node_id in node_ids]
-        expected_fact_ids = _final_root_fact_refs(
-            fact_bindings_by_node[node_ids[0]]
-        )
+        expected_fact_ids = _final_root_fact_refs(fact_bindings_by_node[node_ids[0]])
         fact_binding_ids = observation.get("fact_binding_ids")
         if (
             not isinstance(fact_binding_ids, list)
@@ -28537,11 +27749,8 @@ def _normalize_final_root_summary_packet(
                 strict=True,
             )
             if not any(
-                candidate
-                and candidate.casefold() in statement_folded
-                for candidate in _final_root_fact_assertion_candidates(
-                    binding
-                )
+                candidate and candidate.casefold() in statement_folded
+                for candidate in _final_root_fact_assertion_candidates(binding)
             )
         ]
         if missing_fact_ids:
@@ -28556,15 +27765,11 @@ def _normalize_final_root_summary_packet(
             )
         excerpts = observation.get("evidence_excerpts")
         if not isinstance(excerpts, list):
-            raise OpenRouterError(
-                "Bounded root observation has no per-child excerpts"
-            )
+            raise OpenRouterError("Bounded root observation has no per-child excerpts")
         excerpt_by_id: dict[str, str] = {}
         for item in excerpts:
             if not isinstance(item, dict):
-                raise OpenRouterError(
-                    "Bounded root observation has an invalid excerpt"
-                )
+                raise OpenRouterError("Bounded root observation has an invalid excerpt")
             node_id = item.get("source_node_id")
             excerpt = item.get("excerpt")
             if (
@@ -28581,9 +27786,7 @@ def _normalize_final_root_summary_packet(
                 )
             excerpt_by_id[node_id] = excerpt
         if set(excerpt_by_id) != set(node_ids):
-            raise OpenRouterError(
-                "Bounded root observation omitted a child excerpt"
-            )
+            raise OpenRouterError("Bounded root observation omitted a child excerpt")
         source_content_tokens = _final_root_content_tokens(
             allowed_node_text[node_ids[0]]
         )
@@ -28597,13 +27800,10 @@ def _normalize_final_root_summary_packet(
                 "a grounded semantic summary"
             )
         exact_values = observation.get("exact_values")
-        if (
-            not isinstance(exact_values, list)
-            or any(
-                not isinstance(value, str)
-                or not any(value in text for text in referenced_text)
-                for value in exact_values
-            )
+        if not isinstance(exact_values, list) or any(
+            not isinstance(value, str)
+            or not any(value in text for text in referenced_text)
+            for value in exact_values
         ):
             raise OpenRouterError(
                 "Bounded root exact value is not present in its children"
@@ -28634,14 +27834,10 @@ def _normalize_final_root_summary_packet(
     for field in ("uncertainties", "report_focus"):
         items = output.get(field)
         if not isinstance(items, list):
-            raise OpenRouterError(
-                f"Bounded root packet has invalid {field}"
-            )
+            raise OpenRouterError(f"Bounded root packet has invalid {field}")
         for item in items:
             if not isinstance(item, dict):
-                raise OpenRouterError(
-                    f"Bounded root {field} item has no provenance"
-                )
+                raise OpenRouterError(f"Bounded root {field} item has no provenance")
             text = item.get("text")
             node_ids = item.get("source_node_ids")
             if (
@@ -28650,15 +27846,12 @@ def _normalize_final_root_summary_packet(
                 or not isinstance(node_ids, list)
                 or not node_ids
                 or any(
-                    not isinstance(node_id, str)
-                    or node_id not in allowed_node_ids
+                    not isinstance(node_id, str) or node_id not in allowed_node_ids
                     for node_id in node_ids
                 )
                 or not _final_root_tokens_are_grounded(
                     text,
-                    source_texts=[
-                        allowed_node_text[node_id] for node_id in node_ids
-                    ],
+                    source_texts=[allowed_node_text[node_id] for node_id in node_ids],
                 )
             ):
                 raise OpenRouterError(
@@ -28671,27 +27864,19 @@ def _normalize_final_root_summary_packet(
     coverage_ids: list[str] = []
     for item in coverage:
         if not isinstance(item, dict):
-            raise OpenRouterError(
-                "Bounded root packet has invalid node coverage"
-            )
+            raise OpenRouterError("Bounded root packet has invalid node coverage")
         node_id = item.get("source_node_id")
         if not isinstance(node_id, str) or node_id not in allowed_node_ids:
-            raise OpenRouterError(
-                "Bounded root coverage references an unknown child"
-            )
+            raise OpenRouterError("Bounded root coverage references an unknown child")
         if item.get("disposition") not in {
             "material_observation",
             "supporting_context",
             "explicit_uncertainty",
         }:
-            raise OpenRouterError(
-                "Bounded root coverage has an invalid disposition"
-            )
+            raise OpenRouterError("Bounded root coverage has an invalid disposition")
         rationale = item.get("rationale")
         if not isinstance(rationale, str) or not rationale.strip():
-            raise OpenRouterError(
-                "Bounded root coverage has no rationale"
-            )
+            raise OpenRouterError("Bounded root coverage has no rationale")
         coverage_ids.append(node_id)
     if Counter(coverage_ids) != Counter(allowed_node_ids):
         raise OpenRouterError(
@@ -28718,9 +27903,7 @@ def _final_root_semantic_entries(
         passthrough_container,
         dict,
     ):
-        raise OpenRouterError(
-            "Canonical final evidence cannot seed a bounded root"
-        )
+        raise OpenRouterError("Canonical final evidence cannot seed a bounded root")
     passthrough = passthrough_container.get("values")
     if not isinstance(passthrough, list):
         raise OpenRouterError(
@@ -28749,14 +27932,10 @@ def _final_root_semantic_entries(
         or any(not claim_id for claim_id in claim_ids)
         or len(claim_ids) != len(set(claim_ids))
     ):
-        raise OpenRouterError(
-            "Bounded root source claims are missing or duplicated"
-        )
+        raise OpenRouterError("Bounded root source claims are missing or duplicated")
     contract = model_payload.get("long_input_contract")
     expected_claim_count = (
-        contract.get("source_claim_count")
-        if isinstance(contract, dict)
-        else None
+        contract.get("source_claim_count") if isinstance(contract, dict) else None
     )
     if (
         isinstance(expected_claim_count, int)
@@ -28769,9 +27948,7 @@ def _final_root_semantic_entries(
     for claim in source_claim_rows:
         claim_id = str(claim.get("claim_id") or "")
         source_path = str(claim.get("source_path") or "")
-        domain_context = _validate_final_domain_context(
-            claim.get("domain_context")
-        )
+        domain_context = _validate_final_domain_context(claim.get("domain_context"))
         append(
             "exact_source_claim",
             str(claim.get("excerpt") or ""),
@@ -28780,9 +27957,7 @@ def _final_root_semantic_entries(
             fragment_index=claim.get("fragment_index"),
             fragment_count=claim.get("fragment_count"),
             descendant_claim_count=1,
-            descendant_claim_ids_sha256=_stable_json_sha256(
-                [claim_id]
-            ),
+            descendant_claim_ids_sha256=_stable_json_sha256([claim_id]),
             descendant_unit_count=1,
             descendant_unit_ids_sha256=_stable_json_sha256(
                 [str(claim.get("source_unit_id") or "")]
@@ -28793,15 +27968,11 @@ def _final_root_semantic_entries(
 
     for observation in evidence.get("observations") or []:
         if not isinstance(observation, dict):
-            raise OpenRouterError(
-                "Canonical evidence contains an invalid observation"
-            )
+            raise OpenRouterError("Canonical evidence contains an invalid observation")
         claim_ids = observation.get("source_claim_ids")
         unit_ids = observation.get("source_unit_ids")
         if not isinstance(claim_ids, list) or not isinstance(unit_ids, list):
-            raise OpenRouterError(
-                "Canonical observation has no source lineage"
-            )
+            raise OpenRouterError("Canonical observation has no source lineage")
         append(
             "observation",
             {
@@ -28918,14 +28089,11 @@ def _final_root_leaf_fact_bindings(
                 "source_path": source_path,
                 "value_type": str(value.get("value_type") or ""),
                 "json_literal": str(value.get("json_literal") or ""),
-                "source_value_sha256": str(
-                    value.get("source_value_sha256") or ""
-                ),
+                "source_value_sha256": str(value.get("source_value_sha256") or ""),
             }
             bindings.append(
                 {
-                    "binding_id": "afb_scalar_"
-                    + _stable_json_sha256(scalar_contract),
+                    "binding_id": "afb_scalar_" + _stable_json_sha256(scalar_contract),
                     **scalar_contract,
                 }
             )
@@ -28949,9 +28117,7 @@ def _validate_final_root_fact_binding(binding: dict[str, Any]) -> None:
             ) from exc
         source_path = binding.get("source_path")
         if not isinstance(source_path, str) or not source_path:
-            raise OpenRouterError(
-                "Bounded root typed fact binding has no source path"
-            )
+            raise OpenRouterError("Bounded root typed fact binding has no source path")
         if parsed.entity != source_path or parsed.metric != source_path:
             raise OpenRouterError(
                 "Bounded root typed fact binding changed its source identity"
@@ -28969,12 +28135,8 @@ def _validate_final_root_fact_binding(binding: dict[str, Any]) -> None:
             not isinstance(value, str) or not value
             for value in scalar_contract.values()
         ):
-            raise OpenRouterError(
-                "Bounded root exact scalar binding is incomplete"
-            )
-        expected_id = "afb_scalar_" + _stable_json_sha256(
-            scalar_contract
-        )
+            raise OpenRouterError("Bounded root exact scalar binding is incomplete")
+        expected_id = "afb_scalar_" + _stable_json_sha256(scalar_contract)
         if binding.get("binding_id") != expected_id:
             raise OpenRouterError(
                 "Bounded root exact scalar binding identity mismatches"
@@ -29000,9 +28162,7 @@ def _final_root_binding_ids(node: dict[str, Any]) -> list[str]:
         or any(not binding_id for binding_id in ids)
         or len(ids) != len(set(ids))
     ):
-        raise OpenRouterError(
-            "Bounded root node has invalid mandatory fact bindings"
-        )
+        raise OpenRouterError("Bounded root node has invalid mandatory fact bindings")
     return ids
 
 
@@ -29036,9 +28196,7 @@ def _final_root_fact_table(
         if fact_ref in seen_refs:
             raise OpenRouterError("Mandatory fact model reference collided")
         seen_refs.add(fact_ref)
-        source_path = str(
-            binding.get("source_path") or binding.get("entity") or ""
-        )
+        source_path = str(binding.get("source_path") or binding.get("entity") or "")
         source_ref = "p_" + text_sha256(source_path)[:12]
         if binding.get("contract") == "code_owned_exact_scalar_binding":
             rows.append(
@@ -29113,8 +28271,7 @@ def _final_root_source_nodes(
         units, manifest = split_lossless_text(
             serialized,
             document_id=(
-                f"final-root-entry:{int(entry['ordinal']):08d}:"
-                f"{entry_digest[:24]}"
+                f"final-root-entry:{int(entry['ordinal']):08d}:{entry_digest[:24]}"
             ),
             target_chars=target_chars,
             context_overlap_chars=min(512, max(32, target_chars // 8)),
@@ -29122,7 +28279,7 @@ def _final_root_source_nodes(
         claim_count = int(entry.get("descendant_claim_count") or 0)
         for fragment_index, unit in enumerate(units):
             semantic_text = unit.context_text[
-                unit.core_start_in_context:unit.core_end_in_context
+                unit.core_start_in_context : unit.core_end_in_context
             ]
             if text_sha256(semantic_text) != unit.sha256:
                 raise OpenRouterError(
@@ -29138,9 +28295,7 @@ def _final_root_source_nodes(
             mandatory_fact_ids = [
                 str(item["binding_id"]) for item in mandatory_fact_bindings
             ]
-            mandatory_fact_table = _final_root_fact_table(
-                mandatory_fact_bindings
-            )
+            mandatory_fact_table = _final_root_fact_table(mandatory_fact_bindings)
             mandatory_fact_provenance_sha256 = _stable_json_sha256(
                 {
                     "domain": "aiv-final-root-leaf-facts-v1",
@@ -29168,9 +28323,7 @@ def _final_root_source_nodes(
                 "core_sha256": unit.sha256,
                 "context_value": unit.context_text,
                 "mandatory_fact_count": len(mandatory_fact_ids),
-                "mandatory_fact_provenance_sha256": (
-                    mandatory_fact_provenance_sha256
-                ),
+                "mandatory_fact_provenance_sha256": (mandatory_fact_provenance_sha256),
             }
             source_text = json.dumps(
                 source_view,
@@ -29229,22 +28382,16 @@ def _final_root_node_receipt(node: dict[str, Any]) -> dict[str, Any]:
     if level == 0:
         mandatory_fact_bindings = node.get("mandatory_fact_bindings")
         if not isinstance(mandatory_fact_bindings, list):
-            raise OpenRouterError(
-                "Bounded root leaf has no mandatory fact ledger"
-            )
+            raise OpenRouterError("Bounded root leaf has no mandatory fact ledger")
         mandatory_fact_ids = _final_root_binding_ids(node)
-        mandatory_fact_table = _final_root_fact_table(
-            mandatory_fact_bindings
-        )
+        mandatory_fact_table = _final_root_fact_table(mandatory_fact_bindings)
         fact_provenance_sha256 = _stable_json_sha256(
             {
                 "domain": "aiv-final-root-leaf-facts-v1",
                 "mandatory_fact_bindings_sha256": _stable_json_sha256(
                     mandatory_fact_bindings
                 ),
-                "mandatory_fact_ids_sha256": _stable_json_sha256(
-                    mandatory_fact_ids
-                ),
+                "mandatory_fact_ids_sha256": _stable_json_sha256(mandatory_fact_ids),
                 "mandatory_fact_table_sha256": _stable_json_sha256(
                     mandatory_fact_table
                 ),
@@ -29257,9 +28404,7 @@ def _final_root_node_receipt(node: dict[str, Any]) -> dict[str, Any]:
                 "Bounded root parent duplicated its descendant fact ledger"
             )
         fact_count = node.get("mandatory_fact_count")
-        fact_provenance_sha256 = node.get(
-            "mandatory_fact_provenance_sha256"
-        )
+        fact_provenance_sha256 = node.get("mandatory_fact_provenance_sha256")
         if (
             isinstance(fact_count, bool)
             or not isinstance(fact_count, int)
@@ -29267,25 +28412,18 @@ def _final_root_node_receipt(node: dict[str, Any]) -> dict[str, Any]:
             or not isinstance(fact_provenance_sha256, str)
             or not re.fullmatch(r"[0-9a-f]{64}", fact_provenance_sha256)
         ):
-            raise OpenRouterError(
-                "Bounded root parent fact provenance is invalid"
-            )
+            raise OpenRouterError("Bounded root parent fact provenance is invalid")
     if (
         model_view.get("mandatory_fact_count") != fact_count
-        or model_view.get("mandatory_fact_provenance_sha256")
-        != fact_provenance_sha256
+        or model_view.get("mandatory_fact_provenance_sha256") != fact_provenance_sha256
     ):
-        raise OpenRouterError(
-            "Bounded root model view fact provenance mismatches"
-        )
+        raise OpenRouterError("Bounded root model view fact provenance mismatches")
     return {
         "node_id": str(node["node_id"]),
         "level": level,
         "leaf_start": int(node["leaf_start"]),
         "leaf_end": int(node["leaf_end"]),
-        "descendant_source_node_count": int(
-            node["descendant_source_node_count"]
-        ),
+        "descendant_source_node_count": int(node["descendant_source_node_count"]),
         "descendant_claim_count": int(node["descendant_claim_count"]),
         "tree_commitment": str(node["tree_commitment"]),
         "model_view_sha256": _stable_json_sha256(model_view),
@@ -29326,9 +28464,7 @@ def _validate_final_root_forest(
         seen_node_ids.add(node_id)
         cursor = end
     if cursor != expected_leaf_count:
-        raise OpenRouterError(
-            "Bounded root forest does not cover every source leaf"
-        )
+        raise OpenRouterError("Bounded root forest does not cover every source leaf")
 
 
 def _pack_final_root_nodes(
@@ -29404,13 +28540,16 @@ def _final_root_parent_node(
         }
     )
     packet_sha256 = _stable_json_sha256(packet)
-    node_id = "final-root-node-" + _stable_json_sha256(
-        {
-            "domain": "aiv-final-root-view-v1",
-            "tree_commitment": tree_commitment,
-            "packet_sha256": packet_sha256,
-        }
-    )[:32]
+    node_id = (
+        "final-root-node-"
+        + _stable_json_sha256(
+            {
+                "domain": "aiv-final-root-view-v1",
+                "tree_commitment": tree_commitment,
+                "packet_sha256": packet_sha256,
+            }
+        )[:32]
+    )
     model_view = {
         "source_node_id": node_id,
         "level": level,
@@ -29418,27 +28557,21 @@ def _final_root_parent_node(
         "leaf_end": int(children[-1]["leaf_end"]),
         "summary": packet,
         "descendant_source_node_count": sum(
-            int(child["descendant_source_node_count"])
-            for child in children
+            int(child["descendant_source_node_count"]) for child in children
         ),
         "descendant_claim_count": sum(
-            int(child["descendant_claim_count"])
-            for child in children
+            int(child["descendant_claim_count"]) for child in children
         ),
         "tree_commitment": tree_commitment,
         "mandatory_fact_count": mandatory_fact_count,
-        "mandatory_fact_provenance_sha256": (
-            mandatory_fact_provenance_sha256
-        ),
+        "mandatory_fact_provenance_sha256": (mandatory_fact_provenance_sha256),
     }
     return {
         "node_id": node_id,
         "level": level,
         "leaf_start": int(children[0]["leaf_start"]),
         "leaf_end": int(children[-1]["leaf_end"]),
-        "descendant_source_node_count": model_view[
-            "descendant_source_node_count"
-        ],
+        "descendant_source_node_count": model_view["descendant_source_node_count"],
         "descendant_claim_count": model_view["descendant_claim_count"],
         "tree_commitment": tree_commitment,
         "model_view": model_view,
@@ -29455,9 +28588,7 @@ def _final_root_parent_node(
             separators=(",", ":"),
         ),
         "mandatory_fact_count": mandatory_fact_count,
-        "mandatory_fact_provenance_sha256": (
-            mandatory_fact_provenance_sha256
-        ),
+        "mandatory_fact_provenance_sha256": (mandatory_fact_provenance_sha256),
         "fact_provenance": fact_provenance,
         "child_receipts": receipts,
         "packet_sha256": packet_sha256,
@@ -29494,9 +28625,7 @@ def _bounded_final_root_candidate(
             )
         }
 
-    contract = copy.deepcopy(
-        canonical_payload.get("long_input_contract") or {}
-    )
+    contract = copy.deepcopy(canonical_payload.get("long_input_contract") or {})
     contract.update(
         {
             "mode": "bounded_transitive_evidence_tree",
@@ -29535,9 +28664,7 @@ def _bounded_final_root_candidate(
         "long_input_contract": contract,
         "evidence_digest": {
             "format": FINAL_INPUT_ROOT_SUMMARY_VERSION,
-            "root_nodes": [
-                author_view(node) for node in nodes
-            ],
+            "root_nodes": [author_view(node) for node in nodes],
         },
     }
 
@@ -29556,12 +28683,9 @@ def _verify_final_root_tree(
         expected_leaf_count=len(source_leaves),
     )
     source_receipts = {
-        str(node["node_id"]): _final_root_node_receipt(node)
-        for node in source_leaves
+        str(node["node_id"]): _final_root_node_receipt(node) for node in source_leaves
     }
-    source_nodes_by_id = {
-        str(node["node_id"]): node for node in source_leaves
-    }
+    source_nodes_by_id = {str(node["node_id"]): node for node in source_leaves}
     if len(source_receipts) != len(source_leaves):
         raise OpenRouterError("Bounded root source receipts are not unique")
     visited: set[str] = set()
@@ -29585,14 +28709,10 @@ def _verify_final_root_tree(
         if "mandatory_fact_bindings" in model_view or (
             "mandatory_fact_table" in model_view
         ):
-            raise OpenRouterError(
-                "Bounded root leaf model view leaked its fact ledger"
-            )
+            raise OpenRouterError("Bounded root leaf model view leaked its fact ledger")
         reconstructed = _final_root_node_receipt(source_node)
         if reconstructed != receipt:
-            raise OpenRouterError(
-                "Bounded root leaf fact provenance mismatched"
-            )
+            raise OpenRouterError("Bounded root leaf fact provenance mismatched")
         return copy.deepcopy(bindings)
 
     def semantic_text_for_receipt(receipt: dict[str, Any]) -> str:
@@ -29618,16 +28738,12 @@ def _verify_final_root_tree(
     def visit(receipt: dict[str, Any]) -> None:
         node_id = str(receipt.get("node_id") or "")
         if not node_id or node_id in visited:
-            raise OpenRouterError(
-                "Bounded root proof reuses or omits a node id"
-            )
+            raise OpenRouterError("Bounded root proof reuses or omits a node id")
         visited.add(node_id)
         source_receipt = source_receipts.get(node_id)
         if source_receipt is not None:
             if receipt != source_receipt:
-                raise OpenRouterError(
-                    "Bounded root leaf receipt changed after sealing"
-                )
+                raise OpenRouterError("Bounded root leaf receipt changed after sealing")
             leaf_binding_ledger_for_receipt(receipt)
             visited_leaves.add(node_id)
             return
@@ -29639,9 +28755,7 @@ def _verify_final_root_tree(
             )
         child_receipts = proof.get("ordered_child_receipts")
         if not isinstance(child_receipts, list) or not child_receipts:
-            raise OpenRouterError(
-                "Bounded root internal proof has no ordered children"
-            )
+            raise OpenRouterError("Bounded root internal proof has no ordered children")
         if _stable_json_sha256(child_receipts) != proof.get(
             "ordered_child_receipts_sha256"
         ):
@@ -29662,30 +28776,21 @@ def _verify_final_root_tree(
                     "Bounded root proof contains a child gap or overlap"
                 )
             cursor = int(child_receipt.get("leaf_end", -1))
-            claim_count += int(
-                child_receipt.get("descendant_claim_count", -1)
-            )
-            source_count += int(
-                child_receipt.get("descendant_source_node_count", -1)
-            )
+            claim_count += int(child_receipt.get("descendant_claim_count", -1))
+            source_count += int(child_receipt.get("descendant_source_node_count", -1))
             child_fact_provenance.append(
                 {
                     "source_node_id": str(child_receipt["node_id"]),
-                    "mandatory_fact_count": int(
-                        child_receipt["mandatory_fact_count"]
-                    ),
+                    "mandatory_fact_count": int(child_receipt["mandatory_fact_count"]),
                     "mandatory_fact_provenance_sha256": str(
-                        child_receipt[
-                            "mandatory_fact_provenance_sha256"
-                        ]
+                        child_receipt["mandatory_fact_provenance_sha256"]
                     ),
                 }
             )
         if (
             cursor != int(receipt["leaf_end"])
             or claim_count != int(receipt["descendant_claim_count"])
-            or source_count
-            != int(receipt["descendant_source_node_count"])
+            or source_count != int(receipt["descendant_source_node_count"])
         ):
             raise OpenRouterError(
                 "Bounded root parent counts or span do not match children"
@@ -29703,8 +28808,7 @@ def _verify_final_root_tree(
         model_view = proof.get("model_view")
         packet_sha256 = str(proof.get("packet_sha256") or "")
         expected_fact_count = sum(
-            int(item["mandatory_fact_count"])
-            for item in child_fact_provenance
+            int(item["mandatory_fact_count"]) for item in child_fact_provenance
         )
         expected_fact_provenance_sha256 = _stable_json_sha256(
             {
@@ -29724,32 +28828,24 @@ def _verify_final_root_tree(
             raise OpenRouterError(
                 "Bounded root parent fact provenance changed child facts"
             )
-        if (
-            not isinstance(model_view, dict)
-            or not isinstance(model_view.get("summary"), dict)
+        if not isinstance(model_view, dict) or not isinstance(
+            model_view.get("summary"), dict
         ):
-            raise OpenRouterError(
-                "Bounded root proof has no persisted model summary"
-            )
+            raise OpenRouterError("Bounded root proof has no persisted model summary")
         normalized_packet = _normalize_final_root_summary_packet(
             copy.deepcopy(model_view.get("summary")),
             allowed_node_text={
-                str(child_receipt["node_id"]): semantic_text_for_receipt(
-                    child_receipt
-                )
+                str(child_receipt["node_id"]): semantic_text_for_receipt(child_receipt)
                 for child_receipt in child_receipts
             },
             allowed_node_fact_bindings={
-                str(child_receipt["node_id"]): []
-                for child_receipt in child_receipts
+                str(child_receipt["node_id"]): [] for child_receipt in child_receipts
             },
         )
         if (
             normalized_packet != model_view.get("summary")
-            or _stable_json_sha256(model_view)
-            != receipt.get("model_view_sha256")
-            or _stable_json_sha256(model_view.get("summary"))
-            != packet_sha256
+            or _stable_json_sha256(model_view) != receipt.get("model_view_sha256")
+            or _stable_json_sha256(model_view.get("summary")) != packet_sha256
             or text_sha256(
                 json.dumps(
                     model_view.get("summary"),
@@ -29760,8 +28856,7 @@ def _verify_final_root_tree(
             )
             != receipt.get("semantic_text_sha256")
             or model_view.get("source_node_id") != node_id
-            or model_view.get("tree_commitment")
-            != receipt.get("tree_commitment")
+            or model_view.get("tree_commitment") != receipt.get("tree_commitment")
             or model_view.get("descendant_source_node_count")
             != receipt.get("descendant_source_node_count")
             or model_view.get("descendant_claim_count")
@@ -29776,20 +28871,19 @@ def _verify_final_root_tree(
             or model_view.get("leaf_start") != receipt.get("leaf_start")
             or model_view.get("leaf_end") != receipt.get("leaf_end")
         ):
-            raise OpenRouterError(
-                "Bounded root persisted model view failed its digest"
-            )
-        expected_node_id = "final-root-node-" + _stable_json_sha256(
-            {
-                "domain": "aiv-final-root-view-v1",
-                "tree_commitment": expected_tree_commitment,
-                "packet_sha256": packet_sha256,
-            }
-        )[:32]
+            raise OpenRouterError("Bounded root persisted model view failed its digest")
+        expected_node_id = (
+            "final-root-node-"
+            + _stable_json_sha256(
+                {
+                    "domain": "aiv-final-root-view-v1",
+                    "tree_commitment": expected_tree_commitment,
+                    "packet_sha256": packet_sha256,
+                }
+            )[:32]
+        )
         if expected_node_id != node_id:
-            raise OpenRouterError(
-                "Bounded root internal node id failed reconstruction"
-            )
+            raise OpenRouterError("Bounded root internal node id failed reconstruction")
         for child_receipt in child_receipts:
             visit(child_receipt)
 
@@ -29800,10 +28894,10 @@ def _verify_final_root_tree(
         raise OpenRouterError(
             "Bounded root proof does not reach every semantic source leaf"
         )
-    if sum(
-        int(receipt["descendant_claim_count"])
-        for receipt in root_receipts
-    ) != expected_claim_count:
+    if (
+        sum(int(receipt["descendant_claim_count"]) for receipt in root_receipts)
+        != expected_claim_count
+    ):
         raise OpenRouterError(
             "Bounded root proof does not account for every source claim"
         )
@@ -29814,8 +28908,7 @@ def _verify_final_root_tree(
         "verified_leaf_count": len(visited_leaves),
         "verified_claim_count": expected_claim_count,
         "verified_mandatory_fact_count": sum(
-            int(receipt.get("mandatory_fact_count") or 0)
-            for receipt in root_receipts
+            int(receipt.get("mandatory_fact_count") or 0) for receipt in root_receipts
         ),
         "coverage_complete": True,
         "transport_coverage_complete": True,
@@ -29831,9 +28924,7 @@ async def _build_bounded_final_root_payload(
     source_claim_rows: list[dict[str, Any]],
     target_window: dict[str, Any],
     target_window_bytes: int,
-    final_request_utf8_bytes: Callable[
-        [dict[str, Any], dict[str, Any]], int
-    ],
+    final_request_utf8_bytes: Callable[[dict[str, Any], dict[str, Any]], int],
     stage_key: str,
     artifact_namespace: str,
     prompt_version: str,
@@ -29871,9 +28962,7 @@ provenance фактов, но не растущую таблицу потомк�
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
-    processing_window = await _final_model_input_window(
-        model=PROCESSING_MODEL
-    )
+    processing_window = await _final_model_input_window(model=PROCESSING_MODEL)
     processing_window_bytes = int(processing_window["input_utf8_window"])
     target_chars = min(
         FINAL_INPUT_MAP_UNIT_CHARS,
@@ -29909,8 +28998,7 @@ provenance фактов, но не растущую таблицу потомк�
             target_chars=target_chars,
         )
         if all(
-            provider_request_bytes(index, [node], level=1)
-            <= processing_window_bytes
+            provider_request_bytes(index, [node], level=1) <= processing_window_bytes
             for index, node in enumerate(source_nodes, start=1)
         ):
             break
@@ -29926,8 +29014,7 @@ provenance фактов, но не растущую таблицу потомк�
         [_final_root_node_receipt(node) for node in source_nodes]
     )
     source_manifest_key = (
-        f"{artifact_namespace}_bounded_root_sources_"
-        f"{source_leaf_commitment[:20]}"
+        f"{artifact_namespace}_bounded_root_sources_{source_leaf_commitment[:20]}"
     )
     await _save_artifact(
         run_id,
@@ -29968,8 +29055,7 @@ provenance фактов, но не растущую таблицу потомк�
     seen_forest_commitments: set[str] = set()
     proof_records: dict[str, dict[str, Any]] = {}
     tree_manifest_key = (
-        f"{artifact_namespace}_bounded_root_tree_"
-        f"{source_leaf_commitment[:20]}"
+        f"{artifact_namespace}_bounded_root_tree_{source_leaf_commitment[:20]}"
     )
     semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
 
@@ -30013,16 +29099,12 @@ provenance фактов, но не растущую таблицу потомк�
                     output_json={
                         "version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
                         "source_manifest_artifact_key": source_manifest_key,
-                        "terminal_ledger_artifact_key": (
-                            terminal_ledger_artifact_key
-                        ),
+                        "terminal_ledger_artifact_key": (terminal_ledger_artifact_key),
                         "terminal_ledger_sha256": terminal_ledger_sha256,
                         "source_leaf_count": source_leaf_count,
                         "source_leaf_commitment": source_leaf_commitment,
                         "root_receipts": root_receipts,
-                        "root_receipts_sha256": _stable_json_sha256(
-                            root_receipts
-                        ),
+                        "root_receipts_sha256": _stable_json_sha256(root_receipts),
                         "node_proof_artifact_keys": [
                             str(record["artifact_key"])
                             for record in proof_records.values()
@@ -30072,8 +29154,7 @@ provenance фактов, но не растущую таблицу потомк�
             request_utf8_bytes=request_bytes,
         )
         level_request_bytes = [
-            request_bytes(index, group)
-            for index, group in enumerate(groups, start=1)
+            request_bytes(index, group) for index, group in enumerate(groups, start=1)
         ]
         max_request_bytes = max(max_request_bytes, *level_request_bytes)
 
@@ -30101,9 +29182,7 @@ provenance фактов, но не растущую таблицу потомк�
                         f"{group_index}_{child_digest[:20]}"
                     ),
                     schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
-                    schema_name=(
-                        f"aiv_final_root_l{current_level}_{group_index}"
-                    ),
+                    schema_name=(f"aiv_final_root_l{current_level}_{group_index}"),
                     system=summary_system,
                     user_payload=user_payload,
                     model=PROCESSING_MODEL,
@@ -30113,29 +29192,19 @@ provenance фактов, но не растущую таблицу потомк�
             normalized = _normalize_final_root_summary_packet(
                 result,
                 allowed_node_text={
-                    str(node["node_id"]): str(node["semantic_text"])
-                    for node in group
+                    str(node["node_id"]): str(node["semantic_text"]) for node in group
                 },
-                allowed_node_fact_bindings={
-                    str(node["node_id"]): []
-                    for node in group
-                },
+                allowed_node_fact_bindings={str(node["node_id"]): [] for node in group},
             )
             parent = _final_root_parent_node(
                 level=current_level,
                 children=group,
                 packet=normalized,
             )
-            if child_ids != [
-                str(item["node_id"])
-                for item in parent["child_receipts"]
-            ]:
-                raise OpenRouterError(
-                    "Bounded root parent receipt changed child order"
-                )
+            if child_ids != [str(item["node_id"]) for item in parent["child_receipts"]]:
+                raise OpenRouterError("Bounded root parent receipt changed child order")
             proof_artifact_key = (
-                f"{artifact_namespace}_bounded_root_node_"
-                f"{parent['node_id']}"
+                f"{artifact_namespace}_bounded_root_node_{parent['node_id']}"
             )
             parent["proof_artifact_key"] = proof_artifact_key
             proof_record = {
@@ -30211,10 +29280,7 @@ provenance фактов, но не растущую таблицу потомк�
         transport_bytes = sum(
             len(node["source_text"].encode("utf-8")) for node in parents
         )
-        if (
-            len(parents) >= len(nodes)
-            and transport_bytes >= previous_transport_bytes
-        ):
+        if len(parents) >= len(nodes) and transport_bytes >= previous_transport_bytes:
             raise OpenRouterError(
                 "Bounded root reducer made no transport progress; exact "
                 "artifacts were preserved instead of hiding or truncating "
@@ -30294,9 +29360,7 @@ async def _prepare_final_model_payload(
         direct_accounting: dict[str, Any] | None = None
         direct_accounting_artifact_key: str | None = None
         if tracks_answer_corpus:
-            direct_accounting = _final_direct_answer_accounting_manifest(
-                payload
-            )
+            direct_accounting = _final_direct_answer_accounting_manifest(payload)
             direct_accounting_artifact_key = (
                 artifact_namespace
                 + "_answer_accounting_direct_"
@@ -30309,9 +29373,7 @@ async def _prepare_final_model_payload(
                 status="completed",
                 input_json={
                     "version": FINAL_ANSWER_ACCOUNTING_VERSION,
-                    "source_payload_sha256": direct_accounting[
-                        "source_payload_sha256"
-                    ],
+                    "source_payload_sha256": direct_accounting["source_payload_sha256"],
                     "route": "direct_single_provider_post",
                 },
                 output_json=direct_accounting,
@@ -30332,12 +29394,8 @@ async def _prepare_final_model_payload(
                 "artifact_key": direct_accounting_artifact_key,
                 "sha256": direct_accounting["manifest_sha256"],
                 "answer_count": direct_accounting["answer_count"],
-                "accounted_answer_count": direct_accounting[
-                    "accounted_answer_count"
-                ],
-                "raw_text_answer_count": direct_accounting[
-                    "raw_text_answer_count"
-                ],
+                "accounted_answer_count": direct_accounting["accounted_answer_count"],
+                "raw_text_answer_count": direct_accounting["raw_text_answer_count"],
                 "request_payload_occurrences_per_raw_answer": 1,
                 "provider_submission_proof": direct_accounting[
                     "provider_submission_proof"
@@ -30400,9 +29458,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             units,
             source_payload=payload,
         )
-        claim_row_by_id = {
-            str(item["claim_id"]): item for item in claim_rows
-        }
+        claim_row_by_id = {str(item["claim_id"]): item for item in claim_rows}
         source_payload_sha256 = str(manifest["source_payload_sha256"])
 
         def claims_for_pack(
@@ -30411,9 +29467,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             claim_ids = [
                 claim_id
                 for unit in pack
-                for claim_id in claim_ids_by_unit[
-                    str(unit["source_unit_id"])
-                ]
+                for claim_id in claim_ids_by_unit[str(unit["source_unit_id"])]
             ]
             return [claim_row_by_id[claim_id] for claim_id in claim_ids]
 
@@ -30457,9 +29511,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         else None
     )
     manifest_artifact_key = (
-        artifact_namespace
-        + "_manifest_"
-        + manifest["source_payload_sha256"][:20]
+        artifact_namespace + "_manifest_" + manifest["source_payload_sha256"][:20]
     )
     await _save_artifact(
         run_id,
@@ -30494,9 +29546,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             prompt_version=prompt_version,
         )
     claim_ledger_artifact_key = (
-        artifact_namespace
-        + "_claim_ledger_"
-        + str(claim_ledger["ledger_sha256"])[:20]
+        artifact_namespace + "_claim_ledger_" + str(claim_ledger["ledger_sha256"])[:20]
     )
     await _save_artifact(
         run_id,
@@ -30517,12 +29567,10 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         request_utf8_bytes=map_request_bytes,
     )
     max_mapper_request_bytes = max(
-        map_request_bytes(index, pack)
-        for index, pack in enumerate(packs, start=1)
+        map_request_bytes(index, pack) for index, pack in enumerate(packs, start=1)
     )
     unit_path_by_id = {
-        str(unit["source_unit_id"]): str(unit["source_path"])
-        for unit in units
+        str(unit["source_unit_id"]): str(unit["source_path"]) for unit in units
     }
     semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
 
@@ -30539,9 +29587,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
                 system=map_system,
                 user_payload={
                     "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                    "source_payload_sha256": manifest[
-                        "source_payload_sha256"
-                    ],
+                    "source_payload_sha256": manifest["source_payload_sha256"],
                     "source_units": pack,
                     "source_claims": claims_for_pack(pack),
                 },
@@ -30552,19 +29598,15 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         normalized = _normalize_final_evidence_packet(
             result,
             allowed_unit_paths={
-                str(item["source_unit_id"]): str(item["source_path"])
-                for item in pack
+                str(item["source_unit_id"]): str(item["source_path"]) for item in pack
             },
             allowed_claims={
-                str(item["claim_id"]): item
-                for item in claims_for_pack(pack)
+                str(item["claim_id"]): item for item in claims_for_pack(pack)
             },
             claim_objects={
                 claim_id: claim_objects_by_id[claim_id]
                 for item in pack
-                for claim_id in claim_ids_by_unit[
-                    str(item["source_unit_id"])
-                ]
+                for claim_id in claim_ids_by_unit[str(item["source_unit_id"])]
             },
         )
         return _long_response_leaf(normalized, unit_ids)
@@ -30606,6 +29648,7 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
     max_reducer_request_bytes = 0
     terminal_reducer_mode: str | None = None
     while len(packets) > 1:
+
         def reducer_request_bytes(
             group_index: int,
             group: list[dict[str, Any]],
@@ -30617,15 +29660,11 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
                 system=reduce_system,
                 user_payload={
                     "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                    "source_payload_sha256": manifest[
-                        "source_payload_sha256"
-                    ],
+                    "source_payload_sha256": manifest["source_payload_sha256"],
                     "evidence_packets": group,
                 },
                 schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-                schema_name=(
-                    f"aiv_final_input_reduce_{current_level}_{group_index}"
-                ),
+                schema_name=(f"aiv_final_input_reduce_{current_level}_{group_index}"),
                 reasoning_effort="high",
                 temperature=0.15,
             )
@@ -30658,8 +29697,7 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             terminal = _normalize_final_evidence_packet(
                 terminal,
                 allowed_unit_paths={
-                    unit_id: unit_path_by_id[unit_id]
-                    for unit_id in lineage
+                    unit_id: unit_path_by_id[unit_id] for unit_id in lineage
                 },
                 allowed_claims={
                     claim_id: claim_row_by_id[claim_id]
@@ -30695,15 +29733,11 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
                     f"{group_index}_{digest}"
                 ),
                 schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-                schema_name=(
-                    f"aiv_final_input_reduce_{current_level}_{group_index}"
-                ),
+                schema_name=(f"aiv_final_input_reduce_{current_level}_{group_index}"),
                 system=reduce_system,
                 user_payload={
                     "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                    "source_payload_sha256": manifest[
-                        "source_payload_sha256"
-                    ],
+                    "source_payload_sha256": manifest["source_payload_sha256"],
                     "evidence_packets": inputs,
                 },
                 model=ANALYSIS_MODEL,
@@ -30713,8 +29747,7 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             normalized = _normalize_final_evidence_packet(
                 merged,
                 allowed_unit_paths={
-                    unit_id: unit_path_by_id[unit_id]
-                    for unit_id in lineage
+                    unit_id: unit_path_by_id[unit_id] for unit_id in lineage
                 },
                 allowed_claims={
                     claim_id: claim_row_by_id[claim_id]
@@ -30756,49 +29789,34 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             "version": FINAL_INPUT_HARNESS_VERSION,
             "mode": "hierarchical_evidence_tree",
             "source_payload_sha256": manifest["source_payload_sha256"],
-            "source_payload_utf8_bytes": manifest[
-                "source_payload_utf8_bytes"
-            ],
+            "source_payload_utf8_bytes": manifest["source_payload_utf8_bytes"],
             "source_unit_count": manifest["source_unit_count"],
             "covered_unit_count": len(complete_lineage),
             "source_claim_count": len(claim_rows),
-            "covered_claim_count": len(
-                final_packet.get("claim_coverage") or []
-            ),
+            "covered_claim_count": len(final_packet.get("claim_coverage") or []),
             "coverage_complete": True,
-            "deterministic_passthrough_value_count": len(
-                deterministic_passthrough
-            ),
+            "deterministic_passthrough_value_count": len(deterministic_passthrough),
             "deterministic_passthrough_sha256": _stable_json_sha256(
                 deterministic_passthrough
             ),
             "source_manifest": {
                 "artifact_key": manifest_artifact_key,
-                "source_unit_ids_sha256": manifest[
-                    "source_unit_ids_sha256"
-                ],
+                "source_unit_ids_sha256": manifest["source_unit_ids_sha256"],
             },
             "claim_ledger": {
                 "artifact_key": claim_ledger_artifact_key,
                 "sha256": claim_ledger["ledger_sha256"],
-                "claim_ids_sha256": claim_ledger[
-                    "claim_ids_sha256"
-                ],
+                "claim_ids_sha256": claim_ledger["claim_ids_sha256"],
                 "contract": (
-                    "byte_exact_coverage_and_lineage_not_semantic_"
-                    "understanding"
+                    "byte_exact_coverage_and_lineage_not_semantic_understanding"
                 ),
             },
             "answer_accounting": {
                 "artifact_key": answer_accounting_artifact_key,
                 "sha256": answer_accounting["manifest_sha256"],
                 "answer_count": answer_accounting["answer_count"],
-                "accounted_answer_count": answer_accounting[
-                    "accounted_answer_count"
-                ],
-                "raw_text_answer_count": answer_accounting[
-                    "raw_text_answer_count"
-                ],
+                "accounted_answer_count": answer_accounting["accounted_answer_count"],
+                "raw_text_answer_count": answer_accounting["raw_text_answer_count"],
                 "raw_reconstruction_complete": answer_accounting[
                     "raw_reconstruction_complete"
                 ],
@@ -30837,8 +29855,7 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
         canonical_model_payload = model_payload
         terminal_ledger_sha256 = _stable_json_sha256(model_payload)
         terminal_ledger_artifact_key = (
-            f"{artifact_namespace}_terminal_ledger_"
-            f"{terminal_ledger_sha256[:20]}"
+            f"{artifact_namespace}_terminal_ledger_{terminal_ledger_sha256[:20]}"
         )
         await _save_artifact(
             run_id,
@@ -30861,37 +29878,27 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             terminal_ledger_artifact_key=terminal_ledger_artifact_key,
             terminal_ledger_sha256=terminal_ledger_sha256,
         )
-        final_model_payload_mode = (
-            "hierarchical_evidence_tree_compact_ledger"
-        )
+        final_model_payload_mode = "hierarchical_evidence_tree_compact_ledger"
         model_request_bytes = final_request_utf8_bytes(
             model_payload,
             window["model_envelope"],
         )
         if model_request_bytes > window_bytes:
-            model_payload, bounded_root_plan = (
-                await _build_bounded_final_root_payload(
-                    run_id,
-                    canonical_payload=canonical_model_payload,
-                    source_claim_rows=claim_rows,
-                    target_window=window,
-                    target_window_bytes=window_bytes,
-                    final_request_utf8_bytes=final_request_utf8_bytes,
-                    stage_key=stage_key,
-                    artifact_namespace=artifact_namespace,
-                    prompt_version=prompt_version,
-                    terminal_ledger_artifact_key=(
-                        terminal_ledger_artifact_key
-                    ),
-                    terminal_ledger_sha256=terminal_ledger_sha256,
-                )
+            model_payload, bounded_root_plan = await _build_bounded_final_root_payload(
+                run_id,
+                canonical_payload=canonical_model_payload,
+                source_claim_rows=claim_rows,
+                target_window=window,
+                target_window_bytes=window_bytes,
+                final_request_utf8_bytes=final_request_utf8_bytes,
+                stage_key=stage_key,
+                artifact_namespace=artifact_namespace,
+                prompt_version=prompt_version,
+                terminal_ledger_artifact_key=(terminal_ledger_artifact_key),
+                terminal_ledger_sha256=terminal_ledger_sha256,
             )
-            final_model_payload_mode = (
-                "bounded_transitive_evidence_tree"
-            )
-            model_request_bytes = int(
-                bounded_root_plan["model_request_utf8_bytes"]
-            )
+            final_model_payload_mode = "bounded_transitive_evidence_tree"
+            model_request_bytes = int(bounded_root_plan["model_request_utf8_bytes"])
     return model_payload, {
         **window,
         "mode": final_model_payload_mode,
@@ -30912,9 +29919,7 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
         "claim_ledger_artifact_key": claim_ledger_artifact_key,
         "answer_accounting_artifact_key": answer_accounting_artifact_key,
         "answer_count": (
-            answer_accounting["answer_count"]
-            if answer_accounting is not None
-            else None
+            answer_accounting["answer_count"] if answer_accounting is not None else None
         ),
         "accounted_answer_count": (
             answer_accounting["accounted_answer_count"]
@@ -30932,9 +29937,7 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             else None
         ),
         "source_claim_count": len(claim_rows),
-        "covered_claim_count": len(
-            final_packet.get("claim_coverage") or []
-        ),
+        "covered_claim_count": len(final_packet.get("claim_coverage") or []),
         "terminal_ledger_artifact_key": terminal_ledger_artifact_key,
         "bounded_root_plan": bounded_root_plan,
         "coverage_complete": True,
@@ -30965,15 +29968,9 @@ def _final_input_preflight(
     # average.  Treat each exact serialized UTF-8 byte as one possible token;
     # the full provider wrapper is measured separately by the input harness.
     estimated_tokens = serialized_bytes
-    budget = (
-        settings.FINAL_INPUT_TOKEN_BUDGET
-        if token_budget is None
-        else token_budget
-    )
+    budget = settings.FINAL_INPUT_TOKEN_BUDGET if token_budget is None else token_budget
     budget_enabled = bool(
-        isinstance(budget, int)
-        and not isinstance(budget, bool)
-        and budget > 0
+        isinstance(budget, int) and not isinstance(budget, bool) and budget > 0
     )
     if (
         isinstance(reserve_tokens, bool)
@@ -30982,8 +29979,7 @@ def _final_input_preflight(
     ):
         raise ValueError("reserve_tokens must be a non-negative integer")
     legacy_budget_would_accept = bool(
-        not budget_enabled
-        or estimated_tokens + reserve_tokens <= int(budget)
+        not budget_enabled or estimated_tokens + reserve_tokens <= int(budget)
     )
     physical_direct_fit = bool(
         physical_input_token_window is None
@@ -30998,9 +29994,7 @@ def _final_input_preflight(
         # meaningful document before the model sees it.
         "state": "direct" if physical_direct_fit else "partition_required",
         "accepted": True,
-        "payload_sha256": hashlib.sha256(
-            serialized.encode("utf-8")
-        ).hexdigest(),
+        "payload_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         "serialized_utf8_bytes": serialized_bytes,
         "estimated_input_tokens": estimated_tokens,
         "input_token_budget": budget if budget_enabled else None,
@@ -31015,24 +30009,18 @@ def _final_input_preflight(
         ),
         "repair_reserve_tokens": reserve_tokens,
         "estimated_headroom_tokens": (
-            budget - estimated_tokens - reserve_tokens
-            if budget_enabled
-            else None
+            budget - estimated_tokens - reserve_tokens if budget_enabled else None
         ),
         "selection_digest": selection_manifest.get("digest"),
         "selected_answer_count": selection_manifest.get("selected_count"),
-        "selected_full_text_count": selection_manifest.get(
-            "selected_full_text_count"
-        ),
+        "selected_full_text_count": selection_manifest.get("selected_full_text_count"),
         "selected_limited_prefix_count": selection_manifest.get(
             "selected_limited_prefix_count"
         ),
         "selected_metadata_only_count": selection_manifest.get(
             "selected_metadata_only_count"
         ),
-        "selection_coverage_complete": selection_manifest.get(
-            "coverage_complete"
-        ),
+        "selection_coverage_complete": selection_manifest.get("coverage_complete"),
         "estimation_contract": (
             "conservative_upper_bound:1_serialized_utf8_byte_per_token"
         ),
@@ -31076,9 +30064,7 @@ def _final_report_shard_source_records(
         records.append(
             {
                 **source,
-                "source_shard_id": (
-                    f"{kind}-{ordinal:06d}-{digest[:16]}"
-                ),
+                "source_shard_id": (f"{kind}-{ordinal:06d}-{digest[:16]}"),
                 "source_sha256": digest,
             }
         )
@@ -31090,9 +30076,7 @@ def _final_report_shard_source_records(
     )
     evidence = model_payload.get("evidence_digest")
     if not isinstance(evidence, dict):
-        raise OpenRouterError(
-            "Sharded final report has no structured evidence digest"
-        )
+        raise OpenRouterError("Sharded final report has no structured evidence digest")
 
     def append_packet(
         packet: dict[str, Any],
@@ -31132,9 +30116,7 @@ def _final_report_shard_source_records(
                 node.get("summary"),
                 dict,
             ):
-                raise OpenRouterError(
-                    "Sharded final bounded-root node has no summary"
-                )
+                raise OpenRouterError("Sharded final bounded-root node has no summary")
             append_packet(
                 node["summary"],
                 node_id=str(node.get("source_node_id") or ""),
@@ -31142,18 +30124,14 @@ def _final_report_shard_source_records(
             )
     else:
         append_packet(evidence, node_id=None, node_index=None)
-        passthrough_container = model_payload.get(
-            "deterministic_passthrough"
-        )
+        passthrough_container = model_payload.get("deterministic_passthrough")
         passthrough = (
             passthrough_container.get("values")
             if isinstance(passthrough_container, dict)
             else []
         )
         if not isinstance(passthrough, list):
-            raise OpenRouterError(
-                "Sharded final exact-scalar ledger is invalid"
-            )
+            raise OpenRouterError("Sharded final exact-scalar ledger is invalid")
         for item_index, item in enumerate(passthrough):
             append(
                 "exact_scalar",
@@ -31175,9 +30153,7 @@ def _final_report_shard_source_records(
         excerpt = claim.get("excerpt")
         excerpt_sha256 = str(claim.get("excerpt_sha256") or "")
         source_path = str(claim.get("source_path") or "")
-        domain_context = _validate_final_domain_context(
-            claim.get("domain_context")
-        )
+        domain_context = _validate_final_domain_context(claim.get("domain_context"))
         if (
             not claim_id
             or claim_id in seen_claim_ids
@@ -31212,18 +30188,14 @@ def _final_report_shard_source_records(
                 "fragment_count": claim.get("fragment_count"),
                 "excerpt": excerpt,
                 "excerpt_sha256": excerpt_sha256,
-                "analysis_dimension": domain_context[
-                    "analysis_dimension"
-                ],
+                "analysis_dimension": domain_context["analysis_dimension"],
                 "domain_context": domain_context,
             },
             lineage={
                 "contract": "exact_claim_and_atomic_fact_author_input_v1",
                 "claim_index": claim_index,
                 "source_path": source_path,
-                "domain_context_id": domain_context[
-                    "domain_context_id"
-                ],
+                "domain_context_id": domain_context["domain_context_id"],
             },
             claim_contracts=[
                 {
@@ -31248,9 +30220,7 @@ def _final_report_shard_source_records(
                     "Sharded final claim ledger generated a duplicate fact ref"
                 )
             seen_fact_refs.add(fact_ref)
-            assertion_candidates = _final_root_fact_assertion_candidates(
-                binding
-            )
+            assertion_candidates = _final_root_fact_assertion_candidates(binding)
             if not assertion_candidates:
                 raise OpenRouterError(
                     "Sharded final atomic fact has no exact assertion candidate"
@@ -31266,9 +30236,7 @@ def _final_report_shard_source_records(
                     "claim_id": claim_id,
                     "source_path": source_path,
                     "excerpt_sha256": excerpt_sha256,
-                    "analysis_dimension": domain_context[
-                        "analysis_dimension"
-                    ],
+                    "analysis_dimension": domain_context["analysis_dimension"],
                     "domain_context": domain_context,
                     "mandatory_fact_table": {
                         "version": fact_table["version"],
@@ -31282,9 +30250,7 @@ def _final_report_shard_source_records(
                     "fact_index": fact_index,
                     "claim_id": claim_id,
                     "source_path": source_path,
-                    "domain_context_id": domain_context[
-                        "domain_context_id"
-                    ],
+                    "domain_context_id": domain_context["domain_context_id"],
                 },
                 fact_contracts=[fact_contract],
             )
@@ -31307,11 +30273,7 @@ def _final_report_shard_source_records(
 def _final_report_capsule_group_key(record: dict[str, Any]) -> tuple[str, str]:
     """Return a deterministic semantic join key for one atomic author input."""
 
-    lineage = (
-        record.get("lineage")
-        if isinstance(record.get("lineage"), dict)
-        else {}
-    )
+    lineage = record.get("lineage") if isinstance(record.get("lineage"), dict) else {}
     value = record.get("value") if isinstance(record.get("value"), dict) else {}
     domain_context = (
         value.get("domain_context")
@@ -31330,10 +30292,7 @@ def _final_report_capsule_group_key(record: dict[str, Any]) -> tuple[str, str]:
         or domain_context.get("analysis_dimension")
         or "context"
     )
-    if (
-        domain_context.get("context_kind") == "model_answer"
-        and context_id
-    ):
+    if domain_context.get("context_kind") == "model_answer" and context_id:
         # Keep the user's prompt, the model response, annotations and
         # citations in one semantic bundle whenever the physical envelope
         # permits it.  Their individual AI Visibility dimensions remain on
@@ -31345,17 +30304,20 @@ def _final_report_capsule_group_key(record: dict[str, Any]) -> tuple[str, str]:
     if not context_id:
         # The key is content-addressed and bounded; it never copies a growing
         # global allowlist into each capsule.
-        context_id = "record-" + text_sha256(
-            json.dumps(
-                {
-                    "kind": record.get("kind"),
-                    "lineage": lineage,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )[:24]
+        context_id = (
+            "record-"
+            + text_sha256(
+                json.dumps(
+                    {
+                        "kind": record.get("kind"),
+                        "lineage": lineage,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )[:24]
+        )
     return context_id, dimension
 
 
@@ -31372,9 +30334,7 @@ def _final_report_capsule_record(
         raise OpenRouterError("Final report capsule cannot be empty")
     group_keys = {_final_report_capsule_group_key(item) for item in members}
     if len(group_keys) != 1:
-        raise OpenRouterError(
-            "Final report capsule mixed unrelated semantic contexts"
-        )
+        raise OpenRouterError("Final report capsule mixed unrelated semantic contexts")
     context_id, dimension = next(iter(group_keys))
     claim_contracts = [
         copy.deepcopy(contract)
@@ -31393,9 +30353,7 @@ def _final_report_capsule_record(
         or len(claim_ids) != len(set(claim_ids))
         or len(fact_refs) != len(set(fact_refs))
     ):
-        raise OpenRouterError(
-            "Final report capsule duplicated a claim or atomic fact"
-        )
+        raise OpenRouterError("Final report capsule duplicated a claim or atomic fact")
     member_views = [
         {
             key: copy.deepcopy(member.get(key))
@@ -31420,9 +30378,7 @@ def _final_report_capsule_record(
     member_dimensions: list[str] = []
     for member in members:
         member_value = (
-            member.get("value")
-            if isinstance(member.get("value"), dict)
-            else {}
+            member.get("value") if isinstance(member.get("value"), dict) else {}
         )
         member_context = (
             member_value.get("domain_context")
@@ -31489,8 +30445,7 @@ def _final_report_prompt_join_context(
     all_receipts: list[dict[str, Any]] = []
     fragments: list[dict[str, Any]] = []
     selected_ids = {
-        str(record.get("source_shard_id") or "")
-        for record in selected_records
+        str(record.get("source_shard_id") or "") for record in selected_records
     }
     for record in prompt_records:
         value = record.get("value") if isinstance(record.get("value"), dict) else {}
@@ -31501,8 +30456,7 @@ def _final_report_prompt_join_context(
             not source_shard_id
             or not isinstance(excerpt, str)
             or text_sha256(excerpt) != excerpt_sha256
-            or str(value.get("source_path") or "").rsplit("/", 1)[-1]
-            != "scenario"
+            or str(value.get("source_path") or "").rsplit("/", 1)[-1] != "scenario"
         ):
             raise OpenRouterError(
                 "Final report prompt join fragment failed exact integrity"
@@ -31566,15 +30520,10 @@ def _final_report_answer_join_context(
     all_receipts: list[dict[str, Any]] = []
     fragments: list[dict[str, Any]] = []
     selected_ids = {
-        str(record.get("source_shard_id") or "")
-        for record in selected_records
+        str(record.get("source_shard_id") or "") for record in selected_records
     }
     for record in answer_records:
-        value = (
-            record.get("value")
-            if isinstance(record.get("value"), dict)
-            else {}
-        )
+        value = record.get("value") if isinstance(record.get("value"), dict) else {}
         source_shard_id = str(record.get("source_shard_id") or "")
         excerpt = value.get("excerpt")
         excerpt_sha256 = str(value.get("excerpt_sha256") or "")
@@ -31582,8 +30531,7 @@ def _final_report_answer_join_context(
             not source_shard_id
             or not isinstance(excerpt, str)
             or text_sha256(excerpt) != excerpt_sha256
-            or str(value.get("source_path") or "").rsplit("/", 1)[-1]
-            != "answer_text"
+            or str(value.get("source_path") or "").rsplit("/", 1)[-1] != "answer_text"
         ):
             raise OpenRouterError(
                 "Final report answer join fragment failed exact integrity"
@@ -31686,9 +30634,7 @@ def _minimum_final_report_shard_output_utf8_bytes(
         ),
         "section": {
             "heading": "Вывод",
-            "body": "\n".join(
-                ["Вывод", *visible_claims, *visible_facts]
-            ),
+            "body": "\n".join(["Вывод", *visible_claims, *visible_facts]),
         },
         "actions": [],
         "limitations": [],
@@ -31723,9 +30669,7 @@ def _batch_final_report_source_records(
         raise OpenRouterError("Final report capsule plan has no executive core")
     executive = copy.deepcopy(atomic_records[0])
     executive_input_bytes = request_utf8_bytes(executive)
-    executive_output_bytes = _minimum_final_report_shard_output_utf8_bytes(
-        executive
-    )
+    executive_output_bytes = _minimum_final_report_shard_output_utf8_bytes(executive)
     if (
         executive_input_bytes > input_window_utf8_bytes
         or executive_output_bytes > output_window_utf8_bytes
@@ -31737,9 +30681,7 @@ def _batch_final_report_source_records(
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for record in atomic_records[1:]:
-        grouped.setdefault(
-            _final_report_capsule_group_key(record), []
-        ).append(record)
+        grouped.setdefault(_final_report_capsule_group_key(record), []).append(record)
     answer_bundle_dimension_order = {
         "prompt_context": 0,
         "answer_response": 1,
@@ -31758,11 +30700,7 @@ def _batch_final_report_source_records(
         def answer_bundle_member_order(
             member: dict[str, Any],
         ) -> tuple[int, int]:
-            value = (
-                member.get("value")
-                if isinstance(member.get("value"), dict)
-                else {}
-            )
+            value = member.get("value") if isinstance(member.get("value"), dict) else {}
             domain_context = (
                 value.get("domain_context")
                 if isinstance(value.get("domain_context"), dict)
@@ -31789,8 +30727,7 @@ def _batch_final_report_source_records(
     for members in grouped.values():
         cursor = 0
         is_answer_bundle = (
-            _final_report_capsule_group_key(members[0])[1]
-            == "model_answer_bundle"
+            _final_report_capsule_group_key(members[0])[1] == "model_answer_bundle"
         )
         prompt_records = (
             [
@@ -31859,9 +30796,11 @@ def _batch_final_report_source_records(
                 for member in selected_members
             )
 
-        if is_answer_bundle and any(
-            has_answer_response([member]) for member in members
-        ) and not prompt_records:
+        if (
+            is_answer_bundle
+            and any(has_answer_response([member]) for member in members)
+            and not prompt_records
+        ):
             raise OpenRouterError(
                 "Final report answer bundle has no exact prompt claim"
             )
@@ -31896,11 +30835,7 @@ def _batch_final_report_source_records(
                         [by_id[value] for value in endpoints],
                         [prompt_records[-1]],
                     ]
-                if (
-                    selected_has_prompt
-                    and not selected_has_answer
-                    and answer_records
-                ):
+                if selected_has_prompt and not selected_has_answer and answer_records:
                     answer_endpoints = list(
                         dict.fromkeys(
                             [
@@ -32034,9 +30969,7 @@ def _batch_final_report_source_records(
             if member.get("kind") == "exact_claim"
             and str(
                 (
-                    member.get("value")
-                    if isinstance(member.get("value"), dict)
-                    else {}
+                    member.get("value") if isinstance(member.get("value"), dict) else {}
                 ).get("source_path")
                 or ""
             ).endswith("/scenario")
@@ -32047,9 +30980,7 @@ def _batch_final_report_source_records(
             if member.get("kind") == "exact_claim"
             and str(
                 (
-                    member.get("value")
-                    if isinstance(member.get("value"), dict)
-                    else {}
+                    member.get("value") if isinstance(member.get("value"), dict) else {}
                 ).get("source_path")
                 or ""
             ).endswith("/answer_text")
@@ -32060,9 +30991,7 @@ def _batch_final_report_source_records(
         paired_answer_ids: set[str] = set()
         for capsule in capsules[1:]:
             value = (
-                capsule.get("value")
-                if isinstance(capsule.get("value"), dict)
-                else {}
+                capsule.get("value") if isinstance(capsule.get("value"), dict) else {}
             )
             if value.get("domain_context_id") != group_key[0]:
                 continue
@@ -32099,8 +31028,7 @@ def _batch_final_report_source_records(
                 paired_prompt_ids.update(member_prompt_ids)
         if paired_prompt_ids != prompt_ids or paired_answer_ids != answer_ids:
             raise OpenRouterError(
-                "Final report capsule plan lost exact prompt-answer join "
-                "coverage"
+                "Final report capsule plan lost exact prompt-answer join coverage"
             )
         joined_bundle_count += 1
         joined_prompt_fragments += len(prompt_ids)
@@ -32116,19 +31044,13 @@ def _batch_final_report_source_records(
     capsule_member_receipts = [
         receipt
         for capsule in capsules[1:]
-        for receipt in (capsule.get("lineage") or {}).get(
-            "member_receipts", []
-        )
+        for receipt in (capsule.get("lineage") or {}).get("member_receipts", [])
     ]
     if capsule_member_receipts != atomic_receipts:
         # Grouping intentionally clusters semantic keys, so compare exact
         # multisets while still rejecting a duplicate member receipt.
-        expected = Counter(
-            _stable_json_sha256(item) for item in atomic_receipts
-        )
-        actual = Counter(
-            _stable_json_sha256(item) for item in capsule_member_receipts
-        )
+        expected = Counter(_stable_json_sha256(item) for item in atomic_receipts)
+        actual = Counter(_stable_json_sha256(item) for item in capsule_member_receipts)
         if actual != expected or any(count != 1 for count in actual.values()):
             raise OpenRouterError(
                 "Final report capsule plan lost or duplicated atomic evidence"
@@ -32170,9 +31092,7 @@ async def _final_report_source_claim_rows(
 
     contract = model_payload.get("long_input_contract")
     ledger_reference = (
-        contract.get("claim_ledger")
-        if isinstance(contract, dict)
-        else None
+        contract.get("claim_ledger") if isinstance(contract, dict) else None
     )
     if isinstance(ledger_reference, dict):
         artifact_key = ledger_reference.get("artifact_key")
@@ -32186,9 +31106,7 @@ async def _final_report_source_claim_rows(
             or not isinstance(expected_ids_sha256, str)
             or not re.fullmatch(r"[0-9a-f]{64}", expected_ids_sha256)
         ):
-            raise OpenRouterError(
-                "Final report claim-ledger reference is incomplete"
-            )
+            raise OpenRouterError("Final report claim-ledger reference is incomplete")
         ledger = await _artifact_output(
             run_id,
             artifact_key,
@@ -32247,11 +31165,9 @@ async def _final_report_source_claim_rows(
         target_chars=FINAL_INPUT_MAP_UNIT_CHARS,
         context_overlap_chars=0,
     )
-    claim_rows, _claims_by_id, _ids_by_unit, ledger = (
-        _final_input_claim_ledger(
-            units,
-            source_payload=model_payload,
-        )
+    claim_rows, _claims_by_id, _ids_by_unit, ledger = _final_input_claim_ledger(
+        units,
+        source_payload=model_payload,
     )
     if ledger.get("claim_count") != len(claim_rows):
         raise OpenRouterError(
@@ -32268,16 +31184,12 @@ def _merge_final_report_shards(
     """Assemble every accepted shard in exact plan order without selection."""
 
     if len(values) != len(source_records):
-        raise OpenRouterError(
-            "Final report shard merge has incomplete source coverage"
-        )
+        raise OpenRouterError("Final report shard merge has incomplete source coverage")
     core: dict[str, Any] | None = None
     sections: list[dict[str, str]] = []
     actions: list[dict[str, str]] = []
     limitations: list[str] = []
-    for index, (value, source) in enumerate(
-        zip(values, source_records, strict=True)
-    ):
+    for index, (value, source) in enumerate(zip(values, source_records, strict=True)):
         source_core = {
             key: copy.deepcopy(source.get(key))
             for key in (
@@ -32291,8 +31203,7 @@ def _merge_final_report_shards(
         }
         expected_source_sha256 = _stable_json_sha256(source_core)
         expected_source_shard_id = (
-            f"{source_core['kind']}-{index:06d}-"
-            f"{expected_source_sha256[:16]}"
+            f"{source_core['kind']}-{index:06d}-{expected_source_sha256[:16]}"
         )
         if (
             source_core.get("ordinal") != index
@@ -32303,9 +31214,7 @@ def _merge_final_report_shards(
                 f"Final report source shard {index} failed its code-owned digest"
             )
         if not isinstance(value, dict):
-            raise OpenRouterError(
-                f"Final report shard {index} is not an object"
-            )
+            raise OpenRouterError(f"Final report shard {index} is not an object")
         if (
             value.get("source_shard_id") != source["source_shard_id"]
             or value.get("source_sha256") != source["source_sha256"]
@@ -32316,14 +31225,10 @@ def _merge_final_report_shards(
         shard_core = value.get("core")
         if index == 0:
             if not isinstance(shard_core, dict):
-                raise OpenRouterError(
-                    "Final report executive shard has no global core"
-                )
+                raise OpenRouterError("Final report executive shard has no global core")
             core = copy.deepcopy(shard_core)
         elif shard_core is not None:
-            raise OpenRouterError(
-                "Only the executive shard may author the global core"
-            )
+            raise OpenRouterError("Only the executive shard may author the global core")
         section = value.get("section")
         if (
             not isinstance(section, dict)
@@ -32340,9 +31245,7 @@ def _merge_final_report_shards(
             shard_limitations,
             list,
         ):
-            raise OpenRouterError(
-                f"Final report shard {index} has invalid arrays"
-            )
+            raise OpenRouterError(f"Final report shard {index} has invalid arrays")
         claim_contracts = source.get("claim_contracts")
         fact_contracts = source.get("fact_contracts")
         claim_dispositions = value.get("claim_dispositions")
@@ -32380,10 +31283,8 @@ def _merge_final_report_shards(
             if (
                 not isinstance(disposition, dict)
                 or disposition.get("claim_id") != expected.get("claim_id")
-                or disposition.get("excerpt_sha256")
-                != expected.get("excerpt_sha256")
-                or disposition.get("evidence_excerpt")
-                != expected.get("excerpt")
+                or disposition.get("excerpt_sha256") != expected.get("excerpt_sha256")
+                or disposition.get("evidence_excerpt") != expected.get("excerpt")
                 or disposition.get("disposition")
                 not in {
                     "material_observation",
@@ -32400,14 +31301,11 @@ def _merge_final_report_shards(
             visibility_clauses = expected.get("visibility_clauses")
             if not isinstance(visibility_clauses, list):
                 raise OpenRouterError(
-                    f"Final report shard {index} has no qualitative clause "
-                    "contract"
+                    f"Final report shard {index} has no qualitative clause contract"
                 )
             for clause in visibility_clauses:
                 anchors = (
-                    clause.get("required_anchors")
-                    if isinstance(clause, dict)
-                    else None
+                    clause.get("required_anchors") if isinstance(clause, dict) else None
                 )
                 if (
                     not isinstance(clause, dict)
@@ -32433,8 +31331,7 @@ def _merge_final_report_shards(
                 if missing_anchors:
                     raise OpenRouterError(
                         f"Final report shard {index} lost material "
-                        "qualitative anchors: "
-                        + ", ".join(missing_anchors)
+                        "qualitative anchors: " + ", ".join(missing_anchors)
                     )
         for expected, disposition in zip(
             fact_contracts,
@@ -32442,9 +31339,7 @@ def _merge_final_report_shards(
             strict=True,
         ):
             assertion = (
-                disposition.get("assertion")
-                if isinstance(disposition, dict)
-                else None
+                disposition.get("assertion") if isinstance(disposition, dict) else None
             )
             candidates = expected.get("assertion_candidates")
             if (
@@ -32616,9 +31511,7 @@ def _final_report_shard_contracts(
         "selection": "none",
         "sections": "append_in_plan_order",
         "actions": "append_in_plan_order_without_count_cap",
-        "limitations": (
-            "append_all_then_exact_string_dedupe_reader_projection_only"
-        ),
+        "limitations": ("append_all_then_exact_string_dedupe_reader_projection_only"),
         "core_owner": "shard_index_zero_only",
     }
     return generation_contract, merge_contract
@@ -32664,20 +31557,14 @@ def _reseal_final_report_source_records(
             "ordinal": ordinal,
             "value": copy.deepcopy(record.get("value")),
             "lineage": copy.deepcopy(record.get("lineage") or {}),
-            "claim_contracts": copy.deepcopy(
-                record.get("claim_contracts") or []
-            ),
-            "fact_contracts": copy.deepcopy(
-                record.get("fact_contracts") or []
-            ),
+            "claim_contracts": copy.deepcopy(record.get("claim_contracts") or []),
+            "fact_contracts": copy.deepcopy(record.get("fact_contracts") or []),
         }
         digest = _stable_json_sha256(source)
         sealed.append(
             {
                 **source,
-                "source_shard_id": (
-                    f"{source['kind']}-{ordinal:06d}-{digest[:16]}"
-                ),
+                "source_shard_id": (f"{source['kind']}-{ordinal:06d}-{digest[:16]}"),
                 "source_sha256": digest,
             }
         )
@@ -32739,11 +31626,7 @@ def _split_final_report_output_limited_record(
                     table = member_value.get("mandatory_fact_table")
                     rows = table.get("rows") if isinstance(table, dict) else []
                     for row in rows or []:
-                        fact_ref = (
-                            str(row[0])
-                            if isinstance(row, list) and row
-                            else ""
-                        )
+                        fact_ref = str(row[0]) if isinstance(row, list) and row else ""
                         if fact_ref in fact_contracts_by_ref:
                             fact_contract.append(
                                 copy.deepcopy(fact_contracts_by_ref[fact_ref])
@@ -32753,9 +31636,7 @@ def _split_final_report_output_limited_record(
                 return hydrated
 
             hydrated_members = [
-                hydrate_member(member)
-                for member in members
-                if isinstance(member, dict)
+                hydrate_member(member) for member in members if isinstance(member, dict)
             ]
             if len(hydrated_members) != len(members):
                 raise OpenRouterError(
@@ -32766,12 +31647,8 @@ def _split_final_report_output_limited_record(
                 _final_report_capsule_record(
                     copy.deepcopy(part),
                     ordinal=0,
-                    prompt_join_context=copy.deepcopy(
-                        value.get("prompt_join_context")
-                    ),
-                    answer_join_context=copy.deepcopy(
-                        value.get("answer_join_context")
-                    ),
+                    prompt_join_context=copy.deepcopy(value.get("prompt_join_context")),
+                    answer_join_context=copy.deepcopy(value.get("answer_join_context")),
                 )
                 for part in (
                     hydrated_members[:midpoint],
@@ -32931,12 +31808,11 @@ async def _execute_final_report_adaptive_shards(
                 f"window before POST: {request_bytes}>"
                 f"{input_window_utf8_bytes}"
             )
-        generated = await leaf_store.promote_accepted_provider_response(
-            request
-        )
+        generated = await leaf_store.promote_accepted_provider_response(request)
         if generated is not None:
             resumed_shards += 1
         else:
+
             async def provider_call(
                 audit_checkpoint: Callable[[dict[str, Any]], Any],
                 audit_context: dict[str, Any],
@@ -32955,9 +31831,7 @@ async def _execute_final_report_adaptive_shards(
                     provider_call,
                 )
             except OpenRouterOutputLimitError as exc:
-                children, event = _split_final_report_output_limited_record(
-                    record
-                )
+                children, event = _split_final_report_output_limited_record(record)
                 event = {
                     **event,
                     "version": "aiv-final-output-replan-v1",
@@ -32974,9 +31848,7 @@ async def _execute_final_report_adaptive_shards(
                 records = _reseal_final_report_source_records(
                     [*records[:index], *children, *records[index + 1 :]]
                 )
-                terminal_obligations = (
-                    _final_report_source_obligation_manifest(records)
-                )
+                terminal_obligations = _final_report_source_obligation_manifest(records)
                 if terminal_obligations != initial_obligations:
                     raise OpenRouterError(
                         "Adaptive final-report replan changed exact "
@@ -32986,9 +31858,7 @@ async def _execute_final_report_adaptive_shards(
                     records[index + offset]["source_shard_id"]
                     for offset in range(len(children))
                 ]
-                event["terminal_obligations_sha256"] = (
-                    terminal_obligations["sha256"]
-                )
+                event["terminal_obligations_sha256"] = terminal_obligations["sha256"]
                 replan_events.append(event)
                 continue
             generated_shards += 1
@@ -33001,9 +31871,7 @@ async def _execute_final_report_adaptive_shards(
             request,
         )
         if not isinstance(generated.value, dict):
-            raise OpenRouterError(
-                "Adaptive final-report leaf returned a non-object"
-            )
+            raise OpenRouterError("Adaptive final-report leaf returned a non-object")
         values.append(copy.deepcopy(generated.value))
         provider_receipts.append(
             {
@@ -33032,8 +31900,7 @@ async def _execute_final_report_adaptive_shards(
     manifest = {
         "version": "aiv-final-adaptive-sharded-document-v1",
         "document_id": (
-            f"{run_id}:final-adaptive:{artifact_role}:{attempt}:"
-            f"{source_digest[:16]}"
+            f"{run_id}:final-adaptive:{artifact_role}:{attempt}:{source_digest[:16]}"
         ),
         "document_sha256": document_sha256,
         "response_mode": ResponseMode.PARTITIONED.value,
@@ -33146,12 +32013,8 @@ async def _final_report_sharded_attempt(
             "version": FINAL_INPUT_HARNESS_VERSION,
             "mode": "reuse_exact_prepared_claim_ledger",
             "source_mode": existing_contract.get("mode"),
-            "source_payload_sha256": existing_contract.get(
-                "source_payload_sha256"
-            ),
-            "claim_ledger": copy.deepcopy(
-                existing_contract.get("claim_ledger")
-            ),
+            "source_payload_sha256": existing_contract.get("source_payload_sha256"),
+            "claim_ledger": copy.deepcopy(existing_contract.get("claim_ledger")),
             "coverage_complete": True,
         }
     else:
@@ -33161,9 +32024,7 @@ async def _final_report_sharded_attempt(
             system=shard_system,
             target_model=ANALYSIS_MODEL,
             stage_key="report",
-            artifact_namespace=(
-                f"final_shard_input_{artifact_role}_a{attempt}"
-            ),
+            artifact_namespace=(f"final_shard_input_{artifact_role}_a{attempt}"),
             prompt_version=FINAL_REPORT_VERSION,
             force_hierarchical=True,
             final_request_utf8_bytes=final_request_utf8_bytes,
@@ -33179,11 +32040,7 @@ async def _final_report_sharded_attempt(
     window = await _final_model_input_window(model=ANALYSIS_MODEL)
     envelope = window["model_envelope"]
     maximum = envelope.get("max_completion_tokens")
-    if (
-        isinstance(maximum, bool)
-        or not isinstance(maximum, int)
-        or maximum <= 0
-    ):
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
         raise OpenRouterError(
             "Final report capsule planner requires the model's advertised "
             "completion envelope"
@@ -33224,8 +32081,7 @@ async def _final_report_sharded_attempt(
         request_utf8_bytes=capsule_request_utf8_bytes,
     )
     document_id = (
-        f"{run_id}:final-shards:{artifact_role}:{attempt}:"
-        f"{source_digest[:16]}"
+        f"{run_id}:final-shards:{artifact_role}:{attempt}:{source_digest[:16]}"
     )
     plan = _build_final_report_shard_plan(
         document_id=document_id,
@@ -33234,8 +32090,7 @@ async def _final_report_sharded_attempt(
         merge_contract=merge_contract,
     )
     owner_artifact_key = (
-        f"final_report_{artifact_role}_sharded_a{attempt}_"
-        f"{source_digest[:20]}"
+        f"final_report_{artifact_role}_sharded_a{attempt}_{source_digest[:20]}"
     )
     store = create_sharded_artifact_store(
         run_id=run_id,
@@ -33297,19 +32152,21 @@ async def _final_report_sharded_attempt(
     )
 
     try:
-        document, terminal_records, adaptive_manifest = (
-            await _execute_final_report_adaptive_shards(
-                run_id,
-                source_records=source_records,
-                system=shard_system,
-                generation_contract=generation_contract,
-                merge_contract=merge_contract,
-                artifact_role=artifact_role,
-                attempt=attempt,
-                source_digest=source_digest,
-                input_window_utf8_bytes=window_bytes,
-                max_completion_tokens=maximum,
-            )
+        (
+            document,
+            terminal_records,
+            adaptive_manifest,
+        ) = await _execute_final_report_adaptive_shards(
+            run_id,
+            source_records=source_records,
+            system=shard_system,
+            generation_contract=generation_contract,
+            merge_contract=merge_contract,
+            artifact_role=artifact_role,
+            attempt=attempt,
+            source_digest=source_digest,
+            input_window_utf8_bytes=window_bytes,
+            max_completion_tokens=maximum,
         )
         canonical = json.dumps(
             document,
@@ -33413,22 +32270,16 @@ async def _final_report_author_candidate(
         for attempt in range(MAX_FINAL_STRUCTURE_REPAIRS + 1):
             user_payload = dict(payload)
             if attempt:
-                user_payload["structure_validation_errors_to_fix"] = (
-                    last_errors
-                )
+                user_payload["structure_validation_errors_to_fix"] = last_errors
                 user_payload["rejected_report"] = rejected_report
-                user_payload, _repair_input_plan = (
-                    await _prepare_final_model_payload(
-                        run_id,
-                        payload=user_payload,
-                        system=system,
-                        target_model=ANALYSIS_MODEL,
-                        stage_key="report",
-                        artifact_namespace=(
-                            f"final_structure_repair_input_a{attempt}"
-                        ),
-                        prompt_version=FINAL_REPORT_VERSION,
-                    )
+                user_payload, _repair_input_plan = await _prepare_final_model_payload(
+                    run_id,
+                    payload=user_payload,
+                    system=system,
+                    target_model=ANALYSIS_MODEL,
+                    stage_key="report",
+                    artifact_namespace=(f"final_structure_repair_input_a{attempt}"),
+                    prompt_version=FINAL_REPORT_VERSION,
                 )
             result = await _final_report_structured_attempt(
                 run_id,
@@ -33462,8 +32313,7 @@ async def _final_report_author_candidate(
             )
             return candidate, last_raw_text, last_usage
         raise OpenRouterError(
-            "; ".join(last_errors)
-            or "Final report structural validation failed"
+            "; ".join(last_errors) or "Final report structural validation failed"
         )
     except Exception as exc:
         await _save_artifact(
@@ -33553,25 +32403,20 @@ async def _final_report_structured_attempt(
             "content": json.dumps(user_payload, ensure_ascii=False),
         },
     ]
-    document_id = (
-        f"{run_id}:final-{artifact_role}:{attempt}:"
-        f"{input_digest[:16]}"
-    )
-    audit_checkpoint, resume_checkpoint = (
-        await _durable_structured_transport(
-            run_id,
-            stage_key="report",
-            owner_artifact_key=artifact_key,
-            source_input=user_payload,
-            model=ANALYSIS_MODEL,
-            owner_prompt_version=FINAL_REPORT_VERSION,
-            messages=messages,
-            schema_name="aiv_final_report",
-            response_schema=FINAL_REPORT_SCHEMA,
-            document_id=document_id,
-            reasoning_effort="high",
-            temperature=0.15,
-        )
+    document_id = f"{run_id}:final-{artifact_role}:{attempt}:{input_digest[:16]}"
+    audit_checkpoint, resume_checkpoint = await _durable_structured_transport(
+        run_id,
+        stage_key="report",
+        owner_artifact_key=artifact_key,
+        source_input=user_payload,
+        model=ANALYSIS_MODEL,
+        owner_prompt_version=FINAL_REPORT_VERSION,
+        messages=messages,
+        schema_name="aiv_final_report",
+        response_schema=FINAL_REPORT_SCHEMA,
+        document_id=document_id,
+        reasoning_effort="high",
+        temperature=0.15,
     )
     try:
         result = await chat_continuable_structured(
@@ -33612,9 +32457,7 @@ async def _final_report_structured_attempt(
             status="failed",
             model=ANALYSIS_MODEL,
             input_json=user_payload,
-            raw_text=(
-                str(getattr(failed_result, "text", "") or "") or None
-            ),
+            raw_text=(str(getattr(failed_result, "text", "") or "") or None),
             usage_json=(
                 getattr(failed_result, "usage", None)
                 if isinstance(getattr(failed_result, "usage", None), dict)
@@ -33669,8 +32512,7 @@ async def _invalidate_blocked_final_report_author_candidate(
         input_json=payload,
         output_json=candidate,
         error_message=(
-            "Author candidate was rejected by the semantic gate: "
-            + "; ".join(blockers)
+            "Author candidate was rejected by the semantic gate: " + "; ".join(blockers)
         ),
         prompt_version=FINAL_REPORT_VERSION,
         preserve_existing_evidence=True,
@@ -33681,15 +32523,17 @@ async def _invalidate_blocked_final_report_author_candidate(
     # retaining the append-only raw/usage fields.
     async with SessionLocal() as session:
         receipts = (
-            await session.execute(
-                select(RunArtifact).where(
-                    RunArtifact.run_id == run_id,
-                    RunArtifact.artifact_key.like(
-                        "final_report_author_attempt_%"
-                    ),
+            (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.like("final_report_author_attempt_%"),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         changed = False
         for receipt in receipts:
             if not isinstance(receipt.output_json, dict):
@@ -33775,11 +32619,52 @@ async def _edit_final_report_language(
 
     source = copy.deepcopy(report)
     source["headline_emphasis"] = []
+    protected_terms = _final_editor_protected_terms(public_report)
+    try:
+        _source_units, source_manifest = build_editorial_units(
+            source,
+            protected_terms=protected_terms,
+        )
+    except Exception as exc:
+        # Editorial preflight is downstream from the semantic gate. An
+        # unsupported/partial document shape must never discard that accepted
+        # report or trigger a model call; publish the source and keep an audit.
+        fallback_audit = {
+            "version": REPORT_EDITOR_HARNESS_VERSION,
+            "policy_version": REPORT_EDITOR_POLICY_VERSION,
+            "policy_sha256": editorial_policy_sha256(),
+            "source_report_sha256": _stable_json_sha256(source),
+            "result_report_sha256": _stable_json_sha256(source),
+            "coverage_complete": False,
+            "fallback_reason": f"{type(exc).__name__}: {exc}",
+        }
+        fallback_audit = seal_editorial_audit(fallback_audit)
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key="final_report_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json={
+                "source_report_sha256": fallback_audit["source_report_sha256"],
+                "public_report_sha256": _stable_json_sha256(public_report),
+                "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                "policy_sha256": fallback_audit["policy_sha256"],
+                "source_manifest_sha256": None,
+                "protected_terms": protected_terms,
+            },
+            output_json={"report": source, "audit": fallback_audit},
+            error_message=str(exc),
+            prompt_version=FINAL_EDITORIAL_VERSION,
+        )
+        return source
     cache_input = {
         "source_report_sha256": _stable_json_sha256(source),
         "public_report_sha256": _stable_json_sha256(public_report),
         "policy_version": REPORT_EDITOR_POLICY_VERSION,
-        "protected_terms": _final_editor_protected_terms(public_report),
+        "policy_sha256": editorial_policy_sha256(),
+        "source_manifest_sha256": source_manifest["manifest_sha256"],
+        "protected_terms": protected_terms,
     }
     cached = await _artifact_output(
         run_id,
@@ -33794,10 +32679,12 @@ async def _edit_final_report_language(
         if (
             isinstance(cached_report, dict)
             and isinstance(cached_audit, dict)
-            and cached_audit.get("source_report_sha256")
-            == cache_input["source_report_sha256"]
-            and cached_audit.get("policy_version")
-            == REPORT_EDITOR_POLICY_VERSION
+            and validate_editorial_cache(
+                source,
+                cached_report,
+                cached_audit,
+                protected_terms=protected_terms,
+            )
             and not _validate_final_report(cached_report)
         ):
             return copy.deepcopy(cached_report)
@@ -33816,9 +32703,7 @@ async def _edit_final_report_language(
         return await _structured_artifact(
             run_id,
             stage_key="report",
-            artifact_key=(
-                f"ru_editor_unit_a{attempt}_{unit_identity}"
-            ),
+            artifact_key=(f"ru_editor_unit_a{attempt}_{unit_identity}"),
             schema=EDITOR_UNIT_SCHEMA,
             schema_name="aiv_ru_editor_unit",
             system=EDITORIAL_POLICY,
@@ -33857,8 +32742,7 @@ async def _edit_final_report_language(
             schema=EDITOR_UNIT_SCHEMA,
             schema_name="aiv_ru_editor_arbiter",
             system=(
-                EDITORIAL_POLICY
-                + "\n\nТы старший арбитр. Исправь только доказанный "
+                EDITORIAL_POLICY + "\n\nТы старший арбитр. Исправь только доказанный "
                 "редакционный или смысловой дефект; факты неизменны."
             ),
             user_payload=value,
@@ -33911,8 +32795,10 @@ async def _edit_final_report_language(
             }
             edited = source
             audit["result_report_sha256"] = _stable_json_sha256(edited)
+            audit["changed_paths"] = []
         else:
             audit["semantic_fallback"] = {"used": False, "errors": []}
+        audit = seal_editorial_audit(audit)
         output = {"report": edited, "audit": audit}
         await _save_artifact(
             run_id,
@@ -33927,10 +32813,15 @@ async def _edit_final_report_language(
                 "_aiv_editorial_audit": {
                     key: copy.deepcopy(audit.get(key))
                     for key in (
-                        "version", "policy_version", "policy_sha256",
-                        "source_report_sha256", "result_report_sha256",
-                        "unit_count", "processed_unit_count",
-                        "coverage_complete", "audit_sha256",
+                        "version",
+                        "policy_version",
+                        "policy_sha256",
+                        "source_report_sha256",
+                        "result_report_sha256",
+                        "unit_count",
+                        "processed_unit_count",
+                        "coverage_complete",
+                        "audit_sha256",
                         "semantic_fallback",
                     )
                 }
@@ -33942,11 +32833,14 @@ async def _edit_final_report_language(
         fallback_audit = {
             "version": REPORT_EDITOR_HARNESS_VERSION,
             "policy_version": REPORT_EDITOR_POLICY_VERSION,
+            "policy_sha256": editorial_policy_sha256(),
             "source_report_sha256": cache_input["source_report_sha256"],
             "result_report_sha256": _stable_json_sha256(source),
             "coverage_complete": False,
+            "source_manifest": source_manifest,
             "fallback_reason": f"{type(exc).__name__}: {exc}",
         }
+        fallback_audit = seal_editorial_audit(fallback_audit)
         await _save_artifact(
             run_id,
             stage_key="report",
@@ -34107,6 +33001,7 @@ report_data. Строку с context_access=metadata_only разрешено и�
             answer_selection_manifest=payload["answer_selection_manifest"],
             semantic_evidence_document=semantic_evidence_document,
         )
+
     preflight = _final_input_preflight(
         payload,
         physical_input_token_window=(
@@ -34221,18 +33116,14 @@ report_data. Строку с context_access=metadata_only разрешено и�
             user_payload["validation_errors_to_fix"] = last_errors
             user_payload["semantic_review_to_fix"] = last_semantic_review
             user_payload["rejected_report"] = rejected_report
-            user_payload, _repair_input_plan = (
-                await _prepare_final_model_payload(
-                    run_id,
-                    payload=user_payload,
-                    system=system,
-                    target_model=ANALYSIS_MODEL,
-                    stage_key="report",
-                    artifact_namespace=(
-                        f"final_semantic_repair_input_a{_attempt}"
-                    ),
-                    prompt_version=FINAL_REPORT_VERSION,
-                )
+            user_payload, _repair_input_plan = await _prepare_final_model_payload(
+                run_id,
+                payload=user_payload,
+                system=system,
+                target_model=ANALYSIS_MODEL,
+                stage_key="report",
+                artifact_namespace=(f"final_semantic_repair_input_a{_attempt}"),
+                prompt_version=FINAL_REPORT_VERSION,
             )
             result = await _final_report_structured_attempt(
                 run_id,
@@ -34315,8 +33206,7 @@ def _eligible_illustration_answer_context(
     eligible = [
         item
         for item in sanitized
-        if item.get("context_access")
-        in {"full_text", "provider_limited_prefix"}
+        if item.get("context_access") in {"full_text", "provider_limited_prefix"}
     ]
     selected = [
         {
@@ -34336,12 +33226,10 @@ def _eligible_illustration_answer_context(
             item.get("context_access") == "full_text" for item in selected
         ),
         "selected_limited_prefix_count": sum(
-            item.get("context_access") == "provider_limited_prefix"
-            for item in selected
+            item.get("context_access") == "provider_limited_prefix" for item in selected
         ),
         "withheld_metadata_only_count": sum(
-            item.get("context_access") == "metadata_only"
-            for item in sanitized
+            item.get("context_access") == "metadata_only" for item in sanitized
         ),
         "unattested_raw_content_included": False,
     }
@@ -34496,9 +33384,7 @@ rw.plus исследуемый бренд может совпадать с из�
                 output_json=input_plan,
                 prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
             )
-            attempt_artifact_key = (
-                f"illustration_concepts_attempt_{_attempt + 1}"
-            )
+            attempt_artifact_key = f"illustration_concepts_attempt_{_attempt + 1}"
             messages = [
                 {"role": "system", "content": system},
                 {
@@ -34510,21 +33396,19 @@ rw.plus исследуемый бренд может совпадать с из�
                 f"{run_id}:illustration-concepts:{_attempt + 1}:"
                 f"{_stable_json_sha256(model_payload)[:20]}"
             )
-            audit_checkpoint, resume_checkpoint = (
-                await _durable_structured_transport(
-                    run_id,
-                    stage_key="report",
-                    owner_artifact_key=attempt_artifact_key,
-                    source_input=model_payload,
-                    model=ILLUSTRATION_CONCEPT_MODEL,
-                    owner_prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
-                    messages=messages,
-                    schema_name="aiv_illustration_concepts",
-                    response_schema=ILLUSTRATION_CONCEPTS_SCHEMA,
-                    document_id=document_id,
-                    reasoning_effort="high",
-                    temperature=0.2,
-                )
+            audit_checkpoint, resume_checkpoint = await _durable_structured_transport(
+                run_id,
+                stage_key="report",
+                owner_artifact_key=attempt_artifact_key,
+                source_input=model_payload,
+                model=ILLUSTRATION_CONCEPT_MODEL,
+                owner_prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
+                messages=messages,
+                schema_name="aiv_illustration_concepts",
+                response_schema=ILLUSTRATION_CONCEPTS_SCHEMA,
+                document_id=document_id,
+                reasoning_effort="high",
+                temperature=0.2,
             )
             result = await chat_continuable_structured(
                 model=ILLUSTRATION_CONCEPT_MODEL,
@@ -34770,13 +33654,10 @@ def _illustration_review_errors(review: dict[str, Any]) -> list[str]:
         context_specificity = None
     else:
         context_specificity = scores.get("context_specificity")
-    if (
-        not isinstance(context_specificity, int)
-        or isinstance(context_specificity, bool)
+    if not isinstance(context_specificity, int) or isinstance(
+        context_specificity, bool
     ):
-        errors.append(
-            "Проверка качества не оценила контекстную специфичность."
-        )
+        errors.append("Проверка качества не оценила контекстную специфичность.")
     elif context_specificity < 4:
         errors.append(
             "Изображение недостаточно узнаваемо по рынку, продуктам и "
@@ -34793,9 +33674,7 @@ def _illustration_review_errors(review: dict[str, Any]) -> list[str]:
             if isinstance(value, str) and value.strip()
         )
     if not isinstance(review.get("visible_text_problems"), list):
-        errors.append(
-            "Проверка качества не вернула поле visible_text_problems."
-        )
+        errors.append("Проверка качества не вернула поле visible_text_problems.")
     return list(dict.fromkeys(errors))
 
 
@@ -34887,8 +33766,7 @@ retry_instruction напиши по-английски как позитивно
         prompt_version=ILLUSTRATION_QA_VERSION,
     )
     data_url = (
-        f"data:{media_type};base64,"
-        f"{base64.b64encode(image_content).decode('ascii')}"
+        f"data:{media_type};base64,{base64.b64encode(image_content).decode('ascii')}"
     )
     try:
         result = await chat(
@@ -34997,9 +33875,7 @@ async def _generate_reviewed_image(
         else ""
     )
     last_errors = list(feedback_errors)
-    candidates: list[
-        tuple[ImageResult, dict[str, Any], str, list[str]]
-    ] = []
+    candidates: list[tuple[ImageResult, dict[str, Any], str, list[str]]] = []
     history: list[dict[str, Any]] = []
     attempts_made = 0
 
@@ -35065,9 +33941,8 @@ async def _generate_reviewed_image(
                     "scores": {},
                 }
             )
-        if (
-            attempt >= ILLUSTRATION_QUALITY_ATTEMPTS
-            and any(not candidate[3] for candidate in candidates)
+        if attempt >= ILLUSTRATION_QUALITY_ATTEMPTS and any(
+            not candidate[3] for candidate in candidates
         ):
             break
         if attempt < ILLUSTRATION_MAX_ATTEMPTS:
@@ -35080,6 +33955,7 @@ async def _generate_reviewed_image(
 
     usable = [candidate for candidate in candidates if not candidate[3]]
     if usable:
+
         def candidate_score(
             candidate: tuple[ImageResult, dict[str, Any], str, list[str]],
         ) -> int:
@@ -35299,15 +34175,18 @@ async def _generate_illustrations(
                     await session.commit()
 
             try:
-                image, review, accepted_prompt, quality_attempts = (
-                    await _generate_reviewed_image(
-                        run_id,
-                        sequence=sequence,
-                        concept=generation_concept,
-                        fact_context=fact_context,
-                        base_prompt=prompt,
-                        initial_review=initial_review,
-                    )
+                (
+                    image,
+                    review,
+                    accepted_prompt,
+                    quality_attempts,
+                ) = await _generate_reviewed_image(
+                    run_id,
+                    sequence=sequence,
+                    concept=generation_concept,
+                    fact_context=fact_context,
+                    base_prompt=prompt,
+                    initial_review=initial_review,
                 )
                 filename = f"{sequence:02d}.{image.extension}"
                 target = target_dir / filename
@@ -35476,9 +34355,7 @@ def _fallback_reused_illustration_concepts() -> list[dict[str, Any]]:
                 "Схема показывает место бренда среди названных альтернатив "
                 "по подтверждённым ответам моделей."
             ),
-            "alt_text": (
-                "Схема присутствия бренда и альтернатив в ответах моделей."
-            ),
+            "alt_text": ("Схема присутствия бренда и альтернатив в ответах моделей."),
         },
         {
             "role": "web_memory_gap",
@@ -35745,18 +34622,59 @@ async def _edit_technical_review_language(
     """Apply the audited Russian editorial harness to technical prose."""
 
     source = copy.deepcopy(review)
-    prose_paths = technical_review_narrative_paths(source)
     protected_terms = _technical_editor_protected_terms(profile)
+    profile_identity_sha256 = _stable_json_sha256(
+        {
+            "brand_name": profile.get("brand_name"),
+            "brand_aliases": profile.get("brand_aliases") or [],
+            "products": profile.get("products") or [],
+        }
+    )
+    try:
+        prose_paths = technical_review_narrative_paths(source)
+        _source_units, source_manifest = build_editorial_units(
+            source,
+            prose_paths=prose_paths,
+            protected_terms=protected_terms,
+        )
+    except Exception as exc:
+        fallback_audit = seal_editorial_audit(
+            {
+                "version": REPORT_EDITOR_HARNESS_VERSION,
+                "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                "policy_sha256": editorial_policy_sha256(),
+                "source_report_sha256": _stable_json_sha256(source),
+                "result_report_sha256": _stable_json_sha256(source),
+                "coverage_complete": False,
+                "fallback_reason": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="technical_access",
+            artifact_key="technical_review_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json={
+                "source_review_sha256": fallback_audit["source_report_sha256"],
+                "profile_identity_sha256": profile_identity_sha256,
+                "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                "policy_sha256": fallback_audit["policy_sha256"],
+                "source_manifest_sha256": None,
+                "prose_paths": [],
+                "protected_terms": protected_terms,
+            },
+            output_json={"review": source, "audit": fallback_audit},
+            error_message=str(exc),
+            prompt_version=TECHNICAL_EDITORIAL_VERSION,
+        )
+        return source
     cache_input = {
         "source_review_sha256": _stable_json_sha256(source),
-        "profile_identity_sha256": _stable_json_sha256(
-            {
-                "brand_name": profile.get("brand_name"),
-                "brand_aliases": profile.get("brand_aliases") or [],
-                "products": profile.get("products") or [],
-            }
-        ),
+        "profile_identity_sha256": profile_identity_sha256,
         "policy_version": REPORT_EDITOR_POLICY_VERSION,
+        "policy_sha256": editorial_policy_sha256(),
+        "source_manifest_sha256": source_manifest["manifest_sha256"],
         "prose_paths": prose_paths,
         "protected_terms": protected_terms,
     }
@@ -35773,10 +34691,13 @@ async def _edit_technical_review_language(
         if (
             isinstance(cached_review, dict)
             and isinstance(cached_audit, dict)
-            and cached_audit.get("source_report_sha256")
-            == cache_input["source_review_sha256"]
-            and cached_audit.get("policy_version")
-            == REPORT_EDITOR_POLICY_VERSION
+            and validate_editorial_cache(
+                source,
+                cached_review,
+                cached_audit,
+                prose_paths=prose_paths,
+                protected_terms=protected_terms,
+            )
             and _technical_editorial_shape_is_safe(source, cached_review)
         ):
             return copy.deepcopy(cached_review)
@@ -35832,8 +34753,7 @@ async def _edit_technical_review_language(
             schema=EDITOR_UNIT_SCHEMA,
             schema_name="aiv_technical_ru_editor_arbiter",
             system=(
-                EDITORIAL_POLICY
-                + "\n\nТы старший арбитр. Исправь только доказанный "
+                EDITORIAL_POLICY + "\n\nТы старший арбитр. Исправь только доказанный "
                 "редакционный или смысловой дефект; факты неизменны."
             ),
             user_payload=value,
@@ -35868,8 +34788,10 @@ async def _edit_technical_review_language(
             }
             edited = source
             audit["result_report_sha256"] = _stable_json_sha256(edited)
+            audit["changed_paths"] = []
         else:
             audit["semantic_fallback"] = {"used": False, "errors": []}
+        audit = seal_editorial_audit(audit)
         await _save_artifact(
             run_id,
             stage_key="technical_access",
@@ -35886,11 +34808,14 @@ async def _edit_technical_review_language(
         fallback_audit = {
             "version": REPORT_EDITOR_HARNESS_VERSION,
             "policy_version": REPORT_EDITOR_POLICY_VERSION,
+            "policy_sha256": editorial_policy_sha256(),
             "source_report_sha256": cache_input["source_review_sha256"],
             "result_report_sha256": _stable_json_sha256(source),
             "coverage_complete": False,
+            "source_manifest": source_manifest,
             "fallback_reason": f"{type(exc).__name__}: {exc}",
         }
+        fallback_audit = seal_editorial_audit(fallback_audit)
         await _save_artifact(
             run_id,
             stage_key="technical_access",
@@ -36062,9 +34987,9 @@ async def _finish_saved_answer_analysis(
         canonical_intent_taxonomy=await _uses_canonical_intent_taxonomy(run_id),
     )
     final_input_report = copy.deepcopy(public_report)
-    final_input_report["_analysis_foundation"] = (
-        await _final_analysis_foundation_context(run_id)
-    )
+    final_input_report[
+        "_analysis_foundation"
+    ] = await _final_analysis_foundation_context(run_id)
     await update_progress(
         run_id,
         stage="report",
@@ -36094,9 +35019,7 @@ async def _finish_saved_answer_analysis(
     else:
         async with SessionLocal() as session:
             saved_report = (
-                await session.execute(
-                    select(Run.report_json).where(Run.id == run_id)
-                )
+                await session.execute(select(Run.report_json).where(Run.id == run_id))
             ).scalar_one_or_none()
         saved_illustrations = (
             copy.deepcopy(saved_report.get("illustrations") or [])
@@ -36186,11 +35109,14 @@ async def reprocess_saved_answers(run_id: str) -> None:
             eta_seconds=720,
             status=RunStatus.analyzing,
         )
-        technical, technical_review, profile, _site_context_value = (
-            await _prepare_analysis_foundation(
-                run_id,
-                allow_legacy_snapshot=True,
-            )
+        (
+            technical,
+            technical_review,
+            profile,
+            _site_context_value,
+        ) = await _prepare_analysis_foundation(
+            run_id,
+            allow_legacy_snapshot=True,
         )
         await _save_answer_set_receipt(run_id)
         await _finish_saved_answer_analysis(
@@ -36227,9 +35153,12 @@ async def analyze_run(run_id: str) -> None:
         # follows below, but a DB/artifact mismatch must fail at the cheapest,
         # read-only boundary.
         panel_checkpoint = await _load_panel_resume_checkpoint(run_id)
-        technical, technical_review, profile, site_context = (
-            await _prepare_analysis_foundation(run_id)
-        )
+        (
+            technical,
+            technical_review,
+            profile,
+            site_context,
+        ) = await _prepare_analysis_foundation(run_id)
         if panel_checkpoint is None:
             await update_progress(
                 run_id,

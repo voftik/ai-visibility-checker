@@ -2739,7 +2739,18 @@ async def bootstrap_legacy_crawl_admission(
     )
     if _page_kind(eligible[0].url) != "home":
         raise CrawlAdmissionIncomplete("legacy snapshot has no usable homepage")
-    pages = [(page.url, _page_kind(page.url)) for page in eligible]
+    # A legacy snapshot must describe the rows that produced the already-paid
+    # downstream evidence.  URL classification rules can evolve, so deriving
+    # page_kind again here can create a manifest that no longer matches the
+    # persisted SitePage lineage.  Keep the historical value when present;
+    # only genuinely missing legacy metadata uses the current classifier.
+    pages = [
+        (
+            page.url,
+            str(page.page_kind or "").strip() or _page_kind(page.url),
+        )
+        for page in eligible
+    ]
     page_map = {page.url: page for page in eligible}
     page_receipt = _site_page_receipt(
         pages,
