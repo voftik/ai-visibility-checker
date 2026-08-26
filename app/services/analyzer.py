@@ -13751,17 +13751,86 @@ def _entity_catalog_recovery_checkpoint_identity(
     }
 
 
-def _entity_catalog_recovery_checkpoint_key(job: dict[str, Any]) -> str:
+def _entity_catalog_recovery_checkpoint_legacy_key(job: dict[str, Any]) -> str:
     policy_digest = ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256[:12]
     return f"{job['artifact_key']}_recovery_{policy_digest}_accepted"
 
 
-def _entity_catalog_recovery_stage_key(job: dict[str, Any]) -> str:
-    """Give each concurrent catalog chunk its own bounded planner stage."""
+def _entity_catalog_recovery_identity_digest(
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+) -> str:
+    return stable_digest(
+        _entity_catalog_recovery_checkpoint_identity(job=job, target=target)
+    )
 
-    artifact_digest = text_sha256(str(job["artifact_key"]))[:16]
+
+def _entity_catalog_recovery_checkpoint_key(
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+) -> str:
+    """Namespace accepted recovery leaves by their full immutable identity.
+
+    The base leaf key is intentionally tied only to raw answer units so an
+    ordinary extraction can be replayed across profile improvements.  An
+    accepted recovery checkpoint is stricter: its classification also depends
+    on the target profile and offer catalog.  Keeping only the policy digest in
+    this key made a valid older checkpoint collide with a newer target identity
+    and stopped the whole report.  The identity digest prevents that collision
+    without overwriting the historical checkpoint.
+    """
+
     policy_digest = ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256[:12]
-    return f"{ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE}:{artifact_digest}:{policy_digest}"
+    identity_digest = _entity_catalog_recovery_identity_digest(
+        job=job,
+        target=target,
+    )[:12]
+    return f"{job['artifact_key']}_recovery_{policy_digest}_{identity_digest}_accepted"
+
+
+def _entity_catalog_recovery_stage_key(
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+) -> str:
+    """Give each chunk and target identity its own bounded planner stage."""
+
+    stage_identity = {
+        "artifact_key": str(job["artifact_key"]),
+        "acceptance_policy_sha256": (ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256),
+        "checkpoint_identity_sha256": _entity_catalog_recovery_identity_digest(
+            job=job,
+            target=target,
+        ),
+    }
+    # RecoveryEpoch.stage_key is String(64).  Keep a readable stage namespace
+    # and hash the complete immutable identity into the remaining 37 chars.
+    return f"{ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE}:{stable_digest(stage_identity)[:37]}"
+
+
+def _entity_catalog_recovery_artifact_key(
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+    epoch: int,
+    attempt: int,
+) -> str:
+    identity_digest = _entity_catalog_recovery_identity_digest(
+        job=job,
+        target=target,
+    )[:12]
+    return f"{job['artifact_key']}_{identity_digest}_recovery_e{epoch}_a{attempt}"
+
+
+def _entity_catalog_recovery_legacy_artifact_key(
+    *,
+    job: dict[str, Any],
+    epoch: int,
+    attempt: int,
+) -> str:
+    return f"{job['artifact_key']}_recovery_e{epoch}_a{attempt}"
 
 
 def _validate_entity_catalog_leaf_evidence_binding(
@@ -14661,6 +14730,58 @@ async def _entity_catalog_recovery_artifact(
         ).scalar_one_or_none()
 
 
+def _validated_legacy_entity_catalog_checkpoint_identity(
+    artifact: RunArtifact,
+) -> dict[str, Any]:
+    """Return a legacy checkpoint identity only from a sealed valid envelope."""
+
+    mismatches: list[str] = []
+    if artifact.status != "completed":
+        mismatches.append("status")
+    if artifact.model is not None:
+        mismatches.append("model")
+    if artifact.prompt_version != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION:
+        mismatches.append("prompt_version")
+    envelope_identity = (
+        artifact.input_json if isinstance(artifact.input_json, dict) else None
+    )
+    if envelope_identity is None:
+        mismatches.append("input_json")
+    output = artifact.output_json if isinstance(artifact.output_json, dict) else None
+    if output is None:
+        mismatches.append("output_json")
+    embedded_identity = output.get("identity") if output is not None else None
+    if not isinstance(embedded_identity, dict):
+        mismatches.append("output_identity")
+    elif output.get("identity_sha256") != stable_digest(embedded_identity):
+        mismatches.append("output_identity_sha256")
+    checkpoint_body = copy.deepcopy(output) if output is not None else None
+    checkpoint_sha256 = (
+        str(checkpoint_body.pop("checkpoint_sha256", ""))
+        if checkpoint_body is not None
+        else ""
+    )
+    if (
+        checkpoint_body is None
+        or checkpoint_body.get("version") != ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+        or not checkpoint_sha256
+        or stable_digest(checkpoint_body) != checkpoint_sha256
+    ):
+        mismatches.append("checkpoint_digest")
+    if (
+        envelope_identity is not None
+        and isinstance(embedded_identity, dict)
+        and envelope_identity != embedded_identity
+    ):
+        mismatches.append("envelope_identity_binding")
+    if mismatches:
+        raise OpenRouterError(
+            "Entity-catalog legacy recovery checkpoint exists but violates "
+            "its immutable contract: " + ", ".join(dict.fromkeys(mismatches))
+        )
+    return copy.deepcopy(embedded_identity)
+
+
 async def _validate_entity_catalog_recovery_checkpoint(
     run_id: str,
     value: dict[str, Any],
@@ -14700,10 +14821,20 @@ async def _validate_entity_catalog_recovery_checkpoint(
     ):
         raise OpenRouterError("Entity-catalog recovery checkpoint attempt is malformed")
     recovery_artifact_key = str(checkpoint.get("recovery_artifact_key") or "")
-    expected_recovery_key = (
-        f"{job['artifact_key']}_recovery_e{epoch}_a{execution_attempt}"
-    )
-    if recovery_artifact_key != expected_recovery_key:
+    expected_recovery_keys = {
+        _entity_catalog_recovery_artifact_key(
+            job=job,
+            target=target,
+            epoch=epoch,
+            attempt=execution_attempt,
+        ),
+        _entity_catalog_recovery_legacy_artifact_key(
+            job=job,
+            epoch=epoch,
+            attempt=execution_attempt,
+        ),
+    }
+    if recovery_artifact_key not in expected_recovery_keys:
         raise OpenRouterError(
             "Entity-catalog recovery checkpoint artifact binding mismatch"
         )
@@ -14836,6 +14967,11 @@ async def _recover_entity_catalog_chunk_contract(
         raise contract_error
 
     source_digest = stable_digest(job["answers"])
+    checkpoint_identity = _entity_catalog_recovery_checkpoint_identity(
+        job=job,
+        target=target,
+    )
+    checkpoint_identity_sha256 = stable_digest(checkpoint_identity)
     base_artifact_key = str(job["artifact_key"])
     required_retry_checks = {
         CHECK_PROMPT_CONTRACT_VALID,
@@ -14852,6 +14988,9 @@ async def _recover_entity_catalog_chunk_contract(
         "immutable_core_claims": copy.deepcopy(claims),
         "immutable_core_claims_sha256": stable_digest(claims),
         "source_units_sha256": source_digest,
+        "checkpoint_identity": copy.deepcopy(checkpoint_identity),
+        "checkpoint_identity_sha256": checkpoint_identity_sha256,
+        "target_sha256": checkpoint_identity["target_sha256"],
         "invalid_candidate": copy.deepcopy(candidate),
         "invalid_candidate_sha256": incident["candidate_sha256"],
         "executor_contract": {
@@ -14875,7 +15014,10 @@ async def _recover_entity_catalog_chunk_contract(
         "artifact_key": base_artifact_key,
         "contract_error": str(contract_error),
     }
-    stage_key = _entity_catalog_recovery_stage_key(job)
+    stage_key = _entity_catalog_recovery_stage_key(
+        job=job,
+        target=target,
+    )
 
     async def reserve_plan() -> Any:
         return await plan_durable_recovery(
@@ -14974,6 +15116,7 @@ async def _recover_entity_catalog_chunk_contract(
         {
             "candidate": candidate,
             "source_units_sha256": source_digest,
+            "checkpoint_identity_sha256": checkpoint_identity_sha256,
         }
     )
     action = str(plan.decision.get("action") or "")
@@ -15080,7 +15223,12 @@ async def _recover_entity_catalog_chunk_contract(
                 ),
             },
         }
-        artifact_key = f"{base_artifact_key}_recovery_e{plan.epoch}_a{attempt_number}"
+        artifact_key = _entity_catalog_recovery_artifact_key(
+            job=job,
+            target=target,
+            epoch=plan.epoch,
+            attempt=attempt_number,
+        )
         schema_name = (
             f"aiv_entity_catalog_contract_recovery_e{plan.epoch}_a{attempt_number}"
         )
@@ -15208,11 +15356,10 @@ async def _recover_entity_catalog_chunk_contract(
                 "source_units_sha256": source_digest,
             }
         )
-        checkpoint_identity = _entity_catalog_recovery_checkpoint_identity(
+        checkpoint_key = _entity_catalog_recovery_checkpoint_key(
             job=job,
             target=target,
         )
-        checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
         checkpoint_output = _entity_catalog_recovery_checkpoint_payload(
             identity=checkpoint_identity,
             plan=plan,
@@ -15477,7 +15624,10 @@ evidence_quote пустым и конкретно опиши, что именн�
             job=job,
             target=target,
         )
-        checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
+        checkpoint_key = _entity_catalog_recovery_checkpoint_key(
+            job=job,
+            target=target,
+        )
         recovered_checkpoint = await _artifact_output(
             run_id,
             checkpoint_key,
@@ -15510,6 +15660,43 @@ evidence_quote пустым и конкретно опиши, что именн�
                     "its immutable contract: "
                     + ", ".join(mismatches or ["cache_lookup"])
                 )
+            legacy_checkpoint_key = _entity_catalog_recovery_checkpoint_legacy_key(job)
+            recovered_checkpoint = await _artifact_output(
+                run_id,
+                legacy_checkpoint_key,
+                input_json=checkpoint_identity,
+                model=None,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            )
+            if recovered_checkpoint is None:
+                legacy_artifact = await _entity_catalog_recovery_artifact(
+                    run_id,
+                    legacy_checkpoint_key,
+                )
+                if legacy_artifact is not None:
+                    legacy_identity = (
+                        _validated_legacy_entity_catalog_checkpoint_identity(
+                            legacy_artifact
+                        )
+                    )
+                    if legacy_identity != checkpoint_identity:
+                        # Legacy keys did not bind target/profile identity.  An
+                        # incompatible legacy checkpoint is stale, not corrupt:
+                        # a new identity-namespaced recovery may proceed while
+                        # the historical artifact stays intact for audit.
+                        logger.info(
+                            "Ignoring stale legacy entity-catalog checkpoint %s "
+                            "for run %s",
+                            legacy_checkpoint_key,
+                            run_id,
+                        )
+                    else:
+                        # A fully valid exact-identity row should have been a
+                        # cache hit.  Missing it is itself an integrity error.
+                        raise OpenRouterError(
+                            "Entity-catalog legacy recovery checkpoint exists "
+                            "but violates its immutable contract: cache_lookup"
+                        )
         if recovered_checkpoint is not None:
             if not isinstance(recovered_checkpoint, dict):
                 raise OpenRouterError(

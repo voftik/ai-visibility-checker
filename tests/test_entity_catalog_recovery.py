@@ -16,9 +16,13 @@ from app.services.analyzer import (
     _deterministic_entity_catalog_union,
     _entity_catalog,
     _entity_catalog_quote_recovery_incident,
+    _entity_catalog_recovery_artifact_key,
     _entity_catalog_recovery_checkpoint_identity,
     _entity_catalog_recovery_checkpoint_key,
+    _entity_catalog_recovery_checkpoint_legacy_key,
+    _entity_catalog_recovery_legacy_artifact_key,
     _entity_catalog_recovery_stage_key,
+    stable_digest,
 )
 from app.services.long_response import partition_text_records, text_sha256
 from app.services.openrouter import (
@@ -165,6 +169,15 @@ def _response_contract_error(*, complete: bool) -> Exception:
             transport=transport,
         ),
     )
+
+
+def _sealed_checkpoint_output(identity: dict[str, Any]) -> dict[str, Any]:
+    body = {
+        "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "identity": copy.deepcopy(identity),
+        "identity_sha256": stable_digest(identity),
+    }
+    return {**body, "checkpoint_sha256": stable_digest(body)}
 
 
 class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -356,6 +369,14 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             facts["acceptance_policy"],
             ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY,
+        )
+        self.assertEqual(
+            facts["checkpoint_identity_sha256"],
+            stable_digest(facts["checkpoint_identity"]),
+        )
+        self.assertEqual(
+            facts["target_sha256"],
+            facts["checkpoint_identity"]["target_sha256"],
         )
         self.assertEqual(
             set(
@@ -710,8 +731,14 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             job=job,
             target=target,
         )
-        checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
-        stage_key = _entity_catalog_recovery_stage_key(job)
+        checkpoint_key = _entity_catalog_recovery_checkpoint_key(
+            job=job,
+            target=target,
+        )
+        stage_key = _entity_catalog_recovery_stage_key(
+            job=job,
+            target=target,
+        )
 
         with patch(
             "app.services.analyzer.ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256",
@@ -721,12 +748,54 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 job=job,
                 target=target,
             )
-            changed_checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
-            changed_stage_key = _entity_catalog_recovery_stage_key(job)
+            changed_checkpoint_key = _entity_catalog_recovery_checkpoint_key(
+                job=job,
+                target=target,
+            )
+            changed_stage_key = _entity_catalog_recovery_stage_key(
+                job=job,
+                target=target,
+            )
 
         self.assertNotEqual(identity, changed_identity)
         self.assertNotEqual(checkpoint_key, changed_checkpoint_key)
         self.assertNotEqual(stage_key, changed_stage_key)
+
+        changed_target = {**target, "products": ["BETA"]}
+        self.assertNotEqual(
+            checkpoint_key,
+            _entity_catalog_recovery_checkpoint_key(
+                job=job,
+                target=changed_target,
+            ),
+        )
+        self.assertNotEqual(
+            stage_key,
+            _entity_catalog_recovery_stage_key(
+                job=job,
+                target=changed_target,
+            ),
+        )
+        self.assertNotEqual(
+            _entity_catalog_recovery_artifact_key(
+                job=job,
+                target=target,
+                epoch=1,
+                attempt=1,
+            ),
+            _entity_catalog_recovery_artifact_key(
+                job=job,
+                target=changed_target,
+                epoch=1,
+                attempt=1,
+            ),
+        )
+        self.assertEqual(
+            _entity_catalog_recovery_checkpoint_legacy_key(job),
+            _entity_catalog_recovery_checkpoint_legacy_key(
+                {**job, "model_answers": [{"changed": True}]}
+            ),
+        )
 
     async def _assert_restart_resumes_reserved_attempt(
         self,
@@ -1002,6 +1071,120 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 processing.assert_not_awaited()
                 planner.assert_not_awaited()
 
+    async def test_stale_legacy_checkpoint_does_not_block_new_target_identity(
+        self,
+    ) -> None:
+        artifact_lookups: list[str] = []
+        checkpoint_identities: list[dict[str, Any]] = []
+
+        async def artifact_output(
+            _run_id: str,
+            _artifact_key: str,
+            **kwargs: Any,
+        ) -> None:
+            checkpoint_identities.append(copy.deepcopy(kwargs["input_json"]))
+            return None
+
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            artifact_key = str(kwargs["artifact_key"])
+            payload = kwargs["user_payload"]
+            if "_recovery_" in artifact_key:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="ALPHA",
+                )
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        async def recovery_artifact(
+            _run_id: str,
+            artifact_key: str,
+        ) -> Any:
+            artifact_lookups.append(artifact_key)
+            if len(artifact_lookups) == 1:
+                return None
+            stale_identity = {
+                **checkpoint_identities[-1],
+                "target_sha256": "0" * 64,
+            }
+            return SimpleNamespace(
+                status="completed",
+                model=None,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                input_json=copy.deepcopy(stale_identity),
+                output_json=_sealed_checkpoint_output(stale_identity),
+            )
+
+        result, planner, reserve, finish = await self._run_catalog(
+            processing,
+            artifact_output_mock=AsyncMock(side_effect=artifact_output),
+            recovery_artifact_mock=AsyncMock(side_effect=recovery_artifact),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(artifact_lookups), 2)
+        self.assertNotEqual(artifact_lookups[0], artifact_lookups[1])
+        self.assertTrue(artifact_lookups[0].endswith("_accepted"))
+        self.assertTrue(artifact_lookups[1].endswith("_accepted"))
+        planner.assert_awaited_once()
+        reserve.assert_awaited_once()
+        finish.assert_awaited_once()
+
+    async def test_exact_identity_corrupt_legacy_checkpoint_stays_fail_closed(
+        self,
+    ) -> None:
+        identities: list[dict[str, Any]] = []
+        artifact_lookups = 0
+
+        async def artifact_output(
+            _run_id: str,
+            _artifact_key: str,
+            **kwargs: Any,
+        ) -> None:
+            identities.append(copy.deepcopy(kwargs["input_json"]))
+            return None
+
+        async def recovery_artifact(
+            _run_id: str,
+            _artifact_key: str,
+        ) -> Any:
+            nonlocal artifact_lookups
+            artifact_lookups += 1
+            if artifact_lookups == 1:
+                return None
+            current_identity = copy.deepcopy(identities[-1])
+            return SimpleNamespace(
+                status="completed",
+                model=None,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                input_json={**current_identity, "target_sha256": "f" * 64},
+                output_json=_sealed_checkpoint_output(current_identity),
+            )
+
+        processing = AsyncMock()
+        planner = AsyncMock()
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "legacy recovery checkpoint.*envelope_identity_binding",
+        ):
+            await self._run_catalog(
+                processing,
+                planner_mock=planner,
+                artifact_output_mock=AsyncMock(side_effect=artifact_output),
+                recovery_artifact_mock=AsyncMock(side_effect=recovery_artifact),
+            )
+
+        self.assertEqual(artifact_lookups, 2)
+        processing.assert_not_awaited()
+        planner.assert_not_awaited()
+
     async def test_accepted_checkpoint_reuses_exact_recovery_without_leaf_post(
         self,
     ) -> None:
@@ -1094,6 +1277,78 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "run-id",
             stored["output_json"]["recovery_artifact_key"],
         )
+
+        legacy_checkpoint_key = stored["artifact_key"].rsplit("_", 2)[0] + "_accepted"
+        legacy_checkpoint_output = copy.deepcopy(stored["output_json"])
+        legacy_checkpoint_output["recovery_artifact_key"] = (
+            _entity_catalog_recovery_legacy_artifact_key(
+                job={
+                    "artifact_key": legacy_checkpoint_output["identity"][
+                        "base_artifact_key"
+                    ]
+                },
+                epoch=legacy_checkpoint_output["epoch"],
+                attempt=legacy_checkpoint_output["execution_attempt"],
+            )
+        )
+        legacy_checkpoint_body = copy.deepcopy(legacy_checkpoint_output)
+        legacy_checkpoint_body.pop("checkpoint_sha256")
+        legacy_checkpoint_output["checkpoint_sha256"] = stable_digest(
+            legacy_checkpoint_body
+        )
+
+        async def saved_legacy_artifact(
+            _run_id: str,
+            artifact_key: str,
+            **kwargs: Any,
+        ) -> dict[str, Any] | None:
+            if artifact_key == legacy_checkpoint_key:
+                self.assertEqual(kwargs["input_json"], stored["input_json"])
+                return copy.deepcopy(legacy_checkpoint_output)
+            return None
+
+        recovery_leaf = SimpleNamespace(
+            status="completed",
+            model=PROCESSING_MODEL,
+            prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            input_json=copy.deepcopy(recovery_input),
+            output_json=copy.deepcopy(recovered_leaf),
+        )
+
+        async def legacy_artifact_lookup(
+            _run_id: str,
+            artifact_key: str,
+        ) -> Any:
+            if artifact_key == stored["artifact_key"]:
+                return None
+            if artifact_key == legacy_checkpoint_output["recovery_artifact_key"]:
+                return recovery_leaf
+            self.fail(f"Unexpected legacy artifact lookup: {artifact_key}")
+
+        legacy_calls: list[str] = []
+
+        async def legacy_processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            artifact_key = str(kwargs["artifact_key"])
+            legacy_calls.append(artifact_key)
+            if artifact_key != "entity_catalog":
+                self.fail("Exact legacy checkpoint triggered a new leaf POST")
+            return _deterministic_entity_catalog_union(
+                list(kwargs["user_payload"]["chunk_catalogs"])
+            )
+
+        result, planner, reserve, finish = await self._run_catalog(
+            legacy_processing,
+            artifact_output_mock=AsyncMock(side_effect=saved_legacy_artifact),
+            recovery_artifact_mock=AsyncMock(side_effect=legacy_artifact_lookup),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(legacy_calls, ["entity_catalog"])
+        planner.assert_not_awaited()
+        reserve.assert_not_awaited()
+        finish.assert_not_awaited()
 
         tampered_recovery_input = copy.deepcopy(recovery_input)
         tampered_recovery_input["recovery"]["execution_attempt"] = 2
@@ -1597,18 +1852,36 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(finish.await_args.kwargs["succeeded"])
 
     def test_recovery_stage_is_stable_and_distinct_per_chunk(self) -> None:
+        target = {"brand_name": "ALPHA", "aliases": [], "products": []}
+        first_job = {
+            "artifact_key": "entity_catalog_chunk_1_alpha",
+            "answers": [],
+            "model_answers": [],
+        }
         first = _entity_catalog_recovery_stage_key(
-            {"artifact_key": "entity_catalog_chunk_1_alpha"}
+            job=first_job,
+            target=target,
         )
         repeated = _entity_catalog_recovery_stage_key(
-            {"artifact_key": "entity_catalog_chunk_1_alpha"}
+            job=first_job,
+            target=target,
         )
         second = _entity_catalog_recovery_stage_key(
-            {"artifact_key": "entity_catalog_chunk_2_beta"}
+            job={
+                **first_job,
+                "artifact_key": "entity_catalog_chunk_2_beta",
+            },
+            target=target,
+        )
+        changed_target = _entity_catalog_recovery_stage_key(
+            job=first_job,
+            target={**target, "products": ["BETA"]},
         )
         self.assertEqual(first, repeated)
         self.assertNotEqual(first, second)
+        self.assertNotEqual(first, changed_target)
         self.assertTrue(first.startswith(ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE + ":"))
+        self.assertLessEqual(len(first), 64)
 
     async def test_ambiguous_markdown_failure_stays_fail_closed(self) -> None:
         planner = AsyncMock()
