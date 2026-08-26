@@ -486,6 +486,53 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
         self.assertEqual(inconsistent["sentiment"], "unknown")
 
 
+def _historical_bounded_panel_policy(
+    *,
+    mode: str,
+    provider_key: str,
+    model: str,
+) -> dict[str, object]:
+    policy = _panel_web_policy(mode, provider_key)
+    plugin_off = [{"id": "web", "enabled": False}]
+    if policy is WebSearchPolicy.REQUIRED:
+        mechanism = "openrouter_server_tool"
+        request_fields = {
+            "plugins": plugin_off,
+            "tools": [
+                {
+                    "type": "openrouter:web_search",
+                    "parameters": {
+                        "engine": "auto",
+                        "max_results": 5,
+                        "max_total_results": 12,
+                        "max_uses": 3,
+                        "search_context_size": "low",
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "max_tool_calls": 4,
+        }
+    elif policy is WebSearchPolicy.NATIVE_REQUIRED:
+        mechanism = "perplexity_native_search"
+        request_fields = {"plugins": plugin_off}
+    else:
+        mechanism = "none"
+        request_fields = {
+            "plugins": plugin_off,
+            "tool_choice": "none",
+        }
+    contract: dict[str, object] = {
+        "version": WEB_ATTESTATION_VERSION,
+        "policy": policy.value,
+        "mechanism": mechanism,
+        "model": model,
+        "request_fields": request_fields,
+        "requires_url_citation": policy is not WebSearchPolicy.FORBIDDEN,
+    }
+    return {**contract, "sha256": _stable_json_sha256(contract)}
+
+
 def _attested_panel_usage(
     *,
     prompt_text: str,
@@ -497,10 +544,17 @@ def _attested_panel_usage(
     max_tokens: int | None = None,
 ) -> tuple[dict[str, object], list[dict[str, str]] | None]:
     policy = _panel_web_policy(mode, provider_key)
-    _fields, request_policy = web_request_policy(
-        model=model,
-        policy=policy,
-    )
+    if contract_version == BOUNDED_PANEL_CONTRACT_VERSION:
+        request_policy = _historical_bounded_panel_policy(
+            mode=mode,
+            provider_key=provider_key,
+            model=model,
+        )
+    else:
+        _fields, request_policy = web_request_policy(
+            model=model,
+            policy=policy,
+        )
     has_retrieval = policy is not WebSearchPolicy.FORBIDDEN
     citations = (
         [{"url": "https://source.example", "title": "Source", "content": "Fact"}]
@@ -549,6 +603,7 @@ def _attested_panel_usage(
             provider_key=provider_key,
             model=model,
             max_tokens=3_200 if max_tokens is None else max_tokens,
+            request_policy=request_policy,
         )
     else:
         raise ValueError(f"Unsupported test panel contract: {contract_version}")
@@ -1415,11 +1470,12 @@ class PanelRoutingTests(unittest.TestCase):
 
     def test_panel_v2_budget_allowlist_and_hash_are_attested(self) -> None:
         prompt_text = "Какие решения выбрать?"
+        model = "openai/gpt-chat-latest"
         usage, citations = _attested_panel_usage(
             prompt_text=prompt_text,
             mode="web",
             provider_key="openai",
-            model="test/model",
+            model=model,
             contract_version=BOUNDED_PANEL_CONTRACT_VERSION,
             max_tokens=6_400,
         )
@@ -1427,7 +1483,7 @@ class PanelRoutingTests(unittest.TestCase):
             run_id="run-id",
             prompt_id=1,
             provider_key="openai",
-            model="test/model",
+            model=model,
             mode="web",
             status="completed",
             response_text="Ответ.",
@@ -1449,8 +1505,9 @@ class PanelRoutingTests(unittest.TestCase):
             prompt_text=prompt_text,
             mode="web",
             provider_key="openai",
-            model="test/model",
+            model=model,
             max_tokens=4_800,
+            request_policy=unapproved_usage["_aiv_request_policy"],
         )
         unapproved_usage["_aiv_panel_contract"] = unapproved
         answer.usage_json = unapproved_usage
@@ -1472,6 +1529,241 @@ class PanelRoutingTests(unittest.TestCase):
         )
         self.assertFalse(verified)
         self.assertEqual(reason, "request_hash_mismatch")
+
+    def test_panel_v2_rich_web_policy_survives_current_policy_drift(self) -> None:
+        prompt_text = "Какие решения выбрать?"
+        model = "openai/gpt-chat-latest"
+        usage, citations = _attested_panel_usage(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model=model,
+            contract_version=BOUNDED_PANEL_CONTRACT_VERSION,
+            max_tokens=3_200,
+        )
+        answer = ModelAnswer(
+            run_id="historical-run",
+            prompt_id=1,
+            provider_key="openai",
+            model=model,
+            mode="web",
+            status="completed",
+            response_text="Ответ.",
+            citations_json=citations,
+            usage_json=usage,
+        )
+
+        with patch(
+            "app.services.analyzer.web_request_policy",
+            side_effect=AssertionError("panel-v2 must not use current policy"),
+        ):
+            verified, reason = _panel_answer_attestation(
+                answer,
+                prompt_text=prompt_text,
+            )
+
+        self.assertTrue(verified)
+        self.assertEqual(reason, "verified")
+
+    def test_panel_v2_policy_and_attestation_tampering_fail_closed(self) -> None:
+        prompt_text = "Какие решения выбрать?"
+        model = "openai/gpt-chat-latest"
+        usage, citations = _attested_panel_usage(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model=model,
+            contract_version=BOUNDED_PANEL_CONTRACT_VERSION,
+            max_tokens=3_200,
+        )
+
+        def verify(candidate: dict[str, object]) -> tuple[bool, str]:
+            answer = ModelAnswer(
+                run_id="historical-run",
+                prompt_id=1,
+                provider_key="openai",
+                model=model,
+                mode="web",
+                status="completed",
+                response_text="Ответ.",
+                citations_json=citations,
+                usage_json=candidate,
+            )
+            return _panel_answer_attestation(answer, prompt_text=prompt_text)
+
+        def reseal_policy(candidate: dict[str, object]) -> None:
+            request_policy = candidate["_aiv_request_policy"]
+            assert isinstance(request_policy, dict)
+            policy_contract = {
+                key: value for key, value in request_policy.items() if key != "sha256"
+            }
+            request_policy["sha256"] = _stable_json_sha256(policy_contract)
+            provenance = candidate["_aiv_panel_contract"]
+            assert isinstance(provenance, dict)
+            provenance["request_policy_sha256"] = request_policy["sha256"]
+            provenance["request_sha256"] = _bounded_panel_request_sha256(
+                prompt_text=prompt_text,
+                mode="web",
+                provider_key="openai",
+                model=model,
+                max_tokens=3_200,
+                request_policy=request_policy,
+            )
+
+        corrupt_hash = copy.deepcopy(usage)
+        corrupt_hash["_aiv_request_policy"]["sha256"] = "0" * 64
+        self.assertEqual(verify(corrupt_hash), (False, "corrupt_request_policy_hash"))
+
+        wrong_policy = copy.deepcopy(usage)
+        wrong_policy["_aiv_request_policy"]["policy"] = "forbidden"
+        reseal_policy(wrong_policy)
+        self.assertEqual(verify(wrong_policy), (False, "request_policy_mismatch"))
+
+        wrong_model = copy.deepcopy(usage)
+        wrong_model["_aiv_request_policy"]["model"] = "anthropic/claude-sonnet-5"
+        reseal_policy(wrong_model)
+        self.assertEqual(
+            verify(wrong_model),
+            (False, "bounded_request_policy_model_mismatch"),
+        )
+
+        wrong_tool = copy.deepcopy(usage)
+        wrong_tool["_aiv_request_policy"]["request_fields"]["tools"][0]["parameters"][
+            "max_results"
+        ] = 6
+        reseal_policy(wrong_tool)
+        self.assertEqual(
+            verify(wrong_tool),
+            (False, "bounded_request_policy_fields_mismatch"),
+        )
+
+        missing_search = copy.deepcopy(usage)
+        missing_search["_aiv_web_attestation"]["web_search_requests"] = 0
+        missing_search["_aiv_panel_contract"]["web_attestation"] = copy.deepcopy(
+            missing_search["_aiv_web_attestation"]
+        )
+        self.assertEqual(verify(missing_search), (False, "web_search_not_observed"))
+
+        mismatched_attestation = copy.deepcopy(usage)
+        detached_attestation = copy.deepcopy(
+            mismatched_attestation["_aiv_web_attestation"]
+        )
+        detached_attestation["evidence"] = []
+        mismatched_attestation["_aiv_web_attestation"] = detached_attestation
+        self.assertEqual(
+            verify(mismatched_attestation),
+            (False, "attestation_provenance_mismatch"),
+        )
+
+    def test_panel_v3_does_not_accept_the_historical_rich_policy(self) -> None:
+        prompt_text = "Какие решения выбрать?"
+        model = "openai/gpt-chat-latest"
+        usage, citations = _attested_panel_usage(
+            prompt_text=prompt_text,
+            mode="web",
+            provider_key="openai",
+            model=model,
+            response_text="Ответ.",
+        )
+        historical_policy = _historical_bounded_panel_policy(
+            mode="web",
+            provider_key="openai",
+            model=model,
+        )
+        usage["_aiv_request_policy"] = historical_policy
+        usage["_aiv_panel_contract"]["request_policy_sha256"] = historical_policy[
+            "sha256"
+        ]
+        answer = ModelAnswer(
+            run_id="current-run",
+            prompt_id=1,
+            provider_key="openai",
+            model=model,
+            mode="web",
+            status="completed",
+            response_text="Ответ.",
+            citations_json=citations,
+            usage_json=usage,
+        )
+
+        verified, reason = _panel_answer_attestation(
+            answer,
+            prompt_text=prompt_text,
+        )
+
+        self.assertFalse(verified)
+        self.assertEqual(reason, "request_policy_contract_mismatch")
+
+    def test_historical_panel_v2_keeps_all_81_cells_metric_eligible(self) -> None:
+        lanes = [
+            ("openai", "web", "openai/gpt-chat-latest"),
+            ("gemini", "web", "google/gemini-3.6-flash"),
+            ("perplexity", "web", "perplexity/sonar-pro-search"),
+            ("deepseek", "web", "deepseek/deepseek-v4-pro"),
+            ("claude", "web", "anthropic/claude-sonnet-5"),
+            ("openai", "memory", "openai/gpt-chat-latest"),
+            ("gemini", "memory", "google/gemini-3.6-flash"),
+            ("deepseek", "memory", "deepseek/deepseek-v4-pro"),
+            ("claude", "memory", "anthropic/claude-sonnet-5"),
+        ]
+        expected_cells: list[dict[str, object]] = []
+        observed_rows: list[dict[str, object]] = []
+        for prompt_id in range(1, 10):
+            prompt_text = f"Сценарий {prompt_id}"
+            for provider_key, mode, model in lanes:
+                usage, citations = _attested_panel_usage(
+                    prompt_text=prompt_text,
+                    mode=mode,
+                    provider_key=provider_key,
+                    model=model,
+                    contract_version=BOUNDED_PANEL_CONTRACT_VERSION,
+                    max_tokens=3_200,
+                )
+                answer = ModelAnswer(
+                    run_id="historical-run",
+                    prompt_id=prompt_id,
+                    provider_key=provider_key,
+                    model=model,
+                    mode=mode,
+                    status="completed",
+                    response_text="Ответ.",
+                    citations_json=citations,
+                    usage_json=usage,
+                )
+                verified, reason = _panel_answer_attestation(
+                    answer,
+                    prompt_text=prompt_text,
+                )
+                self.assertTrue(verified, reason)
+                expected_cells.append(
+                    {
+                        "prompt_id": prompt_id,
+                        "provider_key": provider_key,
+                        "mode": mode,
+                        "model": model,
+                    }
+                )
+                observed_rows.append(
+                    {
+                        "prompt_id": prompt_id,
+                        "provider_key": provider_key,
+                        "mode": mode,
+                        "model": model,
+                        "status": "completed",
+                        "metric_eligible": verified,
+                        "metric_evidence_state": "strict_verified",
+                        "metric_limitation": None,
+                    }
+                )
+
+        admission = build_panel_metric_coverage_admission(
+            expected_cells=expected_cells,
+            observed_rows=observed_rows,
+        )
+        self.assertEqual(len(observed_rows), PANEL_CORPUS_EXPECTED_CELL_COUNT)
+        self.assertTrue(admission["allowed"])
+        self.assertEqual(admission["eligible_cell_count"], 81)
+        self.assertEqual(admission["coverage_rate"], 1.0)
 
     def test_strict_schemas_avoid_unsupported_array_cardinality(self) -> None:
         self.assertNotIn("minItems", str(PROMPT_SET_SCHEMA))

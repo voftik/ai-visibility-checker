@@ -303,6 +303,13 @@ PANEL_OUTPUT_POLICY = "single_turn_model_max_available_v1"
 PANEL_RETRY_PROVENANCE_VERSION = "aiv-panel-retry-v1"
 PANEL_ATTEMPT_AUDIT_VERSION = "aiv-panel-attempt-v3"
 PANEL_ATTEMPT_ARTIFACT_PREFIX = "panel_attempt_"
+_BOUNDED_PANEL_PROVIDER_MODEL_NAMESPACES = {
+    "openai": "openai/",
+    "gemini": "google/",
+    "perplexity": "perplexity/",
+    "deepseek": "deepseek/",
+    "claude": "anthropic/",
+}
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v9"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v11"
 CORE_UNIT_DECISION_LEDGER_VERSION = "aiv-core-unit-decision-ledger-v1"
@@ -11626,14 +11633,15 @@ def _bounded_panel_request_sha256(
     provider_key: str,
     model: str,
     max_tokens: int,
+    request_policy: dict[str, Any],
 ) -> str:
-    """Rebuild the immutable 3200/6400 panel-v2 request contract."""
+    """Rebuild panel-v2 from its persisted, self-hashed policy bundle.
 
-    policy = _panel_web_policy(mode, provider_key)
-    _request_fields, request_policy = web_request_policy(
-        model=model,
-        policy=policy,
-    )
+    ``web_request_policy`` describes the current transport and is deliberately
+    not consulted here. Panel-v2 receipts are historical wire contracts; a
+    later search-budget change must not rewrite their request digest.
+    """
+
     contract = {
         "version": BOUNDED_PANEL_CONTRACT_VERSION,
         "model": model,
@@ -11654,6 +11662,101 @@ def _bounded_panel_request_sha256(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _bounded_panel_request_policy_reason(
+    request_policy: dict[str, Any],
+    *,
+    mode: str,
+    provider_key: str,
+    model: str,
+) -> str | None:
+    """Validate the frozen panel-v2 transport policy without current config.
+
+    Panel-v2 existed with one bounded server-search shape. Memory-only and
+    Perplexity-native shapes did not drift, but they are repeated literally
+    here too so every accepted historical bundle has an exact schema. The
+    caller verifies the bundle's self-hash before invoking this function.
+    """
+
+    if mode not in {"web", "memory"}:
+        return "bounded_request_policy_mode_mismatch"
+    model_namespace = _BOUNDED_PANEL_PROVIDER_MODEL_NAMESPACES.get(provider_key)
+    if model_namespace is None:
+        return "bounded_request_policy_provider_mismatch"
+    if (
+        not model.casefold().startswith(model_namespace)
+        or ":online" in model.casefold()
+    ):
+        return "bounded_request_policy_provider_model_mismatch"
+    if provider_key == "perplexity" and mode != "web":
+        return "bounded_request_policy_provider_mode_mismatch"
+    if provider_key == "perplexity" and not model.casefold().startswith(
+        "perplexity/sonar"
+    ):
+        return "bounded_request_policy_provider_model_mismatch"
+
+    required_keys = {
+        "version",
+        "policy",
+        "mechanism",
+        "model",
+        "request_fields",
+        "requires_url_citation",
+        "sha256",
+    }
+    if set(request_policy) != required_keys:
+        return "bounded_request_policy_schema_mismatch"
+    if request_policy.get("version") != WEB_ATTESTATION_VERSION:
+        return "stale_request_policy"
+    if request_policy.get("model") != model:
+        return "bounded_request_policy_model_mismatch"
+
+    plugin_off = [{"id": "web", "enabled": False}]
+    if mode == "memory":
+        expected_policy = WebSearchPolicy.FORBIDDEN.value
+        expected_mechanism = "none"
+        expected_requires_citation = False
+        expected_request_fields = {
+            "plugins": plugin_off,
+            "tool_choice": "none",
+        }
+    elif provider_key == "perplexity":
+        expected_policy = WebSearchPolicy.NATIVE_REQUIRED.value
+        expected_mechanism = "perplexity_native_search"
+        expected_requires_citation = True
+        expected_request_fields = {"plugins": plugin_off}
+    else:
+        expected_policy = WebSearchPolicy.REQUIRED.value
+        expected_mechanism = "openrouter_server_tool"
+        expected_requires_citation = True
+        expected_request_fields = {
+            "plugins": plugin_off,
+            "tools": [
+                {
+                    "type": "openrouter:web_search",
+                    "parameters": {
+                        "engine": "auto",
+                        "max_results": 5,
+                        "max_total_results": 12,
+                        "max_uses": 3,
+                        "search_context_size": "low",
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "max_tool_calls": 4,
+        }
+
+    if request_policy.get("policy") != expected_policy:
+        return "request_policy_mismatch"
+    if request_policy.get("mechanism") != expected_mechanism:
+        return "bounded_request_policy_mechanism_mismatch"
+    if request_policy.get("requires_url_citation") is not expected_requires_citation:
+        return "bounded_request_policy_citation_requirement_mismatch"
+    if request_policy.get("request_fields") != expected_request_fields:
+        return "bounded_request_policy_fields_mismatch"
+    return None
 
 
 def _panel_retry_attempt_record(
@@ -12270,18 +12373,39 @@ def _panel_answer_attestation(
         return False, "missing_web_attestation"
     if not isinstance(annotations, list):
         return False, "missing_response_annotations"
+    if ":online" in answer.model.casefold():
+        return False, "unsupported_legacy_web_contract"
 
     expected_policy = _panel_web_policy(
         answer.mode,
         answer.provider_key,
     ).value
+    if request_policy.get("version") != WEB_ATTESTATION_VERSION:
+        return False, "stale_request_policy"
+    if request_policy.get("policy") != expected_policy:
+        return False, "request_policy_mismatch"
+    stored_policy_contract = {
+        key: value for key, value in request_policy.items() if key != "sha256"
+    }
+    stored_policy_sha256 = hashlib.sha256(
+        json.dumps(
+            stored_policy_contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if request_policy.get("sha256") != stored_policy_sha256:
+        return False, "corrupt_request_policy_hash"
+
+    expected_request_policy: dict[str, Any] | None = None
     try:
-        _expected_fields, expected_request_policy = web_request_policy(
-            model=answer.model,
-            policy=expected_policy,
-        )
         contract_version = provenance.get("version")
         if contract_version == PANEL_CONTRACT_VERSION:
+            _expected_fields, expected_request_policy = web_request_policy(
+                model=answer.model,
+                policy=expected_policy,
+            )
             if provenance.get("output_policy") != PANEL_OUTPUT_POLICY:
                 return False, "panel_output_policy_mismatch"
             output_envelope = usage.get("_aiv_output_envelope")
@@ -12311,12 +12435,21 @@ def _panel_answer_attestation(
                 or persisted_max_tokens not in LEGACY_PANEL_MAX_TOKENS_ALLOWLIST
             ):
                 return False, "unapproved_panel_max_tokens"
+            bounded_policy_reason = _bounded_panel_request_policy_reason(
+                request_policy,
+                mode=answer.mode,
+                provider_key=answer.provider_key,
+                model=answer.model,
+            )
+            if bounded_policy_reason is not None:
+                return False, bounded_policy_reason
             expected_request_sha256 = _bounded_panel_request_sha256(
                 prompt_text=prompt_text,
                 mode=answer.mode,
                 provider_key=answer.provider_key,
                 model=answer.model,
                 max_tokens=persisted_max_tokens,
+                request_policy=request_policy,
             )
         else:
             return False, "stale_panel_contract"
@@ -12329,24 +12462,11 @@ def _panel_answer_attestation(
         return False, "request_hash_mismatch"
     if provenance.get("attestation_version") != WEB_ATTESTATION_VERSION:
         return False, "stale_attestation_contract"
-    if request_policy.get("version") != WEB_ATTESTATION_VERSION:
-        return False, "stale_request_policy"
-    if request_policy.get("policy") != expected_policy:
-        return False, "request_policy_mismatch"
-    stored_policy_contract = {
-        key: value for key, value in request_policy.items() if key != "sha256"
-    }
-    stored_policy_sha256 = hashlib.sha256(
-        json.dumps(
-            stored_policy_contract,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    if request_policy.get("sha256") != stored_policy_sha256:
-        return False, "corrupt_request_policy_hash"
-    if request_policy.get("sha256") != expected_request_policy.get("sha256"):
+    if provenance.get("web_policy") != expected_policy:
+        return False, "panel_web_policy_mismatch"
+    if expected_request_policy is not None and request_policy.get(
+        "sha256"
+    ) != expected_request_policy.get("sha256"):
         return False, "request_policy_contract_mismatch"
     if provenance.get("request_policy_sha256") != request_policy.get("sha256"):
         return False, "request_policy_hash_mismatch"
@@ -12356,6 +12476,15 @@ def _panel_answer_attestation(
         return False, "stale_web_attestation"
     if attestation.get("policy") != expected_policy:
         return False, "attestation_policy_mismatch"
+    if attestation.get("mechanism") != request_policy.get("mechanism"):
+        return False, "attestation_mechanism_mismatch"
+    if attestation.get("requested_model") != answer.model:
+        return False, "attestation_requested_model_mismatch"
+    if (
+        contract_version == BOUNDED_PANEL_CONTRACT_VERSION
+        and attestation.get("response_model") != answer.model
+    ):
+        return False, "bounded_attestation_response_model_mismatch"
     if (
         attestation.get("state") != "verified"
         or attestation.get("metric_eligible") is not True
@@ -12379,6 +12508,12 @@ def _panel_answer_attestation(
         )
         for item in annotations
     )
+    if (
+        attestation.get("citations_count") != citation_count
+        or attestation.get("annotations_count") != len(annotations)
+        or attestation.get("citation_annotations_count") != citation_annotation_count
+    ):
+        return False, "attestation_evidence_count_mismatch"
     if expected_policy == WebSearchPolicy.REQUIRED.value:
         if count(attestation.get("web_search_requests")) < 1:
             return False, "web_search_not_observed"

@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-PANEL_METRIC_COVERAGE_ADMISSION_VERSION = "aiv-panel-metric-coverage-v2"
+PANEL_METRIC_COVERAGE_ADMISSION_VERSION = "aiv-panel-metric-coverage-v3"
 PANEL_METRIC_MINIMUM_RATE = 0.60
 PANEL_METRIC_MAX_UNAVAILABLE_PROVIDERS = {"web": 2, "memory": 1}
 
@@ -62,9 +62,9 @@ def build_panel_metric_coverage_admission(
     """Return a content-addressed allow/block decision for panel coverage.
 
     Coverage is checked globally, per mode, per prompt and per provider.  A
-    provider may be wholly unavailable (and therefore shown as unavailable),
-    but a tiny non-zero sample is rejected because it creates deceptively
-    precise percentages.  Entire provider outages are bounded per mode.
+    provider may be wholly unavailable (and therefore shown as unavailable)
+    without blocking every other valid provider slice.  A tiny non-zero sample
+    is still rejected because it creates deceptively precise percentages.
     """
 
     if not 0 < minimum_rate <= 1:
@@ -127,11 +127,14 @@ def build_panel_metric_coverage_admission(
             if observed_row is not None
             else ""
         )
-        model_matches = bool(
-            observed_row is not None and actual_model == expected_model
-        )
+        observed_cell = observed_row is not None
+        # A missing row is kept distinct from a model mismatch so diagnostics
+        # remain truthful.  It is still a hard structural loss below: provider
+        # outages must be persisted as terminal failed rows, never disappear
+        # from the immutable expected grid.
+        model_matches = not observed_cell or actual_model == expected_model
         metric_eligible = bool(
-            observed_row is not None
+            observed_cell
             and model_matches
             and observed_row.get("metric_eligible") is True
         )
@@ -158,15 +161,19 @@ def build_panel_metric_coverage_admission(
                     if observed_row is not None
                     else "missing_cell"
                 ),
+                "observed": observed_cell,
                 "model_matches": model_matches,
             }
         )
 
-    reasons: list[str] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
     if unknown_cells:
-        reasons.append("unexpected_panel_cells")
-    if any(not row["model_matches"] for row in rows):
-        reasons.append("panel_model_grid_mismatch")
+        blockers.append("unexpected_panel_cells")
+    if any(not row["observed"] for row in rows):
+        blockers.append("missing_panel_cells")
+    if any(row["observed"] and not row["model_matches"] for row in rows):
+        blockers.append("panel_model_grid_mismatch")
 
     def grouped_receipts(
         group_fields: tuple[str, ...],
@@ -198,10 +205,10 @@ def build_panel_metric_coverage_admission(
 
     for receipt in mode_receipts:
         if receipt["eligible_cells"] < receipt["minimum_eligible_cells"]:
-            reasons.append(f"{receipt['mode']}_mode_coverage_below_minimum")
+            warnings.append(f"{receipt['mode']}_mode_coverage_below_minimum")
     for receipt in prompt_mode_receipts:
         if receipt["eligible_cells"] < receipt["minimum_eligible_cells"]:
-            reasons.append(
+            warnings.append(
                 f"{receipt['mode']}_prompt_{receipt['prompt_id']}_coverage_below_minimum"
             )
 
@@ -209,25 +216,36 @@ def build_panel_metric_coverage_admission(
     for receipt in provider_mode_receipts:
         if receipt["eligible_cells"] == 0:
             unavailable_by_mode[str(receipt["mode"])] += 1
+            warnings.append(
+                f"{receipt['mode']}_{receipt['provider_key']}_provider_unavailable"
+            )
         elif receipt["eligible_cells"] < receipt["minimum_eligible_cells"]:
-            reasons.append(
+            blockers.append(
                 f"{receipt['mode']}_{receipt['provider_key']}_partial_slice_below_minimum"
             )
     for mode, count in sorted(unavailable_by_mode.items()):
         allowed_unavailable = PANEL_METRIC_MAX_UNAVAILABLE_PROVIDERS.get(mode, 0)
         if count > allowed_unavailable:
-            reasons.append(f"{mode}_too_many_unavailable_providers")
+            warnings.append(f"{mode}_too_many_unavailable_providers")
 
     total_eligible = sum(row["metric_eligible"] is True for row in rows)
     total_expected = len(rows)
-    if total_eligible < _required_count(total_expected, minimum_rate):
-        reasons.append("overall_coverage_below_minimum")
-    reasons = list(dict.fromkeys(reasons))
+    if total_eligible == 0:
+        blockers.append("zero_eligible_panel_evidence")
+    elif total_eligible < _required_count(total_expected, minimum_rate):
+        warnings.append("overall_coverage_below_minimum")
+    blockers = list(dict.fromkeys(blockers))
+    warnings = list(dict.fromkeys(warnings))
+    quality_state = "blocked" if blockers else "degraded" if warnings else "complete"
     core = {
         "version": PANEL_METRIC_COVERAGE_ADMISSION_VERSION,
         "minimum_rate": minimum_rate,
-        "allowed": not reasons,
-        "reason_codes": reasons,
+        "allowed": not blockers,
+        "quality_state": quality_state,
+        # ``reason_codes`` remains the compatibility field for hard blockers.
+        # Availability and aggregate coverage limitations are explicit warnings.
+        "reason_codes": blockers,
+        "warning_codes": warnings,
         "expected_cell_count": total_expected,
         "eligible_cell_count": total_eligible,
         "coverage_rate": _rate(total_eligible, total_expected),
@@ -250,9 +268,14 @@ def build_panel_metric_coverage_admission(
 
 
 def require_panel_metric_coverage(admission: Mapping[str, Any]) -> None:
-    if admission.get("allowed") is True:
-        return
     reasons = admission.get("reason_codes")
+    quality_state = admission.get("quality_state")
+    if (
+        admission.get("allowed") is True
+        and quality_state in {None, "complete", "degraded"}
+        and not reasons
+    ):
+        return
     reason_text = ", ".join(str(value) for value in reasons or [])
     raise PanelMetricCoverageError(
         "Panel metric coverage admission failed"
