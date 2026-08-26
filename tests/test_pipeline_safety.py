@@ -198,6 +198,7 @@ from app.services.analyzer import (
     _reader_copy_document,
     _reader_copy_gate_decision,
     _reader_copy_publication_contract,
+    _refresh_saved_reprocess_source_foundation,
     _recover_prompt_set,
     reprocess_saved_answers,
     _run_panel,
@@ -5705,6 +5706,11 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         failure = AsyncMock()
         panel = AsyncMock()
+        refresh = AsyncMock(
+            side_effect=OfferCatalogAdmissionError(
+                "zero offer admission still not proven after refresh"
+            )
+        )
         with (
             patch(
                 "app.services.analyzer.update_progress",
@@ -5723,11 +5729,16 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             patch("app.services.analyzer._run_panel", new=panel),
+            patch(
+                "app.services.analyzer._refresh_saved_reprocess_source_foundation",
+                new=refresh,
+            ),
             patch("app.services.analyzer.fail_run", new=failure),
         ):
             await reprocess_saved_answers("run-id")
 
         panel.assert_not_awaited()
+        refresh.assert_awaited_once_with("run-id")
         failure.assert_awaited_once()
         message = failure.await_args.args[1]
         self.assertIn("проверка источников", message)
@@ -5736,6 +5747,133 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             failure.await_args.kwargs,
             {"failure_stage": "source_review_required"},
         )
+
+    async def test_saved_reprocess_refreshes_sources_once_then_retries_without_panel(
+        self,
+    ) -> None:
+        attempt = AsyncMock(
+            side_effect=[
+                crawler.CrawlAdmissionIncomplete("legacy crawl is incomplete"),
+                None,
+            ]
+        )
+        refresh = AsyncMock()
+        panel = AsyncMock()
+        failure = AsyncMock()
+        with (
+            patch(
+                "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                new=AsyncMock(),
+            ),
+            patch("app.services.analyzer.update_progress", new=AsyncMock()),
+            patch(
+                "app.services.analyzer._run_saved_answer_analysis_attempt",
+                new=attempt,
+            ),
+            patch(
+                "app.services.analyzer._refresh_saved_reprocess_source_foundation",
+                new=refresh,
+            ),
+            patch("app.services.analyzer._run_panel", new=panel),
+            patch("app.services.analyzer.fail_run", new=failure),
+        ):
+            await reprocess_saved_answers("run-id")
+
+        self.assertEqual(attempt.await_count, 2)
+        self.assertFalse(attempt.await_args_list[0].kwargs["source_refresh_rebind"])
+        self.assertTrue(attempt.await_args_list[1].kwargs["source_refresh_rebind"])
+        refresh.assert_awaited_once_with("run-id")
+        panel.assert_not_awaited()
+        failure.assert_not_awaited()
+
+    async def test_saved_reprocess_source_refresh_is_bounded_after_retry_failure(
+        self,
+    ) -> None:
+        attempt = AsyncMock(
+            side_effect=[
+                OfferCatalogAdmissionError("catalog needs fresh sources"),
+                OfferCatalogAdmissionError("catalog remains ungrounded"),
+            ]
+        )
+        refresh = AsyncMock()
+        panel = AsyncMock()
+        failure = AsyncMock()
+        with (
+            patch(
+                "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                new=AsyncMock(),
+            ),
+            patch("app.services.analyzer.update_progress", new=AsyncMock()),
+            patch(
+                "app.services.analyzer._run_saved_answer_analysis_attempt",
+                new=attempt,
+            ),
+            patch(
+                "app.services.analyzer._refresh_saved_reprocess_source_foundation",
+                new=refresh,
+            ),
+            patch("app.services.analyzer._run_panel", new=panel),
+            patch("app.services.analyzer.fail_run", new=failure),
+        ):
+            await reprocess_saved_answers("run-id")
+
+        self.assertEqual(attempt.await_count, 2)
+        refresh.assert_awaited_once_with("run-id")
+        panel.assert_not_awaited()
+        failure.assert_awaited_once()
+        self.assertEqual(
+            failure.await_args.kwargs,
+            {"failure_stage": "source_review_required"},
+        )
+
+    async def test_saved_source_refresh_runs_only_the_shared_technical_executor(
+        self,
+    ) -> None:
+        scope = {
+            "version": "test",
+            "run_id": "run-id",
+            "owner": "operator-reprocess:test",
+        }
+        runtime = {
+            "domain": "example.com",
+            "page_limit": 8,
+            "timeout_seconds": 20,
+            "concurrency": 6,
+            "user_agents": ["GPTBot", "Chrome-control"],
+        }
+        technical = AsyncMock(
+            return_value={
+                "pages": [("https://example.com/", "home")],
+                "crawl_admission": {"admission_sha256": "a" * 64},
+                "technical_matrix": {"receipt_sha256": "b" * 64},
+                "site_preview": {"state": "captured"},
+            }
+        )
+        panel = AsyncMock()
+        save = AsyncMock()
+        with (
+            patch(
+                "app.services.analyzer._claim_saved_source_refresh",
+                new=AsyncMock(return_value=(scope, runtime, True)),
+            ),
+            patch(
+                "app.services.analyzer.refresh_technical_foundation",
+                new=technical,
+            ),
+            patch("app.services.analyzer._save_artifact", new=save),
+            patch("app.services.analyzer._run_panel", new=panel),
+        ):
+            await _refresh_saved_reprocess_source_foundation("run-id")
+
+        technical.assert_awaited_once()
+        self.assertTrue(technical.await_args.kwargs["force_refresh"])
+        self.assertEqual(
+            technical.await_args.kwargs["progress_status"],
+            RunStatus.analyzing,
+        )
+        panel.assert_not_awaited()
+        save.assert_awaited_once()
+        self.assertEqual(save.await_args.kwargs["status"], "completed")
 
     async def test_new_analysis_does_not_offer_retry_for_grounding_block(
         self,

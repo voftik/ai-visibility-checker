@@ -176,6 +176,7 @@ from app.services.offer_catalog import (
     artifact_digest as offer_artifact_digest,
     admit_client_identity_aliases,
     assess_offer_catalog_admission,
+    audit_resume_compatibility,
     build_answer_set_receipt,
     build_domain_research_payload,
     build_offer_catalog,
@@ -261,6 +262,7 @@ from app.services.crawler import (
     SITE_PAGE_MANIFEST_KEY,
     SITE_PAGE_MANIFEST_VERSION,
     bootstrap_legacy_crawl_admission,
+    refresh_technical_foundation,
     require_crawl_admission,
     site_page_evidence_sha256,
     validated_site_page_manifest_output,
@@ -272,7 +274,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
 SITE_PROFILE_VERSION = f"{PROMPT_VERSION}-site-profile-v5"
-OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v4"
+OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v5"
 PROMPT_FOUNDATION_PIPELINE_VERSION = f"{PROMPT_VERSION}-prompt-foundation-v1"
 ANSWER_SET_RECEIPT_PIPELINE_VERSION = f"{PROMPT_VERSION}-answer-receipt-v1"
 PANEL_CORPUS_RECEIPT_VERSION = f"{PROMPT_VERSION}-panel-corpus-receipt-v1"
@@ -11330,11 +11332,57 @@ async def _seal_or_validate_panel_corpus_receipt(
     return persisted
 
 
+async def _saved_source_refresh_rebind_receipt(
+    run_id: str,
+    *,
+    site_context: dict[str, Any],
+) -> dict[str, Any]:
+    owner = lease_owner_for(run_id)
+    async with SessionLocal() as session:
+        artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == SAVED_SOURCE_REFRESH_ARTIFACT_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+    current_admission = site_context.get("crawl_admission")
+    scope = artifact.input_json if artifact is not None else None
+    output = artifact.output_json if artifact is not None else None
+    saved_admission = output.get("crawl_admission") if isinstance(output, dict) else None
+    if (
+        owner is None
+        or artifact is None
+        or artifact.status != "completed"
+        or artifact.prompt_version != SAVED_SOURCE_REFRESH_VERSION
+        or not isinstance(scope, dict)
+        or scope.get("version") != SAVED_SOURCE_REFRESH_VERSION
+        or scope.get("run_id") != run_id
+        or scope.get("owner") != owner
+        or not isinstance(output, dict)
+        or not isinstance(current_admission, dict)
+        or saved_admission != current_admission
+        or output.get("page_count") != current_admission.get("page_count")
+        or output.get("technical_matrix_receipt_sha256")
+        != current_admission.get("technical_matrix_receipt_sha256")
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: source_refresh_receipt_invalid"
+        )
+    return {
+        "scope_sha256": _stable_json_sha256(scope),
+        "output_sha256": _stable_json_sha256(output),
+        "crawl_admission_sha256": current_admission.get("admission_sha256"),
+    }
+
+
 async def _validate_panel_foundation_resume(
     run_id: str,
     *,
     profile: dict[str, Any],
     site_context: dict[str, Any],
+    allow_source_refresh_rebind: bool = False,
 ) -> None:
     """Fail closed for new runs; keep old panels as explicit legacy snapshots."""
 
@@ -11392,24 +11440,47 @@ async def _validate_panel_foundation_resume(
         for item in prompt_set_value.get("cluster_exclusions") or []
         if isinstance(item, dict)
     )
+    persisted_prompts = sorted(
+        (item.as_dict() for item in foundation.prompts),
+        key=lambda item: str(item["prompt_key"]),
+    )
+    observed_prompts = sorted(
+        (item.as_dict() for item in current_intent_prompts),
+        key=lambda item: str(item["prompt_key"]),
+    )
+    if observed_prompts != persisted_prompts:
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: persisted_prompt_set_changed"
+        )
+    if sorted(
+        (item.as_dict() for item in current_exclusions),
+        key=lambda item: str(item["cluster_id"]),
+    ) != sorted(
+        (item.as_dict() for item in foundation.exclusions),
+        key=lambda item: str(item["cluster_id"]),
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel checkpoint mismatch: persisted_cluster_exclusions_changed"
+        )
     source_absence_claims_allowed, crawl_coverage_state = _offer_absence_contract(
         site_context
     )
-    reconstructed_foundation = build_prompt_foundation(
-        upstream=current_upstream,
-        catalog=catalog,
-        clusters=_clusters,
-        prompts=current_intent_prompts,
-        exclusions=current_exclusions,
-        profile=profile,
-        source_units=_offer_source_units(site_context),
-        source_absence_claims_allowed=source_absence_claims_allowed,
-        crawl_coverage_state=crawl_coverage_state,
-    )
-    if reconstructed_foundation.foundation_digest != foundation.foundation_digest:
-        raise PanelCheckpointMismatchError(
-            "Panel checkpoint mismatch: prompt_foundation_content_changed"
+    if not allow_source_refresh_rebind:
+        reconstructed_foundation = build_prompt_foundation(
+            upstream=current_upstream,
+            catalog=catalog,
+            clusters=_clusters,
+            prompts=current_intent_prompts,
+            exclusions=current_exclusions,
+            profile=profile,
+            source_units=_offer_source_units(site_context),
+            source_absence_claims_allowed=source_absence_claims_allowed,
+            crawl_coverage_state=crawl_coverage_state,
         )
+        if reconstructed_foundation.foundation_digest != foundation.foundation_digest:
+            raise PanelCheckpointMismatchError(
+                "Panel checkpoint mismatch: prompt_foundation_content_changed"
+            )
     receipt_value = await _completed_artifact_output(run_id, "answer_set_receipt")
     receipt = (
         AnswerSetReceipt.from_mapping(receipt_value)
@@ -11421,26 +11492,63 @@ async def _validate_panel_foundation_resume(
         if receipt is not None
         else None
     )
-    try:
-        report = validate_resume_compatibility(
+    source_refresh_receipt = (
+        await _saved_source_refresh_rebind_receipt(
+            run_id,
+            site_context=site_context,
+        )
+        if allow_source_refresh_rebind
+        else None
+    )
+    if allow_source_refresh_rebind:
+        report = audit_resume_compatibility(
             current_upstream=current_upstream,
             persisted_foundation=foundation,
             answer_receipt=receipt,
             persisted_answers_by_prompt=persisted_answers,
         )
-    except ResumeCompatibilityError as exc:
-        raise PanelCheckpointMismatchError(
-            "Panel checkpoint mismatch: analysis_foundation_changed: " + str(exc)
-        ) from exc
+        allowed_prefixes = (
+            "profile_digest:",
+            "catalog_digest:",
+            "selected_pages_digest:",
+        )
+        disallowed_mismatches = [
+            mismatch
+            for mismatch in report.mismatches
+            if not mismatch.startswith(allowed_prefixes)
+        ]
+        if disallowed_mismatches:
+            raise PanelCheckpointMismatchError(
+                "Panel checkpoint mismatch after source refresh: "
+                + "; ".join(disallowed_mismatches)
+            )
+    else:
+        try:
+            report = validate_resume_compatibility(
+                current_upstream=current_upstream,
+                persisted_foundation=foundation,
+                answer_receipt=receipt,
+                persisted_answers_by_prompt=persisted_answers,
+            )
+        except ResumeCompatibilityError as exc:
+            raise PanelCheckpointMismatchError(
+                "Panel checkpoint mismatch: analysis_foundation_changed: " + str(exc)
+            ) from exc
     await _save_artifact(
         run_id,
         stage_key="scenario_design",
         artifact_key="prompt_foundation_resume_audit",
         status="completed",
         model=None,
-        input_json={"current_upstream": current_upstream.as_dict()},
+        input_json={
+            "current_upstream": current_upstream.as_dict(),
+            "source_refresh_receipt": source_refresh_receipt,
+        },
         output_json={
-            "compatible": report.compatible,
+            "compatible": report.compatible or allow_source_refresh_rebind,
+            "strict_compatible": report.compatible,
+            "source_refresh_rebind": allow_source_refresh_rebind,
+            "source_refresh_receipt": source_refresh_receipt,
             "mismatches": list(report.mismatches),
             "foundation_digest": foundation.foundation_digest,
             "answer_receipt_checked": receipt is not None,
@@ -39632,6 +39740,203 @@ async def _finish_saved_answer_analysis(
     )
 
 
+SAVED_SOURCE_REFRESH_ARTIFACT_KEY = "saved_reprocess_source_refresh"
+SAVED_SOURCE_REFRESH_VERSION = "aiv-saved-reprocess-source-refresh-v1"
+
+
+def _saved_source_refresh_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _claim_saved_source_refresh(
+    run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Claim at most one technical source refresh for this operator claim."""
+
+    owner = lease_owner_for(run_id)
+    if owner is None:
+        raise CrawlAdmissionIncomplete(
+            "saved source refresh requires a bound operator lease"
+        )
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        run = (
+            await session.execute(select(Run).where(Run.id == run_id))
+        ).scalar_one_or_none()
+        artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == SAVED_SOURCE_REFRESH_ARTIFACT_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+    if run is None:
+        raise CrawlAdmissionIncomplete("saved source refresh run is missing")
+    marker = (
+        (run.config_json or {}).get(SAVED_ANSWERS_ONLY_MARKER_KEY)
+        if isinstance(run.config_json, dict)
+        else None
+    )
+    raw_sha256 = (
+        str(marker.get("raw_answers_sha256") or "") if isinstance(marker, dict) else ""
+    )
+    if (
+        run.status != RunStatus.analyzing
+        or run.execution_slot != 1
+        or run.lease_owner != owner
+        or not isinstance(marker, dict)
+        or marker.get("version") != SAVED_ANSWERS_ONLY_MARKER_VERSION
+        or marker.get("mode") != SAVED_ANSWERS_ONLY_MODE
+        or marker.get("run_id") != run_id
+        or marker.get("owner") != owner
+        or marker.get("attempt_count") != int(run.attempt_count or 0)
+        or len(raw_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in raw_sha256)
+    ):
+        raise CrawlAdmissionIncomplete(
+            "saved source refresh claim marker is not admissible"
+        )
+    config = dict(run.config_json or {})
+    config.pop(SAVED_ANSWERS_ONLY_MARKER_KEY, None)
+    domain = str(run.domain or "").strip()
+    if not domain:
+        raise CrawlAdmissionIncomplete("saved source refresh domain is missing")
+    runtime = {
+        "domain": domain,
+        "page_limit": config.get("page_limit"),
+        "timeout_seconds": max(
+            5, min(60, _saved_source_refresh_int(config.get("timeout_seconds"), 20))
+        ),
+        "concurrency": max(
+            1, min(12, _saved_source_refresh_int(config.get("concurrency"), 6))
+        ),
+        "user_agents": config.get("user_agents"),
+    }
+    scope = {
+        "version": SAVED_SOURCE_REFRESH_VERSION,
+        "run_id": run_id,
+        "owner": owner,
+        "attempt_count": int(run.attempt_count or 0),
+        "raw_answers_sha256": raw_sha256,
+        "runtime": copy.deepcopy(runtime),
+    }
+    if artifact is not None and artifact.input_json == scope:
+        if (
+            artifact.status == "completed"
+            and artifact.prompt_version == SAVED_SOURCE_REFRESH_VERSION
+            and isinstance(artifact.output_json, dict)
+        ):
+            return scope, runtime, False
+        raise CrawlAdmissionIncomplete(
+            "saved source refresh budget is exhausted for this operator claim"
+        )
+    await _save_artifact(
+        run_id,
+        stage_key="site_discovery",
+        artifact_key=SAVED_SOURCE_REFRESH_ARTIFACT_KEY,
+        status="running",
+        model=None,
+        input_json=scope,
+        prompt_version=SAVED_SOURCE_REFRESH_VERSION,
+    )
+    return scope, runtime, True
+
+
+async def _refresh_saved_reprocess_source_foundation(run_id: str) -> None:
+    """Refresh crawler evidence once, never the persisted model-answer panel."""
+
+    scope, runtime, refresh_required = await _claim_saved_source_refresh(run_id)
+    if not refresh_required:
+        return
+    try:
+        result = await refresh_technical_foundation(
+            run_id,
+            domain=str(runtime["domain"]),
+            page_limit=runtime.get("page_limit"),
+            timeout_seconds=int(runtime["timeout_seconds"]),
+            concurrency=int(runtime["concurrency"]),
+            user_agents=runtime.get("user_agents"),
+            force_refresh=True,
+            progress_status=RunStatus.analyzing,
+            discovery_percent=70,
+            technical_percent_start=71,
+            technical_percent_end=74,
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="site_discovery",
+            artifact_key=SAVED_SOURCE_REFRESH_ARTIFACT_KEY,
+            status="completed",
+            model=None,
+            input_json=scope,
+            output_json={
+                "page_count": len(result.get("pages") or []),
+                "crawl_admission": copy.deepcopy(result.get("crawl_admission")),
+                "technical_matrix_receipt_sha256": (
+                    (result.get("technical_matrix") or {}).get("receipt_sha256")
+                ),
+                "site_preview": copy.deepcopy(result.get("site_preview")),
+            },
+            prompt_version=SAVED_SOURCE_REFRESH_VERSION,
+        )
+    except asyncio.CancelledError:
+        raise
+    except RunLeaseLostError:
+        raise
+    except Exception as exc:
+        logger.exception("Saved-answer source refresh failed for run %s", run_id)
+        try:
+            await _save_artifact(
+                run_id,
+                stage_key="site_discovery",
+                artifact_key=SAVED_SOURCE_REFRESH_ARTIFACT_KEY,
+                status="failed",
+                model=None,
+                input_json=scope,
+                error_message=f"{type(exc).__name__}: {exc}"[:1000],
+                prompt_version=SAVED_SOURCE_REFRESH_VERSION,
+            )
+        except RunLeaseLostError:
+            raise
+        raise CrawlAdmissionIncomplete(
+            "saved technical source refresh did not reach crawl admission"
+        ) from exc
+
+
+async def _run_saved_answer_analysis_attempt(
+    run_id: str,
+    *,
+    source_refresh_rebind: bool,
+) -> None:
+    (
+        technical,
+        technical_review,
+        profile,
+        site_context_value,
+    ) = await _prepare_analysis_foundation(
+        run_id,
+        allow_legacy_snapshot=True,
+    )
+    await _validate_panel_foundation_resume(
+        run_id,
+        profile=profile,
+        site_context=site_context_value,
+        allow_source_refresh_rebind=source_refresh_rebind,
+    )
+    await _save_answer_set_receipt(run_id)
+    await _finish_saved_answer_analysis(
+        run_id,
+        profile=profile,
+        technical=technical,
+        technical_review=technical_review,
+        regenerate_illustrations=False,
+    )
+
+
 async def reprocess_saved_answers(run_id: str) -> None:
     """Rebuild annotations, metrics and report without calling the model panel."""
 
@@ -39652,28 +39957,19 @@ async def reprocess_saved_answers(run_id: str) -> None:
             eta_seconds=720,
             status=RunStatus.analyzing,
         )
-        (
-            technical,
-            technical_review,
-            profile,
-            _site_context_value,
-        ) = await _prepare_analysis_foundation(
-            run_id,
-            allow_legacy_snapshot=True,
-        )
-        await _validate_panel_foundation_resume(
-            run_id,
-            profile=profile,
-            site_context=_site_context_value,
-        )
-        await _save_answer_set_receipt(run_id)
-        await _finish_saved_answer_analysis(
-            run_id,
-            profile=profile,
-            technical=technical,
-            technical_review=technical_review,
-            regenerate_illustrations=False,
-        )
+        source_refresh_attempted = False
+        while True:
+            try:
+                await _run_saved_answer_analysis_attempt(
+                    run_id,
+                    source_refresh_rebind=source_refresh_attempted,
+                )
+                break
+            except (OfferCatalogAdmissionError, CrawlAdmissionIncomplete):
+                if source_refresh_attempted:
+                    raise
+                source_refresh_attempted = True
+                await _refresh_saved_reprocess_source_foundation(run_id)
     except asyncio.CancelledError:
         raise
     except PanelCheckpointMismatchError as exc:

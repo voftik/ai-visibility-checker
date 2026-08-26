@@ -35,10 +35,10 @@ from urllib.parse import urlsplit, urlunsplit
 import tldextract
 
 
-OFFER_CATALOG_VERSION = "aiv-offer-catalog-v4"
+OFFER_CATALOG_VERSION = "aiv-offer-catalog-v5"
 OFFER_EVIDENCE_VERSION = "aiv-offer-evidence-v2"
 OFFER_USER_JOB_EVIDENCE_VERSION = "aiv-offer-user-job-evidence-v1"
-OFFER_CANDIDATE_NORMALIZATION_VERSION = "aiv-offer-candidate-normalization-v1"
+OFFER_CANDIDATE_NORMALIZATION_VERSION = "aiv-offer-candidate-normalization-v2"
 DOMAIN_RESEARCH_PAYLOAD_VERSION = "aiv-domain-research-payload-v1"
 DOMAIN_RESEARCH_MANIFEST_VERSION = "aiv-domain-research-manifest-v1"
 OFFER_CLUSTER_VERSION = "aiv-offer-cluster-v1"
@@ -101,6 +101,9 @@ _OWNERSHIP_ACTION_RE = re.compile(
     r"develop(?:s|ed|ing)?|build(?:s|ing)?|launch(?:es|ed|ing)?|"
     r"creat(?:e|es|ed|ing)|operat(?:e|es|ed|ing)|"
     r"speciali[sz](?:e|es|ed|ing)(?:\s+in)?|"
+    r"nudi|nudimo|nudite|nude|"
+    r"pruža|pružamo|pružate|pružaju|"
+    r"stvara|stvaramo|stvarate|stvaraju|"
     r"предлага(?:ю|ем|ет|ют|л|ла|ли)|"
     r"оказыва(?:ю|ем|ет|ют|л|ла|ли)|"
     r"предоставля(?:ю|ем|ет|ют|л|ла|ли)|"
@@ -119,6 +122,7 @@ _OWNERSHIP_SAFE_MODIFIERS = frozenset(
         "also",
         "currently",
         "directly",
+        "do",
         "now",
         "nowadays",
         "активно",
@@ -159,6 +163,41 @@ _FIRST_PERSON_POSSESSIVES = (
     "наши",
 )
 _QUOTE_MARKERS = frozenset({'"', "'", "«", "»", "“", "”", "„", "‟"})
+
+# First-person possessives may be the grammatical actor only together with a
+# narrow organization-role noun.  We deliberately do not accept an arbitrary
+# ``our <words>`` span: a first-party page can discuss "our partner agency" or
+# quote a client, and that must not transfer the partner's offers to the site.
+_FIRST_PERSON_ORGANIZATION_ACTOR_RE = re.compile(
+    r"(?<!\S)(?:"
+    r"our\s+(?:studio|agency|company|team|shop|salon|clinic|practice|business)|"
+    r"наш(?:а|е|и)?\s+(?:студия|агентство|компания|команда|салон|клиника|практика|бизнес)|"
+    r"naš(?:a|e|i)?\s+(?:studio|agencija|tvrtka|kompanija|tim|salon|klinika|praksa)"
+    r")(?!\S)",
+    re.IGNORECASE,
+)
+
+# A narrow relative-clause bridge used by ordinary studio copy such as
+# ``our studio offers a professional environment where experienced artists
+# create custom tattoos`` and its Croatian equivalent.  This is a grammatical
+# shape, not a character-distance window.
+_FIRST_PARTY_STAFF_BRIDGE_RE = re.compile(
+    r"(?:"
+    r"(?:a\s+)?(?:professional\s+)?environment\s+(?:where|in\s+which)\s+"
+    r"(?:experienced|skilled|our)\s+(?:artists?|specialists?|professionals?)|"
+    r"profesionalno\s+okruženje\s+u\s+kojem\s+"
+    r"(?:iskusni|vješti|naši)\s+(?:umjetnici|stručnjaci)"
+    r")",
+    re.IGNORECASE,
+)
+_FIRST_PARTY_SCOPE_ACTION_RE = re.compile(
+    r"(?<!\S)(?:offer(?:s|ed|ing)?|provid(?:e|es|ed|ing)|"
+    r"nudi|nudimo|nudite|nude|predlaže|predlažemo)(?!\S)",
+    re.IGNORECASE,
+)
+_COORDINATED_OFFER_CONJUNCTIONS = frozenset(
+    {"and", "or", "i", "ili", "te", "и", "или"}
+)
 
 
 class OfferCatalogError(ValueError):
@@ -1396,6 +1435,17 @@ def _phrase_occurrences(text: str, values: Iterable[str]) -> tuple[tuple[int, in
     return tuple(sorted(spans))
 
 
+def _first_person_actor_values(clause: str) -> tuple[str, ...]:
+    """Return exact, structurally bounded first-party actor phrases."""
+
+    return _normalized_unique(
+        (
+            *_FIRST_PERSON_ACTORS,
+            *(match.group(0) for match in _FIRST_PERSON_ORGANIZATION_ACTOR_RE.finditer(clause)),
+        )
+    )
+
+
 def _only_safe_actor_modifiers(value: str) -> bool:
     tokens = value.split()
     return len(tokens) <= 2 and all(
@@ -1411,6 +1461,38 @@ def _structural_offer_object_prefix(value: str) -> bool:
         _OWNERSHIP_OBJECT_PREFIX_TOKEN_RE.fullmatch(token) is not None
         for token in tokens
     )
+
+
+def _structural_coordinated_offer_prefix(value: str) -> bool:
+    """Allow one bounded preceding object joined to the candidate offer.
+
+    In ``create custom tattoos and precise piercings`` the second offer has a
+    three-token prefix.  Requiring a final conjunction and at most four
+    preceding tokens keeps this a local object-list rule instead of an
+    arbitrary proximity window.
+    """
+
+    tokens = value.split()
+    if not 2 <= len(tokens) <= 5:
+        return False
+    if tokens[-1] not in _COORDINATED_OFFER_CONJUNCTIONS:
+        return False
+    forbidden = {
+        "but",
+        "not",
+        "without",
+        "however",
+        "no",
+        "ne",
+        "nije",
+        "nisu",
+        "без",
+        "не",
+        "нет",
+        "однако",
+        "но",
+    }
+    return not any(token in forbidden for token in tokens[:-1])
 
 
 def _has_foreign_post_offer_attribution(
@@ -1469,6 +1551,64 @@ def _direct_actor_action_offer_binding(
                 ):
                     continue
                 return True
+    return False
+
+
+def _first_party_staff_delivery_binding(
+    clause: str,
+    *,
+    actor_values: Sequence[str],
+    offer_values: Sequence[str],
+    client_aliases: Sequence[str],
+) -> bool:
+    """Prove a first-party actor -> offered setting -> staff delivery chain.
+
+    Marketing copy often places the concrete service in a relative clause:
+    ``our studio offers an environment where artists create custom tattoos``.
+    Treating the whole sentence as a proximity window would be unsafe.  This
+    helper instead requires both action edges, an allowlisted grammatical
+    bridge, and a direct or coordinated object of the staff delivery action.
+    """
+
+    actors = _phrase_occurrences(clause, actor_values)
+    scope_actions = tuple(_FIRST_PARTY_SCOPE_ACTION_RE.finditer(clause))
+    delivery_actions = tuple(_OWNERSHIP_ACTION_RE.finditer(clause))
+    offers = _phrase_occurrences(clause, offer_values)
+    for _actor_start, actor_end in actors:
+        for scope_action in scope_actions:
+            if scope_action.start() < actor_end:
+                continue
+            if not _only_safe_actor_modifiers(
+                clause[actor_end : scope_action.start()]
+            ):
+                continue
+            for action_index, delivery_action in enumerate(delivery_actions):
+                if delivery_action.start() <= scope_action.end():
+                    continue
+                bridge = clause[scope_action.end() : delivery_action.start()].strip()
+                if _FIRST_PARTY_STAFF_BRIDGE_RE.fullmatch(bridge) is None:
+                    continue
+                next_action_start = (
+                    delivery_actions[action_index + 1].start()
+                    if action_index + 1 < len(delivery_actions)
+                    else len(clause) + 1
+                )
+                for offer_start, offer_end in offers:
+                    if not delivery_action.end() <= offer_start < next_action_start:
+                        continue
+                    prefix = clause[delivery_action.end() : offer_start]
+                    if not (
+                        _structural_offer_object_prefix(prefix)
+                        or _structural_coordinated_offer_prefix(prefix)
+                    ):
+                        continue
+                    if _has_foreign_post_offer_attribution(
+                        clause,
+                        offer_end=offer_end,
+                        client_aliases=client_aliases,
+                    ):
+                        continue
+                    return True
     return False
 
 
@@ -1557,9 +1697,15 @@ def _client_offer_binding_proven(
         if source_is_client_owned and not any(
             marker in excerpt for marker in _QUOTE_MARKERS
         ):
+            first_person_actors = _first_person_actor_values(clause)
             if _direct_actor_action_offer_binding(
                 clause,
-                actor_values=_FIRST_PERSON_ACTORS,
+                actor_values=first_person_actors,
+                offer_values=offer_names,
+                client_aliases=client_aliases,
+            ) or _first_party_staff_delivery_binding(
+                clause,
+                actor_values=first_person_actors,
                 offer_values=offer_names,
                 client_aliases=client_aliases,
             ) or _copular_or_possessive_offer_binding(
@@ -2155,6 +2301,8 @@ class OfferCatalog:
 class _AdmittedCandidate:
     candidate: OfferCandidate
     evidence: OfferEvidenceRef
+    effective_canonical_name: str
+    canonical_promoted_from_alias: bool
     generic: bool
     effective_kind: OfferKind
     kind_normalized: bool
@@ -2327,10 +2475,11 @@ def normalize_offer_candidates_against_sources(
 def _candidate_identity_keys(
     candidate: OfferCandidate,
     *,
+    effective_canonical_name: str,
     grounded_aliases: Sequence[str],
 ) -> frozenset[str]:
-    canonical = _normalize_phrase(candidate.canonical_name)
-    all_names = (candidate.canonical_name, *grounded_aliases)
+    canonical = _normalize_phrase(effective_canonical_name)
+    all_names = (effective_canonical_name, *grounded_aliases)
     distinctive = {
         _normalize_phrase(value)
         for value in all_names
@@ -2356,25 +2505,52 @@ def _validate_candidate_evidence(
     if candidate.evidence_excerpt not in source.text:
         raise OfferEvidenceError("excerpt_not_found_verbatim_in_source")
 
-    if not _contains_normalized_phrase(
+    canonical_is_literal = _contains_normalized_phrase(
         candidate.evidence_excerpt,
         candidate.canonical_name,
-    ):
-        raise OfferEvidenceError("canonical_offer_name_not_literal_in_excerpt")
+    )
     if not candidate.commercially_relevant:
         raise OfferEvidenceError("not_commercially_relevant")
 
-    generic = _is_generic_offer_name(candidate.canonical_name)
     source_is_client_owned = _is_client_owned_url(source.source_url, client_domain)
+    promoted_aliases = tuple(
+        alias
+        for alias in candidate.aliases
+        if not canonical_is_literal
+        and source_is_client_owned
+        and not _is_generic_offer_name(alias)
+        and _contains_normalized_phrase(candidate.evidence_excerpt, alias)
+        and _client_offer_binding_proven(
+            candidate.evidence_excerpt,
+            offer_names=(alias,),
+            client_aliases=client_aliases,
+            source_is_client_owned=source_is_client_owned,
+        )
+    )
+    if canonical_is_literal:
+        effective_canonical_name = candidate.canonical_name
+        canonical_promoted_from_alias = False
+    elif promoted_aliases:
+        # ``OfferCandidate.aliases`` is normalized into a stable lexical order,
+        # so the promotion is deterministic.  Crucially, the model's
+        # translated or normalized name is not retained as an alias: only the
+        # literal first-party phrase becomes the evidence-facing identity.
+        effective_canonical_name = promoted_aliases[0]
+        canonical_promoted_from_alias = True
+    else:
+        raise OfferEvidenceError("canonical_offer_name_not_literal_in_excerpt")
+
+    generic = _is_generic_offer_name(effective_canonical_name)
     client_binding_proven = _client_offer_binding_proven(
         candidate.evidence_excerpt,
-        offer_names=(candidate.canonical_name,),
+        offer_names=(effective_canonical_name,),
         client_aliases=client_aliases,
         source_is_client_owned=source_is_client_owned,
     )
     grounded_aliases = tuple(
         alias
         for alias in candidate.aliases
+        if _normalize_phrase(alias) != _normalize_phrase(effective_canonical_name)
         if _contains_normalized_phrase(candidate.evidence_excerpt, alias)
         and not (
             _is_generic_offer_name(alias)
@@ -2383,7 +2559,7 @@ def _validate_candidate_evidence(
         and client_binding_proven
         and _alias_identity_proven(
             candidate.evidence_excerpt,
-            canonical_name=candidate.canonical_name,
+            canonical_name=effective_canonical_name,
             alias=alias,
         )
     )
@@ -2392,7 +2568,7 @@ def _validate_candidate_evidence(
         for job in candidate.user_jobs
         if _user_job_bound_to_offer_excerpt(
             candidate.evidence_excerpt,
-            canonical_name=candidate.canonical_name,
+            canonical_name=effective_canonical_name,
             user_job=job,
         )
     )
@@ -2437,6 +2613,8 @@ def _validate_candidate_evidence(
     return _AdmittedCandidate(
         candidate=candidate,
         evidence=evidence,
+        effective_canonical_name=effective_canonical_name,
+        canonical_promoted_from_alias=canonical_promoted_from_alias,
         generic=generic,
         effective_kind=effective_kind,
         kind_normalized=effective_kind is not candidate.kind,
@@ -2447,6 +2625,7 @@ def _validate_candidate_evidence(
         user_jobs_pruned=len(grounded_user_jobs) != len(candidate.user_jobs),
         identity_keys=_candidate_identity_keys(
             candidate,
+            effective_canonical_name=effective_canonical_name,
             grounded_aliases=grounded_aliases,
         ),
     )
@@ -2459,7 +2638,7 @@ def _candidate_preference(item: _AdmittedCandidate) -> tuple[Any, ...]:
         -int(item.evidence.client_binding_proven),
         -len(item.grounded_user_jobs),
         int(item.generic),
-        _normalize_phrase(candidate.canonical_name),
+        _normalize_phrase(item.effective_canonical_name),
         item.effective_kind.value,
         candidate.source_unit_id,
         candidate.candidate_id,
@@ -2488,11 +2667,11 @@ def _componentize(candidates: Sequence[_AdmittedCandidate]) -> list[list[_Admitt
             parents[left_root] = right_root
 
     for left_index, left in enumerate(candidates):
-        left_canonical = _normalize_phrase(left.candidate.canonical_name)
+        left_canonical = _normalize_phrase(left.effective_canonical_name)
         for right_index in range(left_index + 1, len(candidates)):
             right = candidates[right_index]
             same_canonical = left_canonical == _normalize_phrase(
-                right.candidate.canonical_name
+                right.effective_canonical_name
             )
             if same_canonical or left.identity_keys.intersection(right.identity_keys):
                 union(left_index, right_index)
@@ -2510,8 +2689,9 @@ def _accepted_offer(component: Sequence[_AdmittedCandidate]) -> AcceptedOffer:
     aliases = _normalized_unique(
         value
         for item in component
-        for value in (item.candidate.canonical_name, *item.grounded_aliases)
-        if _normalize_phrase(value) != _normalize_phrase(candidate.canonical_name)
+        for value in (item.effective_canonical_name, *item.grounded_aliases)
+        if _normalize_phrase(value)
+        != _normalize_phrase(representative.effective_canonical_name)
     )
     jobs = _normalized_unique(
         job for item in component for job in item.grounded_user_jobs
@@ -2545,13 +2725,13 @@ def _accepted_offer(component: Sequence[_AdmittedCandidate]) -> AcceptedOffer:
     )
     primary = representative.evidence
     semantic_identity = {
-        "canonical_name": candidate.canonical_name,
+        "canonical_name": representative.effective_canonical_name,
         "aliases": list(aliases),
         "kind": representative.effective_kind.value,
     }
     return AcceptedOffer(
         offer_id=f"offer:{artifact_digest(semantic_identity)}",
-        canonical_name=candidate.canonical_name,
+        canonical_name=representative.effective_canonical_name,
         aliases=aliases,
         kind=representative.effective_kind,
         source_url=primary.source_url,
@@ -2654,15 +2834,19 @@ def build_offer_catalog(
             elif item.candidate.candidate_id == representative.candidate.candidate_id:
                 decision = DispositionDecision.ACCEPTED
                 reason = (
-                    "source_bound_commercial_offer_kind_normalized_to_service"
-                    if item.kind_normalized
+                    "source_bound_commercial_offer_canonical_promoted_from_literal_alias"
+                    if item.canonical_promoted_from_alias
                     else (
-                        "source_bound_commercial_offer_ungrounded_aliases_removed"
-                        if item.aliases_pruned
+                        "source_bound_commercial_offer_kind_normalized_to_service"
+                        if item.kind_normalized
                         else (
-                            "source_bound_commercial_offer_ungrounded_user_jobs_removed"
-                            if item.user_jobs_pruned
-                            else "source_bound_commercial_offer"
+                            "source_bound_commercial_offer_ungrounded_aliases_removed"
+                            if item.aliases_pruned
+                            else (
+                                "source_bound_commercial_offer_ungrounded_user_jobs_removed"
+                                if item.user_jobs_pruned
+                                else "source_bound_commercial_offer"
+                            )
                         )
                     )
                 )

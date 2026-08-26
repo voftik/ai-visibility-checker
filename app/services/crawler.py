@@ -46,7 +46,7 @@ from app.services.protections import detect_protections
 from app.services.proxy_pool import Proxy, get_pool
 from app.services.robots_parser import parse_robots, parse_robots_unavailable
 from app.services.run_lease import assert_run_lease, bind_run_lease
-from app.services.site_preview import capture_site_preview
+from app.services.site_preview import capture_site_preview, get_saved_site_preview
 
 logger = logging.getLogger(__name__)
 
@@ -1969,6 +1969,7 @@ async def _store_site_page(
     page_kind: str,
     probe: ProbeResult,
 ) -> None:
+    await assert_run_lease(run_id)
     signals = extract_text_signals(probe.full_text, probe.content_type)
     signals["_body_truncated"] = probe.body_truncated
     signals["_body_read_policy"] = _body_read_policy(probe)
@@ -2405,6 +2406,7 @@ async def _save_page_relevance_artifact(
     domain: str,
     receipt: dict[str, Any],
 ) -> None:
+    await assert_run_lease(run_id)
     if not _selection_relevance_receipt_is_valid(receipt, domain=domain):
         raise ValueError("Commercial relevance receipt is invalid")
     async with SessionLocal() as session:
@@ -2548,6 +2550,7 @@ async def _save_site_page_manifest(
     output_json: dict[str, Any] | None = None,
     error_message: str | None = None,
 ) -> None:
+    await assert_run_lease(run_id)
     async with SessionLocal() as session:
         artifact = (
             await session.execute(
@@ -2613,7 +2616,11 @@ async def _reconcile_site_pages(
     refresh_probes: dict[str, ProbeResult] | None = None,
     prune: bool = True,
     legacy_snapshot: bool = False,
+    force_refresh: bool = False,
+    progress_percent_start: int = 3,
+    progress_status: RunStatus = RunStatus.crawling,
 ) -> dict[str, Any]:
+    await assert_run_lease(run_id)
     manifest_kinds = dict(pages)
     existing_by_url: dict[str, SitePage] = {}
     async with SessionLocal() as session:
@@ -2640,15 +2647,17 @@ async def _reconcile_site_pages(
             existing is not None
             and _site_page_is_usable(existing, legacy=legacy_snapshot)
             and probe is None
+            and not force_refresh
         ):
             continue
         if probe is None:
             await update_progress(
                 run_id,
                 stage="site_discovery",
-                percent=min(9, 3 + index),
+                percent=min(100, progress_percent_start + index),
                 detail=f"Читаем разделы сайта: {index + 1} из {len(pages)}.",
                 eta_seconds=max(1200, 1800 - index * 45),
+                status=progress_status,
             )
             if index:
                 await asyncio.sleep(MIN_GAP_PER_DOMAIN_SECONDS)
@@ -2687,6 +2696,7 @@ async def _prune_site_pages(
     run_id: str,
     pages: list[tuple[str, str]],
 ) -> None:
+    await assert_run_lease(run_id)
     selected_urls = {url for url, _kind in pages}
     async with SessionLocal() as session:
         existing = list(
@@ -2707,14 +2717,21 @@ async def discover_site_pages(
     limit: int | None = None,
     timeout_seconds: int,
     concurrency: int,
+    force_refresh: bool = False,
+    progress_percent_start: int = 2,
+    progress_status: RunStatus = RunStatus.crawling,
 ) -> list[tuple[str, str]]:
     target = _bounded_page_limit(limit)
     manifest_input = _site_page_manifest_input(domain, target)
     cached_sitemap_manifest: dict[str, Any] | None = None
-    manifest = await _matching_site_page_manifest(
-        run_id,
-        domain=domain,
-        limit=target,
+    manifest = (
+        None
+        if force_refresh
+        else await _matching_site_page_manifest(
+            run_id,
+            domain=domain,
+            limit=target,
+        )
     )
     if manifest is not None:
         output_json, selected = manifest
@@ -2745,21 +2762,23 @@ async def discover_site_pages(
             output_json={**output_json, "site_page_receipt": receipt},
         )
 
-    prior_sitemap_manifest = cached_sitemap_manifest or (
-        await _partial_sitemap_manifest(
-            run_id,
-            domain=domain,
-            limit=target,
+    prior_sitemap_manifest = None
+    if not force_refresh:
+        prior_sitemap_manifest = cached_sitemap_manifest or (
+            await _partial_sitemap_manifest(
+                run_id,
+                domain=domain,
+                limit=target,
+            )
         )
-    )
 
     await update_progress(
         run_id,
         stage="site_discovery",
-        percent=2,
+        percent=progress_percent_start,
         detail="Открываем главную страницу и ищем ключевые разделы.",
         eta_seconds=1800,
-        status=RunStatus.crawling,
+        status=progress_status,
     )
     await _save_site_page_manifest(
         run_id,
@@ -2952,6 +2971,9 @@ async def discover_site_pages(
         concurrency=concurrency,
         refresh_probes={homepage_url: homepage_probe},
         prune=False,
+        force_refresh=force_refresh,
+        progress_percent_start=progress_percent_start + 1,
+        progress_status=progress_status,
     )
     usable = [
         (item["url"], item["page_kind"])
@@ -3003,6 +3025,9 @@ async def discover_site_pages(
             timeout_seconds=timeout_seconds,
             concurrency=concurrency,
             prune=False,
+            force_refresh=force_refresh,
+            progress_percent_start=progress_percent_start + 1,
+            progress_status=progress_status,
         )
         item = (candidate_receipt.get("pages") or [{}])[0]
         if item.get("usable") is True:
@@ -3436,6 +3461,7 @@ async def _save_technical_matrix_artifact(
     output_json: dict[str, Any] | None = None,
     error_message: str | None = None,
 ) -> None:
+    await assert_run_lease(run_id)
     async with SessionLocal() as session:
         artifact = (
             await session.execute(
@@ -3880,6 +3906,149 @@ async def _persist_probe(
         await session.commit()
 
 
+async def refresh_technical_foundation(
+    run_id: str,
+    *,
+    domain: str,
+    page_limit: int | None,
+    timeout_seconds: int,
+    concurrency: int,
+    user_agents: list[str] | tuple[str, ...] | None,
+    force_refresh: bool = False,
+    progress_status: RunStatus = RunStatus.crawling,
+    discovery_percent: int = 2,
+    technical_percent_start: int = 10,
+    technical_percent_end: int = 27,
+) -> dict[str, Any]:
+    """Build the bounded page, preview and crawler-UA foundation only.
+
+    This helper deliberately has no transition to ``analyze_run``.  The normal
+    coordinator and saved-answer recovery can therefore share the exact same
+    technical implementation without ever handing a saved-only claim to the
+    model-panel pipeline.
+    """
+
+    await assert_run_lease(run_id)
+    bounded_concurrency = max(1, min(12, int(concurrency)))
+    bounded_timeout = max(5, min(60, int(timeout_seconds)))
+    bounded_page_limit = _bounded_page_limit(page_limit)
+    labels = _normalised_user_agents(user_agents)
+    pages = await discover_site_pages(
+        run_id,
+        domain,
+        limit=bounded_page_limit,
+        timeout_seconds=bounded_timeout,
+        concurrency=bounded_concurrency,
+        force_refresh=force_refresh,
+        progress_percent_start=discovery_percent,
+        progress_status=progress_status,
+    )
+    preview_task = asyncio.create_task(
+        capture_site_preview(
+            run_id,
+            domain=domain,
+            source_url=pages[0][0],
+            validate_url=_validate_public_url,
+            force_refresh=force_refresh,
+        ),
+        name=f"aiv-site-preview-{run_id}",
+    )
+    try:
+        await update_progress(
+            run_id,
+            stage="technical_access",
+            percent=technical_percent_start,
+            detail="Сравниваем ответы сайта для поисковых и ИИ-краулеров.",
+            eta_seconds=1500,
+            status=progress_status,
+        )
+        jobs = _build_jobs([domain], labels, pages)
+        completed_keys = set() if force_refresh else await _completed_probe_keys(run_id)
+        pending_jobs = [
+            job
+            for job in jobs
+            if (
+                job.target_url,
+                job.user_agent_label,
+                job.probe_type.value,
+            )
+            not in completed_keys
+        ]
+        already_done = len(jobs) - len(pending_jobs)
+        semaphore = asyncio.Semaphore(bounded_concurrency)
+        domain_lock = asyncio.Lock()
+        last_request = 0.0
+        progress_lock = asyncio.Lock()
+        done_count = already_done
+
+        async def worker(job: _Job) -> None:
+            nonlocal last_request, done_count
+            async with semaphore:
+                async with domain_lock:
+                    delay = MIN_GAP_PER_DOMAIN_SECONDS - (
+                        time.monotonic() - last_request
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    last_request = time.monotonic()
+                probe, transport, _ = await _probe_with_transport(
+                    url=job.target_url,
+                    user_agent=job.user_agent_string,
+                    timeout_seconds=bounded_timeout,
+                    concurrency=bounded_concurrency,
+                )
+                await _persist_probe(run_id, job, probe, transport)
+                async with progress_lock:
+                    done_count += 1
+                    ratio = done_count / max(1, len(jobs))
+                    percent = technical_percent_start + round(
+                        ratio * max(0, technical_percent_end - technical_percent_start)
+                    )
+                    await update_progress(
+                        run_id,
+                        stage="technical_access",
+                        percent=percent,
+                        detail=(
+                            "Проверяем, совпадает ли содержимое для обычного "
+                            f"браузера и ИИ-краулеров: {round(ratio * 100)}%."
+                        ),
+                        eta_seconds=max(1000, int(1500 - ratio * 420)),
+                        status=progress_status,
+                    )
+
+        await asyncio.gather(*(worker(job) for job in pending_jobs))
+        await preview_task
+    finally:
+        if not preview_task.done():
+            preview_task.cancel()
+        await asyncio.gather(preview_task, return_exceptions=True)
+    await assert_run_lease(run_id)
+    matrix_receipt = await save_technical_matrix_receipt(
+        run_id,
+        domain=domain,
+        pages=pages,
+        user_agents=labels,
+    )
+    if matrix_receipt.get("complete") is not True:
+        raise TechnicalMatrixIncomplete(
+            "Technical page/UA matrix still has "
+            f"{matrix_receipt.get('retryable_cell_count')} retryable and "
+            f"{matrix_receipt.get('missing_cell_count')} missing cells"
+        )
+    admission = await require_crawl_admission(
+        run_id,
+        domain=domain,
+        user_agents=labels,
+    )
+    await assert_run_lease(run_id)
+    return {
+        "pages": pages,
+        "site_preview": await get_saved_site_preview(run_id),
+        "technical_matrix": matrix_receipt,
+        "crawl_admission": admission,
+    }
+
+
 async def _run_crawl_impl(
     run_id: str,
     *,
@@ -3929,111 +4098,13 @@ async def _run_crawl_impl(
             run.domain = domain
             await session.commit()
 
-        concurrency = max(1, min(12, int(config.get("concurrency") or 6)))
-        timeout_seconds = max(5, min(60, int(config.get("timeout_seconds") or 20)))
-        page_limit = _bounded_page_limit(config.get("page_limit"))
-        user_agents = _normalised_user_agents(config.get("user_agents"))
-
-        pages = await discover_site_pages(
-            run_id,
-            domain,
-            limit=page_limit,
-            timeout_seconds=timeout_seconds,
-            concurrency=concurrency,
-        )
-        preview_task = asyncio.create_task(
-            capture_site_preview(
-                run_id,
-                domain=domain,
-                source_url=pages[0][0],
-                validate_url=_validate_public_url,
-            ),
-            name=f"aiv-site-preview-{run_id}",
-        )
-        try:
-            await update_progress(
-                run_id,
-                stage="technical_access",
-                percent=10,
-                detail="Сравниваем ответы сайта для поисковых и ИИ-краулеров.",
-                eta_seconds=1500,
-                status=RunStatus.crawling,
-            )
-            jobs = _build_jobs([domain], user_agents, pages)
-            completed_keys = await _completed_probe_keys(run_id)
-            pending_jobs = [
-                job
-                for job in jobs
-                if (
-                    job.target_url,
-                    job.user_agent_label,
-                    job.probe_type.value,
-                )
-                not in completed_keys
-            ]
-            already_done = len(jobs) - len(pending_jobs)
-            semaphore = asyncio.Semaphore(concurrency)
-            domain_lock = asyncio.Lock()
-            last_request = 0.0
-            progress_lock = asyncio.Lock()
-            done_count = already_done
-
-            async def worker(job: _Job) -> None:
-                nonlocal last_request, done_count
-                async with semaphore:
-                    async with domain_lock:
-                        delay = MIN_GAP_PER_DOMAIN_SECONDS - (
-                            time.monotonic() - last_request
-                        )
-                        if delay > 0:
-                            await asyncio.sleep(delay)
-                        last_request = time.monotonic()
-                    probe, transport, _ = await _probe_with_transport(
-                        url=job.target_url,
-                        user_agent=job.user_agent_string,
-                        timeout_seconds=timeout_seconds,
-                        concurrency=concurrency,
-                    )
-                    await _persist_probe(run_id, job, probe, transport)
-                    async with progress_lock:
-                        done_count += 1
-                        ratio = done_count / max(1, len(jobs))
-                        percent = 10 + round(ratio * 17)
-                        eta = max(1000, int(1500 - ratio * 420))
-                        detail = (
-                            "Проверяем, совпадает ли содержимое для обычного браузера "
-                            f"и ИИ-краулеров: {round(ratio * 100)}%."
-                        )
-                        await update_progress(
-                            run_id,
-                            stage="technical_access",
-                            percent=percent,
-                            detail=detail,
-                            eta_seconds=eta,
-                        )
-
-            await asyncio.gather(*(worker(job) for job in pending_jobs))
-            await preview_task
-        finally:
-            if not preview_task.done():
-                preview_task.cancel()
-            await asyncio.gather(preview_task, return_exceptions=True)
-        matrix_receipt = await save_technical_matrix_receipt(
+        await refresh_technical_foundation(
             run_id,
             domain=domain,
-            pages=pages,
-            user_agents=user_agents,
-        )
-        if matrix_receipt.get("complete") is not True:
-            raise TechnicalMatrixIncomplete(
-                "Technical page/UA matrix still has "
-                f"{matrix_receipt.get('retryable_cell_count')} retryable and "
-                f"{matrix_receipt.get('missing_cell_count')} missing cells"
-            )
-        await require_crawl_admission(
-            run_id,
-            domain=domain,
-            user_agents=user_agents,
+            page_limit=config.get("page_limit"),
+            timeout_seconds=int(config.get("timeout_seconds") or 20),
+            concurrency=int(config.get("concurrency") or 6),
+            user_agents=config.get("user_agents"),
         )
         await update_progress(
             run_id,

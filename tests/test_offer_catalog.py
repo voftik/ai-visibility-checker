@@ -393,6 +393,241 @@ class OfferCatalogEvidenceTests(unittest.TestCase):
             "canonical_offer_name_not_literal_in_excerpt",
         )
 
+    def test_nonliteral_normalized_name_promotes_bound_literal_alias(self) -> None:
+        excerpt = "Our studio offers custom tattoos for every client."
+        source = SourceUnit.from_text(
+            source_unit_id="page:makarska-home",
+            source_url="https://makarskatattoo.com/",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="makarskatattoo.com",
+            client_aliases=("Makarska Tattoo",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Индивидуальные татуировки",
+                    aliases=("Custom tattoos",),
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            [offer.canonical_name for offer in catalog.accepted_offers],
+            ["Custom tattoos"],
+        )
+        self.assertEqual(catalog.accepted_offers[0].aliases, ())
+        self.assertNotIn(
+            "Индивидуальные татуировки",
+            catalog.accepted_offers[0].as_dict().values(),
+        )
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "source_bound_commercial_offer_canonical_promoted_from_literal_alias",
+        )
+
+    def test_makarska_nested_first_party_copy_binds_each_literal_offer(self) -> None:
+        excerpt = (
+            "Located in the heart of Makarska, near the central square and "
+            "promenade, our studio offers a professional environment where "
+            "experienced artists create custom tattoos and precise piercings "
+            "to bring your vision to life."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:makarska-services",
+            source_url="https://makarskatattoo.com/",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="makarskatattoo.com",
+            client_aliases=("Makarska Tattoo",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Индивидуальные татуировки",
+                    aliases=("Custom tattoos",),
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+                _candidate(
+                    source,
+                    name="Пирсинг",
+                    aliases=("Precise piercings",),
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            {offer.canonical_name for offer in catalog.accepted_offers},
+            {"Custom tattoos", "Precise piercings"},
+        )
+        self.assertTrue(
+            all(
+                offer.evidence_refs[0].client_binding_proven
+                for offer in catalog.accepted_offers
+            )
+        )
+
+    def test_first_person_auxiliary_offer_binds_without_a_proximity_window(
+        self,
+    ) -> None:
+        excerpt = "Yes, we do offer cover-ups, reworks, and tattoo fixes."
+        source = SourceUnit.from_text(
+            source_unit_id="page:makarska-faq",
+            source_url="https://makarskatattoo.com/about",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="makarskatattoo.com",
+            client_aliases=("Makarska Tattoo",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Перекрытие и исправление татуировок",
+                    aliases=("Cover-ups", "Reworks", "Tattoo fixes"),
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers[0].canonical_name, "Cover-ups")
+        self.assertNotIn(
+            "Перекрытие",
+            str(catalog.accepted_offers[0].as_dict()),
+        )
+
+    def test_croatian_first_party_actor_and_delivery_chain_are_structural(
+        self,
+    ) -> None:
+        excerpt = (
+            "Smješten u srcu Makarske, naš studio nudi profesionalno "
+            "okruženje u kojem iskusni umjetnici stvaraju personalizirane "
+            "tetovaže i precizne pirsinge kako bi oživjeli vašu viziju."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:makarska-hr",
+            source_url="https://makarskatattoo.com/hr",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="makarskatattoo.com",
+            client_aliases=("Makarska Tattoo",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Personalizirane tetovaže",
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            [offer.canonical_name for offer in catalog.accepted_offers],
+            ["Personalizirane tetovaže"],
+        )
+
+    def test_literal_alias_without_client_binding_does_not_license_translation(
+        self,
+    ) -> None:
+        excerpt = (
+            "A market guide compares custom tattoos from several studios. "
+            "Realweb offers SEO for local businesses."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:realweb-market-guide",
+            source_url="https://realweb.ru/market-guide",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Индивидуальные татуировки",
+                    aliases=("Custom tattoos",),
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "canonical_offer_name_not_literal_in_excerpt",
+        )
+
+    def test_third_party_client_statement_cannot_promote_model_translation(
+        self,
+    ) -> None:
+        excerpt = "Reviewers report that Realweb offers Custom tattoos."
+        source = SourceUnit.from_text(
+            source_unit_id="page:third-party-review",
+            source_url="https://review.example/realweb",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Индивидуальные татуировки",
+                    aliases=("Custom tattoos",),
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "canonical_offer_name_not_literal_in_excerpt",
+        )
+
+    def test_realweb_generic_aliases_cannot_rebrand_topics_as_a_product(
+        self,
+    ) -> None:
+        excerpt = "Realweb offers SEO, DOOH and programmatic for its clients."
+        source = SourceUnit.from_text(
+            source_unit_id="page:realweb-services",
+            source_url="https://realweb.ru/services",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="QuantumRank Suite",
+                    aliases=("SEO", "DOOH", "programmatic"),
+                    excerpt=excerpt,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "canonical_offer_name_not_literal_in_excerpt",
+        )
+
     def test_only_aliases_with_literal_source_evidence_are_published(self) -> None:
         excerpt = "Realweb развивает платформу AdTech Compass."
         source = SourceUnit.from_text(

@@ -332,6 +332,7 @@ async def capture_site_preview(
     domain: str,
     source_url: str,
     validate_url: Callable[[str], Awaitable[None]],
+    force_refresh: bool = False,
 ) -> dict[str, Any] | None:
     """Capture, cache and persist a report preview without failing the audit."""
 
@@ -345,7 +346,8 @@ async def capture_site_preview(
     }
     cached_artifact = await _artifact(run_id)
     if (
-        cached_artifact is not None
+        not force_refresh
+        and cached_artifact is not None
         and cached_artifact.status == "completed"
         and cached_artifact.prompt_version == SITE_PREVIEW_VERSION
         and cached_artifact.input_json == input_json
