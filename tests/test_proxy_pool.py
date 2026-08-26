@@ -132,6 +132,7 @@ class ProxyPoolFetchAndCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cache_path.exists())
             data = json.loads(cache_path.read_text(encoding="utf-8"))
             self.assertEqual(len(data["proxies"]), 2)
+            self.assertEqual(cache_path.stat().st_mode & 0o777, 0o600)
 
     async def test_load_falls_back_to_cache_when_api_fails(self) -> None:
         with TemporaryDirectory() as tmpdir:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -284,8 +285,26 @@ class ProxyPool:
                 "saved_at": time.time(),
                 "proxies": [p.to_cache_dict() for p in self._proxies],
             }
-            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            descriptor = os.open(
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                # ``mode`` only applies when the file is first created.  A
+                # stale temporary file must also be tightened before secrets
+                # are written into it.
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    descriptor = -1
+                    handle.write(json.dumps(payload, ensure_ascii=False))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
             tmp_path.replace(self._cache_path)
+            self._cache_path.chmod(0o600)
         except Exception as exc:
             logger.warning("ProxyPool: cache write failed: %s: %s", type(exc).__name__, exc)
 
