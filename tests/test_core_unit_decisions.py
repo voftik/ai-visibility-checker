@@ -96,6 +96,35 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             {"catalog", "core_dispositions"},
         )
 
+    def test_filter_head_keeps_prior_head_when_new_ledger_is_added(self) -> None:
+        value = {
+            "target_aliases": [],
+            "entities": [],
+            "uncertainties": [],
+            "_aiv_entity_catalog_filter": {
+                "quality_state": "degraded",
+                "operation_count": 2,
+            },
+            "_aiv_entity_catalog_filter_head": {
+                "filtered_input_count": 3,
+                "degraded_input_count": 2,
+                "operation_count": 7,
+                "head_sha256": "prior",
+            },
+        }
+
+        first = _deterministic_entity_catalog_union([value])
+        head = first["_aiv_entity_catalog_filter_head"]
+        self.assertEqual(head["filtered_input_count"], 4)
+        self.assertEqual(head["degraded_input_count"], 3)
+        self.assertEqual(head["operation_count"], 9)
+
+        second = _deterministic_entity_catalog_union([first])
+        replayed = second["_aiv_entity_catalog_filter_head"]
+        self.assertEqual(replayed["filtered_input_count"], 4)
+        self.assertEqual(replayed["degraded_input_count"], 3)
+        self.assertEqual(replayed["operation_count"], 9)
+
     def test_grounded_blank_or_unquoted_profile_fails_closed(self) -> None:
         _unit, claim = self._one_site_unit()
         grounded = _decision(
@@ -632,7 +661,8 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
         )
         audit = accepted["_aiv_entity_catalog_filter"]
         self.assertEqual(audit["removal_count"], 1)
-        self.assertEqual(audit["removals"][0]["path"], "entities[9]")
+        self.assertEqual(audit["quarantined"][0]["path"], "entities[9]")
+        self.assertEqual(audit["quality_state"], "degraded")
         self.assertNotIn("OMEGA", json.dumps(audit, ensure_ascii=False))
         _validate_entity_catalog_leaf_evidence_binding(
             accepted,
@@ -786,7 +816,9 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
         self.assertEqual(audit["repair_count"], 1)
         self.assertEqual(audit["removal_count"], 0)
 
-    def test_recovery_filter_never_deletes_grounded_alias_or_owned_name(self) -> None:
+    def test_recovery_filter_quarantines_unbound_canonical_without_rebinding(
+        self,
+    ) -> None:
         grounded_names = [f"Source-{index}" for index in range(9)]
         core_text = ", ".join(grounded_names)
         units, _manifests = partition_text_records(
@@ -838,13 +870,20 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             ],
             "uncertainties": [],
         }
-        with self.assertRaisesRegex(OpenRouterError, "canonical_name is not grounded"):
-            _sanitize_recovered_entity_catalog_evidence(
-                alias_catalog,
-                receipts,
-                expected_claims=[claim],
-                profile={},
-            )
+        alias_accepted = _sanitize_recovered_entity_catalog_evidence(
+            alias_catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+        self.assertNotIn(
+            "OMEGA",
+            [entity["canonical_name"] for entity in alias_accepted["entities"]],
+        )
+        self.assertEqual(
+            alias_accepted["_aiv_entity_catalog_filter"]["quarantine_count"],
+            1,
+        )
 
         owned_catalog = {
             "target_aliases": [],
@@ -860,13 +899,79 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             ],
             "uncertainties": [],
         }
-        with self.assertRaisesRegex(OpenRouterError, "canonical_name is not grounded"):
-            _sanitize_recovered_entity_catalog_evidence(
-                owned_catalog,
-                receipts,
-                expected_claims=[claim],
-                profile={"brand_name": "Realweb", "brand_aliases": []},
-            )
+        owned_accepted = _sanitize_recovered_entity_catalog_evidence(
+            owned_catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={"brand_name": "Realweb", "brand_aliases": []},
+        )
+        self.assertNotIn(
+            "Realweb",
+            [entity["canonical_name"] for entity in owned_accepted["entities"]],
+        )
+
+    def test_recovery_filter_cannot_transfer_semantics_through_a_homonym(
+        self,
+    ) -> None:
+        core_text = "Apple is a common fruit."
+        units, _manifests = partition_text_records(
+            [{"answer_id": 649, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Apple",
+                    reason="В core дословно назван фрукт Apple.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output={
+                "target_aliases": [],
+                "entities": [
+                    {
+                        "canonical_name": "Apple",
+                        "aliases": [],
+                        "category": "other",
+                        "target_relationship": "unrelated",
+                        "evidence": core_text,
+                    }
+                ],
+                "uncertainties": [],
+            },
+            output_kind="entity_catalog",
+        )
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            {
+                "target_aliases": [],
+                "entities": [
+                    {
+                        "canonical_name": "Apple",
+                        "aliases": [],
+                        "category": "competitor",
+                        "target_relationship": "competitor",
+                        "commercially_relevant": True,
+                        "mention_policy": "standalone",
+                        "evidence": "Apple is a competitor to Acme.",
+                    }
+                ],
+                "uncertainties": [],
+            },
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        self.assertEqual(accepted["entities"], [])
+        self.assertEqual(
+            accepted["_aiv_entity_catalog_filter"]["quarantine_count"],
+            1,
+        )
 
     def test_recovery_filter_scans_core_marked_no_fact_before_deletion(self) -> None:
         grounded_names = [f"Source-{index}" for index in range(9)]
@@ -929,13 +1034,20 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             output_kind="entity_catalog",
         )
 
-        with self.assertRaisesRegex(OpenRouterError, "canonical_name is not grounded"):
-            _sanitize_recovered_entity_catalog_evidence(
-                catalog,
-                receipts,
-                expected_claims=claims,
-                profile={},
-            )
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            catalog,
+            receipts,
+            expected_claims=claims,
+            profile={},
+        )
+        self.assertNotIn(
+            "OMEGA",
+            [entity["canonical_name"] for entity in accepted["entities"]],
+        )
+        self.assertEqual(
+            accepted["_aiv_entity_catalog_filter"]["quarantine_count"],
+            1,
+        )
 
     def test_markdown_quote_repair_rejects_ambiguity_and_invention(self) -> None:
         repeated = "*ST Tattoo*, *Tattoo Roko*; *ST Tattoo*, *Tattoo Roko*"

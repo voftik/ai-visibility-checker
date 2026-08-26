@@ -35,11 +35,21 @@ from app.models import (
 from app.services import crawler
 from app.services import openrouter as openrouter_service
 from app.services.offer_catalog import (
+    OfferCatalog,
     OfferCatalogAdmissionError,
     SourceUnit,
     build_domain_research_payload,
     build_offer_catalog,
     build_offer_clusters,
+)
+from app.services.offer_identity_policy import (
+    OFFER_IDENTITY_MODEL_BATCH_VERSION,
+    OFFER_IDENTITY_MODEL_DECISION_VERSION,
+    OFFER_IDENTITY_RESULT_VERSION,
+    OfferIdentityDecision,
+    OfferIdentityModelRole,
+    OfferIdentityReasonCode,
+    build_offer_identity_contract,
 )
 from app.services.live_russian_policy import (
     LIVE_RUSSIAN_POLICY_MANIFEST,
@@ -115,6 +125,7 @@ from app.services.analyzer import (
     _annotation_split_oversized_record,
     _attribution_owner_aliases,
     _answers_for_catalog,
+    _attach_offer_identity_policy,
     _artifact_cache_matches,
     _bounded_semantic_model_evidence_context,
     _build_public_report,
@@ -189,6 +200,7 @@ from app.services.analyzer import (
     _persist_prompts,
     _portfolio_entity_is_grounded,
     _portfolio_mention_policy,
+    _profile_offer_scope_entities,
     _preserve_entity_catalog_reduction,
     _preserve_site_profile_reduction,
     _prompt_review_errors,
@@ -764,6 +776,7 @@ def _profile_with_offer_contract(
     domain: str = "example.com",
     source_url: str | None = None,
     offer_name: str = "Платформа",
+    offer_kind: str = "product",
 ) -> dict[str, Any]:
     """Return a profile fixture with one source-proven commercial offer."""
 
@@ -791,7 +804,7 @@ def _profile_with_offer_contract(
             {
                 "canonical_name": offer_name,
                 "aliases": [],
-                "kind": "product",
+                "kind": offer_kind,
                 "source_url": source.source_url,
                 "evidence_excerpt": source_text,
                 "source_unit_id": source.source_unit_id,
@@ -13989,6 +14002,285 @@ class DeterministicMetricTests(unittest.TestCase):
             },
         )
 
+    def test_profile_service_scope_survives_empty_observed_catalog_and_requires_attribution(
+        self,
+    ) -> None:
+        profile = _profile_with_offer_contract(
+            {
+                "brand_name": "Realweb",
+                "brand_aliases": [],
+                "entity_scope": [],
+                "products": [],
+                "customer_jobs": ["Запустить наружную рекламу"],
+            },
+            domain="realweb.example",
+            offer_name="Custom tattoos",
+            offer_kind="service",
+        )
+        rows = [
+            {
+                "answer_id": 701,
+                "mode": "web",
+                "provider_key": "openai",
+                "prompt_id": 1,
+                "prompt_key": "u-1",
+                "intent_class": "I",
+                "role": "unbranded_discovery",
+                "status": "completed",
+                "answer_text": "Custom tattoos are available in many studios.",
+                "annotation": {
+                    "valid": True,
+                    "target_mentioned": False,
+                    "target_position": None,
+                    "target_role": "absent",
+                    "sentiment": "unknown",
+                    "entity_mentions": [
+                        {
+                            "canonical_name": "Custom tattoos",
+                            "position": 1,
+                            "role": "mentioned",
+                            "attributed_to_target": False,
+                            "evidence": "Custom tattoos are available in many studios.",
+                        }
+                    ],
+                },
+            }
+        ]
+
+        metrics = _compute_metrics(
+            rows,
+            profile,
+            {"target_aliases": [], "entities": [], "uncertainties": []},
+        )
+
+        self.assertEqual(metrics["portfolio_scope"]["state"], "complete")
+        self.assertEqual(metrics["portfolio_scope"]["confirmed_entities"], 1)
+        self.assertEqual(metrics["portfolio_visibility"]["web"]["mention_count"], 0)
+        self.assertEqual(
+            _portfolio_mention_policy(
+                {
+                    "canonical_name": "Custom tattoos",
+                    "category": "target",
+                    "target_relationship": "portfolio_entity",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                },
+                profile,
+            ),
+            "requires_target_attribution",
+        )
+
+    def test_common_product_phrase_needs_target_attribution(self) -> None:
+        source_text = "Example offers running shoes for everyday training."
+        source = SourceUnit.from_text(
+            source_unit_id="https://example.com/shoes:000000",
+            source_url="https://example.com/shoes",
+            text=source_text,
+        )
+        offer_catalog = build_offer_catalog(
+            client_domain="example.com",
+            client_aliases=["Example"],
+            source_units=[source],
+            candidates=[
+                {
+                    "canonical_name": "running shoes",
+                    "aliases": [],
+                    "kind": "product",
+                    "source_url": source.source_url,
+                    "evidence_excerpt": source_text,
+                    "source_unit_id": source.source_unit_id,
+                    "source_sha256": source.source_sha256,
+                    "confidence": 0.95,
+                    "user_jobs": ["Buy running shoes"],
+                    "commercially_relevant": True,
+                }
+            ],
+        )
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "products": ["running shoes"],
+            "entity_scope": [],
+            "offer_catalog": offer_catalog.as_dict(),
+        }
+
+        def row(
+            answer_id: int,
+            answer_text: str,
+            *,
+            target_mentioned: bool,
+            attributed: bool,
+        ) -> dict[str, Any]:
+            return {
+                "answer_id": answer_id,
+                "mode": "web",
+                "provider_key": "openai",
+                "prompt_id": answer_id,
+                "prompt_key": f"u-{answer_id}",
+                "intent_class": "I",
+                "role": "unbranded_discovery",
+                "status": "completed",
+                "answer_text": answer_text,
+                "annotation": {
+                    "valid": True,
+                    "target_mentioned": target_mentioned,
+                    "target_position": 1 if target_mentioned else None,
+                    "target_role": "mentioned" if target_mentioned else "absent",
+                    "sentiment": "neutral",
+                    "entity_mentions": [
+                        {
+                            "canonical_name": "running shoes",
+                            "position": 1,
+                            "role": "mentioned",
+                            "attributed_to_target": attributed,
+                            "evidence": answer_text,
+                        }
+                    ],
+                },
+            }
+
+        unbranded = _compute_metrics(
+            [
+                row(
+                    801,
+                    "Running shoes are available from many brands.",
+                    target_mentioned=False,
+                    attributed=False,
+                )
+            ],
+            profile,
+            {"target_aliases": [], "entities": [], "uncertainties": []},
+        )
+        self.assertEqual(
+            unbranded["portfolio_visibility"]["web"]["mention_count"],
+            0,
+        )
+
+        attributed = _compute_metrics(
+            [
+                row(
+                    802,
+                    "Example offers running shoes for everyday training.",
+                    target_mentioned=True,
+                    attributed=True,
+                )
+            ],
+            profile,
+            {"target_aliases": [], "entities": [], "uncertainties": []},
+        )
+        self.assertEqual(
+            attributed["portfolio_visibility"]["web"]["mention_count"],
+            1,
+        )
+
+    def test_prefix_overlapping_offers_keep_independent_profile_scope(self) -> None:
+        names = ["Campaign 360", "Campaign 360 Enterprise Analytics"]
+        sources: list[SourceUnit] = []
+        candidates: list[dict[str, Any]] = []
+        for index, name in enumerate(names):
+            source_text = f"Example offers product {name} for campaign analysis."
+            source_url = f"https://example.com/product-{index}"
+            source = SourceUnit.from_text(
+                source_unit_id=f"{source_url}:000000",
+                source_url=source_url,
+                text=source_text,
+            )
+            sources.append(source)
+            candidates.append(
+                {
+                    "canonical_name": name,
+                    "aliases": [],
+                    "kind": "product",
+                    "source_url": source.source_url,
+                    "evidence_excerpt": source_text,
+                    "source_unit_id": source.source_unit_id,
+                    "source_sha256": source.source_sha256,
+                    "confidence": 0.95,
+                    "user_jobs": [f"Use {name}"],
+                    "commercially_relevant": True,
+                }
+            )
+        offer_catalog = build_offer_catalog(
+            client_domain="example.com",
+            client_aliases=["Example"],
+            source_units=sources,
+            candidates=candidates,
+        )
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "products": names,
+            "entity_scope": [],
+            "offer_catalog": offer_catalog.as_dict(),
+        }
+        observed = {
+            "target_aliases": ["Example"],
+            "entities": [
+                {
+                    "canonical_name": "Campaign 360",
+                    "aliases": [],
+                    "category": "target",
+                    "target_relationship": "portfolio_entity",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "Campaign 360",
+                }
+            ],
+            "uncertainties": [],
+        }
+
+        scoped = _scope_entity_catalog_to_profile(observed, profile)
+        scoped_names = [
+            item["canonical_name"]
+            for item in scoped["entities"]
+            if item.get("category") == "target"
+        ]
+        self.assertEqual(scoped_names, names)
+
+        metrics = _compute_metrics([], profile, observed)
+        self.assertEqual(metrics["portfolio_scope"]["state"], "complete")
+        self.assertEqual(metrics["portfolio_scope"]["confirmed_entities"], 2)
+        self.assertEqual(metrics["portfolio_scope"]["rejected_entities"], 0)
+
+    def test_primary_brand_can_also_be_the_profile_product(self) -> None:
+        profile = _profile_with_offer_contract(
+            {
+                "brand_name": "Spotify",
+                "brand_aliases": [],
+                "entity_scope": [],
+                "products": [],
+                "customer_jobs": ["Listen to music"],
+            },
+            domain="spotify.example",
+            offer_name="Spotify",
+            offer_kind="product",
+        )
+        observed = {
+            "target_aliases": ["Spotify"],
+            "entities": [
+                {
+                    "canonical_name": "Spotify",
+                    "aliases": [],
+                    "category": "target",
+                    "target_relationship": "exact_target",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "Spotify",
+                }
+            ],
+            "uncertainties": [],
+        }
+
+        scoped = _scope_entity_catalog_to_profile(observed, profile)
+        self.assertEqual(len(scoped["entities"]), 1)
+        self.assertTrue(scoped["entities"][0]["_also_exact_target"])
+        self.assertTrue(scoped["entities"][0]["_profile_membership_confirmed"])
+
+        metrics = _compute_metrics([], profile, observed)
+        self.assertEqual(metrics["portfolio_scope"]["state"], "complete")
+        self.assertEqual(metrics["portfolio_scope"]["confirmed_entities"], 1)
+        self.assertEqual(metrics["portfolio_scope"]["rejected_entities"], 0)
+
     def test_multiple_profile_products_count_one_answer_once(self) -> None:
         answer_text = "Realweb предлагает: DOOH, programmatic, аналитика."
         entity_names = ["DOOH", "programmatic", "аналитика"]
@@ -14283,6 +14575,361 @@ class DeterministicMetricTests(unittest.TestCase):
             metrics["competitor_series_contract"]["total_rows"],
             21,
         )
+
+
+class OfferIdentityPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _profile() -> dict[str, Any]:
+        definitions = (
+            (
+                "Centra",
+                (),
+                "service",
+                "Example развивает сервис Centra для покупки рекламы.",
+            ),
+            (
+                "Campaign 360",
+                ("campaign",),
+                "product",
+                "Example предлагает платформу Campaign 360 для планирования.",
+            ),
+            (
+                "eCommerce",
+                (),
+                "service",
+                "Example оказывает услуги eCommerce для магазинов.",
+            ),
+        )
+        sources: list[SourceUnit] = []
+        candidates: list[dict[str, Any]] = []
+        for index, (name, aliases, kind, source_text) in enumerate(definitions):
+            source = SourceUnit.from_text(
+                source_unit_id=f"https://example.com/{index}:000000",
+                source_url=f"https://example.com/{index}",
+                text=source_text,
+            )
+            sources.append(source)
+            candidates.append(
+                {
+                    "canonical_name": name,
+                    "aliases": list(aliases),
+                    "kind": kind,
+                    "source_url": source.source_url,
+                    "evidence_excerpt": source_text,
+                    "source_unit_id": source.source_unit_id,
+                    "source_sha256": source.source_sha256,
+                    "confidence": 0.95,
+                    "user_jobs": ["Выбрать поставщика"],
+                    "commercially_relevant": True,
+                }
+            )
+        catalog = build_offer_catalog(
+            client_domain="example.com",
+            client_aliases=["Example"],
+            source_units=sources,
+            candidates=candidates,
+        )
+        return {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "products": list(catalog.legacy_product_strings()),
+            "entity_scope": [],
+            "offer_catalog": catalog.as_dict(),
+        }
+
+    @staticmethod
+    def _batch_from_call(
+        user_payload: dict[str, Any],
+        *,
+        decisions: dict[str, OfferIdentityDecision] | None = None,
+    ) -> dict[str, Any]:
+        role = OfferIdentityModelRole(user_payload["request_contract"]["role"])
+        decisions = decisions or {
+            "Centra": OfferIdentityDecision.NAMED_OFFERING,
+            "Campaign 360": OfferIdentityDecision.NAMED_OFFERING,
+            "campaign": OfferIdentityDecision.GENERIC_CATEGORY,
+            "eCommerce": OfferIdentityDecision.GENERIC_CATEGORY,
+        }
+        reason_by_decision = {
+            OfferIdentityDecision.NAMED_OFFERING: (
+                OfferIdentityReasonCode.EXPLICIT_NAMED_IDENTITY
+            ),
+            OfferIdentityDecision.GENERIC_CATEGORY: (
+                OfferIdentityReasonCode.DESCRIPTIVE_OFFERING_PHRASE
+            ),
+            OfferIdentityDecision.AMBIGUOUS: (
+                OfferIdentityReasonCode.INSUFFICIENT_IDENTITY_EVIDENCE
+            ),
+        }
+        contract = user_payload["contract"]
+        return {
+            "version": OFFER_IDENTITY_MODEL_BATCH_VERSION,
+            "role": role.value,
+            "input_digest": contract["input_digest"],
+            "policy_digest": contract["policy_digest"],
+            "catalog_digest": contract["catalog_digest"],
+            "request_contract_digest": user_payload["request_contract"][
+                "request_contract_digest"
+            ],
+            "subject_count": contract["subject_count"],
+            "decisions": [
+                {
+                    "version": OFFER_IDENTITY_MODEL_DECISION_VERSION,
+                    "role": role.value,
+                    "subject_id": subject["subject_id"],
+                    "input_digest": contract["input_digest"],
+                    "policy_digest": contract["policy_digest"],
+                    "catalog_digest": contract["catalog_digest"],
+                    "subject_digest": subject["subject_digest"],
+                    "evidence_refs_digest": subject["evidence_refs_digest"],
+                    "reviewed_evidence_ref_digests": subject[
+                        "evidence_ref_digests"
+                    ],
+                    "decision": decisions[subject["name"]].value,
+                    "reason_code": reason_by_decision[
+                        decisions[subject["name"]]
+                    ].value,
+                    "rationale": "Решение принято по точному фрагменту сайта.",
+                }
+                for subject in user_payload["subjects"]
+            ],
+        }
+
+    async def test_two_independent_catalog_calls_enable_only_named_offers(
+        self,
+    ) -> None:
+        profile = self._profile()
+
+        async def model_call(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            return self._batch_from_call(kwargs["user_payload"])
+
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=model_call,
+            ) as structured,
+        ):
+            enriched = await _attach_offer_identity_policy("run-id", profile)
+
+        self.assertEqual(structured.await_count, 2)
+        calls_by_role = {
+            call.kwargs["user_payload"]["request_contract"]["role"]: call
+            for call in structured.await_args_list
+        }
+        self.assertEqual(set(calls_by_role), {"primary", "critic"})
+        primary_payload = calls_by_role["primary"].kwargs["user_payload"]
+        critic_payload = calls_by_role["critic"].kwargs["user_payload"]
+        self.assertEqual(primary_payload["subjects"], critic_payload["subjects"])
+        self.assertNotIn("primary_result", critic_payload)
+        self.assertTrue(
+            all(call.kwargs["continuable"] for call in structured.await_args_list)
+        )
+
+        scoped = {
+            row["canonical_name"]: row
+            for row in _profile_offer_scope_entities(enriched)
+        }
+        self.assertEqual(scoped["Centra"]["mention_policy"], "standalone")
+        self.assertEqual(
+            scoped["Campaign 360"]["mention_policy"],
+            "standalone",
+        )
+        self.assertEqual(
+            scoped["Campaign 360"]["aliases"],
+            [
+                {
+                    "value": "campaign",
+                    "match_policy": "requires_target_attribution",
+                }
+            ],
+        )
+        self.assertEqual(
+            scoped["eCommerce"]["mention_policy"],
+            "requires_target_attribution",
+        )
+        self.assertEqual(
+            enriched["_offer_identity_policy"]["quality_state"],
+            "complete",
+        )
+        completed = save_artifact.await_args_list[-1]
+        self.assertEqual(completed.kwargs["status"], "completed")
+        self.assertEqual(completed.kwargs["model"], None)
+
+    async def test_provider_failure_degrades_policy_without_stopping_report(
+        self,
+    ) -> None:
+        profile = self._profile()
+
+        async def model_call(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if payload["request_contract"]["role"] == "primary":
+                raise OpenRouterError("provider unavailable")
+            return self._batch_from_call(payload)
+
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=model_call,
+            ),
+        ):
+            enriched = await _attach_offer_identity_policy("run-id", profile)
+
+        summary = enriched["_offer_identity_policy"]
+        self.assertEqual(summary["quality_state"], "degraded")
+        self.assertEqual(summary["standalone_count"], 0)
+        self.assertIn("primary:role_error", summary["diagnostic_codes"])
+        self.assertTrue(
+            all(
+                row["mention_policy"] == "requires_target_attribution"
+                for row in _profile_offer_scope_entities(enriched)
+            )
+        )
+
+    async def test_contract_invalid_completed_leaf_is_made_retryable(self) -> None:
+        profile = self._profile()
+
+        async def model_call(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            batch = self._batch_from_call(payload)
+            if payload["request_contract"]["role"] == "primary":
+                batch["decisions"][-1] = copy.deepcopy(batch["decisions"][0])
+            return batch
+
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=model_call,
+            ),
+        ):
+            enriched = await _attach_offer_identity_policy("run-id", profile)
+
+        self.assertEqual(
+            enriched["_offer_identity_policy"]["quality_state"],
+            "degraded",
+        )
+        failed_leaf_writes = [
+            call
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("status") == "failed"
+            and str(call.kwargs.get("artifact_key") or "").startswith(
+                "offer_identity_primary_"
+            )
+        ]
+        self.assertEqual(len(failed_leaf_writes), 1)
+        self.assertTrue(
+            failed_leaf_writes[0].kwargs["preserve_existing_evidence"]
+        )
+
+    def test_policy_digest_changes_annotation_contract(self) -> None:
+        profile = self._profile()
+        contract = build_offer_identity_contract(
+            OfferCatalog.from_mapping(profile["offer_catalog"])
+        )
+        base_summary = {
+            "version": "aiv-offer-identity-result-v1",
+            "catalog_digest": contract.catalog_digest,
+            "input_digest": contract.input_digest,
+            "output_digest": "a" * 64,
+            "standalone_names_by_offer": {},
+        }
+        first = {**profile, "_offer_identity_policy": base_summary}
+        second = {
+            **profile,
+            "_offer_identity_policy": {
+                **base_summary,
+                "output_digest": "b" * 64,
+            },
+        }
+        observed = {"target_aliases": ["Example"], "entities": []}
+        self.assertNotEqual(
+            _annotation_context_sha256(first, observed),
+            _annotation_context_sha256(second, observed),
+        )
+
+    def test_named_alias_is_independent_from_generic_canonical_name(self) -> None:
+        source_text = (
+            "Example предлагает услугу SEO, также называемую Garpun, "
+            "для продвижения."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="https://example.com/seo:000000",
+            source_url="https://example.com/seo",
+            text=source_text,
+        )
+        offer_catalog = build_offer_catalog(
+            client_domain="example.com",
+            client_aliases=["Example"],
+            source_units=[source],
+            candidates=[
+                {
+                    "canonical_name": "SEO",
+                    "aliases": ["Garpun"],
+                    "kind": "service",
+                    "source_url": source.source_url,
+                    "evidence_excerpt": source_text,
+                    "source_unit_id": source.source_unit_id,
+                    "source_sha256": source.source_sha256,
+                    "confidence": 0.95,
+                    "user_jobs": ["Продвигать сайт"],
+                    "commercially_relevant": True,
+                }
+            ],
+        )
+        offer = offer_catalog.accepted_offers[0]
+        contract = build_offer_identity_contract(offer_catalog)
+        profile = {
+            "brand_name": "Example",
+            "brand_aliases": [],
+            "products": ["SEO"],
+            "entity_scope": [],
+            "offer_catalog": offer_catalog.as_dict(),
+            "_offer_identity_policy": {
+                "version": OFFER_IDENTITY_RESULT_VERSION,
+                "catalog_digest": offer_catalog.catalog_digest,
+                "input_digest": contract.input_digest,
+                "output_digest": "a" * 64,
+                "standalone_names_by_offer": {offer.offer_id: ["Garpun"]},
+            },
+        }
+
+        scoped = _profile_offer_scope_entities(profile)
+
+        self.assertEqual(scoped[0]["mention_policy"], "requires_target_attribution")
+        self.assertEqual(
+            scoped[0]["aliases"],
+            [{"value": "Garpun", "match_policy": "standalone"}],
+        )
+        self.assertEqual(scoped[0]["_profile_standalone_match_aliases"], ["Garpun"])
 
 
 class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -15006,8 +15653,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(discovery["annotated_answers"], 1)
             self.assertEqual(discovery["valid_answers"], 1)
             self.assertEqual(discovery["mention_count"], 1)
-            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v19"))
-            self.assertTrue(METRICS_VERSION.endswith("metrics-v21"))
+            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v21"))
+            self.assertTrue(METRICS_VERSION.endswith("metrics-v23"))
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))

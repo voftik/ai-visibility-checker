@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-PANEL_METRIC_COVERAGE_ADMISSION_VERSION = "aiv-panel-metric-coverage-v3"
+PANEL_METRIC_COVERAGE_ADMISSION_VERSION = "aiv-panel-metric-coverage-v4"
 PANEL_METRIC_MINIMUM_RATE = 0.60
 PANEL_METRIC_MAX_UNAVAILABLE_PROVIDERS = {"web": 2, "memory": 1}
 
@@ -62,9 +62,10 @@ def build_panel_metric_coverage_admission(
     """Return a content-addressed allow/block decision for panel coverage.
 
     Coverage is checked globally, per mode, per prompt and per provider.  A
-    provider may be wholly unavailable (and therefore shown as unavailable)
-    without blocking every other valid provider slice.  A tiny non-zero sample
-    is still rejected because it creates deceptively precise percentages.
+    provider may be wholly or partly unavailable (and therefore shown with its
+    actual denominator and a limitation) without blocking every other valid
+    slice. Only structural corruption or a corpus with no eligible evidence
+    vetoes publication.
     """
 
     if not 0 < minimum_rate <= 1:
@@ -220,7 +221,12 @@ def build_panel_metric_coverage_admission(
                 f"{receipt['mode']}_{receipt['provider_key']}_provider_unavailable"
             )
         elif receipt["eligible_cells"] < receipt["minimum_eligible_cells"]:
-            blockers.append(
+            # A sparse provider slice is an availability limitation, not an
+            # integrity failure.  Keep its eligible observations, mark the
+            # slice degraded and let the report show its actual denominator.
+            # Blocking here made one verbose or flaky provider veto an
+            # otherwise complete 81-cell research run.
+            warnings.append(
                 f"{receipt['mode']}_{receipt['provider_key']}_partial_slice_below_minimum"
             )
     for mode, count in sorted(unavailable_by_mode.items()):

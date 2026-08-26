@@ -185,8 +185,20 @@ from app.services.offer_catalog import (
     build_offer_clusters,
     build_prompt_foundation,
     build_upstream_artifact_digests,
+    is_generic_offer_name,
     normalize_offer_candidates_against_sources,
     validate_resume_compatibility,
+)
+from app.services.offer_identity_policy import (
+    OFFER_IDENTITY_CRITIC_PROMPT_VERSION,
+    OFFER_IDENTITY_PRIMARY_PROMPT_VERSION,
+    OFFER_IDENTITY_RESULT_VERSION,
+    OfferIdentityModelRole,
+    OfferIdentityPolicyError,
+    OfferIdentityPolicyResult,
+    build_offer_identity_contract,
+    build_offer_identity_model_request,
+    resolve_offer_identity_policy,
 )
 from app.services.recovery_orchestrator import (
     ACTION_DETERMINISTIC_FALLBACK,
@@ -313,16 +325,17 @@ _BOUNDED_PANEL_PROVIDER_MODEL_NAMESPACES = {
     "claude": "anthropic/",
 }
 ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v9"
-ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v11"
+ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v12"
 CORE_UNIT_DECISION_LEDGER_VERSION = "aiv-core-unit-decision-ledger-v1"
 CORE_UNIT_QUOTE_REPAIR_VERSION = "aiv-core-unit-quote-markdown-v1"
 ENTITY_CATALOG_QUOTE_REPAIR_VERSION = "aiv-entity-catalog-representative-quote-v2"
-ENTITY_CATALOG_GROUNDING_FILTER_VERSION = "aiv-entity-catalog-grounding-filter-v2"
+ENTITY_CATALOG_GROUNDING_FILTER_VERSION = "aiv-entity-catalog-grounding-filter-v3"
+ENTITY_CATALOG_FILTER_HEAD_VERSION = "aiv-entity-catalog-filter-head-v1"
 ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = "aiv-entity-catalog-contract-recovery-v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE = "entity_catalog_contract_v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS = 2
 ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION = (
-    "aiv-entity-catalog-recovery-shard-plan-v2"
+    "aiv-entity-catalog-recovery-shard-plan-v4"
 )
 ENTITY_CATALOG_RECOVERY_SHARD_MERGE_VERSION = (
     "aiv-entity-catalog-recovery-shard-merge-v2"
@@ -337,10 +350,13 @@ ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION = (
     "aiv-entity-catalog-recovery-continuable-parent-v1"
 )
 ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION = (
-    "aiv-entity-catalog-recovery-singleton-context-block-v1"
+    "aiv-entity-catalog-recovery-singleton-context-block-v2"
+)
+ENTITY_CATALOG_RECOVERY_SEMANTIC_BLOCK_VERSION = (
+    "aiv-entity-catalog-recovery-semantic-block-v1"
 )
 ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY = {
-    "version": "aiv-entity-catalog-recovery-acceptance-v2",
+    "version": "aiv-entity-catalog-recovery-acceptance-v3",
     "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
     "grounding_filter_version": ENTITY_CATALOG_GROUNDING_FILTER_VERSION,
     "ordered_gates": [
@@ -364,8 +380,8 @@ class _EntityCatalogRecoverySingletonContextError(OpenRouterError):
     """One minimum recovery core cannot be continued or split losslessly."""
 
 
-ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v19"
-METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v21"
+ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v21"
+METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v23"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
 FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v28"
@@ -4481,6 +4497,59 @@ def _deterministic_site_profile_union(
     return output
 
 
+def _entity_catalog_filter_head(
+    inputs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Fold detailed leaf filter ledgers into a fixed-size audit pointer."""
+
+    components: list[dict[str, Any]] = []
+    filtered_input_count = 0
+    degraded_input_count = 0
+    operation_count = 0
+    for item in inputs:
+        ledger = item.get("_aiv_entity_catalog_filter")
+        head = item.get("_aiv_entity_catalog_filter_head")
+        if isinstance(ledger, dict):
+            operations = int(ledger.get("operation_count") or 0)
+            degraded = ledger.get("quality_state") == "degraded" or operations > 0
+            components.append(
+                {
+                    "kind": "ledger",
+                    "sha256": stable_digest(ledger),
+                    "operation_count": operations,
+                    "degraded": degraded,
+                }
+            )
+            filtered_input_count += 1
+            degraded_input_count += int(degraded)
+            operation_count += operations
+        if isinstance(head, dict):
+            operations = int(head.get("operation_count") or 0)
+            degraded = int(head.get("degraded_input_count") or 0)
+            components.append(
+                {
+                    "kind": "head",
+                    "sha256": stable_digest(head),
+                    "operation_count": operations,
+                    "degraded_input_count": degraded,
+                }
+            )
+            filtered_input_count += int(head.get("filtered_input_count") or 0)
+            degraded_input_count += degraded
+            operation_count += operations
+    if not components:
+        return None
+    body = {
+        "version": ENTITY_CATALOG_FILTER_HEAD_VERSION,
+        "input_count": len(inputs),
+        "filtered_input_count": filtered_input_count,
+        "degraded_input_count": degraded_input_count,
+        "operation_count": operation_count,
+        "components_sha256": stable_digest(components),
+    }
+    return {**body, "head_sha256": stable_digest(body)}
+
+
 def _deterministic_entity_catalog_union(
     inputs: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -4563,6 +4632,9 @@ def _deterministic_entity_catalog_union(
                 raw_entity.get("mention_policy"),
             }:
                 entity["mention_policy"] = "requires_target_attribution"
+    filter_head = _entity_catalog_filter_head(inputs)
+    if filter_head is not None:
+        output["_aiv_entity_catalog_filter_head"] = filter_head
     return output
 
 
@@ -4729,6 +4801,9 @@ def _preserve_entity_catalog_reduction(
                         ],
                     )
     output["uncertainties"] = uncertainties
+    filter_head = _entity_catalog_filter_head(inputs)
+    if filter_head is not None:
+        output["_aiv_entity_catalog_filter_head"] = filter_head
     return output
 
 
@@ -14075,14 +14150,15 @@ def _sanitize_recovered_entity_catalog_evidence(
 
     This function is deliberately available only after the bounded recovery
     model has returned a complete candidate. Model-authored category labels
-    never authorize deletion by themselves. A name that occurs in a
-    content-addressed grounded core is repaired to that exact source span (or
-    remains fail-closed); a site/profile-confirmed name is never removed. A
-    small minority of ``other/unrelated`` rows may be removed only when the
-    canonical name and every alias are absent from every grounded core and
-    none is code-owned. The provider artifact remains immutable, while the
-    accepted checkpoint contains only hashes and source coordinates for each
-    deterministic operation.
+    never authorize either acceptance or rejection. A name that occurs in a
+    content-addressed grounded core may be repaired to that exact source span;
+    an alias that is not grounded is removed; and an entity whose canonical
+    identity cannot be bound is quarantined from the active answer catalog.
+    The number of quarantined rows is a quality signal, never an integrity
+    failure. Site-owned identity and offer scope remain independently available
+    from ``profile`` downstream. The provider artifact and core receipts stay
+    immutable, while the accepted checkpoint records only hashes and exact
+    source coordinates for deterministic operations.
     """
 
     try:
@@ -14104,13 +14180,25 @@ def _sanitize_recovered_entity_catalog_evidence(
         ]
 
     entity_pattern = re.compile(r"entities\[(\d+)\]\.canonical_name is not grounded")
+    alias_pattern = re.compile(
+        r"entities\[(\d+)\]\.aliases\[(\d+)\] is not grounded"
+    )
+    target_alias_pattern = re.compile(r"target_aliases\[(\d+)\] is not grounded")
     entity_indexes: set[int] = set()
+    alias_indexes: dict[int, set[int]] = defaultdict(set)
+    target_alias_indexes: set[int] = set()
     for failure in failures:
         if match := entity_pattern.fullmatch(failure):
             entity_indexes.add(int(match.group(1)))
             continue
+        if match := alias_pattern.fullmatch(failure):
+            alias_indexes[int(match.group(1))].add(int(match.group(2)))
+            continue
+        if match := target_alias_pattern.fullmatch(failure):
+            target_alias_indexes.add(int(match.group(1)))
+            continue
         raise binding_error
-    if not entity_indexes:
+    if not (entity_indexes or alias_indexes or target_alias_indexes):
         raise binding_error
 
     claims_by_identity = {
@@ -14126,7 +14214,6 @@ def _sanitize_recovered_entity_catalog_evidence(
         raise OpenRouterError(
             "Recovered entity-catalog filter expected-claim coverage mismatch"
         ) from binding_error
-    all_cores: list[dict[str, Any]] = []
     cores_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
     for identity, claim in claims_by_identity.items():
         core_text = str(claim.get("core_text") or "")
@@ -14142,7 +14229,6 @@ def _sanitize_recovered_entity_catalog_evidence(
             "source_start_char": int(claim.get("start_char") or 0),
             "core_text": core_text,
         }
-        all_cores.append(core)
         cores_by_identity[identity] = core
 
     grounded_cores: list[dict[str, Any]] = []
@@ -14208,49 +14294,6 @@ def _sanitize_recovered_entity_catalog_evidence(
     def word_character(value: str) -> bool:
         return bool(value and re.match(r"\w", value, re.UNICODE))
 
-    evidence_quote_patterns = (
-        re.compile(r"«([^«»]+)»", re.DOTALL),
-        re.compile(r"“([^“”]+)”", re.DOTALL),
-        re.compile(r"„([^„“]+)“", re.DOTALL),
-        re.compile(r"‘([^‘’]+)’", re.DOTALL),
-        re.compile(r'"([^"\r\n]+)"'),
-        re.compile(r"`([^`\r\n]+)`"),
-    )
-
-    def equivalent_name_is_present(value: str, name: str) -> bool:
-        normalized_name = (
-            unicodedata.normalize("NFKC", name).casefold().replace("ё", "е")
-        )
-        if not normalized_name:
-            return False
-        projected, starts, ends = source_projection(value)
-        offset = 0
-        while True:
-            normalized_start = projected.find(normalized_name, offset)
-            if normalized_start < 0:
-                return False
-            normalized_end = normalized_start + len(normalized_name)
-            source_start = starts[normalized_start]
-            source_end = ends[normalized_end - 1]
-            source_quote = value[source_start:source_end]
-            before = value[source_start - 1] if source_start else ""
-            after = value[source_end] if source_end < len(value) else ""
-            if not (
-                (word_character(source_quote[:1]) and word_character(before))
-                or (word_character(source_quote[-1:]) and word_character(after))
-            ):
-                return True
-            offset = normalized_start + 1
-
-    def submitted_evidence_supports_name(evidence: str, name: str) -> bool:
-        for pattern in evidence_quote_patterns:
-            spans = [
-                match.group(1) for match in pattern.finditer(evidence) if match.group(1)
-            ]
-            if spans:
-                return any(equivalent_name_is_present(span, name) for span in spans)
-        return equivalent_name_is_present(evidence, name)
-
     def first_source_occurrence(
         name: str,
         cores: list[dict[str, Any]],
@@ -14307,6 +14350,34 @@ def _sanitize_recovered_entity_catalog_evidence(
                 offset = normalized_start + 1
         return None
 
+    evidence_quote_patterns = (
+        re.compile(r"«([^«»]+)»", re.DOTALL),
+        re.compile(r"“([^“”]+)”", re.DOTALL),
+        re.compile(r"„([^„“]+)“", re.DOTALL),
+        re.compile(r"‘([^‘’]+)’", re.DOTALL),
+        re.compile(r'"([^"\r\n]+)"'),
+        re.compile(r"`([^`\r\n]+)`"),
+    )
+
+    def submitted_evidence_spans(evidence: str) -> list[str]:
+        """Return the complete source spans asserted by model evidence.
+
+        Delimiters are presentation syntax, not part of the source span.  As
+        in the strict leaf validator, the first delimiter family present owns
+        the evidence contract: prose outside its quotes cannot be substituted
+        for a convenient homonym from another sentence or core.
+        """
+
+        for pattern in evidence_quote_patterns:
+            quoted = [
+                match.group(1)
+                for match in pattern.finditer(evidence)
+                if match.group(1)
+            ]
+            if quoted:
+                return list(dict.fromkeys(quoted))
+        return [evidence] if evidence else []
+
     sanitized = copy.deepcopy(catalog)
     entities = sanitized.get("entities")
     if not isinstance(entities, list):
@@ -14314,8 +14385,14 @@ def _sanitize_recovered_entity_catalog_evidence(
             "Recovered entity-catalog filter received malformed entities"
         ) from binding_error
 
+    target_aliases = sanitized.get("target_aliases")
+    if not isinstance(target_aliases, list):
+        raise OpenRouterError(
+            "Recovered entity-catalog filter received malformed target aliases"
+        ) from binding_error
+
     operations: list[dict[str, Any]] = []
-    removable_indexes: set[int] = set()
+    quarantined_indexes: set[int] = set()
     for index in sorted(entity_indexes):
         if index >= len(entities) or not isinstance(entities[index], dict):
             raise OpenRouterError(
@@ -14343,18 +14420,11 @@ def _sanitize_recovered_entity_catalog_evidence(
         trusted_keys = {identity_text(value) for value in trusted_names if value}
         entity_names = [canonical, *aliases]
         canonical_code_owned = identity_text(canonical) in trusted_keys
-        code_owned = any(
-            identity_text(name) in trusted_keys for name in entity_names if name
-        )
         occurrences = [
             (name_index, name, first_source_occurrence(name, grounded_cores))
             for name_index, name in enumerate(entity_names)
         ]
         grounded_occurrences = [item for item in occurrences if item[2] is not None]
-        any_source_occurrence = any(
-            first_source_occurrence(name, all_cores) is not None
-            for name in entity_names
-        )
 
         repair_occurrence: tuple[int, str, dict[str, Any]] | None = None
         if grounded_occurrences:
@@ -14375,31 +14445,43 @@ def _sanitize_recovered_entity_catalog_evidence(
                 )
                 if independently_owned_alias is not None:
                     repair_occurrence = independently_owned_alias  # type: ignore[assignment]
-                else:
-                    raise binding_error
-            else:
-                # An answer-derived alias cannot prove its ungrounded
-                # canonical owner. It still blocks deletion; recovery must
-                # return a semantically coherent entity instead.
-                raise binding_error
 
         if repair_occurrence is not None:
             name_index, matched_name, occurrence = repair_occurrence
-            source_quote = str(occurrence["source_quote"])
             original_evidence = str(entity.get("evidence") or "")
             original_canonical = canonical
-            if not submitted_evidence_supports_name(
-                original_evidence,
-                matched_name,
-            ):
-                # Exact source occurrence protects the entity from deletion,
-                # but unrelated model-authored evidence cannot be silently
-                # rebound to convenient sibling material.
-                raise binding_error
-            entity["evidence"] = source_quote
-            canonical_replaced = bool(name_index == 0 and source_quote != canonical)
+            evidence_occurrence = next(
+                (
+                    candidate
+                    for evidence_span in submitted_evidence_spans(original_evidence)
+                    if (
+                        candidate := first_source_occurrence(
+                            evidence_span,
+                            grounded_cores,
+                        )
+                    )
+                    is not None
+                    and candidate["claim_id"] == occurrence["claim_id"]
+                    and candidate["unit_id"] == occurrence["unit_id"]
+                    and candidate["core_sha256"] == occurrence["core_sha256"]
+                ),
+                None,
+            )
+            if evidence_occurrence is None:
+                # A convenient homonym elsewhere in the corpus cannot transfer
+                # a model-authored category or relationship. Repair is allowed
+                # only when the complete submitted evidence span is recoverable
+                # from the same immutable grounded core as the name.
+                quarantined_indexes.add(index)
+                continue
+            evidence_source_quote = str(evidence_occurrence["source_quote"])
+            name_source_quote = str(occurrence["source_quote"])
+            entity["evidence"] = evidence_source_quote
+            canonical_replaced = bool(
+                name_index == 0 and name_source_quote != canonical
+            )
             if canonical_replaced:
-                entity["canonical_name"] = source_quote
+                entity["canonical_name"] = name_source_quote
             operations.append(
                 {
                     "operation": "repair_from_grounded_core",
@@ -14410,17 +14492,26 @@ def _sanitize_recovered_entity_catalog_evidence(
                         else f"entities[{index}].aliases[{name_index - 1}]"
                     ),
                     "match": str(occurrence["match"]),
-                    "claim_id": str(occurrence["claim_id"]),
-                    "unit_id": str(occurrence["unit_id"]),
-                    "core_sha256": str(occurrence["core_sha256"]),
-                    "source_sha256": str(occurrence["source_sha256"]),
-                    "core_start_char": int(occurrence["core_start_char"]),
-                    "core_end_char": int(occurrence["core_end_char"]),
-                    "source_start_char": int(occurrence["source_start_char"]),
-                    "source_end_char": int(occurrence["source_end_char"]),
-                    "source_quote_sha256": text_sha256(source_quote),
+                    "claim_id": str(evidence_occurrence["claim_id"]),
+                    "unit_id": str(evidence_occurrence["unit_id"]),
+                    "core_sha256": str(evidence_occurrence["core_sha256"]),
+                    "source_sha256": str(evidence_occurrence["source_sha256"]),
+                    "core_start_char": int(evidence_occurrence["core_start_char"]),
+                    "core_end_char": int(evidence_occurrence["core_end_char"]),
+                    "source_start_char": int(
+                        evidence_occurrence["source_start_char"]
+                    ),
+                    "source_end_char": int(evidence_occurrence["source_end_char"]),
+                    "source_quote_sha256": text_sha256(evidence_source_quote),
+                    "name_core_start_char": int(occurrence["core_start_char"]),
+                    "name_core_end_char": int(occurrence["core_end_char"]),
+                    "name_source_start_char": int(occurrence["source_start_char"]),
+                    "name_source_end_char": int(occurrence["source_end_char"]),
+                    "name_source_quote_sha256": text_sha256(name_source_quote),
                     "original_evidence_sha256": text_sha256(original_evidence),
-                    "replacement_evidence_sha256": text_sha256(source_quote),
+                    "replacement_evidence_sha256": text_sha256(
+                        evidence_source_quote
+                    ),
                     "canonical_replaced": canonical_replaced,
                     "original_canonical_sha256": text_sha256(original_canonical),
                     "replacement_canonical_sha256": text_sha256(
@@ -14430,35 +14521,69 @@ def _sanitize_recovered_entity_catalog_evidence(
             )
             continue
 
-        if any_source_occurrence:
-            # A model-authored explicit_no_fact disposition cannot authorize
-            # deletion of a name that is literally present in that immutable
-            # core. Only grounded cores can support automatic evidence repair;
-            # all other disposition contradictions remain fail-closed.
-            raise binding_error
-        if code_owned:
-            raise binding_error
-        category = str(entity.get("category") or "").casefold()
-        relationship = str(entity.get("target_relationship") or "").casefold()
-        if category != "other" or relationship not in {"other", "unrelated"}:
-            raise binding_error
-        removable_indexes.add(index)
+        # A canonical identity that cannot be proven by the grounded answer
+        # corpus is a local quality defect. Quarantine it from the observed
+        # catalog regardless of model-authored category, relationship or
+        # catalog size. Profile-owned scope is rebuilt independently below.
+        quarantined_indexes.add(index)
 
-    allowed_count = min(5, max(1, len(entities) // 10))
-    if removable_indexes and (
-        len(entities) < 10 or len(removable_indexes) > allowed_count
-    ):
-        raise binding_error
+    alias_removals: list[dict[str, Any]] = []
+    for entity_index, failed_alias_indexes in sorted(alias_indexes.items()):
+        if entity_index in quarantined_indexes:
+            continue
+        if entity_index >= len(entities) or not isinstance(
+            entities[entity_index], dict
+        ):
+            raise OpenRouterError(
+                "Recovered entity-catalog filter alias entity index is stale"
+            ) from binding_error
+        raw_aliases = entities[entity_index].get("aliases")
+        if not isinstance(raw_aliases, list):
+            raise binding_error
+        nonempty_positions = [
+            raw_index
+            for raw_index, raw_alias in enumerate(raw_aliases)
+            if _catalog_alias_value(raw_alias)
+        ]
+        for alias_index in sorted(failed_alias_indexes, reverse=True):
+            if alias_index >= len(nonempty_positions):
+                raise OpenRouterError(
+                    "Recovered entity-catalog filter alias index is stale"
+                ) from binding_error
+            raw_index = nonempty_positions[alias_index]
+            value = raw_aliases.pop(raw_index)
+            removal = {
+                "operation": "remove_ungrounded_alias",
+                "path": f"entities[{entity_index}].aliases[{raw_index}]",
+                "value_sha256": stable_digest(value),
+            }
+            alias_removals.append(removal)
+            operations.append(copy.deepcopy(removal))
 
-    removed: list[dict[str, Any]] = []
-    for index in sorted(removable_indexes, reverse=True):
+    target_alias_removals: list[dict[str, Any]] = []
+    for index in sorted(target_alias_indexes, reverse=True):
+        if index >= len(target_aliases):
+            raise OpenRouterError(
+                "Recovered entity-catalog filter target alias index is stale"
+            ) from binding_error
+        value = target_aliases.pop(index)
+        removal = {
+            "operation": "remove_ungrounded_target_alias",
+            "path": f"target_aliases[{index}]",
+            "value_sha256": stable_digest(value),
+        }
+        target_alias_removals.append(removal)
+        operations.append(copy.deepcopy(removal))
+
+    quarantined: list[dict[str, Any]] = []
+    for index in sorted(quarantined_indexes, reverse=True):
         value = entities.pop(index)
         removal = {
-            "operation": "remove_absent_unowned_other",
+            "operation": "quarantine_unbound_entity",
             "path": f"entities[{index}]",
             "value_sha256": stable_digest(value),
         }
-        removed.append(removal)
+        quarantined.append(removal)
         operations.append(copy.deepcopy(removal))
 
     _validate_entity_catalog_leaf_evidence_binding(
@@ -14473,11 +14598,19 @@ def _sanitize_recovered_entity_catalog_evidence(
         "accepted_catalog_sha256": stable_digest(sanitized),
         "operation_count": len(operations),
         "operations": sorted(operations, key=lambda item: str(item["path"])),
+        "quality_state": "degraded" if operations else "complete",
         "repair_count": sum(
             item.get("operation") == "repair_from_grounded_core" for item in operations
         ),
-        "removal_count": len(removed),
-        "removals": sorted(removed, key=lambda item: str(item["path"])),
+        "removal_count": (
+            len(quarantined)
+            + len(alias_removals)
+            + len(target_alias_removals)
+        ),
+        "quarantine_count": len(quarantined),
+        "quarantined": sorted(quarantined, key=lambda item: str(item["path"])),
+        "alias_removal_count": len(alias_removals),
+        "target_alias_removal_count": len(target_alias_removals),
     }
     return sanitized
 
@@ -15515,9 +15648,22 @@ async def _execute_entity_catalog_recovery_shards(
             base_recovery=base_recovery,
         )
         unit_ids = [str(row["claim"]["unit_id"]) for row in rows]
+        execution_contract = {
+            "version": ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+            "model": PROCESSING_MODEL,
+            "system_sha256": text_sha256(recovery_system),
+            "schema_name": ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+            "schema_sha256": stable_digest(ENTITY_CATALOG_LEAF_SCHEMA),
+            "reasoning_effort": "high",
+            "temperature": 0.15,
+            "acceptance_policy_sha256": (
+                ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+            ),
+        }
         identity = {
             "version": ENTITY_CATALOG_RECOVERY_LEAF_MANIFEST_VERSION,
             "executor_version": ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+            "execution_contract_sha256": stable_digest(execution_contract),
             "parent_artifact_key": recovery_artifact_key,
             "parent_input_sha256": stable_digest(recovery_payload),
             "payload_sha256": stable_digest(payload),
@@ -15536,6 +15682,8 @@ async def _execute_entity_catalog_recovery_shards(
         source_sha256 = stable_digest(identity)
         return {
             "identity": identity,
+            "execution_contract": execution_contract,
+            "execution_contract_sha256": stable_digest(execution_contract),
             "source_sha256": source_sha256,
             "artifact_key": f"ecr_leaf_{source_sha256[:48]}",
             "document_id": (
@@ -15890,15 +16038,191 @@ async def _execute_entity_catalog_recovery_shards(
             leaf_artifact is not None
             and leaf_artifact.status == "failed"
             and isinstance(terminal_block, dict)
-            and terminal_block.get("version")
-            == ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION
-            and terminal_block.get("source_sha256") == record["source_sha256"]
-            and terminal_block.get("unit_ids") == record["unit_ids"]
         ):
+            singleton_mismatches: list[str] = []
+            if leaf_artifact.model != PROCESSING_MODEL:
+                singleton_mismatches.append("model")
+            if (
+                leaf_artifact.prompt_version
+                != ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+            ):
+                singleton_mismatches.append("prompt_version")
+            if leaf_artifact.input_json != record["identity"]:
+                singleton_mismatches.append("source_identity")
+            expected_singleton_fields = {
+                "version": ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION,
+                "model": PROCESSING_MODEL,
+                "prompt_version": ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+                "execution_contract_sha256": record[
+                    "execution_contract_sha256"
+                ],
+                "acceptance_policy_sha256": (
+                    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+                ),
+                "source_sha256": record["source_sha256"],
+                "source_identity_sha256": stable_digest(record["identity"]),
+                "payload_sha256": record["identity"]["payload_sha256"],
+                "unit_ids": record["unit_ids"],
+                "unit_ids_sha256": stable_digest(record["unit_ids"]),
+            }
+            for field, expected in expected_singleton_fields.items():
+                if terminal_block.get(field) != expected:
+                    singleton_mismatches.append(field)
+            if singleton_mismatches:
+                raise OpenRouterError(
+                    "Recovery singleton leaf marker is tampered or stale: "
+                    + ", ".join(dict.fromkeys(singleton_mismatches))
+                )
+            failed_checkpoint = await load_structured_checkpoint(
+                run_id,
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                complete=False,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            failed_manifest = (
+                failed_checkpoint.get("manifest")
+                if isinstance(failed_checkpoint, dict)
+                else None
+            )
+            checkpoint_mismatches: list[str] = []
+            if not isinstance(failed_checkpoint, dict):
+                checkpoint_mismatches.append("checkpoint")
+            else:
+                if failed_checkpoint.get("status") != "failed":
+                    checkpoint_mismatches.append("checkpoint_status")
+                if not isinstance(failed_manifest, dict) or (
+                    failed_manifest.get("complete") is not False
+                ):
+                    checkpoint_mismatches.append("checkpoint_manifest")
+                if terminal_block.get("checkpoint_sha256") != stable_digest(
+                    failed_checkpoint
+                ):
+                    checkpoint_mismatches.append("checkpoint_sha256")
+                if terminal_block.get(
+                    "resume_contract_sha256"
+                ) != stable_digest(failed_checkpoint.get("resume_contract")):
+                    checkpoint_mismatches.append("resume_contract_sha256")
+                if terminal_block.get(
+                    "structured_manifest_sha256"
+                ) != stable_digest(failed_manifest):
+                    checkpoint_mismatches.append("structured_manifest_sha256")
+                call_records = failed_checkpoint.get("call_records") or []
+                if (
+                    not isinstance(call_records, list)
+                    or not call_records
+                    or terminal_block.get("physical_call_count")
+                    != len(call_records)
+                    or terminal_block.get("physical_call_chain_sha256")
+                    != stable_digest(call_records)
+                ):
+                    checkpoint_mismatches.append("physical_call_chain")
+            if checkpoint_mismatches:
+                raise OpenRouterError(
+                    "Recovery singleton leaf checkpoint is missing, tampered, "
+                    "or stale: "
+                    + ", ".join(dict.fromkeys(checkpoint_mismatches))
+                )
             raise _EntityCatalogRecoverySingletonContextError(
                 "One minimum recovery core exhausted provider context; "
                 "the paid prefix is preserved and the identical request "
                 "will not be posted again"
+            )
+        semantic_block = leaf_usage.get(
+            "_aiv_entity_catalog_recovery_semantic_block"
+        )
+        if (
+            leaf_artifact is not None
+            and leaf_artifact.status == "failed"
+            and isinstance(semantic_block, dict)
+        ):
+            cached_value = leaf_artifact.output_json
+            raw_text = leaf_artifact.raw_text
+            semantic_mismatches: list[str] = []
+            if leaf_artifact.model != PROCESSING_MODEL:
+                semantic_mismatches.append("model")
+            if (
+                leaf_artifact.prompt_version
+                != ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+            ):
+                semantic_mismatches.append("prompt_version")
+            if (
+                semantic_block.get("version")
+                != ENTITY_CATALOG_RECOVERY_SEMANTIC_BLOCK_VERSION
+            ):
+                semantic_mismatches.append("version")
+            if semantic_block.get("source_sha256") != record["source_sha256"]:
+                semantic_mismatches.append("source_sha256")
+            if semantic_block.get("unit_ids") != record["unit_ids"]:
+                semantic_mismatches.append("unit_ids")
+            if not isinstance(cached_value, dict) or semantic_block.get(
+                "parsed_output_sha256"
+            ) != stable_digest(cached_value):
+                semantic_mismatches.append("parsed_output_sha256")
+            if not isinstance(raw_text, str) or semantic_block.get(
+                "raw_text_sha256"
+            ) != text_sha256(raw_text or ""):
+                semantic_mismatches.append("raw_text_sha256")
+            if semantic_block.get("acceptance_policy_sha256") != (
+                ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+            ):
+                semantic_mismatches.append("acceptance_policy_sha256")
+            if semantic_mismatches:
+                raise OpenRouterError(
+                    "Recovery semantic leaf marker is tampered or stale: "
+                    + ", ".join(semantic_mismatches)
+                )
+            complete_checkpoint = await load_structured_checkpoint(
+                run_id,
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                complete=True,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            if (
+                not isinstance(complete_checkpoint, dict)
+                or semantic_block.get("checkpoint_sha256")
+                != stable_digest(complete_checkpoint)
+                or semantic_block.get("structured_manifest_sha256")
+                != stable_digest(complete_checkpoint.get("manifest"))
+            ):
+                raise OpenRouterError(
+                    "Recovery semantic leaf checkpoint is missing or mismatched"
+                )
+            restored = restore_completed_structured_checkpoint(
+                complete_checkpoint,
+                PROCESSING_MODEL,
+                messages,
+                ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                ENTITY_CATALOG_LEAF_SCHEMA,
+                record["document_id"],
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            if restored.text != raw_text or restored.parsed != cached_value:
+                raise OpenRouterError(
+                    "Recovery semantic leaf receipt output mismatches marker"
+                )
+            raise _EntityCatalogRecoveryShardSemanticError(
+                str(leaf_artifact.error_message or "sealed semantic failure")
             )
 
         request_bytes = _structured_provider_request_utf8_bytes(
@@ -15957,28 +16281,6 @@ async def _execute_entity_catalog_recovery_shards(
                     "One minimum recovery core exhausted provider context; "
                     "the paid prefix is preserved and the leaf cannot be "
                     "split without changing its immutable source contract"
-                )
-                block = {
-                    "version": ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION,
-                    "source_sha256": record["source_sha256"],
-                    "unit_ids": list(record["unit_ids"]),
-                    "reason": "prefix_context_exhausted_at_minimum_core",
-                }
-                await _save_artifact(
-                    run_id,
-                    stage_key="knowledge_gap",
-                    artifact_key=record["artifact_key"],
-                    status="failed",
-                    model=PROCESSING_MODEL,
-                    input_json=record["identity"],
-                    usage_json={
-                        "_aiv_entity_catalog_recovery_singleton_block": block
-                    },
-                    error_message=str(singleton_error),
-                    prompt_version=(
-                        ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
-                    ),
-                    preserve_existing_evidence=True,
                 )
                 raise singleton_error
             midpoint = len(rows) // 2
@@ -16049,6 +16351,93 @@ async def _execute_entity_catalog_recovery_shards(
             )
         except OpenRouterStructuredContinuationError as exc:
             if singleton_error is not None:
+                # The structured harness emits its terminal failed checkpoint
+                # only after the failover callback returns.  Seal the negative
+                # cache here, never inside the callback, so the absorbing
+                # marker is physically replayable rather than a weak promise
+                # that a paid prefix existed.
+                failed_checkpoint = await load_structured_checkpoint(
+                    run_id,
+                    owner_artifact_key=record["artifact_key"],
+                    source_input=record["identity"],
+                    model=PROCESSING_MODEL,
+                    owner_prompt_version=(
+                        ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                    ),
+                    messages=messages,
+                    schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                    response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                    document_id=record["document_id"],
+                    complete=False,
+                    reasoning_effort="high",
+                    temperature=0.15,
+                )
+                failed_manifest = (
+                    failed_checkpoint.get("manifest")
+                    if isinstance(failed_checkpoint, dict)
+                    else None
+                )
+                failed_calls = (
+                    failed_checkpoint.get("call_records") or []
+                    if isinstance(failed_checkpoint, dict)
+                    else []
+                )
+                if (
+                    not isinstance(failed_checkpoint, dict)
+                    or failed_checkpoint.get("status") != "failed"
+                    or not isinstance(failed_manifest, dict)
+                    or failed_manifest.get("complete") is not False
+                    or not isinstance(failed_calls, list)
+                    or not failed_calls
+                ):
+                    raise OpenRouterError(
+                        "Recovery singleton failure has no durable physical "
+                        "checkpoint"
+                    ) from exc
+                block = {
+                    "version": ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION,
+                    "model": PROCESSING_MODEL,
+                    "prompt_version": (
+                        ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                    ),
+                    "execution_contract_sha256": record[
+                        "execution_contract_sha256"
+                    ],
+                    "acceptance_policy_sha256": (
+                        ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+                    ),
+                    "source_sha256": record["source_sha256"],
+                    "source_identity_sha256": stable_digest(record["identity"]),
+                    "payload_sha256": record["identity"]["payload_sha256"],
+                    "unit_ids": list(record["unit_ids"]),
+                    "unit_ids_sha256": stable_digest(record["unit_ids"]),
+                    "checkpoint_sha256": stable_digest(failed_checkpoint),
+                    "resume_contract_sha256": stable_digest(
+                        failed_checkpoint.get("resume_contract")
+                    ),
+                    "structured_manifest_sha256": stable_digest(
+                        failed_manifest
+                    ),
+                    "physical_call_count": len(failed_calls),
+                    "physical_call_chain_sha256": stable_digest(failed_calls),
+                    "reason": "prefix_context_exhausted_at_minimum_core",
+                }
+                await _save_artifact(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=record["artifact_key"],
+                    status="failed",
+                    model=PROCESSING_MODEL,
+                    input_json=record["identity"],
+                    usage_json={
+                        "_aiv_entity_catalog_recovery_singleton_block": block
+                    },
+                    error_message=str(singleton_error),
+                    prompt_version=(
+                        ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                    ),
+                    preserve_existing_evidence=True,
+                )
                 raise singleton_error from exc
             raise
         if not isinstance(result.parsed, dict):
@@ -16061,6 +16450,76 @@ async def _execute_entity_catalog_recovery_shards(
                 profile=profile,
             )
         except Exception as exc:
+            # The physical response is already complete. Seal this owner as a
+            # terminal semantic failure only when its durable structured
+            # checkpoint can be restored exactly; a crash before that point
+            # deliberately remains ``running`` and resumable.
+            complete_checkpoint = await load_structured_checkpoint(
+                run_id,
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                complete=True,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            if isinstance(complete_checkpoint, dict):
+                restored = restore_completed_structured_checkpoint(
+                    complete_checkpoint,
+                    PROCESSING_MODEL,
+                    messages,
+                    ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                    ENTITY_CATALOG_LEAF_SCHEMA,
+                    record["document_id"],
+                    reasoning_effort="high",
+                    temperature=0.15,
+                )
+                if restored.text != result.text or restored.parsed != value:
+                    raise OpenRouterError(
+                        "Recovery semantic failure receipt mismatches output"
+                    ) from exc
+                semantic_block = {
+                    "version": ENTITY_CATALOG_RECOVERY_SEMANTIC_BLOCK_VERSION,
+                    "source_sha256": record["source_sha256"],
+                    "unit_ids": list(record["unit_ids"]),
+                    "parsed_output_sha256": stable_digest(value),
+                    "raw_text_sha256": text_sha256(result.text),
+                    "checkpoint_sha256": stable_digest(complete_checkpoint),
+                    "structured_manifest_sha256": stable_digest(
+                        complete_checkpoint.get("manifest")
+                    ),
+                    "acceptance_policy_sha256": (
+                        ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+                    ),
+                    "error_type": type(exc).__name__,
+                }
+                await _save_artifact(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=record["artifact_key"],
+                    status="failed",
+                    model=PROCESSING_MODEL,
+                    input_json=record["identity"],
+                    output_json=value,
+                    raw_text=result.text,
+                    usage_json={
+                        "_aiv_entity_catalog_recovery_semantic_block": (
+                            semantic_block
+                        )
+                    },
+                    error_message=str(exc),
+                    prompt_version=(
+                        ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                    ),
+                    preserve_existing_evidence=True,
+                )
             raise _EntityCatalogRecoveryShardSemanticError(str(exc)) from exc
 
         result_usage = result.usage if isinstance(result.usage, dict) else {}
@@ -17424,6 +17883,9 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
 """.strip()
     expected_unit_ids = [str(item.get("_lr_unit_id") or "") for item in answer_units]
     expected_claims = _core_unit_claims(answer_units)
+    expected_claims_by_unit = {
+        str(claim.get("unit_id") or ""): claim for claim in expected_claims
+    }
     leaf_catalogs = list(chunk_catalogs)
     all_decisions = _core_decisions_from_inputs(
         leaf_catalogs,
@@ -17510,6 +17972,12 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
                     merged,
                     leaf_catalogs,
                 )
+                preserved = _sanitize_recovered_entity_catalog_evidence(
+                    preserved,
+                    complete_decisions,
+                    expected_claims=expected_claims,
+                    profile=profile,
+                )
                 preserved = _preserve_entity_catalog_core_decisions(
                     preserved,
                     complete_decisions,
@@ -17542,6 +18010,12 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
         )
         if not any(len(group) > 1 for group in groups):
             terminal = _deterministic_entity_catalog_union(leaf_catalogs)
+            terminal = _sanitize_recovered_entity_catalog_evidence(
+                terminal,
+                complete_decisions,
+                expected_claims=expected_claims,
+                profile=profile,
+            )
             terminal = _preserve_entity_catalog_core_decisions(
                 terminal,
                 complete_decisions,
@@ -17608,6 +18082,15 @@ _aiv_core_unit_decision_head. Не удаляй точные evidence из ча�
                 preserved_group = _preserve_entity_catalog_reduction(
                     merged_group,
                     group,
+                )
+                group_claims = [
+                    expected_claims_by_unit[unit_id] for unit_id in lineage
+                ]
+                preserved_group = _sanitize_recovered_entity_catalog_evidence(
+                    preserved_group,
+                    decisions,
+                    expected_claims=group_claims,
+                    profile=profile,
                 )
                 return _attach_core_decision_head(
                     preserved_group,
@@ -17904,9 +18387,14 @@ def _entity_alias_values(entity: dict[str, Any]) -> list[str]:
 
 def _portfolio_mention_policy(
     entity: dict[str, Any],
-    _profile: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> str:
-    """Use the declared policy; unknown legacy entries fail closed."""
+    """Use the safest code-owned policy; unknown legacy entries fail closed."""
+
+    if is_generic_offer_name(str(entity.get("canonical_name") or "")):
+        return "requires_target_attribution"
+    if profile is not None and _entity_requires_profile_attribution(entity, profile):
+        return "requires_target_attribution"
 
     declared = str(entity.get("mention_policy") or "").casefold()
     if declared in _PORTFOLIO_MATCH_POLICIES:
@@ -18109,6 +18597,12 @@ def _entity_alias_entries(
     trusted_normalized = {
         value.casefold().replace("ё", "е").strip() for value in trusted_names
     }
+    standalone_normalized = {
+        value.casefold().replace("ё", "е").strip()
+        for value in entity.get("_profile_standalone_match_aliases") or []
+        if str(value or "").strip()
+    }
+    standalone_guarded = "_profile_standalone_match_aliases" in entity
     provenance_guarded = bool(
         _catalog_marks_portfolio_entity(entity)
         and (profile is not None or "_profile_confirmed_match_aliases" in entity)
@@ -18125,6 +18619,20 @@ def _entity_alias_entries(
         if len(normalized) < 2 or normalized in excluded_normalized:
             continue
         lexical_tokens = re.findall(r"[a-zа-я0-9]+", normalized, re.UNICODE)
+        if is_generic_offer_name(alias):
+            # A model cannot promote a category word such as DOOH or SEO to a
+            # proprietary standalone product. The site's offer catalog proves
+            # membership, while raw target attribution proves ownership of a
+            # particular mention.
+            policy = "requires_target_attribution"
+        if standalone_guarded and normalized not in standalone_normalized:
+            policy = "requires_target_attribution"
+        if (
+            profile is not None
+            and _catalog_marks_portfolio_entity(entity)
+            and _entity_name_requires_profile_attribution(entity, profile, alias)
+        ):
+            policy = "requires_target_attribution"
         profile_confirms_contextual_alias = bool(
             policy == "requires_target_attribution"
             and any(
@@ -18399,11 +18907,54 @@ def _profile_confirmed_names_for_entity(
             offer_catalog = OfferCatalog.from_mapping(catalog_value)
         except OfferCatalogError:
             return []
+        ranked_offers: list[tuple[tuple[int, int, str], Any]] = []
+        normalized_canonical = identity_text(canonical)
         for offer in offer_catalog.accepted_offers:
             offer_names = [offer.canonical_name, *offer.aliases]
-            if any(canonical_matches(value) for value in offer_names if value):
-                confirmed.extend(offer_names)
-        return list(dict.fromkeys(value for value in confirmed if value))
+            exact_canonical = normalized_canonical == identity_text(
+                offer.canonical_name
+            )
+            exact_alias = any(
+                normalized_canonical == identity_text(value)
+                for value in offer.aliases
+                if value
+            )
+            prefix_names = [
+                value
+                for value in offer_names
+                if value and canonical_matches(value)
+            ]
+            if exact_canonical:
+                rank = (0, 0, offer.offer_id)
+            elif exact_alias:
+                rank = (1, 0, offer.offer_id)
+            elif prefix_names:
+                canonical_token_count = len(identity_tokens(canonical))
+                extra_tokens = min(
+                    max(0, len(identity_tokens(value)) - canonical_token_count)
+                    for value in prefix_names
+                )
+                rank = (2, extra_tokens, offer.offer_id)
+            else:
+                continue
+            ranked_offers.append((rank, offer))
+        if not ranked_offers:
+            return []
+        # One observed row may represent only one accepted offer. Exact
+        # canonical identity wins over alias and prefix compatibility; this
+        # prevents ``Campaign 360`` from suppressing the independent
+        # ``Campaign 360 Enterprise Analytics`` scope row.
+        selected_offer = min(ranked_offers, key=lambda item: item[0])[1]
+        return list(
+            dict.fromkeys(
+                value
+                for value in (
+                    selected_offer.canonical_name,
+                    *selected_offer.aliases,
+                )
+                if value
+            )
+        )
 
     # Compatibility only for historical unit fixtures. Production profiles
     # always carry the source-bound offer catalog above.
@@ -18429,6 +18980,345 @@ def _profile_confirmed_names_for_entity(
         if product_name and canonical_matches(product_name):
             confirmed.append(product_name)
     return list(dict.fromkeys(value for value in confirmed if value))
+
+
+def _profile_confirmed_offer_id_for_entity(
+    entity: dict[str, Any],
+    profile: dict[str, Any],
+) -> str | None:
+    """Return the single accepted offer represented by an observed row."""
+
+    catalog_value = profile.get("offer_catalog")
+    if not isinstance(catalog_value, dict):
+        return None
+    try:
+        offer_catalog = OfferCatalog.from_mapping(catalog_value)
+    except OfferCatalogError:
+        return None
+    confirmed_keys = {
+        _offer_identity_text(value)
+        for value in _profile_confirmed_names_for_entity(entity, profile)
+        if value
+    }
+    if not confirmed_keys:
+        return None
+    exact_matches = [
+        offer.offer_id
+        for offer in offer_catalog.accepted_offers
+        if {
+            _offer_identity_text(value)
+            for value in (offer.canonical_name, *offer.aliases)
+            if value
+        }
+        == confirmed_keys
+    ]
+    return min(exact_matches) if exact_matches else None
+
+
+def _entity_requires_profile_attribution(
+    entity: dict[str, Any],
+    profile: dict[str, Any],
+) -> bool:
+    """Fail closed unless the site proves a distinctive product identity."""
+
+    confirmed_keys = {
+        unicodedata.normalize("NFKC", value)
+        .casefold()
+        .replace("ё", "е")
+        .strip()
+        for value in _profile_confirmed_names_for_entity(entity, profile)
+        if value
+    }
+    if not confirmed_keys:
+        return False
+    catalog_value = profile.get("offer_catalog")
+    if not isinstance(catalog_value, dict):
+        return False
+    try:
+        offer_catalog = OfferCatalog.from_mapping(catalog_value)
+    except OfferCatalogError:
+        return False
+    identity_policy = _validated_offer_identity_policy_summary(
+        profile,
+        offer_catalog,
+    )
+    for offer in offer_catalog.accepted_offers:
+        offer_names = [offer.canonical_name, *offer.aliases]
+        offer_keys = {
+            unicodedata.normalize("NFKC", value)
+            .casefold()
+            .replace("ё", "е")
+            .strip()
+            for value in offer_names
+            if value
+        }
+        if offer_keys & confirmed_keys:
+            return not _offer_name_has_standalone_identity(
+                offer,
+                offer.canonical_name,
+                client_aliases=offer_catalog.client_aliases,
+                identity_policy=identity_policy,
+            )
+    return False
+
+
+def _offer_identity_text(value: str) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        unicodedata.normalize("NFKC", value)
+        .casefold()
+        .replace("ё", "е")
+        .strip(),
+    )
+
+
+def _validated_offer_identity_policy_summary(
+    profile: dict[str, Any],
+    offer_catalog: OfferCatalog,
+) -> dict[str, Any] | None:
+    """Return the compact, catalog-bound identity policy or fail closed.
+
+    The full two-model decision ledger lives in its own durable artifact.  The
+    profile carries only the exact standalone-name allow-list needed by the
+    annotation and metric layers.  Treating a stale or malformed summary as
+    absent prevents a cached policy from widening a later catalog.
+    """
+
+    summary = profile.get("_offer_identity_policy")
+    if not isinstance(summary, dict):
+        return None
+    if (
+        summary.get("version") != OFFER_IDENTITY_RESULT_VERSION
+        or summary.get("catalog_digest") != offer_catalog.catalog_digest
+        or not isinstance(summary.get("input_digest"), str)
+        or len(str(summary.get("input_digest") or "")) != 64
+        or not isinstance(summary.get("output_digest"), str)
+        or len(str(summary.get("output_digest") or "")) != 64
+    ):
+        return None
+    grouped = summary.get("standalone_names_by_offer")
+    if not isinstance(grouped, dict):
+        return None
+    known_names = {
+        offer.offer_id: {
+            _offer_identity_text(value)
+            for value in (offer.canonical_name, *offer.aliases)
+            if str(value or "").strip()
+        }
+        for offer in offer_catalog.accepted_offers
+    }
+    if not set(grouped).issubset(known_names):
+        return None
+    for offer_id, values in grouped.items():
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value.strip() for value in values
+        ):
+            return None
+        normalized = [_offer_identity_text(value) for value in values]
+        if len(normalized) != len(set(normalized)) or not set(normalized).issubset(
+            known_names[offer_id]
+        ):
+            return None
+    return summary
+
+
+def _offer_name_has_standalone_identity(
+    offer: Any,
+    name: str,
+    *,
+    client_aliases: tuple[str, ...] | list[str],
+    identity_policy: dict[str, Any] | None = None,
+) -> bool:
+    """Prove that a profile product name can identify itself without its owner.
+
+    The offer catalog proves that the client sells something; it does not by
+    itself prove that an ordinary category phrase is the client's named
+    product.  Standalone matching therefore needs a replayable identity signal
+    from the literal identity. Ownership phrases and quotation marks are not
+    sufficient: a site can truthfully write ``product «running shoes»``
+    without making that category a proprietary name.
+    """
+
+    candidate = str(name or "").strip()
+    if not candidate:
+        return False
+
+    candidate_identity = _offer_identity_text(candidate)
+    if not candidate_identity:
+        return False
+    canonical_identity = _offer_identity_text(
+        str(getattr(offer, "canonical_name", "") or "")
+    )
+    if is_generic_offer_name(candidate) or (
+        bool(getattr(offer, "generic_category_term", False))
+        and candidate_identity == canonical_identity
+    ):
+        return False
+
+    # A product name that literally contains the target identity already
+    # attributes the mention to the client.
+    if any(
+        _alias_is_present(candidate, str(alias or ""))
+        for alias in client_aliases
+        if len(str(alias or "").strip()) >= 2
+    ):
+        return True
+
+    # For names that do not literally contain the client identity, use the
+    # compact allow-list produced by two independent catalog-wide reviews.  A
+    # missing, malformed or disagreeing review never becomes an implicit yes.
+    if isinstance(identity_policy, dict):
+        grouped = identity_policy.get("standalone_names_by_offer")
+        offer_id = str(getattr(offer, "offer_id", "") or "")
+        values = grouped.get(offer_id) if isinstance(grouped, dict) else None
+        if isinstance(values, list) and candidate_identity in {
+            _offer_identity_text(value)
+            for value in values
+            if isinstance(value, str) and value.strip()
+        }:
+            return True
+
+    # A trademark marker is an explicit identity claim.  Title case,
+    # CamelCase, digits, quotation marks and transliteration are deliberately
+    # insufficient: all occur in ordinary categories such as eCommerce, 3D
+    # printing and performance / перформанс.
+    return bool(re.search(r"[™®]", candidate))
+
+
+def _entity_name_requires_profile_attribution(
+    entity: dict[str, Any],
+    profile: dict[str, Any],
+    name: str,
+) -> bool:
+    """Resolve one canonical name or alias against its source-bound offer."""
+
+    confirmed_keys = {
+        _offer_identity_text(value)
+        for value in _profile_confirmed_names_for_entity(entity, profile)
+        if value
+    }
+    if not confirmed_keys:
+        return False
+    catalog_value = profile.get("offer_catalog")
+    if not isinstance(catalog_value, dict):
+        return False
+    try:
+        offer_catalog = OfferCatalog.from_mapping(catalog_value)
+    except OfferCatalogError:
+        return False
+    identity_policy = _validated_offer_identity_policy_summary(
+        profile,
+        offer_catalog,
+    )
+    matching_offers = [
+        offer
+        for offer in offer_catalog.accepted_offers
+        if {
+            _offer_identity_text(value)
+            for value in (offer.canonical_name, *offer.aliases)
+            if value
+        }
+        & confirmed_keys
+    ]
+    if not matching_offers:
+        return False
+    return not any(
+        _offer_name_has_standalone_identity(
+            offer,
+            name,
+            client_aliases=offer_catalog.client_aliases,
+            identity_policy=identity_policy,
+        )
+        for offer in matching_offers
+    )
+
+
+def _profile_offer_scope_entities(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build metric scope from the independently validated site catalog.
+
+    These rows define what the client actually offers; they do not claim that
+    any panel answer mentioned the offer. Observed evidence remains confined
+    to answer-derived rows and literal matching, so an absent mention produces
+    an honest zero instead of making the entire portfolio slice unavailable.
+    """
+
+    catalog_value = profile.get("offer_catalog")
+    if not isinstance(catalog_value, dict):
+        return []
+    try:
+        offer_catalog = OfferCatalog.from_mapping(catalog_value)
+    except OfferCatalogError:
+        return []
+    identity_policy = _validated_offer_identity_policy_summary(
+        profile,
+        offer_catalog,
+    )
+    entities: list[dict[str, Any]] = []
+    for offer in offer_catalog.accepted_offers:
+        canonical_policy = (
+            "standalone"
+            if _offer_name_has_standalone_identity(
+                offer,
+                offer.canonical_name,
+                client_aliases=offer_catalog.client_aliases,
+                identity_policy=identity_policy,
+            )
+            else "requires_target_attribution"
+        )
+        aliases = [
+            {
+                "value": alias,
+                "match_policy": (
+                    "standalone"
+                    if _offer_name_has_standalone_identity(
+                        offer,
+                        alias,
+                        client_aliases=offer_catalog.client_aliases,
+                        identity_policy=identity_policy,
+                    )
+                    else "requires_target_attribution"
+                ),
+            }
+            for alias in offer.aliases
+            if str(alias or "").strip()
+        ]
+        entities.append(
+            {
+                "canonical_name": offer.canonical_name,
+                "aliases": aliases,
+                "category": "target",
+                "target_relationship": "portfolio_entity",
+                "commercially_relevant": True,
+                "mention_policy": canonical_policy,
+                "evidence": "\n\n".join(
+                    dict.fromkeys(
+                        ref.evidence_excerpt
+                        for ref in offer.evidence_refs
+                        if ref.evidence_excerpt
+                    )
+                ),
+                "_profile_scope_seed": True,
+                "_profile_offer_id": offer.offer_id,
+                "_profile_offer_generic": offer.generic_category_term,
+                "_profile_membership_confirmed": True,
+                "_profile_confirmed_match_aliases": [
+                    offer.canonical_name,
+                    *offer.aliases,
+                ],
+                "_profile_standalone_match_aliases": [
+                    value
+                    for value in (offer.canonical_name, *offer.aliases)
+                    if _offer_name_has_standalone_identity(
+                        offer,
+                        value,
+                        client_aliases=offer_catalog.client_aliases,
+                        identity_policy=identity_policy,
+                    )
+                ],
+            }
+        )
+    return entities
 
 
 def _profile_confirms_portfolio_entity(
@@ -18495,9 +19385,45 @@ def _deduplicate_scoped_catalog_entities(
             positions[key] = len(resolved)
             resolved.append(entity)
             continue
+        existing = resolved[position]
+        existing_profile_bound = bool(
+            existing.get("_profile_membership_confirmed") is True
+            and existing.get("_profile_offer_id")
+        )
+        entity_profile_bound = bool(
+            entity.get("_profile_membership_confirmed") is True
+            and entity.get("_profile_offer_id")
+        )
+        if existing_profile_bound != entity_profile_bound:
+            profile_entity = entity if entity_profile_bound else existing
+            observed_entity = existing if entity_profile_bound else entity
+            observed_relationship = str(
+                observed_entity.get("target_relationship")
+                or observed_entity.get("relationship")
+                or ""
+            ).casefold()
+            if observed_entity.get("category") == "target" and (
+                observed_relationship in {"exact_target", "self"}
+            ):
+                # The same public name can be both the primary brand and one
+                # accepted product (for example a single-product service).
+                # Keep the code-owned portfolio row for denominator and
+                # matching, while preserving the dual target role as derived
+                # metadata instead of letting priority discard either fact.
+                profile_entity["_also_exact_target"] = True
+                profile_entity["_exact_target_relationship"] = (
+                    observed_relationship
+                )
+                observed_evidence = str(observed_entity.get("evidence") or "")
+                if observed_evidence:
+                    profile_entity["_exact_target_evidence_sha256"] = text_sha256(
+                        observed_evidence
+                    )
+                resolved[position] = profile_entity
+                continue
         if _scoped_entity_resolution_priority(
             entity
-        ) > _scoped_entity_resolution_priority(resolved[position]):
+        ) > _scoped_entity_resolution_priority(existing):
             resolved[position] = entity
     return resolved
 
@@ -18506,9 +19432,10 @@ def _scope_entity_catalog_to_profile(
     catalog: dict[str, Any],
     profile: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prevent answer-derived claims from expanding the target portfolio."""
+    """Bind portfolio scope to the site, independently of answer extraction."""
 
     scoped_catalog = copy.deepcopy(catalog)
+    represented_profile_offer_ids: set[str] = set()
     for entity in scoped_catalog.get("entities") or []:
         if not isinstance(entity, dict):
             continue
@@ -18519,6 +19446,52 @@ def _scope_entity_catalog_to_profile(
         entity["_profile_membership_confirmed"] = confirmed
         entity["_profile_confirmed_match_aliases"] = confirmed_names
         if confirmed:
+            standalone_names = [
+                value
+                for value in confirmed_names
+                if not _entity_name_requires_profile_attribution(
+                    entity,
+                    profile,
+                    value,
+                )
+            ]
+            confirmed_offer_id = _profile_confirmed_offer_id_for_entity(
+                entity,
+                profile,
+            )
+            if confirmed_offer_id:
+                entity["_profile_offer_id"] = confirmed_offer_id
+                represented_profile_offer_ids.add(confirmed_offer_id)
+            force_all_attribution = _entity_requires_profile_attribution(
+                entity,
+                profile,
+            )
+            entity["_profile_standalone_match_aliases"] = standalone_names
+            if force_all_attribution:
+                entity["mention_policy"] = "requires_target_attribution"
+            rewritten_aliases: list[Any] = []
+            for raw_alias in entity.get("aliases") or []:
+                alias = _catalog_alias_value(raw_alias)
+                if not alias:
+                    continue
+                if (
+                    force_all_attribution
+                    or is_generic_offer_name(alias)
+                    or _entity_name_requires_profile_attribution(
+                        entity,
+                        profile,
+                        alias,
+                    )
+                ):
+                    rewritten_aliases.append(
+                        {
+                            "value": alias,
+                            "match_policy": "requires_target_attribution",
+                        }
+                    )
+                else:
+                    rewritten_aliases.append(raw_alias)
+            entity["aliases"] = rewritten_aliases
             continue
         entity["category"] = "other"
         entity["target_relationship"] = "unrelated"
@@ -18527,6 +19500,14 @@ def _scope_entity_catalog_to_profile(
             "Ответ модели не может расширять портфель без подтверждения "
             "в профиле исследуемого сайта."
         )
+    profile_scope_entities = _profile_offer_scope_entities(profile)
+    for entity in profile_scope_entities:
+        profile_offer_id = str(entity.get("_profile_offer_id") or "")
+        if profile_offer_id and profile_offer_id in represented_profile_offer_ids:
+            continue
+        scoped_catalog.setdefault("entities", []).append(entity)
+        if profile_offer_id:
+            represented_profile_offer_ids.add(profile_offer_id)
     scoped_catalog["entities"] = _deduplicate_scoped_catalog_entities(
         list(scoped_catalog.get("entities") or [])
     )
@@ -23338,12 +24319,18 @@ def _compute_metrics(
     # Re-apply the deterministic scope guard here as well. This keeps metrics
     # correct for cached historical catalogs created before canonical-name
     # collision resolution was introduced.
-    candidate_portfolio_count = sum(
+    answer_candidate_portfolio_count = sum(
         _catalog_marks_portfolio_entity(entity)
         for entity in catalog.get("entities") or []
         if isinstance(entity, dict)
     )
     scoped_catalog = _scope_entity_catalog_to_profile(catalog, profile)
+    profile_scope_count = len(_profile_offer_scope_entities(profile))
+    candidate_portfolio_count = (
+        profile_scope_count
+        if profile_scope_count
+        else answer_candidate_portfolio_count
+    )
     target_aliases = _target_aliases(profile, scoped_catalog)
     rows = [
         {
@@ -41305,6 +42292,241 @@ async def _uses_canonical_intent_taxonomy(run_id: str) -> bool:
     return version in CANONICAL_INTENT_PROMPT_SET_VERSIONS
 
 
+def _compact_offer_identity_policy(
+    result: OfferIdentityPolicyResult,
+    *,
+    primary_model: str,
+    critic_model: str,
+) -> dict[str, Any]:
+    """Keep the hot-path policy small while the full audit remains durable."""
+
+    standalone_names = {
+        offer_id: list(names)
+        for offer_id, names in result.standalone_names_by_offer().items()
+    }
+    ambiguous_count = sum(
+        item.decision.value == "ambiguous" for item in result.decisions
+    )
+    return {
+        "version": result.version,
+        "catalog_digest": result.catalog_digest,
+        "input_digest": result.input_digest,
+        "output_digest": result.output_digest,
+        "quality_state": (
+            "degraded" if result.diagnostics or ambiguous_count else "complete"
+        ),
+        "decision_count": len(result.decisions),
+        "standalone_count": sum(item.standalone for item in result.decisions),
+        "ambiguous_count": ambiguous_count,
+        "standalone_names_by_offer": standalone_names,
+        "diagnostic_codes": list(result.diagnostics),
+        "primary_model": primary_model,
+        "critic_model": critic_model,
+    }
+
+
+async def _attach_offer_identity_policy(
+    run_id: str,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Classify bare offer names without turning model doubt into a veto.
+
+    The primary and critic see the same immutable catalog packet, but never
+    each other's answer.  Their two aggregate calls run in parallel. Provider
+    failures, malformed batches and disagreements resolve to ``ambiguous``;
+    the report continues with the safer attribution-required match policy.
+    """
+
+    catalog_value = profile.get("offer_catalog")
+    if not isinstance(catalog_value, dict):
+        return copy.deepcopy(profile)
+    offer_catalog = OfferCatalog.from_mapping(catalog_value)
+    contract = build_offer_identity_contract(offer_catalog)
+    primary_request = build_offer_identity_model_request(
+        contract,
+        role=OfferIdentityModelRole.PRIMARY,
+    )
+    critic_request = build_offer_identity_model_request(
+        contract,
+        role=OfferIdentityModelRole.CRITIC,
+    )
+
+    def call_artifact_key(
+        request: dict[str, Any],
+        *,
+        model: str,
+        role: OfferIdentityModelRole,
+    ) -> str:
+        call_digest = _stable_json_sha256(
+            {
+                "request_digest": request["request_digest"],
+                "model": model,
+            }
+        )[:24]
+        return f"offer_identity_{role.value}_{call_digest}"
+
+    result_input = {
+        "contract_input_digest": contract.input_digest,
+        "catalog_digest": contract.catalog_digest,
+        "policy_digest": contract.policy_digest,
+        "primary_model": ANALYSIS_MODEL,
+        "primary_request_digest": primary_request["request_digest"],
+        "critic_model": CRITIC_MODEL,
+        "critic_request_digest": critic_request["request_digest"],
+    }
+    cached = await _artifact_output(
+        run_id,
+        "offer_identity_policy",
+        input_json=result_input,
+        model=None,
+        prompt_version=OFFER_IDENTITY_RESULT_VERSION,
+    )
+    result: OfferIdentityPolicyResult | None = None
+    if isinstance(cached, dict):
+        try:
+            result = OfferIdentityPolicyResult.from_mapping(
+                cached,
+                catalog=offer_catalog,
+            )
+            # Persisted degraded output is publishable, but it must not make a
+            # transient provider/schema failure permanent. On a later
+            # reprocess only the failed logical leaf is retried; a completed
+            # sibling call is reused by its exact model/request contract.
+            if result.diagnostics and contract.subjects:
+                result = None
+        except (OfferIdentityPolicyError, TypeError, ValueError):
+            logger.warning(
+                "Cached offer identity policy failed validation for run %s",
+                run_id,
+            )
+
+    if result is None and contract.subjects:
+        async def classify(
+            request: dict[str, Any],
+            *,
+            model: str,
+            role: OfferIdentityModelRole,
+            prompt_version: str,
+        ) -> dict[str, Any]:
+            return await _structured_artifact(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=call_artifact_key(
+                    request,
+                    model=model,
+                    role=role,
+                ),
+                schema=request["response_schema"],
+                schema_name=request["response_schema_name"],
+                system=request["system_prompt"],
+                user_payload=request["payload"],
+                model=model,
+                reasoning_effort="high",
+                prompt_version=prompt_version,
+                continuable=True,
+            )
+
+        responses = await asyncio.gather(
+            classify(
+                primary_request,
+                model=ANALYSIS_MODEL,
+                role=OfferIdentityModelRole.PRIMARY,
+                prompt_version=OFFER_IDENTITY_PRIMARY_PROMPT_VERSION,
+            ),
+            classify(
+                critic_request,
+                model=CRITIC_MODEL,
+                role=OfferIdentityModelRole.CRITIC,
+                prompt_version=OFFER_IDENTITY_CRITIC_PROMPT_VERSION,
+            ),
+            return_exceptions=True,
+        )
+        for response in responses:
+            if isinstance(response, asyncio.CancelledError):
+                raise response
+        result = resolve_offer_identity_policy(
+            offer_catalog,
+            contract=contract,
+            primary_results=responses[0],
+            critic_results=responses[1],
+        )
+        role_specs = (
+            (
+                OfferIdentityModelRole.PRIMARY,
+                primary_request,
+                ANALYSIS_MODEL,
+                OFFER_IDENTITY_PRIMARY_PROMPT_VERSION,
+            ),
+            (
+                OfferIdentityModelRole.CRITIC,
+                critic_request,
+                CRITIC_MODEL,
+                OFFER_IDENTITY_CRITIC_PROMPT_VERSION,
+            ),
+        )
+        for role, request, model, prompt_version in role_specs:
+            if f"{role.value}:role_invalid" not in result.diagnostics:
+                continue
+            # JSON-schema validity is weaker than the exact catalog binding.
+            # A completed but stale/duplicate batch must not become a permanent
+            # cache hit; retain its raw receipt and make only that leaf
+            # retryable on the next reprocess.
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=call_artifact_key(
+                    request,
+                    model=model,
+                    role=role,
+                ),
+                model=model,
+                input_json=request["payload"],
+                prompt_version=prompt_version,
+                error=OfferIdentityPolicyError(
+                    f"{role.value} offer identity batch failed exact binding"
+                ),
+            )
+    elif result is None:
+        # A proven empty catalog has no names to classify and must not spend
+        # two provider calls merely to return an empty list.
+        result = resolve_offer_identity_policy(
+            offer_catalog,
+            contract=contract,
+            primary_results=None,
+            critic_results=None,
+        )
+
+    result.validate_against(offer_catalog)
+    await _save_artifact(
+        run_id,
+        stage_key="knowledge_gap",
+        artifact_key="offer_identity_policy",
+        status="completed",
+        model=None,
+        input_json=result_input,
+        output_json=result.as_dict(),
+        usage_json={
+            "decision_count": len(result.decisions),
+            "standalone_count": sum(item.standalone for item in result.decisions),
+            "ambiguous_count": sum(
+                item.decision.value == "ambiguous" for item in result.decisions
+            ),
+            "degraded": bool(result.diagnostics),
+        },
+        error_message=(
+            "; ".join(result.diagnostics) if result.diagnostics else None
+        ),
+        prompt_version=OFFER_IDENTITY_RESULT_VERSION,
+    )
+    enriched = copy.deepcopy(profile)
+    enriched["_offer_identity_policy"] = _compact_offer_identity_policy(
+        result,
+        primary_model=ANALYSIS_MODEL,
+        critic_model=CRITIC_MODEL,
+    )
+    return enriched
+
+
 async def _final_analysis_foundation_context(run_id: str) -> dict[str, Any]:
     """Load internal provenance for the author without publishing metadata."""
 
@@ -41313,6 +42535,7 @@ async def _final_analysis_foundation_context(run_id: str) -> dict[str, Any]:
         "prompt_foundation",
         "answer_set_receipt",
         "panel_metric_coverage_admission",
+        "offer_identity_policy",
         "legacy_prompt_foundation_audit",
         "legacy_answer_foundation_audit",
     )
@@ -41328,11 +42551,28 @@ async def _final_analysis_foundation_context(run_id: str) -> dict[str, Any]:
                 )
             ).scalars()
         )
-    return {
-        artifact.artifact_key: copy.deepcopy(artifact.output_json)
-        for artifact in artifacts
-        if isinstance(artifact.output_json, dict)
-    }
+    context: dict[str, Any] = {}
+    for artifact in artifacts:
+        output = artifact.output_json
+        if not isinstance(output, dict):
+            continue
+        if artifact.artifact_key == "offer_identity_policy":
+            context[artifact.artifact_key] = {
+                key: copy.deepcopy(output.get(key))
+                for key in (
+                    "version",
+                    "input_digest",
+                    "catalog_digest",
+                    "decision_count",
+                    "standalone_count",
+                    "ambiguous_count",
+                    "diagnostics",
+                    "output_digest",
+                )
+            }
+        else:
+            context[artifact.artifact_key] = copy.deepcopy(output)
+    return context
 
 
 async def _admit_panel_metric_coverage(
@@ -41471,6 +42711,7 @@ async def _finish_saved_answer_analysis(
         expected_corpus_cells,
         _coverage_admission,
     ) = await _admit_panel_metric_coverage(run_id)
+    profile = await _attach_offer_identity_policy(run_id, profile)
     catalog_answers = await _answers_for_catalog(run_id)
     if not catalog_answers:
         raise OpenRouterError("No saved model answers are available for reanalysis")
@@ -41509,6 +42750,11 @@ async def _finish_saved_answer_analysis(
                 ]
             ),
             "critic_gate_digest": _stable_json_sha256(critic_gate),
+            "offer_identity_policy_output_digest": (
+                (profile.get("_offer_identity_policy") or {}).get(
+                    "output_digest"
+                )
+            ),
         },
         output_json=metrics,
     )

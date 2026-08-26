@@ -107,7 +107,9 @@ class PanelMetricCoverageAdmissionTests(unittest.TestCase):
             1,
         )
 
-    def test_tiny_partial_provider_slice_is_rejected(self) -> None:
+    def test_tiny_partial_provider_slice_is_degraded_without_vetoing_report(
+        self,
+    ) -> None:
         rows = _observed_cells()
         for row in rows:
             if (
@@ -123,13 +125,17 @@ class PanelMetricCoverageAdmissionTests(unittest.TestCase):
             observed_rows=rows,
         )
 
-        self.assertFalse(admission["allowed"])
+        self.assertTrue(admission["allowed"])
+        self.assertEqual(admission["quality_state"], "degraded")
         self.assertIn(
+            "web_gemini_partial_slice_below_minimum",
+            admission["warning_codes"],
+        )
+        self.assertNotIn(
             "web_gemini_partial_slice_below_minimum",
             admission["reason_codes"],
         )
-        with self.assertRaises(PanelMetricCoverageError):
-            require_panel_metric_coverage(admission)
+        require_panel_metric_coverage(admission)
 
     def test_one_to_four_wholly_unavailable_web_providers_are_degraded(
         self,

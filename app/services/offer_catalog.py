@@ -1422,6 +1422,12 @@ def _is_generic_offer_name(value: str) -> bool:
     return _normalize_phrase(value) in _GENERIC_OFFER_TERMS
 
 
+def is_generic_offer_name(value: str) -> bool:
+    """Expose the deterministic generic-category predicate to consumers."""
+
+    return _is_generic_offer_name(value)
+
+
 def _phrase_occurrences(text: str, values: Iterable[str]) -> tuple[tuple[int, int], ...]:
     """Return exact token-boundary spans in already normalized text."""
 

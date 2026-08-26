@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Base, Run, RunArtifact, RunStatus
 from app.services import openrouter as openrouter_service
@@ -1851,7 +1852,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
-    async def test_ungrounded_alias_recovery_remains_bounded_and_fail_closed(
+    async def test_ungrounded_alias_is_removed_without_blocking_recovery(
         self,
     ) -> None:
         async def processing(
@@ -1867,25 +1868,27 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     aliases=["GAMMA"],
                     evidence="ALPHA",
                 )
-            raise AssertionError("Invalid leaf must not reach the reducer")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
 
         planner = AsyncMock(return_value=_retry_plan())
         finish = AsyncMock()
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "contract recovery exhausted",
-        ):
-            await self._run_catalog(
-                processing,
-                planner_mock=planner,
-                attempts=[1, 2],
-                finish_mock=finish,
-            )
+        result, _planner, _reserve, _finish = await self._run_catalog(
+            processing,
+            planner_mock=planner,
+            attempts=[1, 2],
+            finish_mock=finish,
+        )
+        alpha = next(
+            item for item in result["entities"] if item["canonical_name"] == "ALPHA"
+        )
+        self.assertEqual(alpha["aliases"], [])
         planner.assert_awaited_once()
         finish.assert_awaited_once()
-        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
 
-    async def test_recovery_rejects_entity_supported_only_by_sibling_material(
+    async def test_recovery_rebinds_entity_to_its_exact_grounded_span(
         self,
     ) -> None:
         async def processing(
@@ -1910,7 +1913,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         "target_relationship": "competitor",
                         "commercially_relevant": True,
                         "mention_policy": "standalone",
-                        "evidence": "ALPHA",
+                        "evidence": "gamma",
                     }
                 )
                 return value
@@ -1919,28 +1922,23 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="Alpha",
                 )
-            raise AssertionError("Invalid recovery must not reach the reducer")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
 
         finish = AsyncMock()
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "contract recovery exhausted",
-        ):
-            await self._run_catalog(
-                processing,
-                attempts=[1, 2],
-                finish_mock=finish,
-                answers=[{"answer_id": 1, "answer": "ALPHA GAMMA"}],
-            )
-        finish.assert_awaited_once()
-        failures = finish.await_args.kwargs["details"]["attempt_failures"]
-        self.assertEqual(len(failures), 2)
-        self.assertTrue(
-            all(
-                "entities[1].canonical_name is not grounded" in row["error"]
-                for row in failures
-            )
+        result, _planner, _reserve, _finish = await self._run_catalog(
+            processing,
+            attempts=[1, 2],
+            finish_mock=finish,
+            answers=[{"answer_id": 1, "answer": "ALPHA GAMMA"}],
         )
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+        gamma = next(
+            item for item in result["entities"] if item["canonical_name"] == "GAMMA"
+        )
+        self.assertEqual(gamma["evidence"], "GAMMA")
 
     async def test_literal_entity_and_alias_in_same_quote_are_accepted(
         self,
@@ -2052,23 +2050,22 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     evidence="GAMMA якобы названа здесь: «ALPHA».",
                     target_aliases=["ALPHA"],
                 )
-            raise AssertionError("Invalid leaf must not reach reducer")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
 
         finish = AsyncMock()
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "contract recovery exhausted",
-        ):
-            await self._run_catalog(
-                processing,
-                attempts=[1, 2],
-                finish_mock=finish,
-                answers=[{"answer_id": 1, "answer": "ALPHA source"}],
-            )
-        failures = finish.await_args.kwargs["details"]["attempt_failures"]
-        self.assertTrue(
-            all("canonical_name is not grounded" in item["error"] for item in failures)
+        result, _planner, _reserve, _finish = await self._run_catalog(
+            processing,
+            attempts=[1, 2],
+            finish_mock=finish,
+            answers=[{"answer_id": 1, "answer": "ALPHA source"}],
         )
+        self.assertNotIn(
+            "GAMMA",
+            [item["canonical_name"] for item in result["entities"]],
+        )
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
 
     async def test_outer_quote_from_another_core_cannot_ground_name(self) -> None:
         async def processing(
@@ -2113,23 +2110,25 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         )
                     ],
                 }
-            raise AssertionError("Invalid leaf must not reach reducer")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
 
         finish = AsyncMock()
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "contract recovery exhausted",
-        ):
-            await self._run_catalog(
-                processing,
-                attempts=[1, 2],
-                finish_mock=finish,
-                answers=[
-                    {"answer_id": 1, "answer": "ALPHA source"},
-                    {"answer_id": 2, "answer": "BETA unrelated"},
-                ],
-            )
-        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        result, _planner, _reserve, _finish = await self._run_catalog(
+            processing,
+            attempts=[1, 2],
+            finish_mock=finish,
+            answers=[
+                {"answer_id": 1, "answer": "ALPHA source"},
+                {"answer_id": 2, "answer": "BETA unrelated"},
+            ],
+        )
+        self.assertNotIn(
+            "ALPHA",
+            [item["canonical_name"] for item in result["entities"]],
+        )
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
 
     async def test_domain_and_markdown_only_entity_quotes_are_accepted(
         self,
@@ -2231,7 +2230,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         reserve.assert_not_awaited()
         finish.assert_not_awaited()
 
-    async def test_unowned_beta_canonical_cannot_borrow_literal_gamma_alias(
+    async def test_unowned_beta_canonical_is_quarantined_not_rebound_to_alias(
         self,
     ) -> None:
         async def processing(
@@ -2248,31 +2247,33 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     evidence="Риалвеб Gamma",
                     target_aliases=["Риалвеб"],
                 )
-            raise AssertionError("Invalid leaf must not reach reducer")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
 
         planner = AsyncMock(return_value=_retry_plan())
         finish = AsyncMock()
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "contract recovery exhausted",
-        ):
-            await self._run_catalog(
-                processing,
-                planner_mock=planner,
-                attempts=[1, 2],
-                finish_mock=finish,
-                profile={
-                    "brand_name": "Realweb",
-                    "brand_aliases": ["Риалвеб"],
-                    "products": [],
-                    "topics": [],
-                    "entity_scope": [],
-                },
-                answers=[{"answer_id": 1, "answer": "Риалвеб Gamma"}],
-            )
+        result, _planner, _reserve, _finish = await self._run_catalog(
+            processing,
+            planner_mock=planner,
+            attempts=[1, 2],
+            finish_mock=finish,
+            profile={
+                "brand_name": "Realweb",
+                "brand_aliases": ["Риалвеб"],
+                "products": [],
+                "topics": [],
+                "entity_scope": [],
+            },
+            answers=[{"answer_id": 1, "answer": "Риалвеб Gamma"}],
+        )
+        self.assertNotIn(
+            "Beta",
+            [item["canonical_name"] for item in result["entities"]],
+        )
         planner.assert_awaited_once()
         finish.assert_awaited_once()
-        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
 
     def test_recovery_stage_is_stable_and_distinct_per_chunk(self) -> None:
         target = {"brand_name": "ALPHA", "aliases": [], "products": []}
@@ -3130,6 +3131,265 @@ class EntityCatalogRecoveryContinuationTests(
         await self.engine.dispose()
         self._temp_dir.cleanup()
 
+    async def _seal_singleton_recovery_leaf(
+        self,
+        *,
+        recovery_system: str = "strict recovery",
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        _RecoveryPrefixClient,
+    ]:
+        job = _sharded_recovery_job(count=1)
+        payload = _sharded_recovery_payload(job)
+        profile = {
+            "brand_name": "ALPHA",
+            "brand_aliases": ["ALPHA"],
+            "products": [],
+            "entity_scope": [],
+        }
+        claim = payload["answers"][0]["core_claim"]
+        candidate = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "unit_id": claim["unit_id"],
+                    "core_sha256": claim["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "ALPHA",
+                    "reason": "В core назван бренд ALPHA. " + "факт " * 180,
+                }
+            ],
+        }
+        full_text = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        prefix_text = full_text[:-32]
+        self.assertGreater(len(prefix_text), 512)
+        client = _RecoveryPrefixClient(full_text, prefix_text)
+        envelope = {
+            "version": "test-envelope",
+            "policy": "model_max_available",
+            "requested_model": PROCESSING_MODEL,
+            "resolution": "test",
+            "context_length": 1_000_000,
+            "max_completion_tokens": 65_536,
+        }
+        extraction_window = {
+            "input_utf8_window": 2_000_000,
+            "model_envelope": envelope,
+        }
+        real_headroom = openrouter_service._apply_model_output_headroom
+
+        def exhaust_continuation_headroom(
+            **kwargs: Any,
+        ) -> tuple[int | None, dict[str, Any]]:
+            messages = kwargs["payload"].get("messages") or []
+            if messages and "CONTINUATION_CONTRACT_JSON:" in str(
+                messages[-1].get("content") or ""
+            ):
+                raise openrouter_service.OpenRouterContextHeadroomError(
+                    "simulated minimum-core prefix context exhaustion"
+                )
+            return real_headroom(**kwargs)
+
+        with (
+            patch(
+                "app.services.openrouter._apply_model_output_headroom",
+                side_effect=exhaust_continuation_headroom,
+            ),
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+            self.assertRaises(_EntityCatalogRecoverySingletonContextError),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system=recovery_system,
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key="singleton-parent",
+                source_digest=stable_digest(job["answers"]),
+            )
+        self.assertEqual(client.request_kinds, ["initial"])
+        return job, payload, profile, extraction_window, client
+
+    async def test_singleton_marker_is_physical_absorbing_and_contract_addressed(
+        self,
+    ) -> None:
+        job, payload, profile, extraction_window, _client = (
+            await self._seal_singleton_recovery_leaf()
+        )
+        async with self.SessionLocal() as session:
+            first_leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            marker = first_leaf.usage_json[
+                "_aiv_entity_catalog_recovery_singleton_block"
+            ]
+            first_leaf_key = first_leaf.artifact_key
+        self.assertEqual(first_leaf.status, "failed")
+        self.assertEqual(marker["physical_call_count"], 1)
+        self.assertEqual(marker["model"], PROCESSING_MODEL)
+        self.assertEqual(
+            marker["source_identity_sha256"],
+            stable_digest(first_leaf.input_json),
+        )
+
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "identical singleton negative cache must not POST"
+                ),
+            ) as client_factory,
+            self.assertRaises(_EntityCatalogRecoverySingletonContextError),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key="singleton-parent",
+                source_digest=stable_digest(job["answers"]),
+            )
+        client_factory.assert_not_called()
+
+        await self._seal_singleton_recovery_leaf(
+            recovery_system="materially changed recovery contract"
+        )
+        async with self.SessionLocal() as session:
+            leaves = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalars().all()
+        self.assertEqual(len(leaves), 2)
+        self.assertEqual(len({leaf.artifact_key for leaf in leaves}), 2)
+        self.assertIn(first_leaf_key, {leaf.artifact_key for leaf in leaves})
+
+    async def test_singleton_marker_tamper_and_missing_checkpoint_are_network_free(
+        self,
+    ) -> None:
+        job, payload, profile, extraction_window, _client = (
+            await self._seal_singleton_recovery_leaf()
+        )
+        async with self.SessionLocal() as session:
+            leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            leaf.usage_json[
+                "_aiv_entity_catalog_recovery_singleton_block"
+            ]["acceptance_policy_sha256"] = "0" * 64
+            flag_modified(leaf, "usage_json")
+            await session.commit()
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError("tampered singleton must not POST"),
+            ) as tamper_factory,
+            self.assertRaisesRegex(OpenRouterError, "tampered or stale"),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key="singleton-parent",
+                source_digest=stable_digest(job["answers"]),
+            )
+        tamper_factory.assert_not_called()
+
+        async with self.SessionLocal() as session:
+            leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            leaf.usage_json[
+                "_aiv_entity_catalog_recovery_singleton_block"
+            ]["acceptance_policy_sha256"] = (
+                ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+            )
+            flag_modified(leaf, "usage_json")
+            structured_rows = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("lsa2_%"),
+                    )
+                )
+            ).scalars().all()
+            self.assertTrue(structured_rows)
+            for row in structured_rows:
+                await session.delete(row)
+            await session.commit()
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "missing singleton checkpoint must not POST"
+                ),
+            ) as missing_factory,
+            self.assertRaisesRegex(OpenRouterError, "checkpoint is missing"),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key="singleton-parent",
+                source_digest=stable_digest(job["answers"]),
+            )
+        missing_factory.assert_not_called()
+
     async def _complete_current_parent(
         self,
         *,
@@ -3215,6 +3475,135 @@ class EntityCatalogRecoveryContinuationTests(
         self.assertEqual(recovered, candidate)
         self.assertIsNotNone(manifest)
         return job, payload, profile, extraction_window
+
+    async def test_terminal_semantic_leaf_is_absorbing_and_tamper_fails_without_http(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job(count=2)
+        payload = _sharded_recovery_payload(job)
+        profile = {
+            "brand_name": "ALPHA",
+            "brand_aliases": ["ALPHA"],
+            "products": [],
+            "entity_scope": [],
+        }
+        claims = [item["core_claim"] for item in payload["answers"]]
+        invalid = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "unit_id": (
+                        "foreign-unit" if index == 0 else claim["unit_id"]
+                    ),
+                    "core_sha256": claim["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "ALPHA",
+                    "reason": "В core дословно назван бренд ALPHA.",
+                }
+                for index, claim in enumerate(claims)
+            ],
+        }
+        full_text = json.dumps(
+            invalid,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        client = _RecoveryPrefixClient(full_text, full_text)
+        envelope = {
+            "version": "test-envelope",
+            "policy": "model_max_available",
+            "requested_model": PROCESSING_MODEL,
+            "resolution": "test",
+            "context_length": 1_000_000,
+            "max_completion_tokens": 65_536,
+        }
+        extraction_window = {
+            "input_utf8_window": 2_000_000,
+            "model_envelope": envelope,
+        }
+        call = lambda: _execute_entity_catalog_recovery_shards(
+            self.run_id,
+            job=job,
+            target=payload["target"],
+            profile=profile,
+            recovery_system="strict recovery",
+            extraction_window=extraction_window,
+            recovery_payload=payload,
+            recovery_artifact_key="semantic-parent",
+            source_digest=stable_digest(job["answers"]),
+        )
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+            self.assertRaisesRegex(OpenRouterError, "identity mismatch"),
+        ):
+            await call()
+        self.assertEqual(client.request_kinds.count("initial"), 1)
+
+        async with self.SessionLocal() as session:
+            leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            self.assertEqual(leaf.status, "failed")
+            marker = leaf.usage_json[
+                "_aiv_entity_catalog_recovery_semantic_block"
+            ]
+            self.assertEqual(marker["parsed_output_sha256"], stable_digest(invalid))
+
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError("sealed semantic leaf must not use HTTP"),
+            ) as client_factory,
+            self.assertRaisesRegex(OpenRouterError, "identity mismatch"),
+        ):
+            await call()
+        client_factory.assert_not_called()
+
+        async with self.SessionLocal() as session:
+            leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            leaf.usage_json[
+                "_aiv_entity_catalog_recovery_semantic_block"
+            ]["acceptance_policy_sha256"] = "0" * 64
+            flag_modified(leaf, "usage_json")
+            await session.commit()
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError("tampered marker must not use HTTP"),
+            ) as tamper_factory,
+            self.assertRaisesRegex(OpenRouterError, "tampered or stale"),
+        ):
+            await call()
+        tamper_factory.assert_not_called()
 
     async def test_current_parent_missing_leaf_fails_without_http(
         self,
