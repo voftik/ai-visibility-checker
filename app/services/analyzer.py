@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -68,6 +68,8 @@ from app.services.openrouter import (
     model_output_envelope,
     panel_models,
     restore_completed_chat_provider_event,
+    restore_completed_structured_checkpoint,
+    validated_structured_terminal_semantic_failure,
     web_request_policy,
 )
 from app.services.structured_audit_store import (
@@ -319,6 +321,24 @@ ENTITY_CATALOG_GROUNDING_FILTER_VERSION = "aiv-entity-catalog-grounding-filter-v
 ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = "aiv-entity-catalog-contract-recovery-v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE = "entity_catalog_contract_v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS = 2
+ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION = (
+    "aiv-entity-catalog-recovery-shard-plan-v2"
+)
+ENTITY_CATALOG_RECOVERY_SHARD_MERGE_VERSION = (
+    "aiv-entity-catalog-recovery-shard-merge-v2"
+)
+ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME = (
+    "aiv_entity_catalog_contract_recovery_shard"
+)
+ENTITY_CATALOG_RECOVERY_LEAF_MANIFEST_VERSION = (
+    "aiv-entity-catalog-recovery-continuable-leaf-v1"
+)
+ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION = (
+    "aiv-entity-catalog-recovery-continuable-parent-v1"
+)
+ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION = (
+    "aiv-entity-catalog-recovery-singleton-context-block-v1"
+)
 ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY = {
     "version": "aiv-entity-catalog-recovery-acceptance-v2",
     "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
@@ -334,6 +354,16 @@ ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY = {
 ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256 = stable_digest(
     ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY
 )
+
+
+class _EntityCatalogRecoveryShardSemanticError(OpenRouterError):
+    """A complete recovery shard failed its immutable-source contract."""
+
+
+class _EntityCatalogRecoverySingletonContextError(OpenRouterError):
+    """One minimum recovery core cannot be continued or split losslessly."""
+
+
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v19"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v21"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
@@ -2128,6 +2158,10 @@ async def _structured_artifact(
     reasoning_effort: str = "high",
     prompt_version: str = PROMPT_VERSION,
     continuable: bool = True,
+    composable_failover: Callable[
+        [dict[str, Any]], Awaitable[ChatResult]
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     cached = await _artifact_output(
         run_id,
@@ -2185,6 +2219,7 @@ async def _structured_artifact(
                 document_id=document_id,
                 audit_checkpoint=audit_checkpoint,
                 resume_checkpoint=resume_checkpoint,
+                composable_failover=composable_failover,
             )
         else:
             # An authoritative verdict is one model decision. Concatenating a
@@ -13799,6 +13834,9 @@ def _entity_catalog_recovery_stage_key(
 
     stage_identity = {
         "artifact_key": str(job["artifact_key"]),
+        "executor_harness_version": (
+            ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+        ),
         "acceptance_policy_sha256": (ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256),
         "checkpoint_identity_sha256": _entity_catalog_recovery_identity_digest(
             job=job,
@@ -14526,32 +14564,21 @@ def _validated_recovered_entity_catalog_leaf(
 def _complete_entity_catalog_response_contract_failure(
     error: BaseException,
 ) -> bool:
-    """Return true only for an audited, complete but unusable response.
+    """Return true only for a sealed terminal semantic failure.
 
-    A complete HTTP 200 response has spent the semantic attempt and may buy
-    the next bounded attempt.  An incomplete, output-limited, transport, or
-    provenance-ambiguous failure keeps the current attempt reserved for exact
-    resume instead.
+    Transport metadata alone cannot prove that the assembled logical document
+    is terminal under the exact recovery schema.  Without the audited marker,
+    the attempt remains reserved for exact resume.
     """
 
     if not isinstance(error, OpenRouterResponseContractError):
         return False
-    result = getattr(error, "result", None)
-    if not isinstance(result, ChatResult):
-        return False
-    transport = getattr(result, "transport", None)
-    usage = getattr(result, "usage", None)
-    if not isinstance(transport, dict) or not isinstance(usage, dict):
-        return False
-    usage_transport = usage.get("_aiv_transport")
-    return bool(
-        transport.get("status") == "succeeded"
-        and transport.get("http_status") == 200
-        and transport.get("output_complete") is True
-        and transport.get("output_limited") is False
-        and transport.get("output_incomplete_reason") in (None, "")
-        and isinstance(usage_transport, dict)
-        and usage_transport == transport
+    return (
+        validated_structured_terminal_semantic_failure(
+            error,
+            response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+        )
+        is not None
     )
 
 
@@ -14566,6 +14593,7 @@ def _entity_catalog_recovery_checkpoint_payload(
     accepted: dict[str, Any],
     before_digest: str,
     after_digest: str,
+    recovery_execution_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = {
         "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
@@ -14586,6 +14614,10 @@ def _entity_catalog_recovery_checkpoint_payload(
         "after_digest": after_digest,
         "accepted": copy.deepcopy(accepted),
     }
+    if recovery_execution_manifest is not None:
+        body["recovery_execution_manifest_sha256"] = stable_digest(
+            recovery_execution_manifest
+        )
     return {
         **body,
         "checkpoint_sha256": stable_digest(body),
@@ -14854,6 +14886,9 @@ async def _validate_entity_catalog_recovery_checkpoint(
         and isinstance(recovery_artifact.output_json, dict)
         else None
     )
+    recovery_execution_manifest_sha256 = checkpoint.get(
+        "recovery_execution_manifest_sha256"
+    )
     if (
         recovery_artifact is None
         or recovery_artifact.status != "completed"
@@ -14869,6 +14904,25 @@ async def _validate_entity_catalog_recovery_checkpoint(
         raise OpenRouterError(
             "Entity-catalog recovery checkpoint output binding mismatch"
         )
+    stored_usage = getattr(recovery_artifact, "usage_json", None)
+    usage = stored_usage if isinstance(stored_usage, dict) else {}
+    manifest = usage.get("_aiv_sharded_document")
+    if isinstance(manifest, dict) and recovery_execution_manifest_sha256 is None:
+        raise OpenRouterError(
+            "Entity-catalog recovery checkpoint omits its shard manifest"
+        )
+    if recovery_execution_manifest_sha256 is not None:
+        if (
+            not isinstance(recovery_execution_manifest_sha256, str)
+            or not isinstance(manifest, dict)
+            or stable_digest(manifest) != recovery_execution_manifest_sha256
+            or manifest.get("complete") is not True
+            or manifest.get("covered_shard_count") != manifest.get("shard_count")
+            or manifest.get("document_sha256") != stable_digest(recovered)
+        ):
+            raise OpenRouterError(
+                "Entity-catalog recovery checkpoint shard manifest mismatch"
+            )
     recovery_contract = recovery_input.get("recovery")
     if (
         recovery_input.get("target") != target
@@ -14942,6 +14996,1363 @@ async def _validate_entity_catalog_recovery_checkpoint(
     return accepted
 
 
+def _entity_catalog_recovery_paired_rows(
+    job: dict[str, Any],
+    *,
+    source_digest: str,
+) -> list[dict[str, Any]]:
+    source_answers = list(job["answers"])
+    model_answers = list(job["model_answers"])
+    if len(source_answers) != len(model_answers) or not source_answers:
+        raise OpenRouterError("Recovery source/model answer coverage mismatch")
+    if stable_digest(source_answers) != source_digest:
+        raise OpenRouterError("Recovery source changed before shard planning")
+    paired: list[dict[str, Any]] = []
+    for source, model_answer_value in zip(
+        source_answers,
+        model_answers,
+        strict=True,
+    ):
+        claim = _core_unit_claim(source)
+        if model_answer_value.get("core_claim") != claim:
+            raise OpenRouterError(
+                "Recovery model answer is not bound to its immutable core"
+            )
+        paired.append(
+            {
+                "source": copy.deepcopy(source),
+                "model_answer": copy.deepcopy(model_answer_value),
+                "claim": claim,
+            }
+        )
+    return paired
+
+
+def _entity_catalog_recovery_shard_payload(
+    rows: list[dict[str, Any]],
+    *,
+    target: dict[str, Any],
+    base_recovery: dict[str, Any],
+) -> dict[str, Any]:
+    unit_ids = [str(row["claim"]["unit_id"]) for row in rows]
+    claims = [copy.deepcopy(row["claim"]) for row in rows]
+    failed_ids = {
+        str(value) for value in base_recovery.get("failed_unit_ids") or []
+    }
+    contract = copy.deepcopy(base_recovery)
+    failed_unit_id = str(contract.get("failed_unit_id") or "")
+    contract["failed_unit_id"] = (
+        failed_unit_id if failed_unit_id in unit_ids else ""
+    )
+    contract["failed_unit_ids"] = [
+        unit_id for unit_id in unit_ids if unit_id in failed_ids
+    ]
+    contract["shard_source_binding"] = {
+        "unit_ids": unit_ids,
+        "unit_ids_sha256": stable_digest(unit_ids),
+        "core_claims_sha256": stable_digest(claims),
+        "source_answers_sha256": stable_digest(
+            [row["source"] for row in rows]
+        ),
+        "model_answers_sha256": stable_digest(
+            [row["model_answer"] for row in rows]
+        ),
+    }
+    return {
+        "target": copy.deepcopy(target),
+        "answers": [copy.deepcopy(row["model_answer"]) for row in rows],
+        "recovery": contract,
+    }
+
+
+def _entity_catalog_recovery_shard_contracts(
+    recovery_system: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {
+            "model": PROCESSING_MODEL,
+            "system_prompt": recovery_system,
+            "prompt_template": "{{payload}}",
+            "parameters": {
+                "temperature": 0.15,
+                "reasoning_effort": "high",
+                "output_token_policy": "model_max_available",
+            },
+            "web_policy": {"policy": "forbidden"},
+            "schema_name": ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+        },
+        {
+            "version": ENTITY_CATALOG_RECOVERY_SHARD_MERGE_VERSION,
+            "algorithm": "validated_catalog_union_exact_dispositions_v1",
+            "coverage": "every_source_core_exactly_once_in_plan_order",
+            "selection": "none",
+        },
+    )
+
+
+def _entity_catalog_recovery_shard_specs(
+    groups: list[list[dict[str, Any]]],
+    *,
+    target: dict[str, Any],
+    base_recovery: dict[str, Any],
+) -> list[ShardSpec]:
+    specs: list[ShardSpec] = []
+    for index, rows in enumerate(groups):
+        payload = _entity_catalog_recovery_shard_payload(
+            rows,
+            target=target,
+            base_recovery=base_recovery,
+        )
+        unit_ids = [str(row["claim"]["unit_id"]) for row in rows]
+        specs.append(
+            ShardSpec(
+                shard_id=(
+                    f"recovery-{index:06d}-"
+                    f"{stable_digest([unit_ids, payload])[:20]}"
+                ),
+                payload=payload,
+            )
+        )
+    return specs
+
+
+async def _cached_entity_catalog_recovery_parent(
+    run_id: str,
+    *,
+    recovery_payload: dict[str, Any],
+    recovery_artifact_key: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    """Validate and return an exact completed parent before planning new work."""
+
+    cached = await _artifact_output(
+        run_id,
+        recovery_artifact_key,
+        input_json=recovery_payload,
+        model=PROCESSING_MODEL,
+        prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+    )
+    if not isinstance(cached, dict):
+        return None
+    artifact = await _entity_catalog_recovery_artifact(
+        run_id,
+        recovery_artifact_key,
+    )
+    if artifact is None:
+        raise OpenRouterError(
+            "Cached recovery output has no durable parent artifact"
+        )
+    usage = artifact.usage_json if isinstance(artifact.usage_json, dict) else {}
+    manifest = usage.get("_aiv_sharded_document")
+    if "_aiv_sharded_document" in usage:
+        if not isinstance(manifest, dict):
+            raise OpenRouterError(
+                "Cached recovery shard manifest is incomplete or mismatched"
+            )
+        shard_count = manifest.get("shard_count")
+        covered_shard_count = manifest.get("covered_shard_count")
+        is_continuable_parent = (
+            manifest.get("version")
+            == ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION
+        )
+        continuable_parent_valid = True
+        if is_continuable_parent:
+            normalized_parent = copy.deepcopy(manifest)
+            manifest_sha256 = str(
+                normalized_parent.pop("manifest_sha256", "")
+            )
+            expected_unit_ids = []
+            for item in recovery_payload.get("answers") or []:
+                embedded_claim = (
+                    item.get("core_claim") if isinstance(item, dict) else None
+                )
+                claim = (
+                    embedded_claim
+                    if isinstance(embedded_claim, dict)
+                    else _core_unit_claim(item)
+                )
+                expected_unit_ids.append(str(claim["unit_id"]))
+            recovery_contract = recovery_payload.get("recovery")
+            source_units_sha256 = (
+                recovery_contract.get("source_units_sha256")
+                if isinstance(recovery_contract, dict)
+                else None
+            )
+            leaves = manifest.get("leaves")
+            terminal_leaf_count = manifest.get("terminal_leaf_count")
+            continuable_parent_valid = bool(
+                manifest_sha256
+                and stable_digest(normalized_parent) == manifest_sha256
+                and manifest.get("coverage_complete") is True
+                and manifest.get("mode") == ResponseMode.PARTITIONED.value
+                and manifest.get("response_mode")
+                == ResponseMode.PARTITIONED.value
+                and manifest.get("composability")
+                == ShardComposability.INDEPENDENT_DISJOINT.value
+                and manifest.get("plan_version")
+                == ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                and manifest.get("merge_version")
+                == ENTITY_CATALOG_RECOVERY_SHARD_MERGE_VERSION
+                and isinstance(leaves, list)
+                and bool(leaves)
+                and manifest.get("root_leaf_count") == len(leaves)
+                and manifest.get("leaves_sha256") == stable_digest(leaves)
+                and manifest.get("unit_ids") == expected_unit_ids
+                and manifest.get("unit_ids_sha256")
+                == stable_digest(expected_unit_ids)
+                and isinstance(source_units_sha256, str)
+                and manifest.get("source_units_sha256")
+                == source_units_sha256
+                and isinstance(terminal_leaf_count, int)
+                and not isinstance(terminal_leaf_count, bool)
+                and terminal_leaf_count == shard_count
+            )
+        if (
+            manifest.get("complete") is not True
+            or not isinstance(shard_count, int)
+            or isinstance(shard_count, bool)
+            or shard_count < 1
+            or covered_shard_count != shard_count
+            or manifest.get("document_sha256") != stable_digest(cached)
+            or not continuable_parent_valid
+        ):
+            raise OpenRouterError(
+                "Cached recovery shard manifest is incomplete or mismatched"
+            )
+        return copy.deepcopy(cached), copy.deepcopy(manifest)
+
+    # A direct recovery artifact from the pre-sharding implementation may have
+    # completed immediately before its accepted checkpoint was saved. Preserve
+    # that paid result only when its exact continuation and transport receipts
+    # bind the raw JSON to this cached object.
+    direct_manifest = usage.get("_aiv_structured_continuation")
+    direct_transport = usage.get("_aiv_transport")
+    raw_text = artifact.raw_text
+    try:
+        parsed_raw = json.loads(raw_text) if isinstance(raw_text, str) else None
+    except (json.JSONDecodeError, TypeError):
+        parsed_raw = None
+    if (
+        not isinstance(direct_manifest, dict)
+        or direct_manifest.get("complete") is not True
+        or not isinstance(direct_transport, dict)
+        or direct_transport.get("output_complete") is not True
+        or not isinstance(raw_text, str)
+        or direct_manifest.get("document_sha256") != text_sha256(raw_text)
+        or direct_transport.get("document_sha256") != text_sha256(raw_text)
+        or parsed_raw != cached
+    ):
+        raise OpenRouterError(
+            "Cached oversized recovery has no complete direct or sharded "
+            "execution receipt"
+        )
+    return copy.deepcopy(cached), None
+
+
+def _preflight_entity_catalog_recovery_shards(
+    *,
+    run_id: str,
+    job: dict[str, Any],
+    target: dict[str, Any],
+    recovery_system: str,
+    extraction_window: dict[str, Any],
+    recovery_payload: dict[str, Any],
+    recovery_artifact_key: str,
+    source_digest: str,
+) -> list[list[dict[str, Any]]]:
+    """Build a finite lossless layout before a semantic attempt is reserved."""
+
+    paired = _entity_catalog_recovery_paired_rows(
+        job,
+        source_digest=source_digest,
+    )
+    base_recovery = recovery_payload.get("recovery")
+    if not isinstance(base_recovery, dict):
+        raise OpenRouterError("Recovery payload has no recovery contract")
+    window_bytes = int(extraction_window["input_utf8_window"])
+    envelope = dict(extraction_window["model_envelope"])
+
+    def physical_bytes(rows: list[dict[str, Any]]) -> int:
+        return _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=envelope,
+            system=recovery_system,
+            user_payload=_entity_catalog_recovery_shard_payload(
+                rows,
+                target=target,
+                base_recovery=base_recovery,
+            ),
+            schema=ENTITY_CATALOG_LEAF_SCHEMA,
+            schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+
+    groups = _byte_bounded_reducer_groups(
+        paired,
+        window_bytes=window_bytes,
+        request_utf8_bytes=physical_bytes,
+    )
+    generation_contract, merge_contract = (
+        _entity_catalog_recovery_shard_contracts(recovery_system)
+    )
+    document_id = f"{run_id}:entity-catalog-recovery:{recovery_artifact_key}"
+    maximum = envelope.get("max_completion_tokens")
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+        maximum = None
+
+    while True:
+        specs = _entity_catalog_recovery_shard_specs(
+            groups,
+            target=target,
+            base_recovery=base_recovery,
+        )
+        plan = build_shard_plan(
+            document_id=document_id,
+            shards=tuple(specs),
+            shard_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+            document_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+            plan_version=ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+            merge_version=ENTITY_CATALOG_RECOVERY_SHARD_MERGE_VERSION,
+            generation_contract=generation_contract,
+            merge_contract=merge_contract,
+            response_mode=ResponseMode.PARTITIONED,
+            composability=ShardComposability.INDEPENDENT_DISJOINT,
+        )
+        store = create_sharded_artifact_store(
+            run_id=run_id,
+            stage_key="knowledge_gap",
+            owner_artifact_key=recovery_artifact_key,
+            model=PROCESSING_MODEL,
+            owner_prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            plan=plan,
+        )
+        oversized = {
+            request.index
+            for request in store.planned_requests()
+            if len(
+                store.provider_request_utf8_bytes(
+                    request,
+                    max_completion_tokens=maximum,
+                )
+            )
+            > window_bytes
+        }
+        if not oversized:
+            return groups
+        next_groups: list[list[dict[str, Any]]] = []
+        for index, group in enumerate(groups):
+            if index not in oversized:
+                next_groups.append(group)
+                continue
+            if len(group) < 2:
+                raise OpenRouterError(
+                    "One minimum recovery core exceeds the exact physical "
+                    "provider window"
+                )
+            midpoint = len(group) // 2
+            next_groups.extend((group[:midpoint], group[midpoint:]))
+        groups = next_groups
+
+
+async def _execute_entity_catalog_recovery_shards(
+    run_id: str,
+    *,
+    job: dict[str, Any],
+    target: dict[str, Any],
+    profile: dict[str, Any],
+    recovery_system: str,
+    extraction_window: dict[str, Any],
+    recovery_payload: dict[str, Any],
+    recovery_artifact_key: str,
+    source_digest: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Execute oversized recovery through durable continuable leaf streams.
+
+    A recovery leaf can require several physical provider turns.  It therefore
+    cannot honestly be represented by the single-POST ``GeneratedShard``
+    contract.  Each byte-bounded leaf receives its own content-addressed
+    structured stream instead.  Output-limited JSON is resumed from the exact
+    durable prefix.  If that prefix consumes the provider context, only a
+    multi-core leaf is split; its accepted prefix remains audit evidence and is
+    never merged with the independently regenerated children.
+    """
+
+    cached_parent = await _cached_entity_catalog_recovery_parent(
+        run_id,
+        recovery_payload=recovery_payload,
+        recovery_artifact_key=recovery_artifact_key,
+    )
+    cached_current_parent = (
+        cached_parent
+        if cached_parent is not None
+        and isinstance(cached_parent[1], dict)
+        and cached_parent[1].get("version")
+        == ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION
+        else None
+    )
+    if cached_parent is not None and cached_current_parent is None:
+        return cached_parent
+
+    base_recovery = recovery_payload.get("recovery")
+    if not isinstance(base_recovery, dict):
+        raise OpenRouterError("Recovery payload has no recovery contract")
+    if cached_current_parent is None:
+        groups = _preflight_entity_catalog_recovery_shards(
+            run_id=run_id,
+            job=job,
+            target=target,
+            recovery_system=recovery_system,
+            extraction_window=extraction_window,
+            recovery_payload=recovery_payload,
+            recovery_artifact_key=recovery_artifact_key,
+            source_digest=source_digest,
+        )
+    else:
+        paired_rows = _entity_catalog_recovery_paired_rows(
+            job,
+            source_digest=source_digest,
+        )
+        cached_manifest = cached_current_parent[1]
+        assert isinstance(cached_manifest, dict)
+        root_leaves = cached_manifest.get("leaves")
+        if not isinstance(root_leaves, list) or not root_leaves:
+            raise OpenRouterError(
+                "Cached recovery parent has no root leaf manifests"
+            )
+        groups = []
+        cursor = 0
+        for root_manifest in root_leaves:
+            root_unit_ids = (
+                root_manifest.get("unit_ids")
+                if isinstance(root_manifest, dict)
+                else None
+            )
+            if not isinstance(root_unit_ids, list) or not root_unit_ids:
+                raise OpenRouterError(
+                    "Cached recovery root leaf coverage is malformed"
+                )
+            rows = paired_rows[cursor : cursor + len(root_unit_ids)]
+            observed_unit_ids = [
+                str(row["claim"]["unit_id"]) for row in rows
+            ]
+            if observed_unit_ids != root_unit_ids:
+                raise OpenRouterError(
+                    "Cached recovery root leaf coverage changed"
+                )
+            groups.append(rows)
+            cursor += len(root_unit_ids)
+        if cursor != len(paired_rows):
+            raise OpenRouterError(
+                "Cached recovery root leaves do not cover the source"
+            )
+    window_bytes = int(extraction_window["input_utf8_window"])
+    envelope = dict(extraction_window["model_envelope"])
+
+    generation_contract, merge_contract = (
+        _entity_catalog_recovery_shard_contracts(recovery_system)
+    )
+
+    if cached_current_parent is None:
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key=recovery_artifact_key,
+            status="running",
+            model=PROCESSING_MODEL,
+            input_json=recovery_payload,
+            prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            preserve_existing_evidence=True,
+        )
+
+    def subset_job(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            **job,
+            "answers": [copy.deepcopy(row["source"]) for row in rows],
+            "model_answers": [
+                copy.deepcopy(row["model_answer"]) for row in rows
+            ],
+        }
+
+    def merge_values(
+        values: list[dict[str, Any]],
+        row_groups: list[list[dict[str, Any]]],
+        *,
+        parent_job: dict[str, Any],
+    ) -> dict[str, Any]:
+        if len(values) != len(row_groups) or not values:
+            raise OpenRouterError("Recovery shard merge coverage mismatch")
+        accepted_leaves: list[dict[str, Any]] = []
+        dispositions: list[dict[str, Any]] = []
+        for value, rows in zip(values, row_groups, strict=True):
+            if not isinstance(value, dict):
+                raise OpenRouterError("Recovery merge received a non-object")
+            accepted_leaves.append(
+                _validated_recovered_entity_catalog_leaf(
+                    value,
+                    job=subset_job(rows),
+                    profile=profile,
+                )
+            )
+            raw_dispositions = value.get("core_dispositions")
+            if not isinstance(raw_dispositions, list):
+                raise OpenRouterError("Recovery shard lost core dispositions")
+            dispositions.extend(copy.deepcopy(raw_dispositions))
+        merged = {
+            "catalog": _deterministic_entity_catalog_union(accepted_leaves),
+            "core_dispositions": dispositions,
+        }
+        _validated_recovered_entity_catalog_leaf(
+            merged,
+            job=parent_job,
+            profile=profile,
+        )
+        return merged
+
+    def leaf_record(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        payload = _entity_catalog_recovery_shard_payload(
+            rows,
+            target=target,
+            base_recovery=base_recovery,
+        )
+        unit_ids = [str(row["claim"]["unit_id"]) for row in rows]
+        identity = {
+            "version": ENTITY_CATALOG_RECOVERY_LEAF_MANIFEST_VERSION,
+            "executor_version": ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+            "parent_artifact_key": recovery_artifact_key,
+            "parent_input_sha256": stable_digest(recovery_payload),
+            "payload_sha256": stable_digest(payload),
+            "unit_ids": unit_ids,
+            "unit_ids_sha256": stable_digest(unit_ids),
+            "core_claims_sha256": stable_digest(
+                [row["claim"] for row in rows]
+            ),
+            "source_answers_sha256": stable_digest(
+                [row["source"] for row in rows]
+            ),
+            "model_answers_sha256": stable_digest(
+                [row["model_answer"] for row in rows]
+            ),
+        }
+        source_sha256 = stable_digest(identity)
+        return {
+            "identity": identity,
+            "source_sha256": source_sha256,
+            "artifact_key": f"ecr_leaf_{source_sha256[:48]}",
+            "document_id": (
+                f"{run_id}:entity-catalog-recovery-leaf:{source_sha256}"
+            ),
+            "payload": payload,
+            "unit_ids": unit_ids,
+        }
+
+    def validate_sealed_manifest(
+        manifest: Any,
+        *,
+        expected_unit_ids: list[str],
+        expected_output_sha256: str,
+    ) -> dict[str, Any]:
+        if not isinstance(manifest, dict):
+            raise OpenRouterError("Recovery leaf manifest is missing")
+        normalized = copy.deepcopy(manifest)
+        digest = str(normalized.pop("manifest_sha256", ""))
+        if not digest or stable_digest(normalized) != digest:
+            raise OpenRouterError("Recovery leaf manifest digest mismatch")
+        if (
+            manifest.get("version")
+            != ENTITY_CATALOG_RECOVERY_LEAF_MANIFEST_VERSION
+            or manifest.get("complete") is not True
+            or manifest.get("coverage_complete") is not True
+            or manifest.get("response_mode")
+            != ResponseMode.PARTITIONED.value
+            or manifest.get("unit_ids") != expected_unit_ids
+            or manifest.get("unit_ids_sha256")
+            != stable_digest(expected_unit_ids)
+            or manifest.get("output_sha256") != expected_output_sha256
+        ):
+            raise OpenRouterError("Recovery leaf manifest binding mismatch")
+        children = manifest.get("children")
+        if not isinstance(children, list):
+            raise OpenRouterError("Recovery leaf manifest children are invalid")
+        structured_evidence = manifest.get("structured_evidence")
+        if (
+            not isinstance(manifest.get("source_sha256"), str)
+            or not isinstance(manifest.get("source_identity_sha256"), str)
+            or not isinstance(manifest.get("payload_sha256"), str)
+            or manifest.get("children_sha256") != stable_digest(children)
+            or not isinstance(structured_evidence, dict)
+            or manifest.get("structured_evidence_sha256")
+            != stable_digest(structured_evidence)
+        ):
+            raise OpenRouterError("Recovery leaf evidence binding mismatch")
+        covered: list[str] = []
+        terminal_count = 0
+        for child in children:
+            if not isinstance(child, dict):
+                raise OpenRouterError("Recovery child manifest is invalid")
+            child_unit_ids = child.get("unit_ids")
+            child_output_sha256 = child.get("output_sha256")
+            if (
+                not isinstance(child_unit_ids, list)
+                or not all(isinstance(value, str) for value in child_unit_ids)
+                or not isinstance(child_output_sha256, str)
+            ):
+                raise OpenRouterError(
+                    "Recovery child manifest identity is malformed"
+                )
+            validate_sealed_manifest(
+                child,
+                expected_unit_ids=child_unit_ids,
+                expected_output_sha256=child_output_sha256,
+            )
+            covered.extend(child_unit_ids)
+            terminal_count += int(child["terminal_leaf_count"])
+        if not children:
+            covered = list(expected_unit_ids)
+            terminal_count = 1
+        if (
+            covered != expected_unit_ids
+            or len(covered) != len(set(covered))
+            or manifest.get("terminal_leaf_count") != terminal_count
+            or manifest.get("shard_count") != terminal_count
+            or manifest.get("covered_shard_count") != terminal_count
+        ):
+            raise OpenRouterError("Recovery leaf manifest lost exact coverage")
+        return copy.deepcopy(manifest)
+
+    def seal_leaf_manifest(
+        *,
+        record: dict[str, Any],
+        value: dict[str, Any],
+        children: list[dict[str, Any]],
+        structured_evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        covered = [
+            str(unit_id)
+            for child in children
+            for unit_id in child.get("unit_ids") or []
+        ]
+        terminal_count = sum(
+            int(child.get("terminal_leaf_count") or 0)
+            for child in children
+        )
+        if not children:
+            covered = list(record["unit_ids"])
+            terminal_count = 1
+        if covered != record["unit_ids"] or len(covered) != len(set(covered)):
+            raise OpenRouterError("Recovery leaf replan changed source coverage")
+        body = {
+            "version": ENTITY_CATALOG_RECOVERY_LEAF_MANIFEST_VERSION,
+            "response_mode": ResponseMode.PARTITIONED.value,
+            "composability": ShardComposability.INDEPENDENT_DISJOINT.value,
+            "complete": True,
+            "coverage_complete": True,
+            "source_sha256": record["source_sha256"],
+            "source_identity_sha256": stable_digest(record["identity"]),
+            "payload_sha256": record["identity"]["payload_sha256"],
+            "unit_ids": list(record["unit_ids"]),
+            "unit_ids_sha256": stable_digest(record["unit_ids"]),
+            "output_sha256": stable_digest(value),
+            "terminal_leaf_count": terminal_count,
+            "shard_count": terminal_count,
+            "covered_shard_count": terminal_count,
+            "children": copy.deepcopy(children),
+            "children_sha256": stable_digest(children),
+            "structured_evidence": copy.deepcopy(structured_evidence),
+            "structured_evidence_sha256": stable_digest(structured_evidence),
+        }
+        manifest = {**body, "manifest_sha256": stable_digest(body)}
+        return validate_sealed_manifest(
+            manifest,
+            expected_unit_ids=list(record["unit_ids"]),
+            expected_output_sha256=stable_digest(value),
+        )
+
+    async def execute_leaf(
+        rows: list[dict[str, Any]],
+        *,
+        require_completed_cache: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        record = leaf_record(rows)
+        leaf_job = subset_job(rows)
+        messages = [
+            {"role": "system", "content": recovery_system},
+            {
+                "role": "user",
+                "content": json.dumps(record["payload"], ensure_ascii=False),
+            },
+        ]
+        leaf_artifact = await _entity_catalog_recovery_artifact(
+            run_id,
+            record["artifact_key"],
+        )
+        if require_completed_cache and (
+            leaf_artifact is None or leaf_artifact.status != "completed"
+        ):
+            raise OpenRouterError(
+                "Completed recovery parent references a missing child leaf"
+            )
+        if leaf_artifact is not None and leaf_artifact.input_json != record[
+            "identity"
+        ]:
+            raise OpenRouterError(
+                "Recovery content-addressed leaf identity collision"
+            )
+        leaf_usage = (
+            leaf_artifact.usage_json
+            if leaf_artifact is not None
+            and isinstance(leaf_artifact.usage_json, dict)
+            else {}
+        )
+        if leaf_artifact is not None and leaf_artifact.status == "completed":
+            cached_value = leaf_artifact.output_json
+            raw_text = leaf_artifact.raw_text
+            leaf_manifest = leaf_usage.get(
+                "_aiv_entity_catalog_recovery_leaf"
+            )
+            try:
+                parsed_raw = (
+                    json.loads(raw_text)
+                    if isinstance(raw_text, str)
+                    else None
+                )
+            except (json.JSONDecodeError, TypeError):
+                parsed_raw = None
+            if (
+                leaf_artifact.model != PROCESSING_MODEL
+                or leaf_artifact.prompt_version
+                != ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                or not isinstance(cached_value, dict)
+                or not isinstance(raw_text, str)
+                or parsed_raw != cached_value
+                or not isinstance(leaf_manifest, dict)
+                or leaf_manifest.get("source_sha256")
+                != record["source_sha256"]
+                or leaf_manifest.get("source_identity_sha256")
+                != stable_digest(record["identity"])
+                or leaf_manifest.get("payload_sha256")
+                != record["identity"]["payload_sha256"]
+                or not isinstance(
+                    leaf_manifest.get("structured_evidence"), dict
+                )
+                or leaf_manifest["structured_evidence"].get(
+                    "raw_text_sha256"
+                )
+                != text_sha256(raw_text)
+            ):
+                raise OpenRouterError(
+                    "Completed recovery leaf cache is tampered or mismatched"
+                )
+            validate_sealed_manifest(
+                leaf_manifest,
+                expected_unit_ids=list(record["unit_ids"]),
+                expected_output_sha256=stable_digest(cached_value),
+            )
+            structured_evidence = leaf_manifest["structured_evidence"]
+            evidence_mode = structured_evidence.get("mode")
+            checkpoint_complete = evidence_mode == "continuable_document"
+            if evidence_mode not in {
+                "continuable_document",
+                "prefix_context_repartition",
+            }:
+                raise OpenRouterError(
+                    "Completed recovery leaf has an unknown receipt mode"
+                )
+            checkpoint = await load_structured_checkpoint(
+                run_id,
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                complete=checkpoint_complete,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            if (
+                not isinstance(checkpoint, dict)
+                or stable_digest(checkpoint)
+                != structured_evidence.get("checkpoint_sha256")
+                or stable_digest(checkpoint.get("resume_contract"))
+                != structured_evidence.get("resume_contract_sha256")
+                or stable_digest(checkpoint.get("manifest"))
+                != structured_evidence.get("structured_manifest_sha256")
+                or len(checkpoint.get("call_records") or [])
+                != structured_evidence.get("physical_call_count")
+                or stable_digest(checkpoint.get("call_records") or [])
+                != structured_evidence.get("physical_call_chain_sha256")
+            ):
+                raise OpenRouterError(
+                    "Completed recovery leaf physical receipts are missing "
+                    "or mismatched"
+                )
+            if checkpoint_complete:
+                restored = restore_completed_structured_checkpoint(
+                    checkpoint,
+                    PROCESSING_MODEL,
+                    messages,
+                    ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                    ENTITY_CATALOG_LEAF_SCHEMA,
+                    record["document_id"],
+                    reasoning_effort="high",
+                    temperature=0.15,
+                )
+                if (
+                    restored.text != raw_text
+                    or restored.parsed != cached_value
+                ):
+                    raise OpenRouterError(
+                        "Completed recovery leaf receipt output mismatches cache"
+                    )
+            else:
+                abandoned_prefix = structured_evidence.get(
+                    "abandoned_prefix"
+                )
+                checkpoint_manifest = checkpoint.get("manifest")
+                if (
+                    checkpoint.get("status")
+                    != "replanning_to_composable_shards"
+                    or not isinstance(abandoned_prefix, dict)
+                    or not isinstance(checkpoint_manifest, dict)
+                    or checkpoint_manifest.get("document_sha256")
+                    != abandoned_prefix.get("document_sha256")
+                    or checkpoint_manifest.get("document_chars")
+                    != abandoned_prefix.get("document_chars")
+                ):
+                    raise OpenRouterError(
+                        "Completed recovery repartition receipt is invalid"
+                    )
+            child_manifests = leaf_manifest.get("children") or []
+            if child_manifests:
+                child_results: list[
+                    tuple[dict[str, Any], dict[str, Any]]
+                ] = []
+                cursor = 0
+                child_groups: list[list[dict[str, Any]]] = []
+                for child_manifest in child_manifests:
+                    child_unit_ids = child_manifest.get("unit_ids")
+                    if not isinstance(child_unit_ids, list):
+                        raise OpenRouterError(
+                            "Completed recovery child coverage is malformed"
+                        )
+                    child_rows = rows[cursor : cursor + len(child_unit_ids)]
+                    observed_ids = [
+                        str(row["claim"]["unit_id"])
+                        for row in child_rows
+                    ]
+                    if observed_ids != child_unit_ids:
+                        raise OpenRouterError(
+                            "Completed recovery child coverage changed"
+                        )
+                    child_groups.append(child_rows)
+                    child_results.append(
+                        await execute_leaf(
+                            child_rows,
+                            require_completed_cache=True,
+                        )
+                    )
+                    cursor += len(child_unit_ids)
+                if cursor != len(rows) or [
+                    manifest for _value, manifest in child_results
+                ] != child_manifests:
+                    raise OpenRouterError(
+                        "Completed recovery child manifest cache mismatches"
+                    )
+                child_merged = merge_values(
+                    [value for value, _manifest in child_results],
+                    child_groups,
+                    parent_job=leaf_job,
+                )
+                if child_merged != cached_value:
+                    raise OpenRouterError(
+                        "Completed recovery child values do not reconstruct "
+                        "their parent"
+                    )
+            try:
+                _validated_recovered_entity_catalog_leaf(
+                    cached_value,
+                    job=leaf_job,
+                    profile=profile,
+                )
+            except Exception as exc:
+                raise OpenRouterError(
+                    "Completed recovery leaf cache fails semantic validation"
+                ) from exc
+            return copy.deepcopy(cached_value), copy.deepcopy(leaf_manifest)
+        terminal_block = leaf_usage.get(
+            "_aiv_entity_catalog_recovery_singleton_block"
+        )
+        if (
+            leaf_artifact is not None
+            and leaf_artifact.status == "failed"
+            and isinstance(terminal_block, dict)
+            and terminal_block.get("version")
+            == ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION
+            and terminal_block.get("source_sha256") == record["source_sha256"]
+            and terminal_block.get("unit_ids") == record["unit_ids"]
+        ):
+            raise _EntityCatalogRecoverySingletonContextError(
+                "One minimum recovery core exhausted provider context; "
+                "the paid prefix is preserved and the identical request "
+                "will not be posted again"
+            )
+
+        request_bytes = _structured_provider_request_utf8_bytes(
+            model=PROCESSING_MODEL,
+            model_envelope=envelope,
+            system=recovery_system,
+            user_payload=record["payload"],
+            schema=ENTITY_CATALOG_LEAF_SCHEMA,
+            schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+            reasoning_effort="high",
+            temperature=0.15,
+        )
+        if request_bytes > window_bytes:
+            raise OpenRouterError(
+                "Recovery continuable leaf exceeds its exact physical input "
+                f"window: {request_bytes}>{window_bytes}"
+            )
+
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key=record["artifact_key"],
+            status="running",
+            model=PROCESSING_MODEL,
+            input_json=record["identity"],
+            prompt_version=ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+            preserve_existing_evidence=True,
+        )
+        audit_checkpoint, resume_checkpoint = (
+            await _durable_structured_transport(
+                run_id,
+                stage_key="knowledge_gap",
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+        )
+        resumed_from_checkpoint = resume_checkpoint is not None
+        singleton_error: _EntityCatalogRecoverySingletonContextError | None = (
+            None
+        )
+
+        async def composable_failover(_request: dict[str, Any]) -> ChatResult:
+            nonlocal singleton_error
+            if len(rows) < 2:
+                singleton_error = _EntityCatalogRecoverySingletonContextError(
+                    "One minimum recovery core exhausted provider context; "
+                    "the paid prefix is preserved and the leaf cannot be "
+                    "split without changing its immutable source contract"
+                )
+                block = {
+                    "version": ENTITY_CATALOG_RECOVERY_SINGLETON_BLOCK_VERSION,
+                    "source_sha256": record["source_sha256"],
+                    "unit_ids": list(record["unit_ids"]),
+                    "reason": "prefix_context_exhausted_at_minimum_core",
+                }
+                await _save_artifact(
+                    run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=record["artifact_key"],
+                    status="failed",
+                    model=PROCESSING_MODEL,
+                    input_json=record["identity"],
+                    usage_json={
+                        "_aiv_entity_catalog_recovery_singleton_block": block
+                    },
+                    error_message=str(singleton_error),
+                    prompt_version=(
+                        ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                    ),
+                    preserve_existing_evidence=True,
+                )
+                raise singleton_error
+            midpoint = len(rows) // 2
+            child_groups = [rows[:midpoint], rows[midpoint:]]
+            child_results = [
+                await execute_leaf(child_rows)
+                for child_rows in child_groups
+            ]
+            child_values = [value for value, _manifest in child_results]
+            child_manifests = [
+                manifest for _value, manifest in child_results
+            ]
+            merged = merge_values(
+                child_values,
+                child_groups,
+                parent_job=leaf_job,
+            )
+            partition_evidence = {
+                "mode": "context_headroom_repartition",
+                "parent_source_sha256": record["source_sha256"],
+                "child_source_sha256": [
+                    child["source_sha256"] for child in child_manifests
+                ],
+            }
+            nested_manifest = seal_leaf_manifest(
+                record=record,
+                value=merged,
+                children=child_manifests,
+                structured_evidence=partition_evidence,
+            )
+            return ChatResult(
+                text=json.dumps(
+                    merged,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                parsed=copy.deepcopy(merged),
+                citations=[],
+                usage={"_aiv_sharded_document": nested_manifest},
+                annotations=[],
+                request_policy={"policy": "forbidden"},
+                web_attestation={"metric_eligible": True},
+                router_metadata={},
+                transport={
+                    "status": "succeeded",
+                    "http_status": 200,
+                    "output_complete": True,
+                    "output_limited": False,
+                    "mode": ResponseMode.PARTITIONED.value,
+                },
+            )
+
+        try:
+            result = await chat_continuable_structured(
+                model=PROCESSING_MODEL,
+                messages=messages,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                reasoning_effort="high",
+                temperature=0.15,
+                document_id=record["document_id"],
+                retry_transport_errors=False,
+                audit_checkpoint=audit_checkpoint,
+                resume_checkpoint=resume_checkpoint,
+                composable_failover=composable_failover,
+            )
+        except OpenRouterStructuredContinuationError as exc:
+            if singleton_error is not None:
+                raise singleton_error from exc
+            raise
+        if not isinstance(result.parsed, dict):
+            raise OpenRouterError("Recovery continuable leaf returned no object")
+        value = copy.deepcopy(result.parsed)
+        try:
+            _validated_recovered_entity_catalog_leaf(
+                value,
+                job=leaf_job,
+                profile=profile,
+            )
+        except Exception as exc:
+            raise _EntityCatalogRecoveryShardSemanticError(str(exc)) from exc
+
+        result_usage = result.usage if isinstance(result.usage, dict) else {}
+        abandoned_prefix = result_usage.get(
+            "_aiv_abandoned_structured_prefix"
+        )
+        children: list[dict[str, Any]] = []
+        if isinstance(abandoned_prefix, dict):
+            nested_manifest = result_usage.get("_aiv_sharded_document")
+            if not isinstance(nested_manifest, dict):
+                raise OpenRouterError(
+                    "Recovery context replan has no child manifest"
+                )
+            children = copy.deepcopy(nested_manifest.get("children") or [])
+            validate_sealed_manifest(
+                nested_manifest,
+                expected_unit_ids=list(record["unit_ids"]),
+                expected_output_sha256=stable_digest(value),
+            )
+            checkpoint = await load_structured_checkpoint(
+                run_id,
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                complete=False,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            checkpoint_manifest = (
+                checkpoint.get("manifest")
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            if (
+                not isinstance(checkpoint, dict)
+                or checkpoint.get("status")
+                != "replanning_to_composable_shards"
+                or not isinstance(checkpoint_manifest, dict)
+                or checkpoint_manifest.get("complete") is not False
+                or checkpoint_manifest.get("document_sha256")
+                != abandoned_prefix.get("document_sha256")
+                or checkpoint_manifest.get("document_chars")
+                != abandoned_prefix.get("document_chars")
+            ):
+                raise OpenRouterError(
+                    "Recovery abandoned prefix checkpoint is invalid"
+                )
+            structured_evidence = {
+                "mode": "prefix_context_repartition",
+                "checkpoint_sha256": stable_digest(checkpoint),
+                "resume_contract_sha256": stable_digest(
+                    checkpoint.get("resume_contract")
+                ),
+                "structured_manifest_sha256": stable_digest(
+                    checkpoint_manifest
+                ),
+                "physical_call_count": len(
+                    checkpoint.get("call_records") or []
+                ),
+                "physical_call_chain_sha256": stable_digest(
+                    checkpoint.get("call_records") or []
+                ),
+                "resumed_from_checkpoint": resumed_from_checkpoint,
+                "raw_text_sha256": text_sha256(result.text),
+                "abandoned_prefix": copy.deepcopy(abandoned_prefix),
+                "child_manifest_sha256": stable_digest(children),
+            }
+        else:
+            checkpoint = await load_structured_checkpoint(
+                run_id,
+                owner_artifact_key=record["artifact_key"],
+                source_input=record["identity"],
+                model=PROCESSING_MODEL,
+                owner_prompt_version=(
+                    ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+                ),
+                messages=messages,
+                schema_name=ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                response_schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                document_id=record["document_id"],
+                complete=True,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            if not isinstance(checkpoint, dict):
+                raise OpenRouterError(
+                    "Recovery leaf has no complete structured checkpoint"
+                )
+            restored = restore_completed_structured_checkpoint(
+                checkpoint,
+                PROCESSING_MODEL,
+                messages,
+                ENTITY_CATALOG_RECOVERY_SHARD_SCHEMA_NAME,
+                ENTITY_CATALOG_LEAF_SCHEMA,
+                record["document_id"],
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            checkpoint_manifest = checkpoint.get("manifest")
+            if (
+                not isinstance(checkpoint_manifest, dict)
+                or checkpoint_manifest.get("complete") is not True
+                or not isinstance(restored.parsed, dict)
+                or stable_digest(restored.parsed) != stable_digest(value)
+                or restored.text != result.text
+            ):
+                raise OpenRouterError(
+                    "Recovery leaf structured receipt chain is invalid"
+                )
+            structured_evidence = {
+                "mode": "continuable_document",
+                "checkpoint_sha256": stable_digest(checkpoint),
+                "resume_contract_sha256": stable_digest(
+                    checkpoint.get("resume_contract")
+                ),
+                "structured_manifest_sha256": stable_digest(
+                    checkpoint_manifest
+                ),
+                "physical_call_count": len(
+                    checkpoint.get("call_records") or []
+                ),
+                "physical_call_chain_sha256": stable_digest(
+                    checkpoint.get("call_records") or []
+                ),
+                "resumed_from_checkpoint": resumed_from_checkpoint,
+                "raw_text_sha256": text_sha256(result.text),
+            }
+        if int(structured_evidence["physical_call_count"]) < 1:
+            raise OpenRouterError(
+                "Recovery structured leaf has no physical provider receipt"
+            )
+        manifest = seal_leaf_manifest(
+            record=record,
+            value=value,
+            children=children,
+            structured_evidence=structured_evidence,
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key=record["artifact_key"],
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=record["identity"],
+            output_json=value,
+            raw_text=result.text,
+            usage_json={
+                "_aiv_entity_catalog_recovery_leaf": manifest
+            },
+            prompt_version=ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+        )
+        return value, manifest
+
+    try:
+        root_results = [
+            await execute_leaf(
+                rows,
+                require_completed_cache=(cached_current_parent is not None),
+            )
+            for rows in groups
+        ]
+        root_values = [value for value, _manifest in root_results]
+        root_manifests = [manifest for _value, manifest in root_results]
+        document = merge_values(
+            root_values,
+            groups,
+            parent_job=job,
+        )
+        if stable_digest(job["answers"]) != source_digest:
+            raise OpenRouterError("Recovery source changed during shard execution")
+        expected_unit_ids = [
+            str(_core_unit_claim(item)["unit_id"])
+            for item in job["answers"]
+        ]
+        covered_unit_ids = [
+            str(unit_id)
+            for manifest in root_manifests
+            for unit_id in manifest["unit_ids"]
+        ]
+        terminal_count = sum(
+            int(manifest["terminal_leaf_count"])
+            for manifest in root_manifests
+        )
+        if (
+            covered_unit_ids != expected_unit_ids
+            or len(covered_unit_ids) != len(set(covered_unit_ids))
+            or terminal_count < 1
+        ):
+            raise OpenRouterError(
+                "Recovery parent manifest lost exact source coverage"
+            )
+        if cached_current_parent is not None:
+            cached_document, cached_manifest = cached_current_parent
+            if (
+                document != cached_document
+                or root_manifests != cached_manifest.get("leaves")
+                or stable_digest(document)
+                != cached_manifest.get("document_sha256")
+            ):
+                raise OpenRouterError(
+                    "Cached recovery parent does not reconstruct from its "
+                    "durable root leaves"
+                )
+            return (
+                copy.deepcopy(cached_document),
+                copy.deepcopy(cached_manifest),
+            )
+        parent_body = {
+            "version": ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION,
+            "mode": ResponseMode.PARTITIONED.value,
+            "response_mode": ResponseMode.PARTITIONED.value,
+            "composability": ShardComposability.INDEPENDENT_DISJOINT.value,
+            "complete": True,
+            "coverage_complete": True,
+            "document_id": (
+                f"{run_id}:entity-catalog-recovery:{recovery_artifact_key}"
+            ),
+            "plan_version": ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION,
+            "merge_version": ENTITY_CATALOG_RECOVERY_SHARD_MERGE_VERSION,
+            "generation_contract_sha256": stable_digest(
+                generation_contract
+            ),
+            "merge_contract_sha256": stable_digest(merge_contract),
+            "source_units_sha256": source_digest,
+            "unit_ids": expected_unit_ids,
+            "unit_ids_sha256": stable_digest(expected_unit_ids),
+            "root_leaf_count": len(root_manifests),
+            "terminal_leaf_count": terminal_count,
+            "shard_count": terminal_count,
+            "covered_shard_count": terminal_count,
+            "leaves": copy.deepcopy(root_manifests),
+            "leaves_sha256": stable_digest(root_manifests),
+            "document_sha256": stable_digest(document),
+        }
+        parent_manifest = {
+            **parent_body,
+            "manifest_sha256": stable_digest(parent_body),
+        }
+        canonical = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        usage = {
+            "_aiv_sharded_document": copy.deepcopy(parent_manifest),
+            "resumed_shards": sum(
+                1
+                for manifest in root_manifests
+                if manifest["structured_evidence"].get(
+                    "resumed_from_checkpoint"
+                )
+                is True
+            ),
+            "generated_shards": terminal_count,
+        }
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key=recovery_artifact_key,
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=recovery_payload,
+            output_json=document,
+            raw_text=canonical,
+            usage_json=usage,
+            prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        )
+        return copy.deepcopy(document), copy.deepcopy(parent_manifest)
+    except Exception as exc:
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key=recovery_artifact_key,
+            status="failed",
+            model=PROCESSING_MODEL,
+            input_json=recovery_payload,
+            error_message=str(exc),
+            prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            preserve_existing_evidence=True,
+        )
+        raise
+
+
 async def _recover_entity_catalog_chunk_contract(
     run_id: str,
     *,
@@ -14981,6 +16392,9 @@ async def _recover_entity_catalog_chunk_contract(
     }
     facts = {
         "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "executor_harness_version": (
+            ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+        ),
         "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
         "grounding_filter_version": ENTITY_CATALOG_GROUNDING_FILTER_VERSION,
         "acceptance_policy": copy.deepcopy(ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY),
@@ -15013,6 +16427,9 @@ async def _recover_entity_catalog_chunk_contract(
         **incident,
         "artifact_key": base_artifact_key,
         "contract_error": str(contract_error),
+        "executor_harness_version": (
+            ENTITY_CATALOG_RECOVERY_SHARD_PLAN_VERSION
+        ),
     }
     stage_key = _entity_catalog_recovery_stage_key(
         job=job,
@@ -15095,6 +16512,7 @@ async def _recover_entity_catalog_chunk_contract(
         ) from planner_error
 
     execution_state = await recovery_execution_state(plan)
+    attempt_cursor = execution_state.execution_attempts
     reserved_attempt = (
         execution_state.execution_attempts
         if execution_state.status == "executing"
@@ -15102,15 +16520,19 @@ async def _recover_entity_catalog_chunk_contract(
     )
 
     async def reserve_or_resume_attempt() -> int:
-        nonlocal reserved_attempt
+        nonlocal attempt_cursor, reserved_attempt
         if reserved_attempt is not None:
             attempt = reserved_attempt
             reserved_attempt = None
-            return attempt
-        return await mark_recovery_executing(
-            plan,
-            stage_execution_limit=(ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS),
-        )
+        else:
+            attempt = await mark_recovery_executing(
+                plan,
+                stage_execution_limit=(
+                    ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS
+                ),
+            )
+        attempt_cursor = attempt
+        return attempt
 
     before_digest = stable_digest(
         {
@@ -15250,49 +16672,231 @@ async def _recover_entity_catalog_chunk_contract(
     attempt_failures: list[dict[str, Any]] = []
     last_error: Exception = contract_error
     while True:
-        attempt_number = await reserve_or_resume_attempt()
+        preview_attempt = (
+            reserved_attempt
+            if reserved_attempt is not None
+            else attempt_cursor + 1
+        )
         (
             recovery_payload,
             recovery_artifact_key,
             recovery_schema_name,
-        ) = recovery_request(attempt_number)
-        request_bytes = _structured_provider_request_utf8_bytes(
-            model=PROCESSING_MODEL,
-            model_envelope=extraction_window["model_envelope"],
-            system=recovery_system,
-            user_payload=recovery_payload,
-            schema=ENTITY_CATALOG_LEAF_SCHEMA,
-            schema_name=recovery_schema_name,
-            reasoning_effort="high",
-            temperature=0.15,
+        ) = recovery_request(preview_attempt)
+        cached_parent = await _cached_entity_catalog_recovery_parent(
+            run_id,
+            recovery_payload=recovery_payload,
+            recovery_artifact_key=recovery_artifact_key,
         )
-        if request_bytes > int(extraction_window["input_utf8_window"]):
-            last_error = OpenRouterError(
-                "Entity-catalog recovery request does not fit the physical "
-                "model input window"
+        cached_parent_manifest = (
+            cached_parent[1] if cached_parent is not None else None
+        )
+        requires_deep_cache_validation = bool(
+            isinstance(cached_parent_manifest, dict)
+            and cached_parent_manifest.get("version")
+            == ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION
+        )
+        use_sharded_recovery = requires_deep_cache_validation
+        if cached_parent is None:
+            request_bytes = _structured_provider_request_utf8_bytes(
+                model=PROCESSING_MODEL,
+                model_envelope=extraction_window["model_envelope"],
+                system=recovery_system,
+                user_payload=recovery_payload,
+                schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                schema_name=recovery_schema_name,
+                reasoning_effort="high",
+                temperature=0.15,
+            )
+            use_sharded_recovery = request_bytes > int(
+                extraction_window["input_utf8_window"]
+            )
+            if use_sharded_recovery:
+                _preflight_entity_catalog_recovery_shards(
+                    run_id=run_id,
+                    job=job,
+                    target=target,
+                    recovery_system=recovery_system,
+                    extraction_window=extraction_window,
+                    recovery_payload=recovery_payload,
+                    recovery_artifact_key=recovery_artifact_key,
+                    source_digest=source_digest,
+                )
+        attempt_number = await reserve_or_resume_attempt()
+        if attempt_number != preview_attempt:
+            raise OrchestratorContractError(
+                "Entity-catalog recovery attempt changed after preflight"
+            )
+
+        recovery_execution_manifest: dict[str, Any] | None = None
+        try:
+            if cached_parent is not None and not requires_deep_cache_validation:
+                recovered, recovery_execution_manifest = cached_parent
+            elif use_sharded_recovery:
+                (
+                    recovered,
+                    recovery_execution_manifest,
+                ) = await _execute_entity_catalog_recovery_shards(
+                    run_id,
+                    job=job,
+                    target=target,
+                    profile=profile,
+                    recovery_system=recovery_system,
+                    extraction_window=extraction_window,
+                    recovery_payload=recovery_payload,
+                    recovery_artifact_key=recovery_artifact_key,
+                    source_digest=source_digest,
+                )
+            else:
+                direct_failover_error: (
+                    _EntityCatalogRecoverySingletonContextError
+                    | _EntityCatalogRecoveryShardSemanticError
+                    | None
+                ) = None
+
+                async def direct_recovery_failover(
+                    request: dict[str, Any],
+                    *,
+                    bound_artifact_key: str = recovery_artifact_key,
+                    bound_payload_json: str = json.dumps(
+                        recovery_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    bound_schema_name: str = recovery_schema_name,
+                ) -> ChatResult:
+                    nonlocal direct_failover_error
+                    nonlocal recovery_execution_manifest
+                    bound_payload = json.loads(bound_payload_json)
+                    expected_document_id = (
+                        f"{run_id}:{bound_artifact_key}:"
+                        f"{_stable_json_sha256(bound_payload)[:20]}"
+                    )
+                    if (
+                        request.get("reason")
+                        != "prefix_context_exhausted"
+                        or request.get("model") != PROCESSING_MODEL
+                        or request.get("schema_name")
+                        != bound_schema_name
+                        or request.get("document_id")
+                        != expected_document_id
+                        or request.get("response_schema")
+                        != ENTITY_CATALOG_LEAF_SCHEMA
+                    ):
+                        raise OpenRouterError(
+                            "Direct recovery composable failover contract "
+                            "mismatch"
+                        )
+                    try:
+                        recovered_document, manifest = (
+                            await _execute_entity_catalog_recovery_shards(
+                                run_id,
+                                job=job,
+                                target=target,
+                                profile=profile,
+                                recovery_system=recovery_system,
+                                extraction_window=extraction_window,
+                                recovery_payload=bound_payload,
+                                recovery_artifact_key=bound_artifact_key,
+                                source_digest=source_digest,
+                            )
+                        )
+                    except (
+                        _EntityCatalogRecoverySingletonContextError,
+                        _EntityCatalogRecoveryShardSemanticError,
+                    ) as failover_error:
+                        direct_failover_error = failover_error
+                        raise
+                    if not isinstance(manifest, dict):
+                        raise OpenRouterError(
+                            "Direct recovery failover has no partition manifest"
+                        )
+                    recovery_execution_manifest = copy.deepcopy(manifest)
+                    canonical = json.dumps(
+                        recovered_document,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    return ChatResult(
+                        text=canonical,
+                        parsed=copy.deepcopy(recovered_document),
+                        citations=[],
+                        usage={
+                            "_aiv_sharded_document": copy.deepcopy(manifest)
+                        },
+                        annotations=[],
+                        request_policy={"policy": "forbidden"},
+                        web_attestation={"metric_eligible": True},
+                        router_metadata={},
+                        transport={
+                            "status": "succeeded",
+                            "http_status": 200,
+                            "output_complete": True,
+                            "output_limited": False,
+                            "mode": ResponseMode.PARTITIONED.value,
+                        },
+                    )
+
+                try:
+                    recovered = await _processing_artifact(
+                        run_id,
+                        stage_key="knowledge_gap",
+                        artifact_key=recovery_artifact_key,
+                        schema=ENTITY_CATALOG_LEAF_SCHEMA,
+                        schema_name=recovery_schema_name,
+                        system=recovery_system,
+                        user_payload=recovery_payload,
+                        prompt_version=(
+                            ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION
+                        ),
+                        composable_failover=direct_recovery_failover,
+                    )
+                except OpenRouterStructuredContinuationError as exc:
+                    if direct_failover_error is not None:
+                        raise direct_failover_error from exc
+                    raise
+        except (asyncio.CancelledError, RunLeaseLostError):
+            raise
+        except _EntityCatalogRecoverySingletonContextError as processing_error:
+            # This is a terminal topology failure, not another semantic try.
+            # The exact paid prefix and the singleton block are already
+            # durable; advancing to attempt 2 would only create a differently
+            # named copy of the same unsplittable work.
+            last_error = processing_error
+            attempt_failures.append(
+                {
+                    "attempt": attempt_number,
+                    "artifact_key": recovery_artifact_key,
+                    "error": str(processing_error)[:2000],
+                    "failure_kind": "singleton_prefix_context_exhausted",
+                }
+            )
+            break
+        except _EntityCatalogRecoveryShardSemanticError as processing_error:
+            last_error = processing_error
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key="knowledge_gap",
+                artifact_key=recovery_artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=recovery_payload,
+                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+                error=processing_error,
             )
             attempt_failures.append(
                 {
                     "attempt": attempt_number,
-                    "error": str(last_error),
-                    "request_utf8_bytes": request_bytes,
+                    "artifact_key": recovery_artifact_key,
+                    "error": str(processing_error)[:2000],
+                    "failure_kind": "complete_shard_semantic_contract",
                 }
             )
-            break
-
-        try:
-            recovered = await _processing_artifact(
-                run_id,
-                stage_key="knowledge_gap",
-                artifact_key=recovery_artifact_key,
-                schema=ENTITY_CATALOG_LEAF_SCHEMA,
-                schema_name=recovery_schema_name,
-                system=recovery_system,
-                user_payload=recovery_payload,
-                prompt_version=ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
-            )
-        except (asyncio.CancelledError, RunLeaseLostError):
-            raise
+            if attempt_number >= ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS:
+                break
+            continue
         except Exception as processing_error:
             # The attempt is already reserved and its owner/transport ledger
             # contains the only safe resume coordinate.  A transport/provider
@@ -15370,6 +16974,7 @@ async def _recover_entity_catalog_chunk_contract(
             accepted=accepted,
             before_digest=before_digest,
             after_digest=after_digest,
+            recovery_execution_manifest=recovery_execution_manifest,
         )
         await _save_artifact(
             run_id,

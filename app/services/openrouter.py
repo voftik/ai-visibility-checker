@@ -62,6 +62,9 @@ PHYSICAL_POST_AUDIT_DELTA_VERSION = "aiv-openrouter-physical-post-audit-v2"
 STRUCTURED_CHECKPOINT_DELTA_VERSION = "aiv-structured-checkpoint-v2"
 STRUCTURED_AUDIT_EVENT_VERSION_ATTR = "aiv_structured_audit_event_version"
 STRUCTURED_AUDIT_DELTA_CAPABILITY = "aiv-structured-audit-delta-v2"
+STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION = (
+    "aiv-structured-terminal-semantic-failure-v1"
+)
 REQUEST_ENVELOPE_ESTIMATE_VERSION = "aiv-request-envelope-estimate-v1"
 _MODEL_ENVELOPE_TTL_SECONDS = 60 * 60
 _MODEL_ENVELOPE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -1903,6 +1906,364 @@ def _structured_manifest_with_calls(
     return manifest
 
 
+def _structured_terminal_schema_failure_marker(
+    ledger: StructuredContinuationLedger,
+    response_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal the terminal state where complete JSON violates its schema.
+
+    The marker is created only after independently proving both halves of the
+    disposition: the accepted ledger is one complete JSON document, and that
+    document fails the exact response schema.  Callers can therefore spend a
+    bounded semantic attempt without inspecting exception prose or mistaking a
+    partial/transport failure for a completed model decision.
+    """
+
+    parsed = _parse_strict_json_document(ledger.text)
+    try:
+        Draft202012Validator(response_schema).validate(parsed)
+    except ValidationError as exc:
+        body = {
+            "version": STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
+            "failure_kind": "complete_json_schema_violation",
+            "terminal": True,
+            "document_sha256": text_sha256(ledger.text),
+            "document_chars": len(ledger.text),
+            "document_utf8_bytes": len(ledger.text.encode("utf-8")),
+            "response_schema_sha256": _stable_sha256(response_schema),
+            "validation_path": list(exc.absolute_path),
+            "schema_path": list(exc.absolute_schema_path),
+            "validator": str(exc.validator or ""),
+        }
+    else:
+        raise OpenRouterError(
+            "Terminal structured semantic failure requires a schema violation"
+        )
+    return {**body, "marker_sha256": _stable_sha256(body)}
+
+
+def _structured_terminal_non_json_failure_marker(
+    ledger: StructuredContinuationLedger,
+    response_schema: dict[str, Any],
+    transport: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal a complete provider turn whose assembled document is not JSON."""
+
+    if not (
+        isinstance(transport, dict)
+        and transport.get("status") == "succeeded"
+        and transport.get("http_status") == 200
+        and transport.get("output_complete") is True
+        and transport.get("output_limited") is False
+    ):
+        raise OpenRouterError(
+            "Terminal non-JSON failure requires a complete non-limited turn"
+        )
+    try:
+        _parse_strict_json_document(ledger.text)
+    except OpenRouterError:
+        body = {
+            "version": STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
+            "failure_kind": "complete_non_json_document",
+            "terminal": True,
+            "document_sha256": text_sha256(ledger.text),
+            "document_chars": len(ledger.text),
+            "document_utf8_bytes": len(ledger.text.encode("utf-8")),
+            "response_schema_sha256": _stable_sha256(response_schema),
+            "last_transport_sha256": _stable_sha256(transport),
+        }
+    else:
+        raise OpenRouterError(
+            "Terminal non-JSON failure requires an invalid JSON document"
+        )
+    return {**body, "marker_sha256": _stable_sha256(body)}
+
+
+def _structured_terminal_rejected_part_failure_marker(
+    ledger: StructuredContinuationLedger,
+    response_schema: dict[str, Any],
+    rejected_part: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal a complete paid part rejected by the JSON boundary ledger."""
+
+    raw_text = rejected_part.get("raw_text")
+    transport = rejected_part.get("transport")
+    sequence = rejected_part.get("sequence")
+    expected_sequence = 0 if not ledger.text else ledger.continuation_count + 1
+    if not (
+        isinstance(raw_text, str)
+        and rejected_part.get("text_sha256") == text_sha256(raw_text)
+        and rejected_part.get("text_chars") == len(raw_text)
+        and rejected_part.get("text_utf8_bytes")
+        == len(raw_text.encode("utf-8"))
+        and sequence == expected_sequence
+        and isinstance(transport, dict)
+        and transport.get("status") == "succeeded"
+        and transport.get("http_status") == 200
+        and transport.get("output_complete") is True
+        and transport.get("output_limited") is False
+    ):
+        raise OpenRouterError(
+            "Terminal rejected part requires one exact complete paid response"
+        )
+    failure_kind: str
+    if raw_text == "":
+        failure_kind = "complete_empty_response"
+    else:
+        try:
+            if ledger.text:
+                trial = copy.deepcopy(ledger)
+                trial.append(raw_text, sequence=sequence)
+            else:
+                StructuredContinuationLedger(
+                    document_id=ledger.document_id,
+                    text=raw_text,
+                    overlap_chars=ledger.overlap_chars,
+                )
+        except ValueError:
+            failure_kind = "complete_rejected_json_part"
+        else:
+            raise OpenRouterError(
+                "Terminal rejected part requires a failed JSON boundary"
+            )
+    if failure_kind in {
+        "complete_empty_response",
+        "complete_rejected_json_part",
+    }:
+        body = {
+            "version": STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
+            "failure_kind": failure_kind,
+            "terminal": True,
+            "document_sha256": text_sha256(ledger.text),
+            "document_chars": len(ledger.text),
+            "document_utf8_bytes": len(ledger.text.encode("utf-8")),
+            "response_schema_sha256": _stable_sha256(response_schema),
+            "overlap_chars": ledger.overlap_chars,
+            "rejected_sequence": sequence,
+            "rejected_text_sha256": text_sha256(raw_text),
+            "rejected_text_chars": len(raw_text),
+            "rejected_text_utf8_bytes": len(raw_text.encode("utf-8")),
+            "rejected_transport_sha256": _stable_sha256(transport),
+        }
+    return {**body, "marker_sha256": _stable_sha256(body)}
+
+
+def _validated_structured_terminal_semantic_failure(
+    manifest: Any,
+    marker: Any,
+    *,
+    response_schema: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate one sealed terminal semantic marker against its full ledger."""
+
+    if not isinstance(manifest, dict) or not isinstance(marker, dict):
+        return None
+    normalized = copy.deepcopy(marker)
+    marker_sha256 = str(normalized.pop("marker_sha256", ""))
+    accepted_text = manifest.get("accepted_document_text")
+    if (
+        not marker_sha256
+        or _stable_sha256(normalized) != marker_sha256
+        or normalized.get("version")
+        != STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION
+        or normalized.get("failure_kind")
+        not in {
+            "complete_json_schema_violation",
+            "complete_non_json_document",
+            "complete_rejected_json_part",
+            "complete_empty_response",
+        }
+        or normalized.get("terminal") is not True
+        or not isinstance(accepted_text, str)
+        or normalized.get("document_sha256") != text_sha256(accepted_text)
+        or manifest.get("document_sha256") != text_sha256(accepted_text)
+        or normalized.get("document_chars") != len(accepted_text)
+        or normalized.get("document_utf8_bytes")
+        != len(accepted_text.encode("utf-8"))
+        or normalized.get("response_schema_sha256")
+        != _stable_sha256(response_schema)
+    ):
+        return None
+    failure_kind = normalized["failure_kind"]
+    if failure_kind == "complete_json_schema_violation":
+        try:
+            parsed = _parse_strict_json_document(accepted_text)
+        except OpenRouterError:
+            return None
+        try:
+            Draft202012Validator(response_schema).validate(parsed)
+        except ValidationError as exc:
+            if (
+                normalized.get("validation_path")
+                != list(exc.absolute_path)
+                or normalized.get("schema_path")
+                != list(exc.absolute_schema_path)
+                or normalized.get("validator")
+                != str(exc.validator or "")
+            ):
+                return None
+            return copy.deepcopy(marker)
+        return None
+
+    if failure_kind in {
+        "complete_rejected_json_part",
+        "complete_empty_response",
+    }:
+        rejected_part = manifest.get("terminal_rejected_part")
+        if not isinstance(rejected_part, dict):
+            rejected_part = manifest.get("rejected_part")
+        raw_text = (
+            rejected_part.get("raw_text")
+            if isinstance(rejected_part, dict)
+            else None
+        )
+        transport = (
+            rejected_part.get("transport")
+            if isinstance(rejected_part, dict)
+            else None
+        )
+        sequence = (
+            rejected_part.get("sequence")
+            if isinstance(rejected_part, dict)
+            else None
+        )
+        if not (
+            isinstance(raw_text, str)
+            and rejected_part.get("text_sha256") == text_sha256(raw_text)
+            and rejected_part.get("text_chars") == len(raw_text)
+            and rejected_part.get("text_utf8_bytes")
+            == len(raw_text.encode("utf-8"))
+            and normalized.get("rejected_sequence") == sequence
+            and normalized.get("rejected_text_sha256")
+            == text_sha256(raw_text)
+            and normalized.get("rejected_text_chars") == len(raw_text)
+            and normalized.get("rejected_text_utf8_bytes")
+            == len(raw_text.encode("utf-8"))
+            and isinstance(transport, dict)
+            and normalized.get("rejected_transport_sha256")
+            == _stable_sha256(transport)
+            and transport.get("status") == "succeeded"
+            and transport.get("http_status") == 200
+            and transport.get("output_complete") is True
+            and transport.get("output_limited") is False
+        ):
+            return None
+        calls = manifest.get("calls")
+        marker_overlap_chars = normalized.get("overlap_chars")
+        if (
+            isinstance(marker_overlap_chars, bool)
+            or not isinstance(marker_overlap_chars, int)
+            or marker_overlap_chars < 1
+        ):
+            return None
+        try:
+            if isinstance(calls, list) and calls:
+                accepted_ledger = StructuredContinuationLedger(
+                    document_id=str(manifest.get("document_id") or ""),
+                    text=str(calls[0].get("raw_text") or ""),
+                    overlap_chars=marker_overlap_chars,
+                )
+                for call_sequence, call in enumerate(calls[1:], start=1):
+                    accepted_ledger.append(
+                        str(call.get("raw_text") or ""),
+                        sequence=call_sequence,
+                    )
+            elif accepted_text == "":
+                accepted_ledger = StructuredContinuationLedger(
+                    document_id=str(manifest.get("document_id") or ""),
+                    text="",
+                    overlap_chars=marker_overlap_chars,
+                )
+            else:
+                return None
+            if accepted_ledger.text != accepted_text:
+                return None
+            rebuilt_marker = _structured_terminal_rejected_part_failure_marker(
+                accepted_ledger,
+                response_schema,
+                rejected_part,
+            )
+        except (OpenRouterError, ValueError, AttributeError):
+            return None
+        if rebuilt_marker.get("failure_kind") != failure_kind:
+            return None
+        return copy.deepcopy(marker)
+
+    calls = manifest.get("calls")
+    last_call = calls[-1] if isinstance(calls, list) and calls else None
+    last_transport = (
+        last_call.get("transport") if isinstance(last_call, dict) else None
+    )
+    if not (
+        isinstance(last_transport, dict)
+        and normalized.get("last_transport_sha256")
+        == _stable_sha256(last_transport)
+        and last_transport.get("status") == "succeeded"
+        and last_transport.get("http_status") == 200
+        and last_transport.get("output_complete") is True
+        and last_transport.get("output_limited") is False
+    ):
+        return None
+    try:
+        _parse_strict_json_document(accepted_text)
+    except OpenRouterError:
+        return copy.deepcopy(marker)
+    return None
+
+
+def validated_structured_terminal_semantic_failure(
+    error: BaseException,
+    *,
+    response_schema: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return an audited terminal schema failure carried by an exception."""
+
+    if not isinstance(error, OpenRouterStructuredContinuationError):
+        return None
+    manifest = error.manifest
+    marker = (
+        manifest.get("terminal_semantic_failure")
+        if isinstance(manifest, dict)
+        else None
+    )
+    return _validated_structured_terminal_semantic_failure(
+        manifest,
+        marker,
+        response_schema=response_schema,
+    )
+
+
+def _structured_checkpoint_error(
+    error: BaseException | str | None,
+) -> dict[str, Any] | None:
+    """Serialize an error together with its sealed terminal disposition."""
+
+    if error is None:
+        return None
+    payload: dict[str, Any] = {
+        "type": (
+            type(error).__name__
+            if isinstance(error, BaseException)
+            else "OpenRouterStructuredContinuationError"
+        ),
+        "message": str(error),
+    }
+    if isinstance(error, OpenRouterStructuredContinuationError):
+        marker = error.manifest.get("terminal_semantic_failure")
+        if isinstance(marker, dict):
+            payload["terminal_semantic_failure"] = copy.deepcopy(marker)
+            if marker.get("failure_kind") in {
+                "complete_rejected_json_part",
+                "complete_empty_response",
+            }:
+                rejected_part = error.manifest.get("rejected_part")
+                if isinstance(rejected_part, dict):
+                    payload["terminal_rejected_part"] = copy.deepcopy(
+                        rejected_part
+                    )
+    return payload
+
+
 def _structured_audit_context(
     *,
     ledger: StructuredContinuationLedger,
@@ -2046,18 +2407,7 @@ def _structured_checkpoint_delta_event(
         },
         "accepted_fragment": accepted_fragment,
         "resume_contract": dict(resume_contract),
-        "error": (
-            {
-                "type": (
-                    type(error).__name__
-                    if isinstance(error, BaseException)
-                    else "OpenRouterStructuredContinuationError"
-                ),
-                "message": str(error),
-            }
-            if error is not None
-            else None
-        ),
+        "error": _structured_checkpoint_error(error),
     }
 
 
@@ -2093,18 +2443,7 @@ def _structured_checkpoint_event(
         "aggregate_usage": aggregate_usage,
         "call_records": [dict(record) for record in call_records],
         "resume_contract": dict(resume_contract),
-        "error": (
-            {
-                "type": (
-                    type(error).__name__
-                    if isinstance(error, BaseException)
-                    else "OpenRouterStructuredContinuationError"
-                ),
-                "message": str(error),
-            }
-            if error is not None
-            else None
-        ),
+        "error": _structured_checkpoint_error(error),
     }
 
 
@@ -2497,6 +2836,131 @@ def _resume_structured_state(
     return ledger, normalized_calls, initial
 
 
+def _resume_terminal_rejected_checkpoint(
+    checkpoint: dict[str, Any],
+    *,
+    expected_contract: dict[str, Any],
+    overlap_chars: int,
+    response_schema: dict[str, Any],
+) -> OpenRouterStructuredContinuationError | None:
+    """Restore a terminal paid part that was never accepted into the ledger."""
+
+    error = checkpoint.get("error") if isinstance(checkpoint, dict) else None
+    marker = (
+        error.get("terminal_semantic_failure")
+        if isinstance(error, dict)
+        else None
+    )
+    if not isinstance(marker, dict) or marker.get("failure_kind") not in {
+        "complete_rejected_json_part",
+        "complete_empty_response",
+    }:
+        return None
+    rejected_part = error.get("terminal_rejected_part")
+    if not isinstance(rejected_part, dict):
+        raise OpenRouterError(
+            "Durable terminal rejected-part evidence is missing"
+        )
+    calls = checkpoint.get("call_records")
+    if not isinstance(calls, list):
+        raise OpenRouterError(
+            "Durable terminal rejected-part call ledger is invalid"
+        )
+    if calls:
+        ledger, normalized_calls, _initial = _resume_structured_state(
+            checkpoint,
+            expected_contract=expected_contract,
+            overlap_chars=overlap_chars,
+        )
+    else:
+        if checkpoint.get("version") != STRUCTURED_CHECKPOINT_VERSION or (
+            checkpoint.get("event_kind")
+            != "structured_continuation_checkpoint"
+        ):
+            raise OpenRouterError(
+                "Terminal rejected-part checkpoint has an unsupported format"
+            )
+        if checkpoint.get("resume_contract") != expected_contract or (
+            str(checkpoint.get("document_id") or "")
+            != str(expected_contract["document_id"])
+        ):
+            raise OpenRouterError(
+                "Terminal rejected-part checkpoint contract mismatch"
+            )
+        manifest = checkpoint.get("manifest")
+        if not isinstance(manifest, dict) or (
+            manifest.get("complete") is not False
+            or manifest.get("calls") != []
+            or manifest.get("accepted_document_text") != ""
+            or checkpoint.get("partial_text") != ""
+            or manifest.get("document_sha256") != text_sha256("")
+            or manifest.get("document_chars") != 0
+            or manifest.get("document_utf8_bytes", 0) != 0
+            or manifest.get("continuation_count", 0) != 0
+            or manifest.get("part_count") not in {0, 1}
+            or checkpoint.get("sequence") not in {-1, 0}
+        ):
+            raise OpenRouterError(
+                "Terminal rejected-part empty ledger is inconsistent"
+            )
+        ledger = StructuredContinuationLedger(
+            document_id=str(expected_contract["document_id"]),
+            text="",
+            overlap_chars=overlap_chars,
+        )
+        normalized_calls = []
+
+    rejected_sequence = marker.get("rejected_sequence")
+    rejected = _normalize_resume_raw_record(
+        copy.deepcopy(rejected_part),
+        label="terminal rejected part",
+        expected_sequence=(
+            int(rejected_sequence)
+            if isinstance(rejected_sequence, int)
+            and not isinstance(rejected_sequence, bool)
+            else None
+        ),
+    )
+    terminal_manifest = _structured_manifest_with_calls(
+        ledger,
+        call_records=normalized_calls,
+        complete=False,
+    )
+    terminal_manifest["terminal_semantic_failure"] = copy.deepcopy(marker)
+    terminal_manifest["terminal_rejected_part"] = copy.deepcopy(rejected)
+    if (
+        _validated_structured_terminal_semantic_failure(
+            terminal_manifest,
+            marker,
+            response_schema=response_schema,
+        )
+        is None
+    ):
+        raise OpenRouterError(
+            "Durable terminal structured semantic marker is invalid"
+        )
+    result = ChatResult(
+        text=str(rejected["raw_text"]),
+        parsed=None,
+        citations=[],
+        usage={
+            **dict(rejected["usage"]),
+            "_aiv_structured_continuation": terminal_manifest,
+            "_aiv_transport": dict(rejected["transport"]),
+        },
+        annotations=[],
+        request_policy=dict(rejected.get("request_policy") or {}),
+        web_attestation=dict(rejected.get("web_attestation") or {}),
+        router_metadata={},
+        transport=dict(rejected["transport"]),
+    )
+    return OpenRouterStructuredContinuationError(
+        "Durable complete provider response was rejected by the JSON ledger",
+        result=result,
+        manifest=terminal_manifest,
+    )
+
+
 def restore_completed_structured_checkpoint(
     checkpoint: dict[str, Any],
     model: str,
@@ -2694,7 +3158,6 @@ def _validated_provider_event_result(
     raw_text = provider_event.get("raw_text")
     if (
         not isinstance(raw_text, str)
-        or not raw_text
         or _message_text(message) != raw_text
     ):
         raise OpenRouterError("Provider event raw response mismatch")
@@ -2754,12 +3217,24 @@ def _validated_provider_event_result(
     if status == "accepted":
         if error is not None:
             raise OpenRouterError("Accepted provider event contains an error")
-    elif not (
-        transport.get("output_limited")
-        and isinstance(error, dict)
-        and error.get("type") == "OpenRouterOutputLimitError"
-    ):
-        raise OpenRouterError("Rejected provider event is not a usable limit part")
+    else:
+        rejected_limit_part = bool(
+            raw_text
+            and
+            transport.get("output_limited")
+            and isinstance(error, dict)
+            and error.get("type") == "OpenRouterOutputLimitError"
+        )
+        rejected_complete_contract = bool(
+            transport.get("output_complete") is True
+            and transport.get("output_limited") is False
+            and isinstance(error, dict)
+            and error.get("type") == "OpenRouterResponseContractError"
+        )
+        if not rejected_limit_part and not rejected_complete_contract:
+            raise OpenRouterError(
+                "Rejected provider event is not a usable structured part"
+            )
 
     return ChatResult(
         text=raw_text,
@@ -2790,8 +3265,9 @@ def promote_provider_post_to_structured_checkpoint(
 
     The helper is network-free and accepts only a successful response that can
     be chained exactly onto a fully revalidated predecessor.  HTTP failures,
-    policy/contract rejections and malformed/tampered provider events remain
-    audit evidence but are never promoted into accepted document state.
+    policy failures and malformed/tampered provider events remain audit
+    evidence.  A complete schema-contract rejection may be promoted only into
+    a sealed terminal failed checkpoint, never accepted document state.
     """
 
     if not isinstance(provider_event, dict):
@@ -2888,36 +3364,165 @@ def promote_provider_post_to_structured_checkpoint(
         current,
         sequence=expected_sequence,
     )
-    if ledger is None:
-        ledger = StructuredContinuationLedger(
+
+    def terminal_rejected_checkpoint(
+        accepted_ledger: StructuredContinuationLedger,
+        message: str,
+    ) -> dict[str, Any]:
+        marker = _structured_terminal_rejected_part_failure_marker(
+            accepted_ledger,
+            response_schema,
+            current_call,
+        )
+        terminal_manifest = _structured_manifest_with_calls(
+            accepted_ledger,
+            call_records=call_records,
+            complete=False,
+        )
+        terminal_manifest["rejected_part"] = copy.deepcopy(current_call)
+        terminal_manifest["terminal_semantic_failure"] = marker
+        terminal_failure = OpenRouterStructuredContinuationError(
+            message,
+            result=current,
+            manifest=terminal_manifest,
+        )
+        failed_checkpoint = _structured_checkpoint_event(
+            ledger=accepted_ledger,
+            call_records=call_records,
+            base_result=initial or current,
+            # The rejected paid response is sealed separately in the terminal
+            # marker.  Snapshot sequence tracks only accepted call records.
+            sequence=accepted_ledger.continuation_count,
+            status="failed",
+            complete=False,
+            resume_contract=contract,
+            error=terminal_failure,
+        )
+        failed_checkpoint["promoted_from_provider_event_id"] = (
+            provider_event.get("event_id")
+        )
+        return failed_checkpoint
+
+    if (
+        current.text == ""
+        and current.transport.get("output_complete") is True
+        and current.transport.get("output_limited") is False
+    ):
+        accepted_ledger = ledger or StructuredContinuationLedger(
             document_id=document_id,
-            text=current.text,
+            text="",
             overlap_chars=overlap_chars,
         )
-        initial = current
-    else:
-        ledger.append(current.text, sequence=expected_sequence)
+        return terminal_rejected_checkpoint(
+            accepted_ledger,
+            "Promoted complete provider response is empty",
+        )
+    try:
+        if ledger is None:
+            ledger = StructuredContinuationLedger(
+                document_id=document_id,
+                text=current.text,
+                overlap_chars=overlap_chars,
+            )
+            initial = current
+        else:
+            ledger.append(current.text, sequence=expected_sequence)
+    except ValueError as exc:
+        if not (
+            current.transport.get("output_complete") is True
+            and current.transport.get("output_limited") is False
+        ):
+            raise OpenRouterError(
+                "Provider event did not form a continuable JSON boundary"
+            ) from exc
+        accepted_ledger = ledger
+        if accepted_ledger is None:
+            accepted_ledger = StructuredContinuationLedger(
+                document_id=document_id,
+                text="",
+                overlap_chars=overlap_chars,
+            )
+        return terminal_rejected_checkpoint(
+            accepted_ledger,
+            "Promoted complete provider response violates the JSON boundary: "
+            f"{exc}",
+        )
     call_records.append(current_call)
     assert initial is not None
 
+    terminal_failure: OpenRouterStructuredContinuationError | None = None
     try:
         parsed = _parse_strict_json_document(ledger.text)
     except OpenRouterError as exc:
-        if not current.transport.get("output_limited"):
-            raise OpenRouterError(
-                "Non-limited provider event did not complete valid JSON"
-            ) from exc
-        complete = False
+        if current.transport.get("output_limited"):
+            complete = False
+        else:
+            marker = _structured_terminal_non_json_failure_marker(
+                ledger,
+                response_schema,
+                current.transport,
+            )
+            terminal_manifest = _structured_manifest_with_calls(
+                ledger,
+                call_records=call_records,
+                complete=False,
+            )
+            terminal_manifest["terminal_semantic_failure"] = marker
+            terminal_failure = OpenRouterStructuredContinuationError(
+                "Promoted structured document reached a complete provider "
+                f"turn but is not JSON: {exc}",
+                result=current,
+                manifest=terminal_manifest,
+            )
+            complete = False
     else:
         try:
             Draft202012Validator(response_schema).validate(parsed)
         except ValidationError as exc:
-            raise OpenRouterError(
-                f"Promoted provider event violates the response schema: {exc}"
-            ) from exc
-        complete = True
+            marker = _structured_terminal_schema_failure_marker(
+                ledger,
+                response_schema,
+            )
+            terminal_manifest = _structured_manifest_with_calls(
+                ledger,
+                call_records=call_records,
+                complete=False,
+            )
+            terminal_manifest["terminal_semantic_failure"] = marker
+            terminal_failure = OpenRouterStructuredContinuationError(
+                "Promoted structured document is complete JSON but violates "
+                f"its schema: {exc}",
+                result=current,
+                manifest=terminal_manifest,
+            )
+            complete = False
+        else:
+            complete = True
 
-    if expected_sequence == 0:
+    if terminal_failure is not None:
+        failure_kind = terminal_failure.manifest[
+            "terminal_semantic_failure"
+        ]["failure_kind"]
+        failure_label = (
+            "non_json_failure"
+            if failure_kind == "complete_non_json_document"
+            else "contract_failure"
+        )
+        limit_suffix = (
+            "_with_limit_signal"
+            if current.transport.get("output_limited")
+            else ""
+        )
+        if expected_sequence == 0:
+            ledger.parts[0]["kind"] = (
+                f"initial_complete_{failure_label}{limit_suffix}"
+            )
+        else:
+            ledger.parts[-1]["kind"] = (
+                "literal_continuation_"
+                f"{failure_label}{limit_suffix}"
+            )
+    elif expected_sequence == 0:
         ledger.parts[0]["kind"] = (
             "initial_complete_with_limit_signal"
             if complete and current.transport.get("output_limited")
@@ -2934,9 +3539,16 @@ def promote_provider_post_to_structured_checkpoint(
         call_records=call_records,
         base_result=initial,
         sequence=expected_sequence,
-        status="completed" if complete else "partial",
+        status=(
+            "failed"
+            if terminal_failure is not None
+            else "completed"
+            if complete
+            else "partial"
+        ),
         complete=complete,
         resume_contract=contract,
+        error=terminal_failure,
     )
     checkpoint["promoted_from_provider_event_id"] = provider_event.get(
         "event_id"
@@ -2985,6 +3597,9 @@ async def _raise_structured_continuation_error(
     rejection: dict[str, Any] | None = None,
     audit_checkpoint: AuditCheckpoint | None = None,
     resume_contract: dict[str, Any] | None = None,
+    terminal_semantic_failure_schema: dict[str, Any] | None = None,
+    terminal_non_json_failure_schema: dict[str, Any] | None = None,
+    terminal_rejected_part_failure_schema: dict[str, Any] | None = None,
 ) -> None:
     manifest = _structured_manifest_with_calls(
         ledger,
@@ -2993,6 +3608,43 @@ async def _raise_structured_continuation_error(
     )
     if rejection is not None:
         manifest["rejected_part"] = dict(rejection)
+    terminal_failure_kinds = sum(
+        candidate is not None
+        for candidate in (
+            terminal_semantic_failure_schema,
+            terminal_non_json_failure_schema,
+            terminal_rejected_part_failure_schema,
+        )
+    )
+    if terminal_failure_kinds > 1:
+        raise OpenRouterError("Terminal semantic failure kinds are ambiguous")
+    if terminal_semantic_failure_schema is not None:
+        manifest["terminal_semantic_failure"] = (
+            _structured_terminal_schema_failure_marker(
+                ledger,
+                terminal_semantic_failure_schema,
+            )
+        )
+    elif terminal_non_json_failure_schema is not None:
+        manifest["terminal_semantic_failure"] = (
+            _structured_terminal_non_json_failure_marker(
+                ledger,
+                terminal_non_json_failure_schema,
+                result.transport,
+            )
+        )
+    elif terminal_rejected_part_failure_schema is not None:
+        if not isinstance(rejection, dict):
+            raise OpenRouterError(
+                "Terminal rejected-part failure requires rejection evidence"
+            )
+        manifest["terminal_semantic_failure"] = (
+            _structured_terminal_rejected_part_failure_marker(
+                ledger,
+                terminal_rejected_part_failure_schema,
+                rejection,
+            )
+        )
     usage = _aggregate_continuation_usage(
         result.usage,
         [*call_records, *([rejection] if rejection is not None else [])],
@@ -3299,6 +3951,14 @@ async def chat_continuable_structured(
                 reasoning_effort=reasoning_effort,
                 temperature=temperature,
             )
+        rejected_terminal = _resume_terminal_rejected_checkpoint(
+            resume_checkpoint,
+            expected_contract=resume_contract,
+            overlap_chars=overlap_chars,
+            response_schema=response_schema,
+        )
+        if rejected_terminal is not None:
+            raise rejected_terminal
         ledger, call_records, initial = _resume_structured_state(
             resume_checkpoint,
             expected_contract=resume_contract,
@@ -3313,6 +3973,48 @@ async def chat_continuable_structured(
             request_policy=dict(last_call.get("request_policy") or {}),
             web_attestation=dict(last_call.get("web_attestation") or {}),
         )
+        resume_error = resume_checkpoint.get("error")
+        durable_terminal_marker = (
+            resume_error.get("terminal_semantic_failure")
+            if isinstance(resume_error, dict)
+            else None
+        )
+        if durable_terminal_marker is not None:
+            terminal_manifest = _structured_manifest_with_calls(
+                ledger,
+                call_records=call_records,
+                complete=False,
+            )
+            terminal_manifest["terminal_semantic_failure"] = copy.deepcopy(
+                durable_terminal_marker
+            )
+            if (
+                _validated_structured_terminal_semantic_failure(
+                    terminal_manifest,
+                    durable_terminal_marker,
+                    response_schema=response_schema,
+                )
+                is None
+            ):
+                raise OpenRouterError(
+                    "Durable terminal structured semantic marker is invalid"
+                )
+            terminal_usage = _aggregate_continuation_usage(
+                initial.usage,
+                call_records,
+            )
+            terminal_usage["_aiv_structured_continuation"] = terminal_manifest
+            terminal_usage["_aiv_transport"] = dict(latest.transport)
+            raise OpenRouterStructuredContinuationError(
+                "Durable structured document is complete JSON but violates "
+                "its schema",
+                result=replace(
+                    latest,
+                    parsed=None,
+                    usage=terminal_usage,
+                ),
+                manifest=terminal_manifest,
+            )
         try:
             parsed = _parse_strict_json_document(ledger.text)
             Draft202012Validator(response_schema).validate(parsed)
@@ -3458,6 +4160,7 @@ async def chat_continuable_structured(
                         call_records=call_records,
                         audit_checkpoint=audit_checkpoint,
                         resume_contract=resume_contract,
+                        terminal_semantic_failure_schema=response_schema,
                     )
                 ledger.parts[0]["kind"] = "initial_complete_with_limit_signal"
                 await _emit_structured_checkpoint(
@@ -3511,12 +4214,117 @@ async def chat_continuable_structured(
                 resume_contract=resume_contract,
             )
         except Exception as exc:
+            result = _synthetic_failure_result(model=model, error=exc)
+            if isinstance(exc, OpenRouterResponseContractError):
+                if (
+                    result.text == ""
+                    and result.transport.get("output_complete") is True
+                    and result.transport.get("output_limited") is False
+                ):
+                    empty_ledger = StructuredContinuationLedger(
+                        document_id=resolved_document_id,
+                        text="",
+                        overlap_chars=overlap_chars,
+                    )
+                    rejection = _continuation_call_record(
+                        result,
+                        sequence=0,
+                    )
+                    await _raise_structured_continuation_error(
+                        "Initial complete structured response is empty",
+                        result=result,
+                        ledger=empty_ledger,
+                        call_records=[],
+                        rejection=rejection,
+                        audit_checkpoint=audit_checkpoint,
+                        resume_contract=resume_contract,
+                        terminal_rejected_part_failure_schema=response_schema,
+                    )
+                try:
+                    terminal_ledger = StructuredContinuationLedger(
+                        document_id=resolved_document_id,
+                        text=result.text,
+                        overlap_chars=overlap_chars,
+                    )
+                except ValueError as boundary_error:
+                    if (
+                        result.transport.get("output_complete") is True
+                        and result.transport.get("output_limited") is False
+                    ):
+                        empty_ledger = StructuredContinuationLedger(
+                            document_id=resolved_document_id,
+                            text="",
+                            overlap_chars=overlap_chars,
+                        )
+                        rejection = _continuation_call_record(
+                            result,
+                            sequence=0,
+                        )
+                        await _raise_structured_continuation_error(
+                            "Initial complete structured response violates the "
+                            f"JSON boundary: {boundary_error}",
+                            result=result,
+                            ledger=empty_ledger,
+                            call_records=[],
+                            rejection=rejection,
+                            audit_checkpoint=audit_checkpoint,
+                            resume_contract=resume_contract,
+                            terminal_rejected_part_failure_schema=(
+                                response_schema
+                            ),
+                        )
+                else:
+                    terminal_calls = [
+                        _continuation_call_record(result, sequence=0)
+                    ]
+                    try:
+                        terminal_parsed = _parse_strict_json_document(
+                            terminal_ledger.text
+                        )
+                    except OpenRouterError as parse_error:
+                        if (
+                            result.transport.get("output_complete") is True
+                            and result.transport.get("output_limited") is False
+                        ):
+                            terminal_ledger.parts[0]["kind"] = (
+                                "initial_complete_non_json_failure"
+                            )
+                            await _raise_structured_continuation_error(
+                                "Initial structured response reached a complete "
+                                "turn but is not a JSON document: "
+                                f"{parse_error}",
+                                result=result,
+                                ledger=terminal_ledger,
+                                call_records=terminal_calls,
+                                audit_checkpoint=audit_checkpoint,
+                                resume_contract=resume_contract,
+                                terminal_non_json_failure_schema=response_schema,
+                            )
+                    else:
+                        try:
+                            Draft202012Validator(response_schema).validate(
+                                terminal_parsed
+                            )
+                        except ValidationError as schema_error:
+                            terminal_ledger.parts[0]["kind"] = (
+                                "initial_complete_contract_failure"
+                            )
+                            await _raise_structured_continuation_error(
+                                "Initial structured response is complete JSON but "
+                                "violates its schema: "
+                                f"{schema_error}",
+                                result=result,
+                                ledger=terminal_ledger,
+                                call_records=terminal_calls,
+                                audit_checkpoint=audit_checkpoint,
+                                resume_contract=resume_contract,
+                                terminal_semantic_failure_schema=response_schema,
+                            )
             empty_ledger = StructuredContinuationLedger(
                 document_id=resolved_document_id,
                 text="",
                 overlap_chars=overlap_chars,
             )
-            result = _synthetic_failure_result(model=model, error=exc)
             await _raise_structured_continuation_error(
                 f"Initial structured provider POST failed: {exc}",
                 result=result,
@@ -3539,8 +4347,7 @@ async def chat_continuable_structured(
             call_records.append(_continuation_call_record(initial, sequence=0))
             try:
                 parsed = _parse_strict_json_document(ledger.text)
-                Draft202012Validator(response_schema).validate(parsed)
-            except (OpenRouterError, ValidationError) as exc:
+            except OpenRouterError as exc:
                 await _raise_structured_continuation_error(
                     f"Complete structured document is unusable: {exc}",
                     result=initial,
@@ -3548,6 +4355,19 @@ async def chat_continuable_structured(
                     call_records=call_records,
                     audit_checkpoint=audit_checkpoint,
                     resume_contract=resume_contract,
+                    terminal_non_json_failure_schema=response_schema,
+                )
+            try:
+                Draft202012Validator(response_schema).validate(parsed)
+            except ValidationError as exc:
+                await _raise_structured_continuation_error(
+                    f"Complete structured document violates its schema: {exc}",
+                    result=initial,
+                    ledger=ledger,
+                    call_records=call_records,
+                    audit_checkpoint=audit_checkpoint,
+                    resume_contract=resume_contract,
+                    terminal_semantic_failure_schema=response_schema,
                 )
             await _emit_structured_checkpoint(
                 audit_checkpoint,
@@ -3621,6 +4441,13 @@ async def chat_continuable_structured(
                 rejection=rejected,
                 audit_checkpoint=audit_checkpoint,
                 resume_contract=resume_contract,
+                terminal_rejected_part_failure_schema=(
+                    response_schema
+                    if exc.result.text == ""
+                    and exc.result.transport.get("output_complete") is True
+                    and exc.result.transport.get("output_limited") is False
+                    else None
+                ),
             )
         except asyncio.CancelledError as exc:
             result = _synthetic_failure_result(
@@ -3708,6 +4535,12 @@ async def chat_continuable_structured(
                 rejection=call_record,
                 audit_checkpoint=audit_checkpoint,
                 resume_contract=resume_contract,
+                terminal_rejected_part_failure_schema=(
+                    response_schema
+                    if latest.transport.get("output_complete") is True
+                    and latest.transport.get("output_limited") is False
+                    else None
+                ),
             )
         call_records.append(call_record)
         if latest.transport.get("output_limited"):
@@ -3728,6 +4561,7 @@ async def chat_continuable_structured(
                         call_records=call_records,
                         audit_checkpoint=audit_checkpoint,
                         resume_contract=resume_contract,
+                        terminal_semantic_failure_schema=response_schema,
                     )
                 ledger.parts[-1]["kind"] = (
                     "literal_continuation_complete_with_limit_signal"
@@ -3773,8 +4607,7 @@ async def chat_continuable_structured(
             continue
         try:
             parsed = _parse_strict_json_document(ledger.text)
-            Draft202012Validator(response_schema).validate(parsed)
-        except (OpenRouterError, ValidationError) as exc:
+        except OpenRouterError as exc:
             await _raise_structured_continuation_error(
                 f"Assembled structured document is unusable: {exc}",
                 result=latest,
@@ -3782,6 +4615,19 @@ async def chat_continuable_structured(
                 call_records=call_records,
                 audit_checkpoint=audit_checkpoint,
                 resume_contract=resume_contract,
+                terminal_non_json_failure_schema=response_schema,
+            )
+        try:
+            Draft202012Validator(response_schema).validate(parsed)
+        except ValidationError as exc:
+            await _raise_structured_continuation_error(
+                f"Assembled structured document violates its schema: {exc}",
+                result=latest,
+                ledger=ledger,
+                call_records=call_records,
+                audit_checkpoint=audit_checkpoint,
+                resume_contract=resume_contract,
+                terminal_semantic_failure_schema=response_schema,
             )
         await _emit_structured_checkpoint(
             audit_checkpoint,

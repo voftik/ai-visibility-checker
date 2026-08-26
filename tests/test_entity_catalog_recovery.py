@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 import copy
+import json
+import tempfile
 import unittest
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from app.models import Base, Run, RunArtifact, RunStatus
+from app.services import openrouter as openrouter_service
+from app.services import structured_audit_store as audit_store
 from app.services.analyzer import (
     ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS,
     ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE,
     ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+    ENTITY_CATALOG_LEAF_SCHEMA,
     ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY,
     ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256,
+    ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION,
     PROCESSING_MODEL,
+    _EntityCatalogRecoveryShardSemanticError,
+    _EntityCatalogRecoverySingletonContextError,
+    _core_unit_claim,
     _deterministic_entity_catalog_union,
     _entity_catalog,
     _entity_catalog_quote_recovery_incident,
@@ -22,13 +41,18 @@ from app.services.analyzer import (
     _entity_catalog_recovery_checkpoint_legacy_key,
     _entity_catalog_recovery_legacy_artifact_key,
     _entity_catalog_recovery_stage_key,
+    _execute_entity_catalog_recovery_shards,
+    _preflight_entity_catalog_recovery_shards,
+    _recover_entity_catalog_chunk_contract,
     stable_digest,
 )
 from app.services.long_response import partition_text_records, text_sha256
+from app.services.long_response import StructuredContinuationLedger
 from app.services.openrouter import (
     ChatResult,
     OpenRouterError,
     OpenRouterResponseContractError,
+    OpenRouterStructuredContinuationError,
 )
 from app.services.recovery_orchestrator import (
     ACTION_RETRY_WITH_GUIDANCE,
@@ -171,6 +195,120 @@ def _response_contract_error(*, complete: bool) -> Exception:
     )
 
 
+def _terminal_schema_contract_error() -> Exception:
+    raw_text = "{}"
+    ledger = StructuredContinuationLedger(
+        document_id="entity-catalog-terminal-schema",
+        text=raw_text,
+    )
+    manifest = openrouter_service._structured_manifest_with_calls(
+        ledger,
+        call_records=[],
+        complete=False,
+    )
+    manifest["terminal_semantic_failure"] = (
+        openrouter_service._structured_terminal_schema_failure_marker(
+            ledger,
+            ENTITY_CATALOG_LEAF_SCHEMA,
+        )
+    )
+    transport = {
+        "status": "succeeded",
+        "http_status": 200,
+        "output_complete": False,
+        "output_limited": True,
+        "output_incomplete_reason": "length",
+    }
+    return OpenRouterStructuredContinuationError(
+        "Complete JSON violates the entity-catalog schema",
+        result=ChatResult(
+            text=raw_text,
+            parsed=None,
+            citations=[],
+            usage={
+                "_aiv_transport": copy.deepcopy(transport),
+                "_aiv_structured_continuation": copy.deepcopy(manifest),
+            },
+            annotations=[],
+            request_policy={},
+            web_attestation={},
+            router_metadata={},
+            transport=transport,
+        ),
+        manifest=manifest,
+    )
+
+
+def _terminal_rejected_part_contract_error() -> Exception:
+    accepted_text = '{"catalog":'
+    accepted_transport = {
+        "status": "succeeded",
+        "http_status": 200,
+        "output_complete": False,
+        "output_limited": True,
+        "output_incomplete_reason": "length",
+    }
+    accepted_result = ChatResult(
+        text=accepted_text,
+        parsed=None,
+        citations=[],
+        usage={"_aiv_transport": copy.deepcopy(accepted_transport)},
+        annotations=[],
+        request_policy={},
+        web_attestation={},
+        router_metadata={},
+        transport=accepted_transport,
+    )
+    rejected_transport = {
+        "status": "succeeded",
+        "http_status": 200,
+        "output_complete": True,
+        "output_limited": False,
+        "output_incomplete_reason": None,
+    }
+    rejected_result = ChatResult(
+        text="",
+        parsed=None,
+        citations=[],
+        usage={"_aiv_transport": copy.deepcopy(rejected_transport)},
+        annotations=[],
+        request_policy={},
+        web_attestation={},
+        router_metadata={},
+        transport=rejected_transport,
+    )
+    ledger = StructuredContinuationLedger(
+        document_id="entity-catalog-terminal-rejected-part",
+        text=accepted_text,
+    )
+    accepted_call = openrouter_service._continuation_call_record(
+        accepted_result,
+        sequence=0,
+    )
+    rejected_part = openrouter_service._continuation_call_record(
+        rejected_result,
+        sequence=1,
+    )
+    manifest = openrouter_service._structured_manifest_with_calls(
+        ledger,
+        call_records=[accepted_call],
+        complete=False,
+    )
+    manifest["rejected_part"] = copy.deepcopy(rejected_part)
+    manifest["terminal_semantic_failure"] = (
+        openrouter_service._structured_terminal_rejected_part_failure_marker(
+            ledger,
+            ENTITY_CATALOG_LEAF_SCHEMA,
+            rejected_part,
+        )
+    )
+    return OpenRouterStructuredContinuationError(
+        "Complete continuation response is empty",
+        result=rejected_result,
+        manifest=manifest,
+    )
+
+
 def _sealed_checkpoint_output(identity: dict[str, Any]) -> dict[str, Any]:
     body = {
         "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
@@ -178,6 +316,189 @@ def _sealed_checkpoint_output(identity: dict[str, Any]) -> dict[str, Any]:
         "identity_sha256": stable_digest(identity),
     }
     return {**body, "checkpoint_sha256": stable_digest(body)}
+
+
+def _sharded_recovery_job(count: int = 3) -> dict[str, Any]:
+    units, _manifests = partition_text_records(
+        [
+            {
+                "answer_id": index,
+                "answer": f"ALPHA — подтверждённое имя, ответ {index}.",
+            }
+            for index in range(1, count + 1)
+        ],
+        text_key="answer",
+        id_key="answer_id",
+        target_chars=1_000,
+    )
+    return {
+        "artifact_key": "entity_catalog_chunk_test",
+        "schema_name": "aiv_entity_catalog_chunk_test",
+        "answers": units,
+        "model_answers": [
+            {
+                "answer_id": item["answer_id"],
+                "answer": item["answer"],
+                "core_claim": _core_unit_claim(item),
+            }
+            for item in units
+        ],
+    }
+
+
+def _sharded_recovery_payload(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target": {"brand_name": "ALPHA", "aliases": ["ALPHA"]},
+        "answers": copy.deepcopy(job["model_answers"]),
+        "recovery": {
+            "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+            "epoch": 7,
+            "execution_attempt": 1,
+            "failure_code": "core_quote_not_exact_substring",
+            "failed_unit_id": "",
+            "failed_unit_ids": [],
+            "binding_failures": [],
+            "source_units_sha256": stable_digest(job["answers"]),
+            "quote_repair_version": "test",
+            "grounding_filter_version": "test",
+            "acceptance_policy": copy.deepcopy(
+                ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY
+            ),
+            "acceptance_policy_sha256": (
+                ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+            ),
+            "invalid_candidate_sha256": "c" * 64,
+            "orchestrator_guidance": "Сохрани точные цитаты.",
+            "immutable_contract": "No source mutation.",
+        },
+    }
+
+
+class _RecoveryProviderResponse:
+    status_code = 200
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = copy.deepcopy(body)
+
+    def json(self) -> dict[str, Any]:
+        return copy.deepcopy(self._body)
+
+
+def _recovery_provider_body(
+    text: str,
+    *,
+    limited: bool,
+) -> dict[str, Any]:
+    return {
+        "model": PROCESSING_MODEL,
+        "provider": "Recovery Harness Test",
+        "choices": [
+            {
+                "finish_reason": "length" if limited else "stop",
+                "native_finish_reason": (
+                    "MAX_TOKENS" if limited else "stop"
+                ),
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                    "annotations": [],
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": max(1, len(text) // 4),
+            "total_tokens": 100 + max(1, len(text) // 4),
+            "server_tool_use": {"web_search_requests": 0},
+        },
+        "openrouter_metadata": {"pipeline": []},
+    }
+
+
+class _RecoveryPrefixClient:
+    def __init__(self, full_text: str, prefix_text: str) -> None:
+        self.full_text = full_text
+        self.prefix_text = prefix_text
+        self.requests: list[dict[str, Any]] = []
+        self.request_kinds: list[str] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(
+        self,
+        _url: str,
+        *,
+        headers: dict[str, str],
+        content: bytes,
+    ) -> _RecoveryProviderResponse:
+        payload = json.loads(content.decode("utf-8"))
+        self.requests.append({"headers": dict(headers), "json": payload})
+        messages = payload["messages"]
+        is_continuation = "CONTINUATION_CONTRACT_JSON:" in str(
+            messages[-1].get("content") or ""
+        )
+        if not is_continuation:
+            self.request_kinds.append("initial")
+            if self.request_kinds.count("initial") > 1:
+                raise AssertionError("Paid initial recovery POST was repeated")
+            return _RecoveryProviderResponse(
+                _recovery_provider_body(self.prefix_text, limited=True)
+            )
+        self.request_kinds.append("continuation")
+        accepted_prefix = str(messages[-2].get("content") or "")
+        if accepted_prefix != self.prefix_text:
+            raise AssertionError("Continuation did not resume the durable prefix")
+        response_text = accepted_prefix[-512:] + self.full_text[
+            len(accepted_prefix) :
+        ]
+        return _RecoveryProviderResponse(
+            _recovery_provider_body(response_text, limited=False)
+        )
+
+
+class _RecoveryHeadroomFailoverClient:
+    def __init__(self, full_text: str, prefix_text: str) -> None:
+        self.full_text = full_text
+        self.prefix_text = prefix_text
+        self.requests: list[dict[str, Any]] = []
+        self.request_kinds: list[str] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(
+        self,
+        _url: str,
+        *,
+        headers: dict[str, str],
+        content: bytes,
+    ) -> _RecoveryProviderResponse:
+        payload = json.loads(content.decode("utf-8"))
+        self.requests.append({"headers": dict(headers), "json": payload})
+        if len(self.requests) == 1:
+            self.request_kinds.append("direct_initial")
+            return _RecoveryProviderResponse(
+                _recovery_provider_body(self.prefix_text, limited=True)
+            )
+        if len(self.requests) == 2:
+            if "CONTINUATION_CONTRACT_JSON:" in str(
+                payload["messages"][-1].get("content") or ""
+            ):
+                raise AssertionError(
+                    "Context-exhausted direct continuation reached provider"
+                )
+            self.request_kinds.append("shard_initial")
+            return _RecoveryProviderResponse(
+                _recovery_provider_body(self.full_text, limited=False)
+            )
+        raise AssertionError("Unexpected recovery provider POST")
 
 
 class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -939,9 +1260,54 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(key.endswith("_recovery_e4_a1") for key in calls))
         self.assertFalse(any(key.endswith("_recovery_e4_a2") for key in calls))
 
-    async def test_complete_response_contract_failure_spends_a1_and_uses_a2(
+    async def test_unmarked_complete_contract_failure_keeps_a1_reserved(
         self,
     ) -> None:
+        calls: list[str] = []
+        reserve = AsyncMock(return_value=1)
+        finish = AsyncMock()
+        mark_contract_failed = AsyncMock()
+
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            artifact_key = str(kwargs["artifact_key"])
+            calls.append(artifact_key)
+            payload = kwargs["user_payload"]
+            if artifact_key.endswith("_recovery_e4_a1"):
+                raise _response_contract_error(complete=True)
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+
+        with self.assertRaisesRegex(
+            OpenRouterResponseContractError,
+            "Structured response is unusable",
+        ):
+            await self._run_catalog(
+                processing,
+                reserve_mock=reserve,
+                finish_mock=finish,
+                mark_contract_failed_mock=mark_contract_failed,
+            )
+
+        recovery_calls = [key for key in calls if "_recovery_" in key]
+        self.assertEqual(len(recovery_calls), 1)
+        self.assertTrue(recovery_calls[0].endswith("_a1"))
+        self.assertEqual(reserve.await_count, 1)
+        self.assertFalse(
+            any(
+                call.kwargs["artifact_key"].endswith("_recovery_e4_a1")
+                for call in mark_contract_failed.await_args_list
+            )
+        )
+        finish.assert_not_awaited()
+
+    async def test_terminal_schema_failure_spends_a1_and_uses_a2(self) -> None:
         calls: list[str] = []
         reserve = AsyncMock(side_effect=[1, 2])
         finish = AsyncMock()
@@ -955,7 +1321,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             calls.append(artifact_key)
             payload = kwargs["user_payload"]
             if artifact_key.endswith("_recovery_e4_a1"):
-                raise _response_contract_error(complete=True)
+                raise _terminal_schema_contract_error()
             if artifact_key.endswith("_recovery_e4_a2"):
                 return _catalog_candidate(
                     payload["answers"][0]["core_claim"],
@@ -966,7 +1332,64 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     payload["answers"][0]["core_claim"],
                     quote="Alpha",
                 )
-            return _deterministic_entity_catalog_union(list(payload["chunk_catalogs"]))
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
+
+        result, _planner, _reserve, _finish = await self._run_catalog(
+            processing,
+            reserve_mock=reserve,
+            finish_mock=finish,
+            mark_contract_failed_mock=mark_contract_failed,
+        )
+
+        self.assertIsNotNone(result)
+        recovery_calls = [key for key in calls if "_recovery_" in key]
+        self.assertEqual(len(recovery_calls), 2)
+        self.assertTrue(recovery_calls[0].endswith("_a1"))
+        self.assertTrue(recovery_calls[1].endswith("_a2"))
+        self.assertEqual(reserve.await_count, 2)
+        self.assertTrue(
+            any(
+                call.kwargs["artifact_key"].endswith("_recovery_e4_a1")
+                for call in mark_contract_failed.await_args_list
+            )
+        )
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+        self.assertEqual(
+            finish.await_args.kwargs["details"]["execution_attempt"],
+            2,
+        )
+
+    async def test_terminal_rejected_part_spends_a1_and_uses_a2(self) -> None:
+        calls: list[str] = []
+        reserve = AsyncMock(side_effect=[1, 2])
+        finish = AsyncMock()
+        mark_contract_failed = AsyncMock()
+
+        async def processing(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            artifact_key = str(kwargs["artifact_key"])
+            calls.append(artifact_key)
+            payload = kwargs["user_payload"]
+            if artifact_key.endswith("_recovery_e4_a1"):
+                raise _terminal_rejected_part_contract_error()
+            if artifact_key.endswith("_recovery_e4_a2"):
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="ALPHA",
+                )
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
 
         result, _planner, _reserve, _finish = await self._run_catalog(
             processing,
@@ -1883,6 +2306,751 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.startswith(ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE + ":"))
         self.assertLessEqual(len(first), 64)
 
+    def test_recovery_overflow_preflight_shards_all_cores_exactly_once(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job()
+        payload = _sharded_recovery_payload(job)
+
+        class FakeStore:
+            def __init__(self, plan: Any) -> None:
+                self.plan = plan
+
+            def planned_requests(self) -> tuple[Any, ...]:
+                return tuple(
+                    SimpleNamespace(index=index, shard_id=shard.shard_id)
+                    for index, shard in enumerate(self.plan.shards)
+                )
+
+            def provider_request_utf8_bytes(
+                self,
+                request: Any,
+                *,
+                max_completion_tokens: int | None,
+            ) -> bytes:
+                self.assert_model_max(max_completion_tokens)
+                answer_count = len(
+                    self.plan.shards[request.index].payload["answers"]
+                )
+                return b"x" * (100 + 100 * answer_count)
+
+            @staticmethod
+            def assert_model_max(value: int | None) -> None:
+                if value != 100:
+                    raise AssertionError(f"unexpected model max: {value}")
+
+        def request_bytes(*_args: Any, **kwargs: Any) -> int:
+            self.assertTrue(kwargs["user_payload"]["answers"])
+            return 200
+
+        with (
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=request_bytes,
+            ),
+            patch(
+                "app.services.analyzer.create_sharded_artifact_store",
+                side_effect=lambda **kwargs: FakeStore(kwargs["plan"]),
+            ),
+        ):
+            groups = _preflight_entity_catalog_recovery_shards(
+                run_id="run-id",
+                job=job,
+                target=payload["target"],
+                recovery_system="strict recovery",
+                extraction_window={
+                    "input_utf8_window": 350,
+                    "model_envelope": {"max_completion_tokens": 100},
+                },
+                recovery_payload=payload,
+                recovery_artifact_key="recovery-parent",
+                source_digest=stable_digest(job["answers"]),
+            )
+
+        self.assertEqual([len(group) for group in groups], [1, 2])
+        observed = [
+            str(row["claim"]["unit_id"])
+            for group in groups
+            for row in group
+        ]
+        expected = [
+            str(_core_unit_claim(item)["unit_id"])
+            for item in job["answers"]
+        ]
+        self.assertEqual(observed, expected)
+        self.assertEqual(len(observed), len(set(observed)))
+
+    async def test_recovery_overflow_merges_losslessly_and_seals_manifest(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job()
+        payload = _sharded_recovery_payload(job)
+        save = AsyncMock()
+
+        class FakeStore:
+            def __init__(self, plan: Any) -> None:
+                self.plan = plan
+
+            def planned_requests(self) -> tuple[Any, ...]:
+                return tuple(
+                    SimpleNamespace(index=index, shard_id=shard.shard_id)
+                    for index, shard in enumerate(self.plan.shards)
+                )
+
+            def provider_request_utf8_bytes(
+                self,
+                _request: Any,
+                *,
+                max_completion_tokens: int | None,
+            ) -> bytes:
+                if max_completion_tokens != 100:
+                    raise AssertionError("model max drift")
+                return b"x" * 250
+
+            async def verify_provider_audit(self, *_args: Any) -> None:
+                return None
+
+            async def load_receipts(self, *_args: Any) -> list[Any]:
+                return []
+
+            async def save_receipt(self, *_args: Any) -> None:
+                return None
+
+        def request_bytes(*_args: Any, **kwargs: Any) -> int:
+            return 100 + 100 * len(kwargs["user_payload"]["answers"])
+
+        def result_for_messages(messages: list[dict[str, Any]]) -> ChatResult:
+            leaf_payload = json.loads(messages[-1]["content"])
+            claims = [
+                copy.deepcopy(item["core_claim"])
+                for item in leaf_payload["answers"]
+            ]
+            value = {
+                "catalog": {
+                    "target_aliases": ["ALPHA"],
+                    "entities": [],
+                    "uncertainties": [],
+                },
+                "core_dispositions": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "unit_id": claim["unit_id"],
+                        "core_sha256": claim["core_sha256"],
+                        "disposition": "grounded_fact",
+                        "evidence_quote": "ALPHA",
+                        "reason": "В core дословно назван бренд ALPHA.",
+                    }
+                    for claim in claims
+                ],
+            }
+            return ChatResult(
+                text=json.dumps(value, ensure_ascii=False),
+                parsed=value,
+                citations=[],
+                usage={},
+                annotations=[],
+                request_policy={"policy": "forbidden"},
+                web_attestation={"metric_eligible": True},
+                router_metadata={},
+                transport={"output_complete": True},
+            )
+
+        async def load_checkpoint(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            result = result_for_messages(kwargs["messages"])
+            return {
+                "status": "completed",
+                "manifest": {
+                    "complete": True,
+                    "document_sha256": text_sha256(result.text),
+                },
+                "resume_contract": {"sha256": "a" * 64},
+                "call_records": [{"sequence": 0}],
+                "partial_text": result.text,
+                "parsed_value": result.parsed,
+            }
+
+        def restore_checkpoint(
+            checkpoint: dict[str, Any],
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> ChatResult:
+            return ChatResult(
+                text=checkpoint["partial_text"],
+                parsed=copy.deepcopy(checkpoint["parsed_value"]),
+                citations=[],
+                usage={},
+                annotations=[],
+                request_policy={"policy": "forbidden"},
+                web_attestation={"metric_eligible": True},
+                router_metadata={},
+                transport={"output_complete": True},
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=request_bytes,
+            ),
+            patch(
+                "app.services.analyzer.create_sharded_artifact_store",
+                side_effect=lambda **kwargs: FakeStore(kwargs["plan"]),
+            ),
+            patch(
+                "app.services.analyzer._entity_catalog_recovery_artifact",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.services.analyzer._durable_structured_transport",
+                new=AsyncMock(return_value=(AsyncMock(), None)),
+            ),
+            patch(
+                "app.services.analyzer.chat_continuable_structured",
+                new=AsyncMock(
+                    side_effect=lambda **kwargs: result_for_messages(
+                        kwargs["messages"]
+                    )
+                ),
+            ),
+            patch(
+                "app.services.analyzer.load_structured_checkpoint",
+                new=AsyncMock(side_effect=load_checkpoint),
+            ),
+            patch(
+                "app.services.analyzer.restore_completed_structured_checkpoint",
+                side_effect=restore_checkpoint,
+            ),
+            patch("app.services.analyzer._save_artifact", save),
+        ):
+            recovered, manifest = await _execute_entity_catalog_recovery_shards(
+                "run-id",
+                job=job,
+                target=payload["target"],
+                profile={
+                    "brand_name": "ALPHA",
+                    "brand_aliases": ["ALPHA"],
+                    "products": [],
+                    "entity_scope": [],
+                },
+                recovery_system="strict recovery",
+                extraction_window={
+                    "input_utf8_window": 350,
+                    "model_envelope": {"max_completion_tokens": 100},
+                },
+                recovery_payload=payload,
+                recovery_artifact_key="recovery-parent",
+                source_digest=stable_digest(job["answers"]),
+            )
+
+        self.assertIsNotNone(manifest)
+        assert manifest is not None
+        self.assertTrue(manifest["complete"])
+        self.assertEqual(manifest["covered_shard_count"], 2)
+        decisions = recovered["core_dispositions"]
+        self.assertEqual(len(decisions), len(job["answers"]))
+        self.assertEqual(
+            [row["unit_id"] for row in decisions],
+            [
+                _core_unit_claim(item)["unit_id"]
+                for item in job["answers"]
+            ],
+        )
+        completed = [
+            call.kwargs
+            for call in save.await_args_list
+            if call.kwargs.get("status") == "completed"
+            and call.kwargs.get("artifact_key") == "recovery-parent"
+        ]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["output_json"], recovered)
+        self.assertEqual(
+            completed[0]["usage_json"]["_aiv_sharded_document"],
+            manifest,
+        )
+
+    async def test_cached_overflow_requires_direct_or_sharded_receipt(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job()
+        payload = _sharded_recovery_payload(job)
+        cached = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [],
+        }
+        artifact = SimpleNamespace(
+            usage_json={},
+            raw_text=json.dumps(cached, ensure_ascii=False),
+        )
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new=AsyncMock(return_value=copy.deepcopy(cached)),
+            ),
+            patch(
+                "app.services.analyzer._entity_catalog_recovery_artifact",
+                new=AsyncMock(return_value=artifact),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new=AsyncMock(),
+            ) as save,
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "no complete direct or sharded execution receipt",
+            ):
+                await _execute_entity_catalog_recovery_shards(
+                    "run-id",
+                    job=job,
+                    target=payload["target"],
+                    profile={"brand_name": "ALPHA"},
+                    recovery_system="strict recovery",
+                    extraction_window={
+                        "input_utf8_window": 350,
+                        "model_envelope": {"max_completion_tokens": 100},
+                    },
+                    recovery_payload=payload,
+                    recovery_artifact_key="recovery-parent",
+                    source_digest=stable_digest(job["answers"]),
+                )
+        save.assert_not_awaited()
+
+    async def test_completed_parent_is_reused_before_drifted_preflight(
+        self,
+    ) -> None:
+        def candidate_for(payload: dict[str, Any], *, quote: str) -> dict[str, Any]:
+            claims = [
+                copy.deepcopy(answer["core_claim"])
+                for answer in payload["answers"]
+            ]
+            return {
+                "catalog": {
+                    "target_aliases": [quote],
+                    "entities": [],
+                    "uncertainties": [],
+                },
+                "core_dispositions": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "unit_id": claim["unit_id"],
+                        "core_sha256": claim["core_sha256"],
+                        "disposition": "grounded_fact",
+                        "evidence_quote": quote,
+                        "reason": "В core дословно назван бренд ALPHA.",
+                    }
+                    for claim in claims
+                ],
+            }
+
+        processing_calls: list[str] = []
+
+        async def processing(_run_id: str, **kwargs: Any) -> dict[str, Any]:
+            artifact_key = str(kwargs["artifact_key"])
+            processing_calls.append(artifact_key)
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                return candidate_for(payload, quote="Alpha")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
+
+        recovered_holder: dict[str, dict[str, Any]] = {}
+        manifest_holder: dict[str, dict[str, Any]] = {}
+
+        async def artifact_output(
+            _run_id: str,
+            artifact_key: str,
+            **kwargs: Any,
+        ) -> dict[str, Any] | None:
+            if artifact_key.endswith("_accepted"):
+                return None
+            if artifact_key.endswith("_recovery_e4_a1"):
+                payload = kwargs["input_json"]
+                recovered = candidate_for(payload, quote="ALPHA")
+                recovered_holder[artifact_key] = copy.deepcopy(recovered)
+                return recovered
+            return None
+
+        async def recovery_artifact(
+            _run_id: str,
+            artifact_key: str,
+        ) -> Any | None:
+            recovered = recovered_holder.get(artifact_key)
+            if recovered is None:
+                return None
+            manifest = {
+                "complete": True,
+                "shard_count": 2,
+                "covered_shard_count": 2,
+                "document_sha256": stable_digest(recovered),
+            }
+            manifest_holder[artifact_key] = copy.deepcopy(manifest)
+            return SimpleNamespace(
+                usage_json={"_aiv_sharded_document": manifest},
+                raw_text=None,
+            )
+
+        def request_bytes(*_args: Any, **kwargs: Any) -> int:
+            payload = kwargs["user_payload"]
+            return 20_000_000 if "recovery" in payload else 100
+
+        reserve = AsyncMock()
+        save = AsyncMock()
+        preflight = patch(
+            "app.services.analyzer._preflight_entity_catalog_recovery_shards",
+            side_effect=AssertionError(
+                "A completed exact parent must bypass fresh shard preflight"
+            ),
+        )
+        with (
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=request_bytes,
+            ),
+            preflight as preflight_mock,
+        ):
+            result, _planner, _reserve, finish = await self._run_catalog(
+                processing,
+                plan=_retry_plan(reused=True),
+                reserve_mock=reserve,
+                save_mock=save,
+                execution_state_mock=AsyncMock(
+                    return_value=SimpleNamespace(
+                        status="executing",
+                        execution_attempts=1,
+                    )
+                ),
+                artifact_output_mock=AsyncMock(side_effect=artifact_output),
+                recovery_artifact_mock=AsyncMock(side_effect=recovery_artifact),
+                answers=[
+                    {"answer_id": 1, "answer": "ALPHA — первый ответ."},
+                    {"answer_id": 2, "answer": "ALPHA — второй ответ."},
+                ],
+            )
+
+        self.assertIsNotNone(result)
+        preflight_mock.assert_not_called()
+        reserve.assert_not_awaited()
+        self.assertFalse(any("_recovery_" in key for key in processing_calls))
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+        self.assertEqual(
+            finish.await_args.kwargs["details"]["execution_attempt"],
+            1,
+        )
+        checkpoint = save.await_args.kwargs["output_json"]
+        parent_key = checkpoint["recovery_artifact_key"]
+        self.assertEqual(
+            checkpoint["recovery_execution_manifest_sha256"],
+            stable_digest(manifest_holder[parent_key]),
+        )
+
+    async def test_current_parent_routes_through_deep_cache_executor(
+        self,
+    ) -> None:
+        def candidate_for(payload: dict[str, Any], *, quote: str) -> dict[str, Any]:
+            claims = [
+                copy.deepcopy(answer["core_claim"])
+                for answer in payload["answers"]
+            ]
+            return {
+                "catalog": {
+                    "target_aliases": [quote],
+                    "entities": [],
+                    "uncertainties": [],
+                },
+                "core_dispositions": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "unit_id": claim["unit_id"],
+                        "core_sha256": claim["core_sha256"],
+                        "disposition": "grounded_fact",
+                        "evidence_quote": quote,
+                        "reason": "В core дословно назван бренд ALPHA.",
+                    }
+                    for claim in claims
+                ],
+            }
+
+        async def processing(_run_id: str, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            if "answers" in payload:
+                return candidate_for(payload, quote="Alpha")
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
+
+        cached_result: dict[str, Any] = {}
+        cached_manifest = {
+            "version": ENTITY_CATALOG_RECOVERY_PARENT_MANIFEST_VERSION,
+            "complete": True,
+        }
+
+        async def cached_parent(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            recovered = candidate_for(
+                kwargs["recovery_payload"],
+                quote="ALPHA",
+            )
+            cached_result.clear()
+            cached_result.update(copy.deepcopy(recovered))
+            return recovered, copy.deepcopy(cached_manifest)
+
+        executor = AsyncMock(
+            side_effect=lambda *_args, **_kwargs: (
+                copy.deepcopy(cached_result),
+                copy.deepcopy(cached_manifest),
+            )
+        )
+
+        def request_bytes(*_args: Any, **kwargs: Any) -> int:
+            if "recovery" in kwargs["user_payload"]:
+                raise AssertionError(
+                    "current parent validation must not remeasure or POST"
+                )
+            return 100
+
+        with (
+            patch(
+                "app.services.analyzer._cached_entity_catalog_recovery_parent",
+                new=AsyncMock(side_effect=cached_parent),
+            ) as cache_lookup,
+            patch(
+                "app.services.analyzer._execute_entity_catalog_recovery_shards",
+                new=executor,
+            ),
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=request_bytes,
+            ) as request_measurement,
+        ):
+            result, _planner, reserve, finish = await self._run_catalog(
+                processing,
+            )
+
+        self.assertIsNotNone(result)
+        cache_lookup.assert_awaited_once()
+        executor.assert_awaited_once()
+        self.assertTrue(request_measurement.called)
+        reserve.assert_awaited_once()
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+
+    async def test_direct_failover_singleton_is_terminal_without_attempt_two(
+        self,
+    ) -> None:
+        reserve = AsyncMock(side_effect=[1, 2])
+        finish = AsyncMock()
+        executor = AsyncMock(
+            side_effect=_EntityCatalogRecoverySingletonContextError(
+                "minimum core exhausted context"
+            )
+        )
+        recovery_processing_calls = 0
+
+        async def processing(_run_id: str, **kwargs: Any) -> dict[str, Any]:
+            nonlocal recovery_processing_calls
+            payload = kwargs["user_payload"]
+            failover = kwargs.get("composable_failover")
+            if failover is not None:
+                recovery_processing_calls += 1
+                request = {
+                    "reason": "prefix_context_exhausted",
+                    "model": PROCESSING_MODEL,
+                    "schema_name": kwargs["schema_name"],
+                    "document_id": (
+                        f"run-id:{kwargs['artifact_key']}:"
+                        f"{stable_digest(payload)[:20]}"
+                    ),
+                    "response_schema": copy.deepcopy(kwargs["schema"]),
+                }
+                try:
+                    await failover(request)
+                except Exception as exc:
+                    raise OpenRouterStructuredContinuationError(
+                        "wrapped direct failover",
+                        result=ChatResult(
+                            text="{",
+                            parsed=None,
+                            citations=[],
+                            usage={},
+                            annotations=[],
+                            request_policy={"policy": "forbidden"},
+                            web_attestation={"metric_eligible": True},
+                            router_metadata={},
+                            transport={"output_complete": False},
+                        ),
+                        manifest={"complete": False},
+                    ) from exc
+                raise AssertionError("singleton failover unexpectedly succeeded")
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._execute_entity_catalog_recovery_shards",
+                executor,
+            ),
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError("direct semantic test must not POST"),
+            ) as client_factory,
+            self.assertRaises(OpenRouterError),
+        ):
+            await self._run_catalog(
+                processing,
+                reserve_mock=reserve,
+                finish_mock=finish,
+            )
+
+        client_factory.assert_not_called()
+        self.assertEqual(recovery_processing_calls, 1)
+        self.assertEqual(executor.await_count, 1)
+        self.assertEqual(reserve.await_count, 1)
+        finish.assert_awaited_once()
+        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        failures = finish.await_args.kwargs["details"]["attempt_failures"]
+        self.assertEqual(
+            failures[0]["failure_kind"],
+            "singleton_prefix_context_exhausted",
+        )
+
+    async def test_direct_semantic_failover_advances_bounded_attempt_two(
+        self,
+    ) -> None:
+        reserve = AsyncMock(side_effect=[1, 2])
+        finish = AsyncMock()
+        executor_calls = 0
+
+        async def executor(
+            _run_id: str,
+            **kwargs: Any,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            nonlocal executor_calls
+            executor_calls += 1
+            if executor_calls == 1:
+                raise _EntityCatalogRecoveryShardSemanticError(
+                    "complete child failed semantic validation"
+                )
+            recovered = {
+                "catalog": {
+                    "target_aliases": ["ALPHA"],
+                    "entities": [],
+                    "uncertainties": [],
+                },
+                "core_dispositions": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "unit_id": claim["unit_id"],
+                        "core_sha256": claim["core_sha256"],
+                        "disposition": "grounded_fact",
+                        "evidence_quote": "ALPHA",
+                        "reason": "В core дословно назван бренд ALPHA.",
+                    }
+                    for claim in [
+                        _core_unit_claim(item)
+                        for item in kwargs["job"]["answers"]
+                    ]
+                ],
+            }
+            manifest = {
+                "complete": True,
+                "coverage_complete": True,
+                "response_mode": "partitioned",
+                "shard_count": 1,
+                "covered_shard_count": 1,
+                "document_sha256": stable_digest(recovered),
+            }
+            return recovered, manifest
+
+        async def processing(_run_id: str, **kwargs: Any) -> dict[str, Any]:
+            payload = kwargs["user_payload"]
+            failover = kwargs.get("composable_failover")
+            if failover is not None:
+                request = {
+                    "reason": "prefix_context_exhausted",
+                    "model": PROCESSING_MODEL,
+                    "schema_name": kwargs["schema_name"],
+                    "document_id": (
+                        f"run-id:{kwargs['artifact_key']}:"
+                        f"{stable_digest(payload)[:20]}"
+                    ),
+                    "response_schema": copy.deepcopy(kwargs["schema"]),
+                }
+                try:
+                    result = await failover(request)
+                except Exception as exc:
+                    raise OpenRouterStructuredContinuationError(
+                        "wrapped direct failover",
+                        result=ChatResult(
+                            text="{",
+                            parsed=None,
+                            citations=[],
+                            usage={},
+                            annotations=[],
+                            request_policy={"policy": "forbidden"},
+                            web_attestation={"metric_eligible": True},
+                            router_metadata={},
+                            transport={"output_complete": False},
+                        ),
+                        manifest={"complete": False},
+                    ) from exc
+                assert isinstance(result.parsed, dict)
+                return copy.deepcopy(result.parsed)
+            if "answers" in payload:
+                return _catalog_candidate(
+                    payload["answers"][0]["core_claim"],
+                    quote="Alpha",
+                )
+            return _deterministic_entity_catalog_union(
+                list(payload["chunk_catalogs"])
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._execute_entity_catalog_recovery_shards",
+                new=AsyncMock(side_effect=executor),
+            ),
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "completed child checkpoint reuse must not POST"
+                ),
+            ) as client_factory,
+        ):
+            result, _planner, _reserve, _finish = await self._run_catalog(
+                processing,
+                reserve_mock=reserve,
+                finish_mock=finish,
+                attempts=[1, 2],
+            )
+
+        client_factory.assert_not_called()
+        self.assertIsNotNone(result)
+        self.assertEqual(executor_calls, 2)
+        self.assertEqual(reserve.await_count, 2)
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+        self.assertEqual(
+            finish.await_args.kwargs["details"]["execution_attempt"],
+            2,
+        )
+
     async def test_ambiguous_markdown_failure_stays_fail_closed(self) -> None:
         planner = AsyncMock()
         with (
@@ -1907,6 +3075,920 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(admitted)
         planner.assert_not_awaited()
+
+
+class EntityCatalogRecoveryContinuationTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    async def asyncSetUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self._temp_dir.name) / "recovery.sqlite3"
+        self.engine = create_async_engine(
+            f"sqlite+aiosqlite:///{database_path}",
+            echo=False,
+        )
+        self.SessionLocal = async_sessionmaker(
+            self.engine,
+            expire_on_commit=False,
+            class_=AsyncSession,
+        )
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        self.run_id = str(uuid.uuid4())
+        async with self.SessionLocal() as session:
+            session.add(
+                Run(
+                    id=self.run_id,
+                    domain="example.com",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            await session.commit()
+        self._patches = [
+            patch(
+                "app.services.analyzer.SessionLocal",
+                self.SessionLocal,
+            ),
+            patch.object(audit_store, "SessionLocal", self.SessionLocal),
+            patch(
+                "app.services.analyzer.assert_run_lease",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                audit_store,
+                "assert_run_lease",
+                new=AsyncMock(),
+            ),
+        ]
+        for active_patch in self._patches:
+            active_patch.start()
+
+    async def asyncTearDown(self) -> None:
+        for active_patch in reversed(self._patches):
+            active_patch.stop()
+        await self.engine.dispose()
+        self._temp_dir.cleanup()
+
+    async def _complete_current_parent(
+        self,
+        *,
+        artifact_key: str,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        job = _sharded_recovery_job(count=2)
+        payload = _sharded_recovery_payload(job)
+        profile = {
+            "brand_name": "ALPHA",
+            "brand_aliases": ["ALPHA"],
+            "products": [],
+            "entity_scope": [],
+        }
+        candidate = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [
+                {
+                    "claim_id": item["core_claim"]["claim_id"],
+                    "unit_id": item["core_claim"]["unit_id"],
+                    "core_sha256": item["core_claim"]["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "ALPHA",
+                    "reason": "В core дословно назван бренд ALPHA.",
+                }
+                for item in payload["answers"]
+            ],
+        }
+        full_text = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        client = _RecoveryPrefixClient(full_text, full_text)
+        envelope = {
+            "version": "test-envelope",
+            "policy": "model_max_available",
+            "requested_model": PROCESSING_MODEL,
+            "resolution": "test",
+            "context_length": 1_000_000,
+            "max_completion_tokens": 65_536,
+        }
+        extraction_window = {
+            "input_utf8_window": 2_000_000,
+            "model_envelope": envelope,
+        }
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+        ):
+            recovered, manifest = (
+                await _execute_entity_catalog_recovery_shards(
+                    self.run_id,
+                    job=job,
+                    target=payload["target"],
+                    profile=profile,
+                    recovery_system="strict recovery",
+                    extraction_window=extraction_window,
+                    recovery_payload=payload,
+                    recovery_artifact_key=artifact_key,
+                    source_digest=stable_digest(job["answers"]),
+                )
+            )
+        self.assertEqual(recovered, candidate)
+        self.assertIsNotNone(manifest)
+        return job, payload, profile, extraction_window
+
+    async def test_current_parent_missing_leaf_fails_without_http(
+        self,
+    ) -> None:
+        artifact_key = "recovery-parent-missing-leaf"
+        job, payload, profile, extraction_window = (
+            await self._complete_current_parent(artifact_key=artifact_key)
+        )
+        async with self.SessionLocal() as session:
+            leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            await session.delete(leaf)
+            await session.commit()
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "parent cache validation must not use HTTP"
+                ),
+            ) as client_factory,
+            self.assertRaisesRegex(
+                OpenRouterError,
+                "missing child leaf",
+            ),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key=artifact_key,
+                source_digest=stable_digest(job["answers"]),
+            )
+        client_factory.assert_not_called()
+
+    async def test_current_parent_missing_checkpoint_fails_without_http(
+        self,
+    ) -> None:
+        artifact_key = "recovery-parent-missing-checkpoint"
+        job, payload, profile, extraction_window = (
+            await self._complete_current_parent(artifact_key=artifact_key)
+        )
+        async with self.SessionLocal() as session:
+            structured_rows = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("lsa2_%"),
+                    )
+                )
+            ).scalars().all()
+            self.assertTrue(structured_rows)
+            for row in structured_rows:
+                await session.delete(row)
+            await session.commit()
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "checkpoint validation must not use HTTP"
+                ),
+            ) as client_factory,
+            self.assertRaisesRegex(
+                OpenRouterError,
+                "physical receipts are missing or mismatched",
+            ),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key=artifact_key,
+                source_digest=stable_digest(job["answers"]),
+            )
+        client_factory.assert_not_called()
+
+    async def test_output_limited_prefix_resumes_without_repeating_post(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job(count=2)
+        payload = _sharded_recovery_payload(job)
+        dispositions = []
+        for item in payload["answers"]:
+            claim = item["core_claim"]
+            dispositions.append(
+                {
+                    "claim_id": claim["claim_id"],
+                    "unit_id": claim["unit_id"],
+                    "core_sha256": claim["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "ALPHA",
+                    "reason": (
+                        "В core дословно назван бренд ALPHA. " + "факт " * 180
+                    ),
+                }
+            )
+        candidate = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": dispositions,
+        }
+        catalog_text = json.dumps(
+            candidate["catalog"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        disposition_texts = [
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for value in dispositions
+        ]
+        prefix_text = (
+            '{"catalog":'
+            + catalog_text
+            + ',"core_dispositions":['
+            + disposition_texts[0]
+            + ","
+        )
+        full_text = prefix_text + disposition_texts[1] + "]}"
+        self.assertGreater(len(prefix_text), 512)
+        client = _RecoveryPrefixClient(full_text, prefix_text)
+        envelope = {
+            "version": "test-envelope",
+            "policy": "model_max_available",
+            "requested_model": PROCESSING_MODEL,
+            "resolution": "test",
+            "context_length": 1_000_000,
+            "max_completion_tokens": 65_536,
+        }
+        extraction_window = {
+            "input_utf8_window": 2_000_000,
+            "model_envelope": envelope,
+        }
+        profile = {
+            "brand_name": "ALPHA",
+            "brand_aliases": ["ALPHA"],
+            "products": [],
+            "entity_scope": [],
+        }
+        source_digest = stable_digest(job["answers"])
+        real_persist = audit_store.persist_structured_audit_event
+        crash_state = {"raised": False}
+
+        async def persist_receipt_then_crash(
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            await real_persist(*args, **kwargs)
+            event = kwargs["event"]
+            if (
+                not crash_state["raised"]
+                and event.get("event_kind") == "provider_post"
+                and event.get("sequence") == 0
+            ):
+                crash_state["raised"] = True
+                raise RuntimeError("simulated crash after durable provider receipt")
+
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+            patch.object(
+                audit_store,
+                "persist_structured_audit_event",
+                new=persist_receipt_then_crash,
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key="recovery-parent",
+                source_digest=source_digest,
+            )
+
+        self.assertTrue(crash_state["raised"])
+        self.assertEqual(client.request_kinds, ["initial"])
+
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+        ):
+            recovered, manifest = (
+                await _execute_entity_catalog_recovery_shards(
+                    self.run_id,
+                    job=job,
+                    target=payload["target"],
+                    profile=profile,
+                    recovery_system="strict recovery",
+                    extraction_window=extraction_window,
+                    recovery_payload=payload,
+                    recovery_artifact_key="recovery-parent",
+                    source_digest=source_digest,
+                )
+            )
+
+        self.assertEqual(client.request_kinds, ["initial", "continuation"])
+        self.assertEqual(recovered, candidate)
+        self.assertIsNotNone(manifest)
+        assert manifest is not None
+        self.assertTrue(manifest["complete"])
+        self.assertTrue(manifest["coverage_complete"])
+        self.assertEqual(manifest["document_sha256"], stable_digest(candidate))
+
+        with patch(
+            "app.services.openrouter.httpx.AsyncClient",
+            side_effect=AssertionError("completed parent must be network-free"),
+        ) as client_factory:
+            reused, reused_manifest = (
+                await _execute_entity_catalog_recovery_shards(
+                    self.run_id,
+                    job=job,
+                    target=payload["target"],
+                    profile=profile,
+                    recovery_system="strict recovery",
+                    extraction_window=extraction_window,
+                    recovery_payload=payload,
+                    recovery_artifact_key="recovery-parent",
+                    source_digest=source_digest,
+                )
+            )
+        client_factory.assert_not_called()
+        self.assertEqual(reused, recovered)
+        self.assertEqual(reused_manifest, manifest)
+
+        async with self.SessionLocal() as session:
+            parent = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key == "recovery-parent",
+                    )
+                )
+            ).scalar_one()
+            receipts = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("lsa2_receipt_%"),
+                    )
+                )
+            ).scalars().all()
+        self.assertEqual(parent.status, "completed")
+        self.assertEqual(parent.output_json, candidate)
+        self.assertEqual(len(receipts), 2)
+
+        async with self.SessionLocal() as session:
+            parent = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key == "recovery-parent",
+                    )
+                )
+            ).scalar_one()
+            parent.status = "failed"
+            await session.commit()
+        with patch(
+            "app.services.openrouter.httpx.AsyncClient",
+            side_effect=AssertionError(
+                "completed leaf reuse must be network-free"
+            ),
+        ) as leaf_reuse_factory:
+            leaf_reused, _leaf_reused_manifest = (
+                await _execute_entity_catalog_recovery_shards(
+                    self.run_id,
+                    job=job,
+                    target=payload["target"],
+                    profile=profile,
+                    recovery_system="strict recovery",
+                    extraction_window=extraction_window,
+                    recovery_payload=payload,
+                    recovery_artifact_key="recovery-parent",
+                    source_digest=source_digest,
+                )
+            )
+        leaf_reuse_factory.assert_not_called()
+        self.assertEqual(leaf_reused, candidate)
+
+        async with self.SessionLocal() as session:
+            parent = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key == "recovery-parent",
+                    )
+                )
+            ).scalar_one()
+            leaf = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key.like("ecr_leaf_%"),
+                    )
+                )
+            ).scalar_one()
+            parent.status = "failed"
+            assert isinstance(leaf.raw_text, str)
+            leaf.raw_text += " "
+            await session.commit()
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError("tamper path must be network-free"),
+            ) as tamper_factory,
+            self.assertRaisesRegex(
+                OpenRouterError,
+                "tampered or mismatched",
+            ),
+        ):
+            await _execute_entity_catalog_recovery_shards(
+                self.run_id,
+                job=job,
+                target=payload["target"],
+                profile=profile,
+                recovery_system="strict recovery",
+                extraction_window=extraction_window,
+                recovery_payload=payload,
+                recovery_artifact_key="recovery-parent",
+                source_digest=source_digest,
+            )
+        tamper_factory.assert_not_called()
+
+    async def test_overflow_route_reaches_harness_and_seals_checkpoint(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job(count=2)
+        target = {"brand_name": "ALPHA", "aliases": ["ALPHA"]}
+        profile = {
+            "brand_name": "ALPHA",
+            "brand_aliases": ["ALPHA"],
+            "products": [],
+            "entity_scope": [],
+        }
+        claims = [
+            copy.deepcopy(item["core_claim"])
+            for item in job["model_answers"]
+        ]
+        invalid_candidate = {
+            "catalog": {
+                "target_aliases": ["Alpha"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "unit_id": claim["unit_id"],
+                    "core_sha256": claim["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "Alpha",
+                    "reason": "Регистр цитаты намеренно нарушен.",
+                }
+                for claim in claims
+            ],
+        }
+        recovered_candidate = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "unit_id": claim["unit_id"],
+                    "core_sha256": claim["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "ALPHA",
+                    "reason": "В core дословно назван бренд ALPHA.",
+                }
+                for claim in claims
+            ],
+        }
+        full_text = json.dumps(
+            recovered_candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        client = _RecoveryPrefixClient(full_text, full_text)
+        envelope = {
+            "version": "test-envelope",
+            "policy": "model_max_available",
+            "requested_model": PROCESSING_MODEL,
+            "resolution": "test",
+            "context_length": 1_000_000,
+            "max_completion_tokens": 65_536,
+        }
+        input_window = 2_000_000
+        plan = _retry_plan()
+        plan.run_id = self.run_id
+        finish = AsyncMock()
+
+        def measured_request_bytes(*_args: Any, **kwargs: Any) -> int:
+            user_payload = kwargs["user_payload"]
+            recovery_contract = user_payload.get("recovery")
+            if (
+                isinstance(recovery_contract, dict)
+                and "shard_source_binding" not in recovery_contract
+            ):
+                return input_window + 1
+            return 1_000
+
+        with (
+            patch(
+                "app.services.analyzer.settings.PIPELINE_ORCHESTRATOR_ENABLED",
+                True,
+            ),
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ),
+            patch(
+                "app.services.analyzer.recovery_execution_state",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        status="planned",
+                        execution_attempts=0,
+                    )
+                ),
+            ),
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new=AsyncMock(return_value=1),
+            ) as reserve,
+            patch(
+                "app.services.analyzer.finish_recovery",
+                finish,
+            ),
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                side_effect=measured_request_bytes,
+            ),
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+        ):
+            accepted = await _recover_entity_catalog_chunk_contract(
+                self.run_id,
+                job=job,
+                target=target,
+                profile=profile,
+                extraction_system="strict extraction",
+                extraction_window={
+                    "input_utf8_window": input_window,
+                    "model_envelope": envelope,
+                },
+                candidate=invalid_candidate,
+                contract_error=OpenRouterError(
+                    "Core-unit quote is not an exact core substring: "
+                    + str(claims[0]["unit_id"])
+                ),
+            )
+
+        self.assertEqual(
+            accepted["target_aliases"],
+            recovered_candidate["catalog"]["target_aliases"],
+        )
+        self.assertEqual(client.request_kinds, ["initial"])
+        reserve.assert_awaited_once()
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+
+        async with self.SessionLocal() as session:
+            artifacts = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                    )
+                )
+            ).scalars().all()
+        checkpoints = [
+            artifact
+            for artifact in artifacts
+            if artifact.model is None
+            and artifact.status == "completed"
+            and isinstance(artifact.output_json, dict)
+            and "checkpoint_sha256" in artifact.output_json
+        ]
+        parents = [
+            artifact
+            for artifact in artifacts
+            if artifact.status == "completed"
+            and isinstance(artifact.usage_json, dict)
+            and "_aiv_sharded_document" in artifact.usage_json
+        ]
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(len(parents), 1)
+        checkpoint = checkpoints[0].output_json
+        assert isinstance(checkpoint, dict)
+        self.assertEqual(
+            checkpoint["recovery_execution_manifest_sha256"],
+            stable_digest(
+                parents[0].usage_json["_aiv_sharded_document"]
+            ),
+        )
+        self.assertEqual(
+            checkpoint["identity"]["source_units_sha256"],
+            stable_digest(job["answers"]),
+        )
+
+    async def test_fitting_direct_recovery_repartitions_on_headroom(
+        self,
+    ) -> None:
+        job = _sharded_recovery_job(count=2)
+        target = {"brand_name": "ALPHA", "aliases": ["ALPHA"]}
+        profile = {
+            "brand_name": "ALPHA",
+            "brand_aliases": ["ALPHA"],
+            "products": [],
+            "entity_scope": [],
+        }
+        claims = [
+            copy.deepcopy(item["core_claim"])
+            for item in job["model_answers"]
+        ]
+        invalid_candidate = {
+            "catalog": {
+                "target_aliases": ["Alpha"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "unit_id": claim["unit_id"],
+                    "core_sha256": claim["core_sha256"],
+                    "disposition": "grounded_fact",
+                    "evidence_quote": "Alpha",
+                    "reason": "Регистр цитаты намеренно нарушен.",
+                }
+                for claim in claims
+            ],
+        }
+        dispositions = [
+            {
+                "claim_id": claim["claim_id"],
+                "unit_id": claim["unit_id"],
+                "core_sha256": claim["core_sha256"],
+                "disposition": "grounded_fact",
+                "evidence_quote": "ALPHA",
+                "reason": (
+                    "В core дословно назван бренд ALPHA. " + "факт " * 180
+                ),
+            }
+            for claim in claims
+        ]
+        recovered_candidate = {
+            "catalog": {
+                "target_aliases": ["ALPHA"],
+                "entities": [],
+                "uncertainties": [],
+            },
+            "core_dispositions": dispositions,
+        }
+        catalog_text = json.dumps(
+            recovered_candidate["catalog"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        disposition_texts = [
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for value in dispositions
+        ]
+        prefix_text = (
+            '{"catalog":'
+            + catalog_text
+            + ',"core_dispositions":['
+            + disposition_texts[0]
+            + ","
+        )
+        full_text = prefix_text + disposition_texts[1] + "]}"
+        self.assertGreater(len(prefix_text), 512)
+        client = _RecoveryHeadroomFailoverClient(full_text, prefix_text)
+        envelope = {
+            "version": "test-envelope",
+            "policy": "model_max_available",
+            "requested_model": PROCESSING_MODEL,
+            "resolution": "test",
+            "context_length": 1_000_000,
+            "max_completion_tokens": 65_536,
+        }
+        input_window = 2_000_000
+        plan = _retry_plan()
+        plan.run_id = self.run_id
+        finish = AsyncMock()
+        real_headroom = openrouter_service._apply_model_output_headroom
+        continuation_headroom_attempts = 0
+
+        def fail_direct_continuation_headroom(
+            **kwargs: Any,
+        ) -> tuple[int | None, dict[str, Any]]:
+            nonlocal continuation_headroom_attempts
+            messages = kwargs["payload"].get("messages") or []
+            if messages and "CONTINUATION_CONTRACT_JSON:" in str(
+                messages[-1].get("content") or ""
+            ):
+                continuation_headroom_attempts += 1
+                raise openrouter_service.OpenRouterContextHeadroomError(
+                    "simulated prefix context exhaustion"
+                )
+            return real_headroom(**kwargs)
+
+        with (
+            patch(
+                "app.services.analyzer.settings.PIPELINE_ORCHESTRATOR_ENABLED",
+                True,
+            ),
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ),
+            patch(
+                "app.services.analyzer.recovery_execution_state",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        status="planned",
+                        execution_attempts=0,
+                    )
+                ),
+            ),
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new=AsyncMock(return_value=1),
+            ) as reserve,
+            patch(
+                "app.services.analyzer.finish_recovery",
+                finish,
+            ),
+            patch(
+                "app.services.analyzer._structured_provider_request_utf8_bytes",
+                return_value=1_000,
+            ) as request_measurement,
+            patch(
+                "app.services.openrouter._apply_model_output_headroom",
+                side_effect=fail_direct_continuation_headroom,
+            ),
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=envelope,
+            ),
+        ):
+            accepted = await _recover_entity_catalog_chunk_contract(
+                self.run_id,
+                job=job,
+                target=target,
+                profile=profile,
+                extraction_system="strict extraction",
+                extraction_window={
+                    "input_utf8_window": input_window,
+                    "model_envelope": envelope,
+                },
+                candidate=invalid_candidate,
+                contract_error=OpenRouterError(
+                    "Core-unit quote is not an exact core substring: "
+                    + str(claims[0]["unit_id"])
+                ),
+            )
+
+        self.assertEqual(accepted["target_aliases"], ["ALPHA"])
+        self.assertEqual(
+            client.request_kinds,
+            ["direct_initial", "shard_initial"],
+        )
+        self.assertEqual(continuation_headroom_attempts, 1)
+        self.assertGreaterEqual(request_measurement.call_count, 3)
+        reserve.assert_awaited_once()
+        finish.assert_awaited_once()
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
+
+        async with self.SessionLocal() as session:
+            artifacts = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == self.run_id,
+                    )
+                )
+            ).scalars().all()
+        parents = [
+            artifact
+            for artifact in artifacts
+            if artifact.status == "completed"
+            and isinstance(artifact.usage_json, dict)
+            and "_aiv_sharded_document" in artifact.usage_json
+            and "_aiv_abandoned_structured_prefix" in artifact.usage_json
+        ]
+        checkpoints = [
+            artifact
+            for artifact in artifacts
+            if artifact.model is None
+            and artifact.status == "completed"
+            and isinstance(artifact.output_json, dict)
+            and "recovery_execution_manifest_sha256"
+            in artifact.output_json
+        ]
+        self.assertEqual(len(parents), 1)
+        self.assertEqual(len(checkpoints), 1)
+        parent_manifest = parents[0].usage_json["_aiv_sharded_document"]
+        checkpoint = checkpoints[0].output_json
+        assert isinstance(checkpoint, dict)
+        self.assertEqual(
+            checkpoint["recovery_execution_manifest_sha256"],
+            stable_digest(parent_manifest),
+        )
+        self.assertTrue(parent_manifest["coverage_complete"])
 
 
 if __name__ == "__main__":

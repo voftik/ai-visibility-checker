@@ -17,6 +17,7 @@ from app.services.openrouter import (
     STRUCTURED_AUDIT_EVENT_VERSION_ATTR,
     STRUCTURED_CHECKPOINT_DELTA_VERSION,
     STRUCTURED_CHECKPOINT_VERSION,
+    STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
     OpenRouterAuditCheckpointError,
     OpenRouterError,
     OpenRouterOutputLimitError,
@@ -1027,6 +1028,53 @@ class OpenRouterStructuredContinuationTests(unittest.IsolatedAsyncioTestCase):
             )
         return result, client
 
+    def _promote_provider_event(
+        self,
+        provider_event: dict[str, Any],
+        predecessor: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return promote_provider_post_to_structured_checkpoint(
+            provider_event,
+            predecessor,
+            "google/gemini-3.6-flash",
+            [{"role": "user", "content": "Верни документ."}],
+            "aiv_continuable_document",
+            self.schema,
+            provider_event["document_id"],
+            overlap_chars=12,
+        )
+
+    async def _assert_terminal_checkpoint_is_network_free(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> None:
+        self.assertEqual(checkpoint["status"], "failed")
+        self.assertFalse(checkpoint["manifest"]["complete"])
+        marker = checkpoint["error"]["terminal_semantic_failure"]
+        self.assertEqual(
+            marker["version"],
+            STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
+        )
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "terminal receipt replay must not repeat a provider POST"
+                ),
+            ) as client_factory,
+            self.assertRaises(OpenRouterStructuredContinuationError),
+        ):
+            await chat_continuable_structured(
+                model="google/gemini-3.6-flash",
+                messages=[{"role": "user", "content": "Верни документ."}],
+                response_schema=self.schema,
+                document_id=checkpoint["document_id"],
+                overlap_chars=12,
+                retry_transport_errors=False,
+                resume_checkpoint=checkpoint,
+            )
+        client_factory.assert_not_called()
+
     async def test_successful_multi_part_document_is_joined_and_validated(
         self,
     ) -> None:
@@ -1072,6 +1120,139 @@ class OpenRouterStructuredContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call["sequence"] for call in manifest["calls"]], [0, 1, 2])
         self.assertTrue(result.transport["output_complete"])
         self.assertFalse(result.transport["output_limited"])
+
+    async def test_terminal_schema_failure_resume_is_network_free(self) -> None:
+        initial = '{"items":[{"name":"А"},'
+        continuation = initial[-12:] + "{}]}"
+        events: list[dict[str, Any]] = []
+        client = _SequenceClient(
+            [
+                self._part(initial, limited=True),
+                self._part(continuation, limited=True),
+            ]
+        )
+        messages = [{"role": "user", "content": "Верни документ."}]
+        document_id = "terminal-schema-failure"
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=dict(self.envelope),
+            ),
+            self.assertRaises(
+                OpenRouterStructuredContinuationError
+            ) as raised,
+        ):
+            await chat_continuable_structured(
+                model="google/gemini-3.6-flash",
+                messages=messages,
+                response_schema=self.schema,
+                document_id=document_id,
+                overlap_chars=12,
+                retry_transport_errors=False,
+                audit_checkpoint=events.append,
+            )
+
+        self.assertEqual(len(client.requests), 2)
+        marker = raised.exception.manifest["terminal_semantic_failure"]
+        self.assertEqual(
+            marker["version"],
+            STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
+        )
+        self.assertEqual(
+            marker["failure_kind"],
+            "complete_json_schema_violation",
+        )
+        failed_checkpoint = next(
+            event
+            for event in reversed(events)
+            if event["event_kind"] == "structured_continuation_checkpoint"
+            and event["status"] == "failed"
+        )
+        self.assertEqual(
+            failed_checkpoint["error"]["terminal_semantic_failure"],
+            marker,
+        )
+
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                side_effect=AssertionError(
+                    "terminal semantic checkpoint must not repeat a POST"
+                ),
+            ) as client_factory,
+            self.assertRaises(
+                OpenRouterStructuredContinuationError
+            ) as resumed,
+        ):
+            await chat_continuable_structured(
+                model="google/gemini-3.6-flash",
+                messages=messages,
+                response_schema=self.schema,
+                document_id=document_id,
+                overlap_chars=12,
+                retry_transport_errors=False,
+                resume_checkpoint=failed_checkpoint,
+            )
+        client_factory.assert_not_called()
+        self.assertEqual(
+            resumed.exception.manifest["terminal_semantic_failure"],
+            marker,
+        )
+
+    async def test_initial_terminal_schema_failure_is_marked(self) -> None:
+        events: list[dict[str, Any]] = []
+        client = _SequenceClient([self._part('{"items":[{}]}', limited=False)])
+        with (
+            patch(
+                "app.services.openrouter.httpx.AsyncClient",
+                return_value=client,
+            ),
+            patch(
+                "app.services.openrouter._headers",
+                return_value={"Authorization": "Bearer test"},
+            ),
+            patch(
+                "app.services.openrouter.model_output_envelope",
+                return_value=dict(self.envelope),
+            ),
+            self.assertRaises(
+                OpenRouterStructuredContinuationError
+            ) as raised,
+        ):
+            await chat_continuable_structured(
+                model="google/gemini-3.6-flash",
+                messages=[{"role": "user", "content": "Верни документ."}],
+                response_schema=self.schema,
+                document_id="initial-terminal-schema-failure",
+                overlap_chars=12,
+                retry_transport_errors=False,
+                audit_checkpoint=events.append,
+            )
+
+        self.assertEqual(len(client.requests), 1)
+        marker = raised.exception.manifest["terminal_semantic_failure"]
+        self.assertEqual(
+            marker["version"],
+            STRUCTURED_TERMINAL_SEMANTIC_FAILURE_VERSION,
+        )
+        failed_checkpoint = next(
+            event
+            for event in reversed(events)
+            if event["event_kind"] == "structured_continuation_checkpoint"
+            and event["status"] == "failed"
+        )
+        self.assertEqual(
+            failed_checkpoint["error"]["terminal_semantic_failure"],
+            marker,
+        )
 
     async def test_resume_contract_binds_generation_and_protocol_policy(
         self,
@@ -1595,6 +1776,101 @@ class OpenRouterStructuredContinuationTests(unittest.IsolatedAsyncioTestCase):
             provider_event["event_id"],
         )
 
+    async def test_schema_invalid_initial_receipt_promotes_terminal_failure(
+        self,
+    ) -> None:
+        for limited in (False, True):
+            with self.subTest(limited=limited):
+                events: list[dict[str, Any]] = []
+                with self.assertRaises(OpenRouterStructuredContinuationError):
+                    await self._run(
+                        [self._part('{"items":[{}]}', limited=limited)],
+                        document_id=f"initial-schema-gap-{limited}",
+                        audit_checkpoint=events.append,
+                    )
+                provider_event = next(
+                    event
+                    for event in events
+                    if event["event_kind"] == "provider_post"
+                    and event["sequence"] == 0
+                )
+                self.assertEqual(provider_event["status"], "rejected")
+                self.assertEqual(
+                    provider_event["error"]["type"],
+                    (
+                        "OpenRouterOutputLimitError"
+                        if limited
+                        else "OpenRouterResponseContractError"
+                    ),
+                )
+                promoted = self._promote_provider_event(provider_event, None)
+                self.assertEqual(promoted["partial_text"], '{"items":[{}]}')
+                self.assertEqual(len(promoted["call_records"]), 1)
+                await self._assert_terminal_checkpoint_is_network_free(
+                    promoted
+                )
+
+    async def test_non_json_initial_receipt_promotes_terminal_failure(
+        self,
+    ) -> None:
+        events: list[dict[str, Any]] = []
+        with self.assertRaises(OpenRouterStructuredContinuationError):
+            await self._run(
+                [self._part("not-json", limited=False)],
+                document_id="initial-non-json-gap",
+                audit_checkpoint=events.append,
+            )
+        provider_event = next(
+            event
+            for event in events
+            if event["event_kind"] == "provider_post"
+        )
+        self.assertEqual(provider_event["status"], "rejected")
+        promoted = self._promote_provider_event(provider_event, None)
+        self.assertEqual(
+            promoted["error"]["terminal_semantic_failure"]["failure_kind"],
+            "complete_non_json_document",
+        )
+        await self._assert_terminal_checkpoint_is_network_free(promoted)
+
+    async def test_impossible_and_empty_initial_receipts_promote_terminal_failure(
+        self,
+    ) -> None:
+        for label, raw_text, expected_kind in (
+            (
+                "impossible-boundary",
+                '{"items":]',
+                "complete_rejected_json_part",
+            ),
+            ("empty", "", "complete_empty_response"),
+        ):
+            with self.subTest(label=label):
+                events: list[dict[str, Any]] = []
+                with self.assertRaises(OpenRouterStructuredContinuationError):
+                    await self._run(
+                        [self._part(raw_text, limited=False)],
+                        document_id=f"initial-{label}-gap",
+                        audit_checkpoint=events.append,
+                    )
+                provider_event = next(
+                    event
+                    for event in events
+                    if event["event_kind"] == "provider_post"
+                )
+                self.assertEqual(provider_event["status"], "rejected")
+                promoted = self._promote_provider_event(provider_event, None)
+                self.assertEqual(promoted["partial_text"], "")
+                self.assertEqual(promoted["call_records"], [])
+                self.assertEqual(
+                    promoted["error"]["terminal_semantic_failure"][
+                        "failure_kind"
+                    ],
+                    expected_kind,
+                )
+                await self._assert_terminal_checkpoint_is_network_free(
+                    promoted
+                )
+
     async def test_continuation_provider_gap_is_promoted(self) -> None:
         initial = '{"items":[{"name":"А"},'
         following = initial[-12:] + '{"name":"Б"},'
@@ -1638,6 +1914,239 @@ class OpenRouterStructuredContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(promoted["sequence"], 1)
         self.assertEqual(promoted["partial_text"], initial + '{"name":"Б"},')
         self.assertEqual(promoted["manifest"]["part_count"], 2)
+
+    async def test_schema_invalid_continuation_receipt_promotes_terminal_failure(
+        self,
+    ) -> None:
+        initial = '{"items":[{"name":"А"},'
+        invalid_final = initial[-12:] + "{}]}"
+        for limited in (False, True):
+            with self.subTest(limited=limited):
+                events: list[dict[str, Any]] = []
+                with self.assertRaises(OpenRouterStructuredContinuationError):
+                    await self._run(
+                        [
+                            self._part(initial, limited=True),
+                            self._part(invalid_final, limited=limited),
+                        ],
+                        document_id=f"continuation-schema-gap-{limited}",
+                        audit_checkpoint=events.append,
+                    )
+                predecessor = next(
+                    event
+                    for event in events
+                    if event["event_kind"]
+                    == "structured_continuation_checkpoint"
+                    and event["sequence"] == 0
+                    and event["status"] == "partial"
+                )
+                provider_event = next(
+                    event
+                    for event in events
+                    if event["event_kind"] == "provider_post"
+                    and event["sequence"] == 1
+                )
+                self.assertEqual(provider_event["status"], "accepted")
+                self.assertIs(
+                    provider_event["transport"]["output_limited"],
+                    limited,
+                )
+                promoted = self._promote_provider_event(
+                    provider_event,
+                    predecessor,
+                )
+                self.assertEqual(promoted["partial_text"], initial + "{}]}")
+                self.assertEqual(len(promoted["call_records"]), 2)
+                await self._assert_terminal_checkpoint_is_network_free(
+                    promoted
+                )
+
+    async def test_non_json_continuation_receipt_promotes_terminal_failure(
+        self,
+    ) -> None:
+        initial = '{"items":[{"name":"А"},'
+        non_json_final = initial[-12:] + "not-json"
+        events: list[dict[str, Any]] = []
+        with self.assertRaises(OpenRouterStructuredContinuationError):
+            await self._run(
+                [
+                    self._part(initial, limited=True),
+                    self._part(non_json_final, limited=False),
+                ],
+                document_id="continuation-non-json-gap",
+                audit_checkpoint=events.append,
+            )
+        predecessor = next(
+            event
+            for event in events
+            if event["event_kind"] == "structured_continuation_checkpoint"
+            and event["sequence"] == 0
+            and event["status"] == "partial"
+        )
+        provider_event = next(
+            event
+            for event in events
+            if event["event_kind"] == "provider_post"
+            and event["sequence"] == 1
+        )
+        promoted = self._promote_provider_event(provider_event, predecessor)
+        self.assertEqual(
+            promoted["error"]["terminal_semantic_failure"]["failure_kind"],
+            "complete_non_json_document",
+        )
+        await self._assert_terminal_checkpoint_is_network_free(promoted)
+
+    async def test_rejected_continuation_boundary_promotes_terminal_failure(
+        self,
+    ) -> None:
+        initial = '{"items":[{"name":"А"},'
+        rejected_final = "no-overlap]}"
+        events: list[dict[str, Any]] = []
+        with self.assertRaises(OpenRouterStructuredContinuationError):
+            await self._run(
+                [
+                    self._part(initial, limited=True),
+                    self._part(rejected_final, limited=False),
+                ],
+                document_id="continuation-rejected-boundary-gap",
+                audit_checkpoint=events.append,
+            )
+        predecessor = next(
+            event
+            for event in events
+            if event["event_kind"] == "structured_continuation_checkpoint"
+            and event["sequence"] == 0
+            and event["status"] == "partial"
+        )
+        provider_event = next(
+            event
+            for event in events
+            if event["event_kind"] == "provider_post"
+            and event["sequence"] == 1
+        )
+        promoted = self._promote_provider_event(provider_event, predecessor)
+        self.assertEqual(promoted["partial_text"], initial)
+        self.assertEqual(len(promoted["call_records"]), 1)
+        self.assertEqual(
+            promoted["error"]["terminal_semantic_failure"]["failure_kind"],
+            "complete_rejected_json_part",
+        )
+        await self._assert_terminal_checkpoint_is_network_free(promoted)
+
+    async def test_empty_continuation_is_immediately_terminal(self) -> None:
+        initial = '{"items":[{"name":"А"},'
+        events: list[dict[str, Any]] = []
+        with self.assertRaises(
+            OpenRouterStructuredContinuationError
+        ) as raised:
+            await self._run(
+                [
+                    self._part(initial, limited=True),
+                    self._part("", limited=False),
+                ],
+                document_id="continuation-empty-terminal",
+                audit_checkpoint=events.append,
+            )
+
+        manifest = raised.exception.manifest
+        marker = manifest["terminal_semantic_failure"]
+        self.assertEqual(marker["failure_kind"], "complete_empty_response")
+        self.assertEqual(manifest["accepted_document_text"], initial)
+        self.assertEqual(len(manifest["calls"]), 1)
+        self.assertEqual(manifest["rejected_part"]["sequence"], 1)
+        self.assertEqual(manifest["rejected_part"]["raw_text"], "")
+        failed_checkpoint = next(
+            event
+            for event in reversed(events)
+            if event["event_kind"] == "structured_continuation_checkpoint"
+            and event["status"] == "failed"
+        )
+        self.assertEqual(failed_checkpoint["partial_text"], initial)
+        self.assertEqual(
+            failed_checkpoint["error"]["terminal_semantic_failure"],
+            marker,
+        )
+        await self._assert_terminal_checkpoint_is_network_free(
+            failed_checkpoint
+        )
+
+    async def test_terminal_promotion_marker_tamper_fails_closed(self) -> None:
+        events: list[dict[str, Any]] = []
+        with self.assertRaises(OpenRouterStructuredContinuationError):
+            await self._run(
+                [self._part('{"items":[{}]}', limited=False)],
+                document_id="terminal-promotion-tamper",
+                audit_checkpoint=events.append,
+            )
+        provider_event = next(
+            event
+            for event in events
+            if event["event_kind"] == "provider_post"
+        )
+        promoted = self._promote_provider_event(provider_event, None)
+
+        def reseal(marker: dict[str, Any]) -> None:
+            body = deepcopy(marker)
+            body.pop("marker_sha256", None)
+            marker["marker_sha256"] = hashlib.sha256(
+                json_lib.dumps(
+                    body,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+
+        tampered_checkpoints: list[dict[str, Any]] = []
+        bad_hash = deepcopy(promoted)
+        bad_hash["error"]["terminal_semantic_failure"][
+            "marker_sha256"
+        ] = "0" * 64
+        tampered_checkpoints.append(bad_hash)
+
+        bad_schema = deepcopy(promoted)
+        bad_schema_marker = bad_schema["error"]["terminal_semantic_failure"]
+        bad_schema_marker["response_schema_sha256"] = "1" * 64
+        reseal(bad_schema_marker)
+        tampered_checkpoints.append(bad_schema)
+
+        bad_text = deepcopy(promoted)
+        bad_text_marker = bad_text["error"]["terminal_semantic_failure"]
+        bad_text_marker["document_sha256"] = "2" * 64
+        reseal(bad_text_marker)
+        tampered_checkpoints.append(bad_text)
+
+        bad_validation = deepcopy(promoted)
+        bad_validation_marker = bad_validation["error"][
+            "terminal_semantic_failure"
+        ]
+        bad_validation_marker["validation_path"] = ["tampered"]
+        reseal(bad_validation_marker)
+        tampered_checkpoints.append(bad_validation)
+
+        for checkpoint in tampered_checkpoints:
+            with (
+                patch(
+                    "app.services.openrouter.httpx.AsyncClient",
+                    side_effect=AssertionError(
+                        "tampered terminal checkpoint must not use network"
+                    ),
+                ) as client_factory,
+                self.assertRaisesRegex(OpenRouterError, "marker is invalid"),
+            ):
+                await chat_continuable_structured(
+                    model="google/gemini-3.6-flash",
+                    messages=[
+                        {"role": "user", "content": "Верни документ."}
+                    ],
+                    response_schema=self.schema,
+                    document_id=checkpoint["document_id"],
+                    overlap_chars=12,
+                    retry_transport_errors=False,
+                    resume_checkpoint=checkpoint,
+                )
+            client_factory.assert_not_called()
 
     async def test_final_complete_provider_gap_is_promoted(self) -> None:
         initial = '{"items":[{"name":"А"},'
@@ -1726,7 +2235,10 @@ class OpenRouterStructuredContinuationTests(unittest.IsolatedAsyncioTestCase):
 
         unusable = deepcopy(provider_event)
         unusable["error"]["type"] = "OpenRouterResponseContractError"
-        with self.assertRaisesRegex(OpenRouterError, "not a usable limit part"):
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "not a usable structured part",
+        ):
             promote_provider_post_to_structured_checkpoint(
                 unusable,
                 *args,

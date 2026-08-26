@@ -322,6 +322,163 @@ class StructuredAuditStoreTests(unittest.IsolatedAsyncioTestCase):
             await self._load(document_id=document_id, complete=False)
         )
 
+    async def test_terminal_schema_receipt_crash_gaps_are_promoted_without_network(
+        self,
+    ) -> None:
+        initial = '{"items":[{"name":"А"},'
+        invalid_final = initial[-16:] + "{}]}"
+        scenarios = [
+            (
+                "initial-normal",
+                [_body('{"items":[{}]}', limited=False)],
+                "complete_json_schema_violation",
+            ),
+            (
+                "initial-output-limited",
+                [_body('{"items":[{}]}', limited=True)],
+                "complete_json_schema_violation",
+            ),
+            (
+                "continuation-normal",
+                [
+                    _body(initial, limited=True),
+                    _body(invalid_final, limited=False),
+                ],
+                "complete_json_schema_violation",
+            ),
+            (
+                "continuation-output-limited",
+                [
+                    _body(initial, limited=True),
+                    _body(invalid_final, limited=True),
+                ],
+                "complete_json_schema_violation",
+            ),
+            (
+                "initial-impossible-boundary",
+                [_body('{"items":]', limited=False)],
+                "complete_rejected_json_part",
+            ),
+            (
+                "initial-empty",
+                [_body("", limited=False)],
+                "complete_empty_response",
+            ),
+            (
+                "continuation-rejected-boundary",
+                [
+                    _body(initial, limited=True),
+                    _body("no-overlap]}", limited=False),
+                ],
+                "complete_rejected_json_part",
+            ),
+            (
+                "continuation-empty",
+                [
+                    _body(initial, limited=True),
+                    _body("", limited=False),
+                ],
+                "complete_empty_response",
+            ),
+        ]
+
+        for label, bodies, expected_kind in scenarios:
+            with self.subTest(label=label):
+                document_id = f"critic:terminal-gap:{label}"
+
+                async def omit_failed_head(event: dict[str, Any]) -> None:
+                    if (
+                        event.get("event_kind")
+                        == "structured_continuation_checkpoint"
+                        and event.get("status") == "failed"
+                    ):
+                        return
+                    await self._persist(event)
+
+                _delta_capable(omit_failed_head)
+                with self.assertRaises(OpenRouterStructuredContinuationError):
+                    await self._generate(
+                        bodies,
+                        document_id=document_id,
+                        checkpoint=omit_failed_head,
+                    )
+
+                with patch(
+                    "app.services.openrouter.httpx.AsyncClient",
+                    side_effect=AssertionError(
+                        "receipt promotion must be network-free"
+                    ),
+                ) as load_client_factory:
+                    checkpoint = await self._load(document_id=document_id)
+                    replayed = await self._load(document_id=document_id)
+                load_client_factory.assert_not_called()
+                self.assertIsNotNone(checkpoint)
+                assert checkpoint is not None
+                self.assertEqual(replayed, checkpoint)
+                self.assertEqual(checkpoint["status"], "failed")
+                self.assertFalse(checkpoint["manifest"]["complete"])
+                marker = checkpoint["error"]["terminal_semantic_failure"]
+                self.assertEqual(
+                    marker["failure_kind"],
+                    expected_kind,
+                )
+
+                with (
+                    patch(
+                        "app.services.openrouter.httpx.AsyncClient",
+                        side_effect=AssertionError(
+                            "terminal resume must not repeat a provider POST"
+                        ),
+                    ) as resume_client_factory,
+                    self.assertRaises(OpenRouterStructuredContinuationError),
+                ):
+                    await chat_continuable_structured(
+                        model=MODEL,
+                        messages=MESSAGES,
+                        response_schema=SCHEMA,
+                        schema_name=SCHEMA_NAME,
+                        document_id=document_id,
+                        overlap_chars=16,
+                        retry_transport_errors=False,
+                        resume_checkpoint=checkpoint,
+                    )
+                resume_client_factory.assert_not_called()
+
+    async def test_terminal_head_is_idempotent_and_absorbing(self) -> None:
+        document_id = "critic:terminal-absorbing"
+        events: list[dict[str, Any]] = []
+
+        async def capture_and_persist(event: dict[str, Any]) -> None:
+            events.append(deepcopy(event))
+            await self._persist(event)
+
+        _delta_capable(capture_and_persist)
+        with self.assertRaises(OpenRouterStructuredContinuationError):
+            await self._generate(
+                [_body('{"items":[{}]}', limited=False)],
+                document_id=document_id,
+                checkpoint=capture_and_persist,
+            )
+
+        terminal = next(
+            event
+            for event in events
+            if event.get("event_kind")
+            == "structured_continuation_checkpoint"
+            and event.get("status") == "failed"
+        )
+        await self._persist(deepcopy(terminal))
+
+        downgrade = deepcopy(terminal)
+        downgrade["event_id"] = uuid.uuid4().hex
+        downgrade["status"] = "partial"
+        downgrade["error"] = None
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "cannot be downgraded or extended",
+        ):
+            await self._persist(downgrade)
+
     async def test_newer_paid_continuation_receipt_replays_after_partial_head(
         self,
     ) -> None:

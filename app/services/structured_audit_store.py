@@ -703,22 +703,54 @@ def _normalized_call_metadata(record: dict[str, Any]) -> dict[str, Any]:
 def _provider_event_is_promotable(event: dict[str, Any]) -> bool:
     raw_text = event.get("raw_text")
     transport = event.get("transport")
-    if not isinstance(raw_text, str) or not raw_text or not isinstance(
-        transport, dict
-    ):
+    if not isinstance(raw_text, str) or not isinstance(transport, dict):
         return False
     status = event.get("status")
     if status == "accepted":
         return (
+            bool(raw_text)
+            and (
             transport.get("output_complete") is True
             or transport.get("output_limited") is True
+            )
         )
     error = event.get("error")
+    response = event.get("response")
+    response_body = (
+        response.get("body_json") if isinstance(response, dict) else None
+    )
+    http_status = (
+        response.get("http_status") if isinstance(response, dict) else None
+    )
+    complete_http_receipt = bool(
+        isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+        and 200 <= http_status < 300
+        and isinstance(response_body, dict)
+        and isinstance(response_body.get("choices"), list)
+        and bool(response_body.get("choices"))
+        and isinstance(response_body.get("usage"), dict)
+        and isinstance(event.get("usage"), dict)
+        and isinstance(event.get("request_payload"), dict)
+        and isinstance(event.get("request_sha256"), str)
+    )
     return bool(
         status == "rejected"
-        and transport.get("output_limited") is True
         and isinstance(error, dict)
-        and error.get("type") == "OpenRouterOutputLimitError"
+        and (
+            (
+                bool(raw_text)
+                and
+                transport.get("output_limited") is True
+                and error.get("type") == "OpenRouterOutputLimitError"
+            )
+            or (
+                complete_http_receipt
+                and transport.get("output_complete") is True
+                and transport.get("output_limited") is False
+                and error.get("type") == "OpenRouterResponseContractError"
+            )
+        )
     )
 
 
@@ -1053,6 +1085,41 @@ async def _receipt_for_call(
     return matching[0]
 
 
+def _terminal_disposition(
+    error: Any,
+    *,
+    latest_sequence: int,
+) -> tuple[int, str] | None:
+    if not isinstance(error, dict):
+        return None
+    marker = error.get("terminal_semantic_failure")
+    if not isinstance(marker, dict) or marker.get("terminal") is not True:
+        return None
+    marker_sha256 = marker.get("marker_sha256")
+    if not isinstance(marker_sha256, str) or len(marker_sha256) != 64:
+        raise OpenRouterError("Structured terminal marker digest is invalid")
+    failure_kind = marker.get("failure_kind")
+    if failure_kind in {
+        "complete_rejected_json_part",
+        "complete_empty_response",
+    }:
+        sequence = marker.get("rejected_sequence")
+        expected_sequence = latest_sequence + 1
+    else:
+        sequence = latest_sequence
+        expected_sequence = latest_sequence
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+        or sequence != expected_sequence
+    ):
+        raise OpenRouterError(
+            "Structured terminal disposition sequence is invalid"
+        )
+    return sequence, _stable_json_sha256(error)
+
+
 async def _persist_checkpoint(
     run_id: str,
     *,
@@ -1070,6 +1137,10 @@ async def _persist_checkpoint(
         fragment_candidates,
         aggregate_usage,
     ) = _checkpoint_projection(event)
+    incoming_terminal = _terminal_disposition(
+        event.get("error"),
+        latest_sequence=latest_sequence,
+    )
 
     await assert_run_lease(run_id)
     async with SessionLocal() as session:
@@ -1087,6 +1158,7 @@ async def _persist_checkpoint(
         ).scalar_one_or_none()
         existing_latest = -1
         existing_complete = False
+        existing_terminal: tuple[int, str] | None = None
         if existing_head is not None:
             head_input, head_output = _validate_row_identity(
                 existing_head,
@@ -1107,10 +1179,50 @@ async def _persist_checkpoint(
                 raise OpenRouterError("Structured audit head sequence is corrupt")
             existing_latest = stored_latest
             existing_complete = head_output.get("complete") is True
+            stored_terminal_sequence = head_output.get(
+                "terminal_disposition_sequence"
+            )
+            stored_terminal_error_sha256 = head_output.get(
+                "terminal_error_sha256"
+            )
+            if stored_terminal_sequence is not None or (
+                stored_terminal_error_sha256 is not None
+            ):
+                if (
+                    isinstance(stored_terminal_sequence, bool)
+                    or not isinstance(stored_terminal_sequence, int)
+                    or stored_terminal_sequence < 0
+                    or not isinstance(stored_terminal_error_sha256, str)
+                    or len(stored_terminal_error_sha256) != 64
+                    or _stable_json_sha256(head_output.get("error"))
+                    != stored_terminal_error_sha256
+                ):
+                    raise OpenRouterError(
+                        "Structured terminal head disposition is corrupt"
+                    )
+                existing_terminal = (
+                    stored_terminal_sequence,
+                    stored_terminal_error_sha256,
+                )
 
         # Decide whether this event is admissible before creating immutable
         # rows. Otherwise a late partial callback can leave fragments beyond a
         # completed head and make the next reconstruction fail closed.
+        if existing_terminal is not None:
+            if (
+                incoming_terminal == existing_terminal
+                and latest_sequence == existing_latest
+                and compact_manifest == head_output.get("manifest")
+            ):
+                await session.commit()
+                return
+            raise OpenRouterError(
+                "Terminal structured head cannot be downgraded or extended"
+            )
+        if existing_complete and incoming_terminal is not None:
+            raise OpenRouterError(
+                "Completed structured head cannot accept a terminal failure"
+            )
         if existing_complete and not complete:
             await session.commit()
             return
@@ -1252,6 +1364,16 @@ async def _persist_checkpoint(
             "manifest": compact_manifest,
             "resume_contract_sha256": contract["sha256"],
             "error": copy.deepcopy(event.get("error")),
+            "terminal_disposition_sequence": (
+                incoming_terminal[0]
+                if incoming_terminal is not None
+                else None
+            ),
+            "terminal_error_sha256": (
+                incoming_terminal[1]
+                if incoming_terminal is not None
+                else None
+            ),
         }
         head_digest = _stable_json_sha256(head_output)
         head_input = {
@@ -1832,6 +1954,51 @@ async def _reconstruct_checkpoint(
             raise OpenRouterError(
                 "Empty structured audit head byte count is corrupt"
             )
+        terminal = _terminal_disposition(
+            head_output.get("error"),
+            latest_sequence=-1,
+        )
+        if terminal is not None:
+            if (
+                head_output.get("terminal_disposition_sequence")
+                != terminal[0]
+                or head_output.get("terminal_error_sha256") != terminal[1]
+                or head_output.get("checkpoint_status") != "failed"
+            ):
+                raise OpenRouterError(
+                    "Empty terminal structured head disposition is corrupt"
+                )
+            rebuilt_empty_manifest = copy.deepcopy(empty_manifest)
+            rebuilt_empty_manifest.update(
+                {
+                    "complete": False,
+                    "continuation_count": 0,
+                    "part_count": 0,
+                    "document_sha256": text_sha256(""),
+                    "document_chars": 0,
+                    "document_utf8_bytes": 0,
+                    "parts": [],
+                    "calls": [],
+                    "accepted_document_text": "",
+                }
+            )
+            return (
+                {
+                    "version": _CHECKPOINT_EVENT_VERSION,
+                    "event_id": head_output.get("checkpoint_event_id"),
+                    "event_kind": "structured_continuation_checkpoint",
+                    "document_id": identity["document_id"],
+                    "sequence": -1,
+                    "status": "failed",
+                    "partial_text": "",
+                    "manifest": rebuilt_empty_manifest,
+                    "aggregate_usage": {},
+                    "call_records": [],
+                    "resume_contract": contract,
+                    "error": copy.deepcopy(head_output.get("error")),
+                },
+                receipts,
+            )
         return None, receipts
 
     if len(fragments) != latest_sequence + 1:
@@ -2039,6 +2206,18 @@ async def _reconstruct_checkpoint(
         "resume_contract": contract,
         "error": copy.deepcopy(head_output.get("error")),
     }
+    terminal = _terminal_disposition(
+        head_output.get("error"),
+        latest_sequence=latest_sequence,
+    )
+    if terminal is not None and (
+        head_output.get("terminal_disposition_sequence") != terminal[0]
+        or head_output.get("terminal_error_sha256") != terminal[1]
+        or head_output.get("checkpoint_status") != "failed"
+    ):
+        raise OpenRouterError(
+            "Terminal structured head disposition is corrupt"
+        )
     return checkpoint, receipts
 
 
@@ -2221,6 +2400,95 @@ async def load_structured_checkpoint(
         contract=contract,
         predecessor=checkpoint,
     )
+    checkpoint_error = (
+        checkpoint.get("error") if isinstance(checkpoint, dict) else None
+    )
+    terminal = (
+        _terminal_disposition(
+            checkpoint_error,
+            latest_sequence=int(checkpoint.get("sequence", -1)),
+        )
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if terminal is not None:
+        terminal_marker = checkpoint_error.get("terminal_semantic_failure")
+        terminal_kind = (
+            terminal_marker.get("failure_kind")
+            if isinstance(terminal_marker, dict)
+            else None
+        )
+        if terminal_kind in {
+            "complete_rejected_json_part",
+            "complete_empty_response",
+        }:
+            terminal_sequence = terminal[0]
+            if set(response_bearing) != {terminal_sequence}:
+                raise OpenRouterError(
+                    "Terminal rejected-part head has missing or later receipts"
+                )
+            row, _candidate = _recovery_candidate(
+                sequence=terminal_sequence,
+                response_bearing=response_bearing[terminal_sequence],
+                promotable=promotable.get(terminal_sequence, []),
+            )
+            predecessor_for_promotion = (
+                checkpoint
+                if checkpoint.get("call_records")
+                else None
+            )
+            provider_event = _receipt_event(
+                row,
+                identity=identity,
+                stream_sha256=stream_sha256,
+                contract=contract,
+                predecessor=predecessor_for_promotion,
+                inflate_delta_for_promotion=True,
+            )
+            reproduced = promoter(
+                provider_event,
+                predecessor_for_promotion,
+                model=model,
+                messages=messages,
+                schema_name=schema_name,
+                response_schema=response_schema,
+                document_id=document_id,
+                overlap_chars=overlap_chars,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            )
+            if inspect.isawaitable(reproduced):
+                reproduced = await reproduced
+            reproduced_error = (
+                reproduced.get("error")
+                if isinstance(reproduced, dict)
+                else None
+            )
+            if not (
+                isinstance(reproduced_error, dict)
+                and reproduced_error.get("terminal_semantic_failure")
+                == checkpoint_error.get("terminal_semantic_failure")
+                and reproduced_error.get("terminal_rejected_part")
+                == checkpoint_error.get("terminal_rejected_part")
+                and reproduced.get("partial_text")
+                == checkpoint.get("partial_text")
+                and reproduced.get("call_records")
+                == checkpoint.get("call_records")
+            ):
+                raise OpenRouterError(
+                    "Terminal rejected-part head does not match its receipt"
+                )
+        elif response_bearing:
+            raise OpenRouterError(
+                "Terminal structured head has a later provider receipt"
+            )
+        manifest = checkpoint.get("manifest")
+        if complete is not None and (
+            not isinstance(manifest, dict)
+            or manifest.get("complete") is not complete
+        ):
+            return None
+        return checkpoint
     next_sequence = (
         int(checkpoint.get("sequence", -1)) + 1
         if isinstance(checkpoint, dict)
@@ -2283,19 +2551,42 @@ async def load_structured_checkpoint(
         )
         promoted_any = True
         checkpoint = promoted
-        if (promoted.get("manifest") or {}).get("complete") is True:
+        promoted_error = promoted.get("error")
+        promoted_terminal_marker = (
+            promoted_error.get("terminal_semantic_failure")
+            if isinstance(promoted_error, dict)
+            else None
+        )
+        if (
+            (promoted.get("manifest") or {}).get("complete") is True
+            or isinstance(promoted_terminal_marker, dict)
+        ):
             break
         next_sequence += 1
 
-    if response_bearing:
-        recovered_sequence = (
-            int(checkpoint.get("sequence", -1))
-            if isinstance(checkpoint, dict)
-            else -1
-        )
-        unrecovered = sorted(
-            sequence
-            for sequence in response_bearing
+        if response_bearing:
+            recovered_sequence = (
+                int(checkpoint.get("sequence", -1))
+                if isinstance(checkpoint, dict)
+                else -1
+            )
+            checkpoint_error = (
+                checkpoint.get("error")
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            recovered_terminal = _terminal_disposition(
+                checkpoint_error,
+                latest_sequence=recovered_sequence,
+            )
+            if recovered_terminal is not None:
+                # A rejected-part terminal head deliberately keeps the paid
+                # response out of the accepted call ledger.  Its sealed
+                # disposition sequence still counts that receipt as recovered.
+                recovered_sequence = recovered_terminal[0]
+            unrecovered = sorted(
+                sequence
+                for sequence in response_bearing
             if sequence > recovered_sequence
         )
         recovered_manifest = (
