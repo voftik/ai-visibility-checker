@@ -12468,59 +12468,136 @@ def _entity_catalog_quote_recovery_incident(
     *,
     candidate: dict[str, Any],
     expected_claims: list[dict[str, Any]],
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Admit only one deterministic exact-quote contract incident.
+    """Admit only deterministic, replayable catalog-contract incidents.
 
-    This is deliberately narrower than the normalizer.  Unknown failures and
-    ambiguous Markdown-coordinate matches stay terminal.  The strong planner
-    is allowed to consider a retry only when one submitted grounded-fact row
-    points to one immutable core and its quote is demonstrably non-literal.
+    Unknown failures and ambiguous Markdown-coordinate matches stay terminal.
+    The strong planner may retry only when the candidate deterministically
+    reproduces one of three strict leaf failures: a non-literal core quote, a
+    literal quote omitted from the analytic catalog, or a name/evidence
+    binding violation.  The retry still passes the same strict validators, so
+    admitting an incident never admits its invalid candidate.
     """
 
-    match = re.fullmatch(
-        r"Core-unit quote is not an exact core substring: (.+)",
-        str(error),
+    message = str(error)
+    exact_quote_match = re.fullmatch(
+        r"Core-unit quote is not an exact core substring: (.+)", message
     )
-    if match is None:
-        return None
-    failed_unit_id = match.group(1).strip()
-    matching_claims = [
-        claim
-        for claim in expected_claims
-        if str(claim.get("unit_id") or "") == failed_unit_id
-    ]
+    missing_output_match = re.fullmatch(
+        r"Grounded core-unit quote is absent from the analytic output: (.+)",
+        message,
+    )
+    catalog = candidate.get("catalog")
     raw_dispositions = candidate.get("core_dispositions")
-    if len(matching_claims) != 1 or not isinstance(raw_dispositions, list):
+    if not isinstance(catalog, dict) or not isinstance(raw_dispositions, list):
         return None
-    claim = matching_claims[0]
-    matching_rows = [
-        row
-        for row in raw_dispositions
-        if isinstance(row, dict)
-        and str(row.get("unit_id") or "") == failed_unit_id
-        and str(row.get("claim_id") or "")
-        == str(claim.get("claim_id") or "")
-        and str(row.get("core_sha256") or "")
-        == str(claim.get("core_sha256") or "")
+
+    if exact_quote_match is not None or missing_output_match is not None:
+        match = exact_quote_match or missing_output_match
+        assert match is not None
+        failed_unit_id = match.group(1).strip()
+        matching_claims = [
+            claim
+            for claim in expected_claims
+            if str(claim.get("unit_id") or "") == failed_unit_id
+        ]
+        if len(matching_claims) != 1:
+            return None
+        claim = matching_claims[0]
+        matching_rows = [
+            row
+            for row in raw_dispositions
+            if isinstance(row, dict)
+            and str(row.get("unit_id") or "") == failed_unit_id
+            and str(row.get("claim_id") or "")
+            == str(claim.get("claim_id") or "")
+            and str(row.get("core_sha256") or "")
+            == str(claim.get("core_sha256") or "")
+        ]
+        if len(matching_rows) != 1:
+            return None
+        failed_row = matching_rows[0]
+        submitted_quote = str(failed_row.get("evidence_quote") or "")
+        core_text = str(claim.get("core_text") or "")
+        if (
+            failed_row.get("disposition") != "grounded_fact"
+            or not submitted_quote.strip()
+            or not core_text
+        ):
+            return None
+        try:
+            _normalize_core_dispositions(
+                raw_dispositions,
+                expected_claims=expected_claims,
+                analytic_output=catalog,
+                output_kind="entity_catalog",
+            )
+        except OpenRouterError as reproduced:
+            if str(reproduced) != message:
+                return None
+        else:
+            return None
+        if exact_quote_match is not None and submitted_quote in core_text:
+            return None
+        return {
+            "failure_code": (
+                "core_quote_not_exact_substring"
+                if exact_quote_match is not None
+                else "core_quote_absent_from_analytic_output"
+            ),
+            "failed_unit_id": failed_unit_id,
+            "failed_unit_ids": [failed_unit_id],
+            "claim_id": str(claim.get("claim_id") or ""),
+            "core_sha256": str(claim.get("core_sha256") or ""),
+            "submitted_quote_sha256": text_sha256(submitted_quote),
+            "candidate_sha256": stable_digest(candidate),
+        }
+
+    binding_match = re.fullmatch(
+        r"Entity-catalog evidence binding failed: (.+)", message
+    )
+    if binding_match is None:
+        return None
+    binding_failures = [
+        item.strip() for item in binding_match.group(1).split(";") if item.strip()
     ]
-    if len(matching_rows) != 1:
-        return None
-    failed_row = matching_rows[0]
-    submitted_quote = str(failed_row.get("evidence_quote") or "")
-    core_text = str(claim.get("core_text") or "")
-    if (
-        failed_row.get("disposition") != "grounded_fact"
-        or not submitted_quote.strip()
-        or not core_text
-        or submitted_quote in core_text
+    allowed_binding_failure = re.compile(
+        r"(?:target_aliases\[\d+\]|entities\[\d+\]\.canonical_name|"
+        r"entities\[\d+\]\.aliases\[\d+\]) is not grounded"
+    )
+    if not binding_failures or any(
+        allowed_binding_failure.fullmatch(item) is None
+        for item in binding_failures
     ):
         return None
+    try:
+        receipts = _normalize_core_dispositions(
+            raw_dispositions,
+            expected_claims=expected_claims,
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+    except OpenRouterError:
+        return None
+    try:
+        _validate_entity_catalog_leaf_evidence_binding(
+            catalog,
+            receipts,
+            profile=profile or {},
+        )
+    except OpenRouterError as reproduced:
+        if str(reproduced) != message:
+            return None
+    else:
+        return None
     return {
-        "failure_code": "core_quote_not_exact_substring",
-        "failed_unit_id": failed_unit_id,
-        "claim_id": str(claim.get("claim_id") or ""),
-        "core_sha256": str(claim.get("core_sha256") or ""),
-        "submitted_quote_sha256": text_sha256(submitted_quote),
+        "failure_code": "entity_catalog_evidence_binding_failed",
+        "failed_unit_id": "",
+        "failed_unit_ids": [
+            str(claim.get("unit_id") or "") for claim in expected_claims
+        ],
+        "binding_failures": binding_failures,
         "candidate_sha256": stable_digest(candidate),
     }
 
@@ -13108,6 +13185,7 @@ async def _recover_entity_catalog_chunk_contract(
         contract_error,
         candidate=candidate,
         expected_claims=claims,
+        profile=profile,
     )
     if incident is None or not settings.PIPELINE_ORCHESTRATOR_ENABLED:
         raise contract_error
@@ -13263,6 +13341,12 @@ async def _recover_entity_catalog_chunk_contract(
         "grounded_fact скопируй evidence_quote как непрерывную дословную "
         "подстроку соответствующего core_claim.core_text. Если такого "
         "свидетельства нет, верни explicit_no_fact с конкретной причиной. "
+        "Каждый target_aliases и alias оставляй только если само это имя "
+        "буквально присутствует в grounded evidence_quote, а evidence записи "
+        "содержит ту же цитату. canonical_name также должен быть буквальным; "
+        "исключение допустимо только для code-owned имени из профиля, если "
+        "его алиас той же сущности буквально подтверждён той же цитатой. "
+        "Неподтверждённые имена удали. "
         "Подсказка оркестратора не отменяет эти правила."
     )
 
@@ -13278,6 +13362,12 @@ async def _recover_entity_catalog_chunk_contract(
                 "execution_attempt": attempt_number,
                 "failure_code": incident["failure_code"],
                 "failed_unit_id": incident["failed_unit_id"],
+                "failed_unit_ids": copy.deepcopy(
+                    incident.get("failed_unit_ids") or []
+                ),
+                "binding_failures": copy.deepcopy(
+                    incident.get("binding_failures") or []
+                ),
                 "source_units_sha256": source_digest,
                 "invalid_candidate_sha256": incident["candidate_sha256"],
                 "orchestrator_guidance": str(
