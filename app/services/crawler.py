@@ -2719,10 +2719,22 @@ async def bootstrap_legacy_crawl_admission(
                 )
             ).scalars()
         )
-    eligible = [
-        page
+    # Resolve page kind once.  For a legacy snapshot, persisted metadata is
+    # the historical truth: applying today's URL rules to eligibility as well
+    # as the manifest could silently remove a page that contributed to the
+    # saved downstream evidence (for example, an old content page at
+    # /privacy).  The current classifier is only a missing-metadata fallback.
+    stored_with_kinds = [
+        (
+            page,
+            str(page.page_kind or "").strip() or _page_kind(page.url),
+        )
         for page in stored
-        if _page_kind(page.url) != "utility"
+    ]
+    eligible = [
+        (page, effective_kind)
+        for page, effective_kind in stored_with_kinds
+        if effective_kind != "utility"
         and normalize_domain(urlparse(page.url).hostname or "") == normalized_domain
         and _site_page_is_usable(page, legacy=True)
     ]
@@ -2731,27 +2743,16 @@ async def bootstrap_legacy_crawl_admission(
             "legacy snapshot must contain 1..10 usable same-domain pages"
         )
     eligible.sort(
-        key=lambda page: (
-            0 if _page_kind(page.url) == "home" else 1,
-            _candidate_sort_key(page.url),
-            page.id,
+        key=lambda item: (
+            0 if item[1] == "home" else 1,
+            _candidate_sort_key(item[0].url),
+            item[0].id,
         )
     )
-    if _page_kind(eligible[0].url) != "home":
+    if eligible[0][1] != "home":
         raise CrawlAdmissionIncomplete("legacy snapshot has no usable homepage")
-    # A legacy snapshot must describe the rows that produced the already-paid
-    # downstream evidence.  URL classification rules can evolve, so deriving
-    # page_kind again here can create a manifest that no longer matches the
-    # persisted SitePage lineage.  Keep the historical value when present;
-    # only genuinely missing legacy metadata uses the current classifier.
-    pages = [
-        (
-            page.url,
-            str(page.page_kind or "").strip() or _page_kind(page.url),
-        )
-        for page in eligible
-    ]
-    page_map = {page.url: page for page in eligible}
+    pages = [(page.url, effective_kind) for page, effective_kind in eligible]
+    page_map = {page.url: page for page, _effective_kind in eligible}
     page_receipt = _site_page_receipt(
         pages,
         page_map,

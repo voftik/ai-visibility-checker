@@ -380,6 +380,73 @@ class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(saved["output_json"]["audit"]["coverage_complete"])
         self.assertIn("audit_sha256", saved["output_json"]["audit"])
 
+    async def test_final_action_without_evidence_never_reaches_cache_or_models(
+        self,
+    ) -> None:
+        partial = _report()
+        partial["actions"][0].pop("evidence")
+        expected = copy.deepcopy(partial)
+        expected["headline_emphasis"] = []
+        artifact_output = AsyncMock()
+        structured_artifact = AsyncMock()
+        editor = AsyncMock()
+        save_artifact = AsyncMock()
+
+        with (
+            patch("app.services.analyzer._artifact_output", artifact_output),
+            patch("app.services.analyzer._structured_artifact", structured_artifact),
+            patch("app.services.analyzer.edit_report", editor),
+            patch("app.services.analyzer._save_artifact", save_artifact),
+        ):
+            result = await _edit_final_report_language(
+                "run-action-without-evidence",
+                report=partial,
+                public_report={"brand": {"name": "Acme"}},
+                selected_answer_context=[],
+                answer_selection_manifest={},
+                semantic_evidence_document={},
+            )
+
+        self.assertEqual(result, expected)
+        artifact_output.assert_not_awaited()
+        structured_artifact.assert_not_awaited()
+        editor.assert_not_awaited()
+        save_artifact.assert_awaited_once()
+        audit = save_artifact.await_args.kwargs["output_json"]["audit"]
+        self.assertFalse(audit["coverage_complete"])
+        self.assertIn("audit_sha256", audit)
+
+    async def test_technical_finding_without_evidence_never_reaches_cache_or_models(
+        self,
+    ) -> None:
+        partial = _technical_review()
+        partial["findings"][0].pop("evidence")
+        artifact_output = AsyncMock()
+        structured_artifact = AsyncMock()
+        editor = AsyncMock()
+        save_artifact = AsyncMock()
+
+        with (
+            patch("app.services.analyzer._artifact_output", artifact_output),
+            patch("app.services.analyzer._structured_artifact", structured_artifact),
+            patch("app.services.analyzer.edit_report", editor),
+            patch("app.services.analyzer._save_artifact", save_artifact),
+        ):
+            result = await _edit_technical_review_language(
+                "run-finding-without-evidence",
+                review=partial,
+                profile={"brand_name": "Acme"},
+            )
+
+        self.assertEqual(result, partial)
+        artifact_output.assert_not_awaited()
+        structured_artifact.assert_not_awaited()
+        editor.assert_not_awaited()
+        save_artifact.assert_awaited_once()
+        audit = save_artifact.await_args.kwargs["output_json"]["audit"]
+        self.assertFalse(audit["coverage_complete"])
+        self.assertIn("audit_sha256", audit)
+
     async def test_incomplete_reader_contract_fails_before_model_calls(self) -> None:
         source = _technical_review()
         editor = AsyncMock()

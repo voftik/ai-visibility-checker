@@ -465,6 +465,101 @@ def technical_review_immutable_passthrough_paths(
     return _existing_nonempty_string_paths(review, paths)
 
 
+def _require_exact_string_fields(
+    value: Any,
+    *,
+    path: str,
+    fields: set[str],
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"invalid editorial document shape at {path}")
+    if not all(isinstance(value.get(field), str) for field in fields):
+        raise ValueError(f"invalid editorial string field at {path}")
+    return value
+
+
+def _require_string_array(value: Any, *, path: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"invalid editorial string array at {path}")
+    return value
+
+
+def _validate_final_report_shape(document: dict[str, Any]) -> None:
+    expected_keys = {
+        "headline",
+        "headline_emphasis",
+        "verdict",
+        "executive_summary",
+        "sections",
+        "actions",
+        "limitations",
+    }
+    if set(document) != expected_keys:
+        raise ValueError("unsupported editorial document shape")
+    for field in ("headline", "verdict", "executive_summary"):
+        if not isinstance(document.get(field), str):
+            raise ValueError(f"invalid editorial string field at /{field}")
+    _require_string_array(document.get("headline_emphasis"), path="/headline_emphasis")
+    _require_string_array(document.get("limitations"), path="/limitations")
+
+    sections = document.get("sections")
+    if not isinstance(sections, list):
+        raise ValueError("invalid editorial row array at /sections")
+    for index, section in enumerate(sections):
+        _require_exact_string_fields(
+            section,
+            path=f"/sections/{index}",
+            fields={"heading", "body"},
+        )
+
+    actions = document.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("invalid editorial row array at /actions")
+    action_fields = {"priority", "title", "why", "step", "evidence"}
+    for index, action in enumerate(actions):
+        row = _require_exact_string_fields(
+            action,
+            path=f"/actions/{index}",
+            fields=action_fields,
+        )
+        if row["priority"] not in {"now", "next", "later"}:
+            raise ValueError(f"invalid editorial enum at /actions/{index}/priority")
+
+
+def _validate_technical_review_shape(document: dict[str, Any]) -> None:
+    expected_keys = {
+        "overall_conclusion",
+        "render_conclusion",
+        "findings",
+        "limitations",
+    }
+    if set(document) != expected_keys:
+        raise ValueError("unsupported editorial document shape")
+    for field in ("overall_conclusion", "render_conclusion"):
+        if not isinstance(document.get(field), str):
+            raise ValueError(f"invalid editorial string field at /{field}")
+    _require_string_array(document.get("limitations"), path="/limitations")
+
+    findings = document.get("findings")
+    if not isinstance(findings, list):
+        raise ValueError("invalid editorial row array at /findings")
+    finding_fields = {
+        "severity",
+        "title",
+        "evidence",
+        "business_effect",
+        "action",
+    }
+    for index, finding in enumerate(findings):
+        row = _require_exact_string_fields(
+            finding,
+            path=f"/findings/{index}",
+            fields=finding_fields,
+        )
+        if row["severity"] not in {"critical", "important", "observation"}:
+            raise ValueError(f"invalid editorial enum at /findings/{index}/severity")
+
+
 def _editorial_path_contract(
     document: dict[str, Any],
 ) -> tuple[str, list[str], list[str], list[str]]:
@@ -486,11 +581,13 @@ def _editorial_path_contract(
         "limitations",
     }
     if technical_keys.issubset(document):
+        _validate_technical_review_shape(document)
         kind = "technical_review"
         expected = technical_review_rendered_string_paths(document)
         editable = technical_review_narrative_paths(document)
         immutable = technical_review_immutable_passthrough_paths(document)
     elif final_keys.issubset(document):
+        _validate_final_report_shape(document)
         kind = "final_report"
         expected = reader_rendered_string_paths(document)
         editable = reader_narrative_paths(document)

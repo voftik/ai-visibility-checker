@@ -251,11 +251,13 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
         run_id = await self._run(config={"user_agents": ["GPTBot"]})
         home_url = "https://example.com/"
         service_url = "https://example.com/services"
+        privacy_url = "https://example.com/privacy"
         historical_service_kind = "other"
         self.assertNotEqual(
             crawler._page_kind(service_url),
             historical_service_kind,
         )
+        self.assertEqual(crawler._page_kind(privacy_url), "utility")
         await self._page(run_id, home_url, "home", legacy=True)
         await self._page(
             run_id,
@@ -263,8 +265,15 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
             historical_service_kind,
             legacy=True,
         )
+        await self._page(
+            run_id,
+            privacy_url,
+            "content",
+            legacy=True,
+        )
         await self._probe(run_id, home_url, "GPTBot", legacy=True)
         await self._probe(run_id, service_url, "GPTBot", legacy=True)
+        await self._probe(run_id, privacy_url, "GPTBot", legacy=True)
 
         with patch.object(crawler, "_probe_with_transport", AsyncMock()) as network:
             admission = await crawler.bootstrap_legacy_crawl_admission(
@@ -281,6 +290,7 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
             [
                 (home_url, "home"),
                 (service_url, historical_service_kind),
+                (privacy_url, "content"),
             ],
         )
         self.assertEqual(
@@ -291,6 +301,7 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
             [
                 (home_url, "home"),
                 (service_url, historical_service_kind),
+                (privacy_url, "content"),
             ],
         )
 
