@@ -397,7 +397,7 @@ FINAL_CONTEXT_SELECTION_VERSION = f"{PROMPT_VERSION}-final-context-v5"
 FINAL_CONTEXT_MAX_ANSWERS: None = None
 FINAL_REPORT_AUTHOR_ARTIFACT_KEY = "final_report_author_candidate"
 MAX_FINAL_STRUCTURE_REPAIRS = 1
-FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v9"
+FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v10"
 FINAL_INPUT_CLAIM_LEDGER_VERSION = "aiv-final-input-claim-ledger-v2"
 FINAL_ANSWER_ACCOUNTING_VERSION = "aiv-final-answer-accounting-v1"
 FINAL_INPUT_ROOT_SUMMARY_VERSION = "aiv-final-input-bounded-root-v3"
@@ -410,6 +410,10 @@ FINAL_INPUT_FALLBACK_WINDOW_BYTES = 192_000
 # directly instead.
 FINAL_INPUT_SAFETY_TOKENS = 0
 FINAL_INPUT_MAP_UNIT_CHARS = 32_000
+# Mapper leaves contain exact one-to-one claim receipts.  A separate, larger
+# fan-in keeps small semantic scalars from degenerating into thousands of paid
+# calls, while exact serialized-request admission still bounds every pack.
+FINAL_INPUT_MAP_FAN_IN = 128
 FINAL_INPUT_REDUCE_FAN_IN = 6
 FINAL_INPUT_CLAIM_FRAGMENT_UTF8_BYTES = 4_096
 FINAL_ANALYSIS_DIMENSIONS = (
@@ -1646,21 +1650,18 @@ FINAL_INPUT_EVIDENCE_SCHEMA: dict[str, Any] = {
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": 1,
-                        "uniqueItems": True,
                     },
                     "source_unit_ids": {
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": 1,
-                        "uniqueItems": True,
                     },
                     "source_claim_ids": {
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": 1,
-                        "uniqueItems": True,
                     },
                     "exact_values": {
                         "type": "array",
@@ -25723,6 +25724,7 @@ def _critic_payload(
     metrics: dict[str, Any],
     policy_history: list[dict[str, Any]],
     mandatory_raw_answer_ids: set[int] | None = None,
+    expected_corpus_cells: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scoped_catalog = _scope_entity_catalog_to_profile(catalog, profile)
     deterministic_warnings = [
@@ -25749,6 +25751,29 @@ def _critic_payload(
             target_chars=CRITIC_EVIDENCE_PARTITION_CHARS,
         )
         raw_manifests[answer_id] = manifest.as_dict()
+    if expected_corpus_cells is None:
+        # Direct callers (notably isolated critic/harness checks) may supply
+        # several synthetic answers for the same panel cell.  Production
+        # callers always pass the persisted expected grid, where duplicate
+        # rows must remain a hard integrity error.  For the standalone payload
+        # fallback, describe only the distinct represented cells rather than
+        # turning synthetic critic evidence into a false topology failure.
+        inferred_by_cell = {
+            _corpus_cell_key(row): row
+            for row in rows
+        }
+        coverage_expected_cells = _expected_corpus_cells_from_rows(rows)
+        coverage_observed_rows = [
+            inferred_by_cell[key]
+            for key in sorted(inferred_by_cell)
+        ]
+    else:
+        coverage_expected_cells = expected_corpus_cells
+        coverage_observed_rows = rows
+    coverage_admission = build_panel_metric_coverage_admission(
+        expected_cells=coverage_expected_cells,
+        observed_rows=coverage_observed_rows,
+    )
     return {
         "client_domain": _profile_client_domain(profile),
         "site_profile": profile,
@@ -25804,6 +25829,7 @@ def _critic_payload(
             scoped_catalog,
         ),
         "candidate_metrics": metrics,
+        "panel_metric_coverage_admission": coverage_admission,
         "deterministic_warnings": deterministic_warnings,
         "raw_evidence_selection": {
             **raw_selection,
@@ -26272,6 +26298,43 @@ def _critic_review_errors(
             errors.append("revise contains no policy adjustments")
         if not guidance.strip():
             errors.append("revise contains no annotation guidance")
+    elif verdict == "block":
+        fallback = review.get("fallback")
+        fallback_kind = (
+            str(fallback.get("kind") or "") if isinstance(fallback, dict) else ""
+        )
+        material_anomalies = [
+            item
+            for item in anomalies
+            if isinstance(item, dict)
+            and item.get("severity") in {"critical", "important"}
+        ]
+        if (
+            not material_anomalies
+            and fallback_kind != "deterministic_actionability_block"
+        ):
+            errors.append("block contains no critical/important anomalies")
+        integrity_codes = {
+            "scope_leakage",
+            "fabricated_evidence",
+            "annotation_evidence_mismatch",
+            "denominator_error",
+            "missing_data_as_zero",
+        }
+        for anomaly in material_anomalies:
+            if fallback_kind == "deterministic_actionability_block":
+                continue
+            if anomaly.get("code") not in integrity_codes:
+                errors.append(
+                    "block anomaly is not an integrity failure: "
+                    + str(anomaly.get("code") or "unknown")
+                )
+            answer_ids = anomaly.get("answer_ids")
+            if not isinstance(answer_ids, list) or not answer_ids:
+                errors.append(
+                    "block anomaly has no answer-bound evidence: "
+                    + str(anomaly.get("code") or "unknown")
+                )
     return errors
 
 
@@ -26353,6 +26416,15 @@ def _deterministic_critic_fallback_review(
         isinstance(item, dict) and item.get("raw_answer_truncated") is True
         for item in payload.get("answers") or []
     )
+    raw_selection = payload.get("raw_evidence_selection")
+    incomplete_warning_ids = (
+        [
+            *(raw_selection.get("omitted_warning_answer_ids") or []),
+            *(raw_selection.get("missing_warning_answer_ids") or []),
+        ]
+        if isinstance(raw_selection, dict)
+        else []
+    )
     safe_pass = bool(
         incomplete_review.get("verdict") == "pass"
         and observations_are_bounded
@@ -26362,6 +26434,7 @@ def _deterministic_critic_fallback_review(
         and isinstance(guidance, str)
         and not guidance.strip()
         and not has_truncated_raw
+        and not incomplete_warning_ids
         and warnings_are_resolved
     )
     if safe_pass:
@@ -28410,6 +28483,7 @@ async def _successful_analysis_critic_recovery_gate(
         mandatory_raw_answer_ids=set(
             matching_epoch.plan_json.get("target_answer_ids") or []
         ),
+        expected_corpus_cells=expected_corpus_cells,
     )
     final_payload["orchestrated_recovery"] = {
         "epoch": matching_epoch.epoch,
@@ -28747,6 +28821,7 @@ async def _resume_executing_analysis_critic_recovery(
         metrics=metrics,
         policy_history=policy_history,
         mandatory_raw_answer_ids=target_answer_ids,
+        expected_corpus_cells=expected_corpus_cells,
     )
     required_checks = {
         CHECK_RAW_CORPUS_UNCHANGED,
@@ -29349,6 +29424,7 @@ async def _recover_analysis_critic_exhaustion(
             metrics=recovered_metrics,
             policy_history=recovered_policy_history,
             mandatory_raw_answer_ids=target_answer_ids,
+            expected_corpus_cells=expected_corpus_cells,
         )
         final_payload["orchestrated_recovery"] = {
             "epoch": plan.epoch,
@@ -29588,6 +29664,7 @@ async def _run_analysis_critic_loop(
             rows=current_rows,
             metrics=current_metrics,
             policy_history=policy_history,
+            expected_corpus_cells=expected_corpus_cells,
         )
         review = await _analysis_critic_artifact(
             run_id,
@@ -33276,7 +33353,7 @@ def _pack_final_input_units(
         candidate = [*current, unit]
         pack_index = len(packs) + 1
         if current and (
-            len(candidate) > FINAL_INPUT_REDUCE_FAN_IN
+            len(candidate) > FINAL_INPUT_MAP_FAN_IN
             or request_utf8_bytes(pack_index, candidate) > window_bytes
         ):
             packs.append(current)
@@ -33507,6 +33584,119 @@ def _final_input_deterministic_passthrough(
             }
         )
     return passthrough
+
+
+def _final_input_unit_can_skip_semantic_mapper(
+    unit: dict[str, Any],
+) -> bool:
+    """Return whether code can account for a unit without semantic inference.
+
+    This allowlist is deliberately narrower than deterministic passthrough.
+    Names, labels, reasons, prompts and raw answers still reach the mapper even
+    though their exact values are also preserved by code.  Only typed scalar
+    facts and explicit empty/state literals can bypass semantic processing.
+    """
+
+    value_type = str(unit.get("value_type") or "")
+    if value_type != "string":
+        return True
+    if int(unit.get("unit_count") or 0) != 1 or unit.get("unit_index") != 0:
+        return False
+    source_path = str(unit.get("source_path") or "")
+    if source_path.startswith("/selected_full_answers/"):
+        return False
+    context_value = str(unit.get("context_value") or "")
+    core_start = unit.get("core_start_in_context")
+    core_end = unit.get("core_end_in_context")
+    if (
+        isinstance(core_start, bool)
+        or not isinstance(core_start, int)
+        or isinstance(core_end, bool)
+        or not isinstance(core_end, int)
+        or core_start < 0
+        or core_end < core_start
+        or core_end > len(context_value)
+    ):
+        raise OpenRouterError(
+            "Final input semantic-bypass unit has invalid code-owned core bounds"
+        )
+    core_value = context_value[core_start:core_end].strip().casefold()
+    return core_value in _FINAL_INPUT_STRUCTURAL_STRING_VALUES
+
+
+def _deterministic_final_evidence_packet(
+    units: list[dict[str, Any]],
+    *,
+    claim_row_by_id: dict[str, dict[str, Any]],
+    claim_objects_by_id: dict[str, SourceClaim],
+    claim_ids_by_unit: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Build exact coverage receipts for code-owned scalar units.
+
+    These values do not require model interpretation, but they retain the same
+    strict unit and claim lineage as semantic mapper output.  A later stage can
+    therefore never trade reliability for silent evidence loss.
+    """
+
+    unit_path_by_id = {
+        str(unit["source_unit_id"]): str(unit["source_path"]) for unit in units
+    }
+    unit_ids = list(unit_path_by_id)
+    claim_ids = [
+        claim_id
+        for unit_id in unit_ids
+        for claim_id in claim_ids_by_unit[unit_id]
+    ]
+    observations: list[dict[str, Any]] = []
+    for claim_id in claim_ids:
+        claim = claim_row_by_id[claim_id]
+        domain_context = _validate_final_domain_context(claim.get("domain_context"))
+        observations.append(
+            {
+                "category": "context",
+                "analysis_dimension": domain_context["analysis_dimension"],
+                "domain_context_id": domain_context["domain_context_id"],
+                "statement": "Точное исходное значение.",
+                "source_paths": [str(claim["source_path"])],
+                "source_unit_ids": [str(claim["source_unit_id"])],
+                "source_claim_ids": [claim_id],
+                "exact_values": [],
+                "evidence_excerpt": str(claim.get("excerpt") or ""),
+                "importance": "supporting",
+            }
+        )
+    packet = {
+        "observations": observations,
+        "uncertainties": [],
+        "report_focus": [],
+        "unit_coverage": [
+            {
+                "source_unit_id": unit_id,
+                "disposition": "supporting_context",
+                "rationale": "Значение сохранено кодом без модельного пересказа.",
+            }
+            for unit_id in unit_ids
+        ],
+        "claim_coverage": [
+            {
+                "claim_id": claim_id,
+                "excerpt_sha256": str(claim_row_by_id[claim_id]["excerpt_sha256"]),
+                "disposition": "supporting_context",
+                "rationale": "Точный фрагмент сохранён в code-owned реестре.",
+            }
+            for claim_id in claim_ids
+        ],
+    }
+    return _normalize_final_evidence_packet(
+        packet,
+        allowed_unit_paths=unit_path_by_id,
+        allowed_claims={
+            claim_id: claim_row_by_id[claim_id] for claim_id in claim_ids
+        },
+        claim_objects={
+            claim_id: claim_objects_by_id[claim_id] for claim_id in claim_ids
+        },
+    )
 
 
 def _normalize_final_evidence_packet(
@@ -36110,9 +36300,20 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
                 temperature=0.15,
             )
 
+        deterministic_units = [
+            unit for unit in units if _final_input_unit_can_skip_semantic_mapper(unit)
+        ]
+        deterministic_unit_ids = {
+            str(unit["source_unit_id"]) for unit in deterministic_units
+        }
+        semantic_units = [
+            unit
+            for unit in units
+            if str(unit["source_unit_id"]) not in deterministic_unit_ids
+        ]
         if all(
             map_request_bytes(index, [unit]) <= mapper_window_bytes
-            for index, unit in enumerate(units, start=1)
+            for index, unit in enumerate(semantic_units, start=1)
         ):
             break
         if target_chars <= 256:
@@ -36180,39 +36381,40 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         prompt_version=prompt_version,
     )
     packs = _pack_final_input_units(
-        units,
+        semantic_units,
         window_bytes=mapper_window_bytes,
         request_utf8_bytes=map_request_bytes,
     )
     max_mapper_request_bytes = max(
-        map_request_bytes(index, pack) for index, pack in enumerate(packs, start=1)
+        (
+            map_request_bytes(index, pack)
+            for index, pack in enumerate(packs, start=1)
+        ),
+        default=0,
     )
     unit_path_by_id = {
         str(unit["source_unit_id"]): str(unit["source_path"]) for unit in units
     }
-    semaphore = asyncio.Semaphore(PROCESSING_BATCH_CONCURRENCY)
-
     async def map_pack(index: int, pack: list[dict[str, Any]]) -> dict[str, Any]:
         unit_ids = [str(item["source_unit_id"]) for item in pack]
         digest = _stable_json_sha256(unit_ids)[:20]
-        async with semaphore:
-            result = await _structured_artifact(
-                run_id,
-                stage_key=stage_key,
-                artifact_key=f"{artifact_namespace}_map_{digest}",
-                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-                schema_name=f"aiv_final_input_map_{index}",
-                system=map_system,
-                user_payload={
-                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                    "source_payload_sha256": manifest["source_payload_sha256"],
-                    "source_units": pack,
-                    "source_claims": claims_for_pack(pack),
-                },
-                model=PROCESSING_MODEL,
-                reasoning_effort="high",
-                prompt_version=prompt_version,
-            )
+        result = await _structured_artifact(
+            run_id,
+            stage_key=stage_key,
+            artifact_key=f"{artifact_namespace}_map_{digest}",
+            schema=FINAL_INPUT_EVIDENCE_SCHEMA,
+            schema_name=f"aiv_final_input_map_{index}",
+            system=map_system,
+            user_payload={
+                "contract_version": FINAL_INPUT_HARNESS_VERSION,
+                "source_payload_sha256": manifest["source_payload_sha256"],
+                "source_units": pack,
+                "source_claims": claims_for_pack(pack),
+            },
+            model=PROCESSING_MODEL,
+            reasoning_effort="high",
+            prompt_version=prompt_version,
+        )
         normalized = _normalize_final_evidence_packet(
             result,
             allowed_unit_paths={
@@ -36229,15 +36431,35 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         )
         return _long_response_leaf(normalized, unit_ids)
 
-    outcomes = await asyncio.gather(
-        *(map_pack(index, pack) for index, pack in enumerate(packs, start=1)),
-        return_exceptions=True,
-    )
     packets: list[dict[str, Any]] = []
-    for outcome in outcomes:
-        if isinstance(outcome, BaseException):
-            raise outcome
-        packets.append(outcome)
+    if packs:
+        # One real canary prevents a systemic provider/schema rejection from
+        # enqueueing the full corpus.  Later work is admitted in bounded waves;
+        # an error finishes only the already-started siblings and schedules no
+        # further leaves.
+        packets.append(await map_pack(1, packs[0]))
+        for start in range(1, len(packs), PROCESSING_BATCH_CONCURRENCY):
+            wave = list(
+                enumerate(
+                    packs[start : start + PROCESSING_BATCH_CONCURRENCY],
+                    start=start + 1,
+                )
+            )
+            outcomes = await asyncio.gather(
+                *(map_pack(index, pack) for index, pack in wave),
+                return_exceptions=True,
+            )
+            first_error = next(
+                (
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException)
+                ),
+                None,
+            )
+            if first_error is not None:
+                raise first_error
+            packets.extend(outcome for outcome in outcomes if isinstance(outcome, dict))
 
     reduce_system = f"""
 Ты иерархический reducer evidence-пакетов AI visibility. Синтезируй дубли и
@@ -36396,6 +36618,51 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             packets.append(outcome)
         level += 1
 
+    deterministic_leaf: dict[str, Any] | None = None
+    if deterministic_units:
+        deterministic_packet = _deterministic_final_evidence_packet(
+            deterministic_units,
+            claim_row_by_id=claim_row_by_id,
+            claim_objects_by_id=claim_objects_by_id,
+            claim_ids_by_unit=claim_ids_by_unit,
+        )
+        deterministic_leaf = _long_response_leaf(
+            deterministic_packet,
+            [str(unit["source_unit_id"]) for unit in deterministic_units],
+        )
+    if deterministic_leaf is not None:
+        if packets:
+            union_inputs = [packets[0], deterministic_leaf]
+            union_lineage = _long_response_lineage(union_inputs)
+            union_claim_ids = [
+                claim_id
+                for unit_id in union_lineage
+                for claim_id in claim_ids_by_unit[unit_id]
+            ]
+            final_union = _deterministic_final_evidence_union(union_inputs)
+            final_union = _normalize_final_evidence_packet(
+                final_union,
+                allowed_unit_paths={
+                    unit_id: unit_path_by_id[unit_id] for unit_id in union_lineage
+                },
+                allowed_claims={
+                    claim_id: claim_row_by_id[claim_id]
+                    for claim_id in union_claim_ids
+                },
+                claim_objects={
+                    claim_id: claim_objects_by_id[claim_id]
+                    for claim_id in union_claim_ids
+                },
+            )
+            packets = [_long_response_leaf(final_union, union_lineage)]
+            if terminal_reducer_mode is None:
+                terminal_reducer_mode = "semantic_plus_code_owned_union"
+        else:
+            packets = [deterministic_leaf]
+            terminal_reducer_mode = "code_owned_scalar_only"
+    if not packets:
+        raise OpenRouterError("Final input harness produced no evidence packets")
+
     complete_lineage = _long_response_lineage(
         packets,
         expected_unit_ids=[str(item["source_unit_id"]) for item in units],
@@ -36413,6 +36680,8 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
             "source_claim_count": len(claim_rows),
             "covered_claim_count": len(final_packet.get("claim_coverage") or []),
             "coverage_complete": True,
+            "mapped_source_unit_count": len(semantic_units),
+            "code_owned_source_unit_count": len(deterministic_units),
             "deterministic_passthrough_value_count": len(deterministic_passthrough),
             "deterministic_passthrough_sha256": _stable_json_sha256(
                 deterministic_passthrough
@@ -36525,6 +36794,8 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
         "source_payload_utf8_bytes": manifest["source_payload_utf8_bytes"],
         "source_unit_count": manifest["source_unit_count"],
         "map_leaf_count": len(packs),
+        "mapped_source_unit_count": len(semantic_units),
+        "code_owned_source_unit_count": len(deterministic_units),
         "reduce_levels": level,
         "mapper_window": mapper_window,
         "mapper_request_window_utf8_bytes": mapper_window_bytes,

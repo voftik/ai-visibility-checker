@@ -75,6 +75,7 @@ from app.services.analyzer import (
     _compute_metrics,
     _current_annotation_input_digests,
     _deterministic_annotation_warnings,
+    _deterministic_critic_fallback_review,
     _literal_target_attribution_evidence,
     _reconcile_annotation,
     _recover_analysis_critic_exhaustion,
@@ -568,7 +569,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(payload["iteration"], 1)
         self.assertEqual(payload["max_iterations"], MAX_CRITIC_ITERATIONS)
-        self.assertEqual(CRITIC_VERSION, "aiv-analysis-critic-v26")
+        self.assertEqual(CRITIC_VERSION, "aiv-analysis-critic-v27")
         self.assertEqual(
             usage["_aiv_critic_contract"]["semantic_verdict_status"],
             "pending_deterministic_validation",
@@ -5134,6 +5135,169 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["answers"][0]["raw_answer"], raw_answer)
         self.assertIsNone(
             payload["raw_evidence_selection"]["optional_char_window"]
+        )
+
+    def test_coverage_only_block_is_rejected_and_fallback_stays_closed(
+        self,
+    ) -> None:
+        degraded_rows = [copy.deepcopy(ROWS[0]), copy.deepcopy(ROWS[0])]
+        degraded_rows[1]["answer_id"] = 12
+        degraded_rows[1]["provider_key"] = "gemini"
+        degraded_rows[1]["model"] = "google/gemini-3.1-pro-preview"
+        degraded_rows[1]["metric_eligible"] = False
+        degraded_rows[1]["metric_evidence_state"] = "provider_limited_prefix"
+        degraded_rows[1]["metric_limitation"] = "provider_output_limit"
+        degraded_rows[1]["annotation"]["_answer_model"] = degraded_rows[1]["model"]
+        payload = _critic_payload(
+            profile=PROFILE,
+            catalog=CATALOG,
+            rows=degraded_rows,
+            metrics=METRICS,
+            policy_history=[],
+        )
+        review = _critic_review("block")
+        warning_code = payload["panel_metric_coverage_admission"]["warning_codes"][0]
+        review["acceptance_checks"] = [f"coverage_warning_ack:{warning_code}"]
+
+        errors = _critic_review_validation_errors(review, payload=payload)
+        fallback = _deterministic_critic_fallback_review(
+            payload,
+            review,
+            validation_errors=errors,
+        )
+
+        self.assertTrue(payload["panel_metric_coverage_admission"]["allowed"])
+        self.assertEqual(
+            payload["panel_metric_coverage_admission"]["quality_state"],
+            "degraded",
+        )
+        self.assertIn("block contains no critical/important anomalies", errors)
+        self.assertEqual(fallback["verdict"], "block")
+        self.assertEqual(
+            fallback["fallback"]["kind"],
+            "deterministic_actionability_block",
+        )
+
+    async def test_coverage_only_block_gets_one_bounded_repair_to_pass(
+        self,
+    ) -> None:
+        degraded_rows = [copy.deepcopy(ROWS[0]), copy.deepcopy(ROWS[0])]
+        degraded_rows[1]["answer_id"] = 12
+        degraded_rows[1]["provider_key"] = "gemini"
+        degraded_rows[1]["model"] = "google/gemini-3.1-pro-preview"
+        degraded_rows[1]["metric_eligible"] = False
+        degraded_rows[1]["metric_evidence_state"] = "provider_limited_prefix"
+        degraded_rows[1]["metric_limitation"] = "provider_output_limit"
+        degraded_rows[1]["annotation"]["_answer_model"] = degraded_rows[1]["model"]
+        payload = _critic_payload(
+            profile=PROFILE,
+            catalog=CATALOG,
+            rows=degraded_rows,
+            metrics=METRICS,
+            policy_history=[],
+        )
+        warning_code = payload["panel_metric_coverage_admission"]["warning_codes"][0]
+        invalid_block = _critic_review("block")
+        invalid_block["acceptance_checks"] = [
+            f"coverage_warning_ack:{warning_code}"
+        ]
+        repaired_pass = _critic_review("pass")
+        repaired_pass["acceptance_checks"].append(
+            f"coverage_warning_ack:{warning_code}"
+        )
+
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.review_analysis",
+                new_callable=AsyncMock,
+                return_value=(invalid_block, "{}", {"total_tokens": 10}),
+            ),
+            patch(
+                "app.services.analyzer.repair_analysis_review",
+                new_callable=AsyncMock,
+                return_value=(repaired_pass, "{}", {"total_tokens": 5}),
+            ) as repair_mock,
+        ):
+            result = await _analysis_critic_artifact(
+                "run-coverage-repair",
+                iteration=1,
+                payload=payload,
+            )
+
+        self.assertEqual(result, repaired_pass)
+        repair_mock.assert_awaited_once()
+        self.assertIn(
+            "block contains no critical/important anomalies",
+            repair_mock.await_args.kwargs["validation_errors"],
+        )
+
+    def test_malformed_non_coverage_block_remains_fail_closed(self) -> None:
+        degraded_rows = [copy.deepcopy(ROWS[0]), copy.deepcopy(ROWS[0])]
+        degraded_rows[1]["answer_id"] = 12
+        degraded_rows[1]["provider_key"] = "gemini"
+        degraded_rows[1]["model"] = "google/gemini-3.1-pro-preview"
+        degraded_rows[1]["metric_eligible"] = False
+        degraded_rows[1]["metric_evidence_state"] = "provider_limited_prefix"
+        degraded_rows[1]["metric_limitation"] = "provider_output_limit"
+        degraded_rows[1]["annotation"]["_answer_model"] = degraded_rows[1]["model"]
+        payload = _critic_payload(
+            profile=PROFILE,
+            catalog=CATALOG,
+            rows=degraded_rows,
+            metrics=METRICS,
+            policy_history=[],
+        )
+        review = _critic_review("block")
+        errors = _critic_review_validation_errors(review, payload=payload)
+
+        fallback = _deterministic_critic_fallback_review(
+            payload,
+            review,
+            validation_errors=errors,
+        )
+
+        self.assertEqual(fallback["verdict"], "block")
+        self.assertNotEqual(
+            fallback.get("fallback", {}).get("kind"),
+            "deterministic_safe_pass",
+        )
+
+    def test_answer_bound_missing_as_zero_can_still_block(self) -> None:
+        payload = _critic_payload(
+            profile=PROFILE,
+            catalog=CATALOG,
+            rows=[copy.deepcopy(ROWS[0])],
+            metrics=METRICS,
+            policy_history=[],
+        )
+        review = _critic_review(
+            "block",
+            anomalies=[
+                {
+                    "code": "missing_data_as_zero",
+                    "severity": "critical",
+                    "finding": (
+                        "Недоступная ячейка попала в опубликованный числитель "
+                        "как нулевое наблюдение."
+                    ),
+                    "answer_ids": [11],
+                    "entities": ["Campaign 360"],
+                }
+            ],
+        )
+
+        self.assertEqual(
+            _critic_review_validation_errors(review, payload=payload),
+            [],
         )
 
     async def test_r2_block_never_invokes_fable_recovery(self) -> None:

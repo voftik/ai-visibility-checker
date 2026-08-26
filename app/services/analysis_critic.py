@@ -30,7 +30,7 @@ from app.services.openrouter import (
     web_request_policy,
 )
 
-CRITIC_VERSION = "aiv-analysis-critic-v26"
+CRITIC_VERSION = "aiv-analysis-critic-v27"
 CRITIC_TRANSPORT_CONTRACT_VERSION = "aiv-analysis-critic-transport-v1"
 CRITIC_MAP_REDUCE_VERSION = "aiv-analysis-critic-map-reduce-v5"
 CRITIC_CALL_AUDIT_VERSION = "aiv-analysis-critic-call-audit-v1"
@@ -388,8 +388,18 @@ entities исходного предупреждения. Сама фраза к
 Предупреждение без такого resolver требует revise или block. Наблюдения без
 влияния на корректность можно оставить только с severity=observation.
 verdict=revise — когда перечисленные ограниченные правки позволяют безопасно
-повторить разметку и расчёт. verdict=block — если исходные данные повреждены,
-неполны или корректность нельзя восстановить разрешёнными правками.
+повторить разметку и расчёт. panel_metric_coverage_admission — обязательное
+code-owned решение о пригодности панели: если allowed=true, его warning_codes
+означают ограничение конкретного среза, а не основание остановить весь отчёт.
+Не требуй полного покрытия сверх этого контракта и не блокируй публикацию
+только из-за unavailable/limited провайдера, режима или сценария. verdict=block
+допустим лишь при конкретной critical/important anomaly, которая доказывает
+повреждение, неверный знаменатель, missing-as-zero, подмену evidence или иную
+неустранимую ошибку целостности и связана с конкретными answer_id. Если срез
+просто неполон, сохрани limitation и оцени только подтверждённый знаменатель.
+Каждый учтённый как limitation warning_code из admission зафиксируй дословно в
+acceptance_checks как `coverage_warning_ack:<warning_code>`. Это машинная
+квитанция об осознанном ограничении, а не разрешение выбрать block.
 Пиши кратко и предметно по-русски.
 """.strip()
 

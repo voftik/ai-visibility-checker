@@ -87,6 +87,7 @@ from app.services.analyzer import (
     FINAL_REPORT_VERSION,
     FINAL_CONTEXT_MAX_ANSWERS,
     FINAL_REPORT_AUTHOR_ARTIFACT_KEY,
+    FINAL_INPUT_EVIDENCE_SCHEMA,
     FINAL_REPORT_SCHEMA,
     ILLUSTRATION_CONCEPTS_SCHEMA,
     ILLUSTRATION_GENERATION_VERSION,
@@ -8452,6 +8453,32 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             "input_utf8_window": 192_000,
         }
 
+    def test_final_input_mapper_schema_uses_provider_supported_keywords(
+        self,
+    ) -> None:
+        unique_item_paths: list[str] = []
+
+        def visit(value: Any, path: str = "") -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    child_path = f"{path}/{key}"
+                    if key == "uniqueItems":
+                        unique_item_paths.append(child_path)
+                    visit(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, f"{path}/{index}")
+
+        visit(FINAL_INPUT_EVIDENCE_SCHEMA)
+
+        self.assertEqual(unique_item_paths, [])
+        observation_properties = FINAL_INPUT_EVIDENCE_SCHEMA["properties"][
+            "observations"
+        ]["items"]["properties"]
+        for field in ("source_paths", "source_unit_ids", "source_claim_ids"):
+            self.assertEqual(observation_properties[field]["minItems"], 1)
+            self.assertEqual(observation_properties[field]["maxItems"], 1)
+
     @staticmethod
     def _stable_sha(value: Any) -> str:
         return hashlib.sha256(
@@ -8563,6 +8590,218 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             metric_code,
         )
         self.assertNotIn("/report_data/long_narrative", passthrough)
+
+    async def test_structural_units_bypass_mapper_without_losing_coverage(
+        self,
+    ) -> None:
+        payload = {
+            "report_data": {
+                "score": 73,
+                "status": "completed",
+                "eligible": True,
+                "optional_value": None,
+                "note": "Содержательный вывод клиента",
+            }
+        }
+        mapper_payloads: list[dict[str, Any]] = []
+
+        async def capture_mapper(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            mapper_payloads.append(copy.deepcopy(user_payload))
+            return self._packet_for_units(
+                user_payload["source_units"],
+                source_claims=user_payload.get("source_claims"),
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=capture_mapper,
+            ) as structured_artifact,
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertEqual(structured_artifact.await_count, 1)
+        mapped_paths = {
+            str(unit["source_path"])
+            for mapper_payload in mapper_payloads
+            for unit in mapper_payload["source_units"]
+        }
+        self.assertEqual(mapped_paths, {"/report_data/note"})
+        passthrough = {
+            item["source_path"]: item
+            for item in model_payload["deterministic_passthrough"]["values"]
+        }
+        self.assertEqual(passthrough["/report_data/score"]["value"], 73)
+        self.assertEqual(passthrough["/report_data/status"]["value"], "completed")
+        self.assertIs(passthrough["/report_data/eligible"]["value"], True)
+        self.assertIsNone(passthrough["/report_data/optional_value"]["value"])
+        self.assertEqual(plan["mapped_source_unit_count"], 1)
+        self.assertEqual(plan["code_owned_source_unit_count"], 4)
+        self.assertEqual(plan["source_unit_count"], 5)
+        self.assertEqual(plan["covered_claim_count"], plan["source_claim_count"])
+        self.assertEqual(
+            len(model_payload["evidence_digest"]["unit_coverage"]),
+            plan["source_unit_count"],
+        )
+
+    async def test_all_structural_payload_needs_no_mapper_call(self) -> None:
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+            ) as structured_artifact,
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload={
+                    "report_data": {
+                        "score": 73,
+                        "eligible": True,
+                        "optional_value": None,
+                    }
+                },
+                system="author",
+                force_hierarchical=True,
+            )
+
+        structured_artifact.assert_not_awaited()
+        self.assertEqual(plan["map_leaf_count"], 0)
+        self.assertEqual(plan["mapped_source_unit_count"], 0)
+        self.assertEqual(plan["code_owned_source_unit_count"], 3)
+        self.assertEqual(plan["terminal_reducer_mode"], "code_owned_scalar_only")
+        self.assertEqual(
+            len(model_payload["evidence_digest"]["unit_coverage"]),
+            3,
+        )
+
+    async def test_systemic_map_failure_stops_at_canary(self) -> None:
+        payload = {
+            "report_data": {
+                "notes": [f"Содержательный вывод {index}" for index in range(10)]
+            }
+        }
+
+        def singleton_packs(
+            units: list[dict[str, Any]],
+            **_kwargs: Any,
+        ) -> list[list[dict[str, Any]]]:
+            return [[unit] for unit in units]
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._pack_final_input_units",
+                side_effect=singleton_packs,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=OpenRouterError("invalid_json_schema"),
+            ) as structured_artifact,
+        ):
+            with self.assertRaisesRegex(OpenRouterError, "invalid_json_schema"):
+                await _prepare_final_model_payload(
+                    "run-id",
+                    payload=payload,
+                    system="author",
+                    force_hierarchical=True,
+                )
+
+        self.assertEqual(structured_artifact.await_count, 1)
+
+    async def test_failed_map_wave_never_starts_the_next_wave(self) -> None:
+        payload = {
+            "report_data": {
+                "notes": [f"Содержательный вывод {index}" for index in range(10)]
+            }
+        }
+        call_count = 0
+
+        def singleton_packs(
+            units: list[dict[str, Any]],
+            **_kwargs: Any,
+        ) -> list[list[dict[str, Any]]]:
+            return [[unit] for unit in units]
+
+        async def fail_first_wave(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OpenRouterError("systemic-wave-error")
+            user_payload = kwargs["user_payload"]
+            return self._packet_for_units(
+                user_payload["source_units"],
+                source_claims=user_payload.get("source_claims"),
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._pack_final_input_units",
+                side_effect=singleton_packs,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=fail_first_wave,
+            ) as structured_artifact,
+        ):
+            with self.assertRaisesRegex(OpenRouterError, "systemic-wave-error"):
+                await _prepare_final_model_payload(
+                    "run-id",
+                    payload=payload,
+                    system="author",
+                    force_hierarchical=True,
+                )
+
+        self.assertEqual(
+            structured_artifact.await_count,
+            1 + PROCESSING_BATCH_CONCURRENCY,
+        )
 
     @staticmethod
     def _packet_for_units(
