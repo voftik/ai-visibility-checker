@@ -10352,6 +10352,183 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             normalized,
         )
 
+        paired_typo = copy.deepcopy(packet)
+        paired_typo["claim_coverage"][0]["claim_id"] = typo_id
+        original_paired_typo = copy.deepcopy(paired_typo)
+        paired_reconciled = _reconcile_final_mapper_observation_claim_ids(
+            paired_typo,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            global_claim_ids={claim_id},
+        )
+        self.assertEqual(paired_typo, original_paired_typo)
+        self.assertEqual(
+            paired_reconciled["observations"][0]["source_claim_ids"],
+            [claim_id],
+        )
+        self.assertEqual(
+            paired_reconciled["claim_coverage"][0]["claim_id"],
+            claim_id,
+        )
+        paired_audit = paired_reconciled[
+            "_aiv_final_input_grounding_filter"
+        ]
+        self.assertEqual(paired_audit["operation_count"], 2)
+        self.assertEqual(
+            [item["operation"] for item in paired_audit["operations"]],
+            [
+                "replace_invalid_claim_coverage_id",
+                "replace_invalid_observation_claim_id",
+            ],
+        )
+        self.assertNotIn(
+            typo_id,
+            json.dumps(paired_audit, ensure_ascii=False),
+        )
+        _precheck_final_mapper_exact_coverage(
+            paired_reconciled,
+            expected_unit_ids=list(allowed_paths),
+            expected_claim_ids=[claim_id],
+        )
+        paired_normalized = _normalize_final_evidence_packet(
+            paired_reconciled,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            claim_objects={claim_id: claim_objects[claim_id]},
+        )
+        self.assertEqual(
+            _reconcile_final_mapper_observation_claim_ids(
+                paired_normalized,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids={claim_id},
+            ),
+            paired_normalized,
+        )
+
+        ambiguous_coverage = copy.deepcopy(paired_typo)
+        duplicate_coverage = copy.deepcopy(ambiguous_coverage["claim_coverage"][0])
+        duplicate_coverage["claim_id"] = claim_id
+        ambiguous_coverage["claim_coverage"].append(duplicate_coverage)
+        with self.assertRaisesRegex(OpenRouterError, "not uniquely attested"):
+            _reconcile_final_mapper_observation_claim_ids(
+                ambiguous_coverage,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids={claim_id},
+            )
+
+        multi_units, _multi_manifest = _flatten_final_input_payload(
+            {
+                "report_data": {
+                    "first": "alpha",
+                    "second": "bravo",
+                    "third": "charlie",
+                    "fourth": "delta",
+                }
+            },
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        multi_claims, _objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(multi_units)
+        )
+        self.assertEqual(len(multi_claims), 4)
+        multi_packet = self._packet_for_units(
+            multi_units,
+            source_claims=multi_claims,
+        )
+        multi_expected_ids = [str(item["claim_id"]) for item in multi_claims]
+        missing_id = multi_expected_ids[-1]
+        paired_missing_id = missing_id[:36] + missing_id[37:]
+        multi_packet["observations"][-1]["source_claim_ids"] = [
+            paired_missing_id
+        ]
+        multi_packet["claim_coverage"][-1]["claim_id"] = paired_missing_id
+        multi_allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in multi_units
+        }
+        multi_reconciled = _reconcile_final_mapper_observation_claim_ids(
+            multi_packet,
+            allowed_unit_paths=multi_allowed_paths,
+            allowed_claims={
+                str(item["claim_id"]): item for item in multi_claims
+            },
+            global_claim_ids=set(multi_expected_ids),
+        )
+        self.assertEqual(
+            [
+                item["source_claim_ids"][0]
+                for item in multi_reconciled["observations"]
+            ],
+            multi_expected_ids,
+        )
+        self.assertEqual(
+            [item["claim_id"] for item in multi_reconciled["claim_coverage"]],
+            multi_expected_ids,
+        )
+        _precheck_final_mapper_exact_coverage(
+            multi_reconciled,
+            expected_unit_ids=list(multi_allowed_paths),
+            expected_claim_ids=multi_expected_ids,
+        )
+
+        shuffled_paired = self._packet_for_units(
+            multi_units,
+            source_claims=multi_claims,
+        )
+        first_typo_id = multi_expected_ids[0][:34] + multi_expected_ids[0][35:]
+        last_typo_id = multi_expected_ids[-1][:36] + multi_expected_ids[-1][37:]
+        shuffled_paired["observations"][0]["source_claim_ids"] = [
+            first_typo_id
+        ]
+        shuffled_paired["observations"][-1]["source_claim_ids"] = [
+            last_typo_id
+        ]
+        shuffled_paired["claim_coverage"][0]["claim_id"] = first_typo_id
+        shuffled_paired["claim_coverage"][-1]["claim_id"] = last_typo_id
+        shuffled_paired["claim_coverage"].reverse()
+        shuffled_reconciled = _reconcile_final_mapper_observation_claim_ids(
+            shuffled_paired,
+            allowed_unit_paths=multi_allowed_paths,
+            allowed_claims={
+                str(item["claim_id"]): item for item in multi_claims
+            },
+            global_claim_ids=set(multi_expected_ids),
+        )
+        self.assertEqual(
+            [
+                item["source_claim_ids"][0]
+                for item in shuffled_reconciled["observations"]
+            ],
+            multi_expected_ids,
+        )
+        self.assertEqual(
+            Counter(
+                item["claim_id"]
+                for item in shuffled_reconciled["claim_coverage"]
+            ),
+            Counter(multi_expected_ids),
+        )
+        _precheck_final_mapper_exact_coverage(
+            shuffled_reconciled,
+            expected_unit_ids=list(multi_allowed_paths),
+            expected_claim_ids=multi_expected_ids,
+        )
+
+        mismatched_paired_typo = copy.deepcopy(paired_typo)
+        mismatched_paired_typo["claim_coverage"][0]["claim_id"] = (
+            claim_id[:38] + claim_id[39:]
+        )
+        with self.assertRaisesRegex(OpenRouterError, "not uniquely attested"):
+            _reconcile_final_mapper_observation_claim_ids(
+                mismatched_paired_typo,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids={claim_id},
+            )
+
         cross_leaf = copy.deepcopy(packet)
         cross_leaf_id = "clm_" + "f" * 64
         cross_leaf["observations"][0]["source_claim_ids"] = [cross_leaf_id]

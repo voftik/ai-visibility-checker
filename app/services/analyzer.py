@@ -34989,8 +34989,9 @@ def _reconcile_final_mapper_observation_claim_ids(
 
     Claim ids are code-owned hashes, but the mapper must echo them. A copied
     id may lose characters while the independent unit, path, full excerpt,
-    digest and canonical coverage row remain exact. In that one case the id is
-    redundant metadata and can be re-attested. No fuzzy hash matching is used.
+    digest and dependent coverage row remain exact. The coverage row may carry
+    either the canonical id or the same copied typo; in the latter case both
+    redundant ids are re-attested atomically. No fuzzy hash matching is used.
 
     Cross-pack ids, ambiguous anchors, partial excerpts, wrong digests and any
     result that does not restore exact-once observation/coverage counters stay
@@ -35008,18 +35009,22 @@ def _reconcile_final_mapper_observation_claim_ids(
 
     expected_claim_ids = list(allowed_claims)
     expected_claim_set = set(expected_claim_ids)
-    coverage_by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    coverage_by_id: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     coverage_ids: list[str] = []
-    for item in claim_coverage:
+    for coverage_index, item in enumerate(claim_coverage):
         if not isinstance(item, dict) or not isinstance(item.get("claim_id"), str):
-            continue
+            raise OpenRouterError(
+                "Final evidence mapper emitted invalid claim coverage"
+            )
         claim_id = str(item["claim_id"])
         coverage_ids.append(claim_id)
-        coverage_by_id[claim_id].append(item)
+        coverage_by_id[claim_id].append((coverage_index, item))
 
     replacements: list[tuple[int, int, str, str]] = []
+    coverage_replacements: list[tuple[int, str, str]] = []
     replacement_targets: set[str] = set()
     observed_after: list[str] = []
+    coverage_after = list(coverage_ids)
     for observation_index, observation in enumerate(observations):
         if not isinstance(observation, dict):
             continue
@@ -35075,7 +35080,18 @@ def _reconcile_final_mapper_observation_claim_ids(
                 path = str(claim.get("source_path") or "")
                 excerpt = str(claim.get("excerpt") or "")
                 digest = str(claim.get("excerpt_sha256") or "")
-                coverage_rows = coverage_by_id.get(canonical_claim_id, [])
+                canonical_coverage_rows = coverage_by_id.get(
+                    canonical_claim_id,
+                    [],
+                )
+                supplied_coverage_rows = coverage_by_id.get(
+                    supplied_claim_id,
+                    [],
+                )
+                coverage_rows = [
+                    *canonical_coverage_rows,
+                    *supplied_coverage_rows,
+                ]
                 if (
                     unit_ids != [unit_id]
                     or paths != [path]
@@ -35083,7 +35099,7 @@ def _reconcile_final_mapper_observation_claim_ids(
                     or evidence_excerpt != excerpt
                     or digest != text_sha256(excerpt)
                     or len(coverage_rows) != 1
-                    or coverage_rows[0].get("excerpt_sha256") != digest
+                    or coverage_rows[0][1].get("excerpt_sha256") != digest
                     or any(
                         not value.strip()
                         or value not in excerpt
@@ -35116,12 +35132,26 @@ def _reconcile_final_mapper_observation_claim_ids(
                     canonical_claim_id,
                 )
             )
+            supplied_coverage_rows = coverage_by_id.get(
+                supplied_claim_id,
+                [],
+            )
+            if supplied_coverage_rows:
+                coverage_index, _coverage_row = supplied_coverage_rows[0]
+                coverage_replacements.append(
+                    (
+                        coverage_index,
+                        supplied_claim_id,
+                        canonical_claim_id,
+                    )
+                )
+                coverage_after[coverage_index] = canonical_claim_id
             observed_after.append(canonical_claim_id)
 
     if not replacements:
         return output
     if Counter(observed_after) != Counter(expected_claim_ids) or Counter(
-        coverage_ids
+        coverage_after
     ) != Counter(expected_claim_ids):
         raise OpenRouterError(
             "Final evidence mapper claim reconciliation did not restore "
@@ -35148,6 +35178,20 @@ def _reconcile_final_mapper_observation_claim_ids(
                 replacement=canonical_claim_id,
             )
         )
+    for coverage_index, supplied_claim_id, canonical_claim_id in (
+        coverage_replacements
+    ):
+        output["claim_coverage"][coverage_index]["claim_id"] = canonical_claim_id
+        operations.append(
+            _final_input_grounding_filter_operation(
+                scope="mapper",
+                operation="replace_invalid_claim_coverage_id",
+                path=f"claim_coverage[{coverage_index}].claim_id",
+                binding_sha256=text_sha256(canonical_claim_id),
+                value=supplied_claim_id,
+                replacement=canonical_claim_id,
+            )
+        )
     _record_final_input_grounding_filter(
         output,
         scope="mapper",
@@ -35169,6 +35213,7 @@ _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
         "replace_quarantined_claim_coverage_disposition",
         "replace_invalid_observation_excerpt",
         "replace_invalid_observation_claim_id",
+        "replace_invalid_claim_coverage_id",
         "replace_invalid_claim_coverage_digest",
         "replace_generic_observation_statement",
         "replace_ungrounded_unit_coverage_rationale",
