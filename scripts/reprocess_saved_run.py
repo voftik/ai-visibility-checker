@@ -31,11 +31,15 @@ from app.services.run_coordinator import (
     SAVED_ANSWERS_ONLY_MODE,
 )
 from app.services.run_lease import bind_run_lease
-
+from app.services.sqlite_lease_heartbeat import (
+    SQLiteLeaseHeartbeat,
+    database_path_for_engine,
+)
 
 EXECUTION_SLOT = 1
 REPROCESS_LEASE_SECONDS = 90
 REPROCESS_HEARTBEAT_SECONDS = 30.0
+REPROCESS_TERMINAL_GRACE_SECONDS = 15.0
 ACTIVE_QUEUE_STATUSES = (
     RunStatus.pending,
     RunStatus.crawling,
@@ -271,8 +275,6 @@ def _validate_complete_saved_panel(
 async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
     """Check the whole durable queue and reserve its only execution slot."""
 
-    now = datetime.now(timezone.utc)
-    lease_expires_at = now + timedelta(seconds=REPROCESS_LEASE_SECONDS)
     owner = _operator_owner()
     async with engine.connect() as connection:
         await connection.exec_driver_sql("BEGIN IMMEDIATE")
@@ -451,6 +453,13 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
                     previous=previous,
                 )
             )
+            # The lossless snapshot and fingerprint above may process an
+            # arbitrarily large saved corpus. Start the lease clock only after
+            # that work, immediately before the ownership write.
+            claimed_at = datetime.now(timezone.utc)
+            lease_expires_at = claimed_at + timedelta(
+                seconds=REPROCESS_LEASE_SECONDS
+            )
             claimed = await connection.execute(
                 update(Run)
                 .where(
@@ -468,12 +477,12 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
                     execution_slot=EXECUTION_SLOT,
                     lease_owner=owner,
                     lease_expires_at=lease_expires_at,
-                    heartbeat_at=now,
+                    heartbeat_at=claimed_at,
                     error_message=None,
                     finished_at=None,
                     attempt_count=claim_attempt_count,
                     state_revision=func.coalesce(Run.state_revision, 0) + 1,
-                    state_changed_at=now,
+                    state_changed_at=claimed_at,
                     stage_key="knowledge_gap",
                     stage_label="Переанализируем сохранённые ответы",
                     stage_detail=(
@@ -506,71 +515,93 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
     )
 
 
-async def _renew_reprocess_lease(claim: ReprocessClaim) -> bool:
-    now = datetime.now(timezone.utc)
+async def _terminal_transition_belongs_to_claim(claim: ReprocessClaim) -> bool:
+    """Distinguish our worker's terminal write from external lease recovery."""
+
     async with SessionLocal() as session:
-        renewed = await session.execute(
-            update(Run)
-            .where(
-                Run.id == claim.run_id,
-                Run.status == RunStatus.analyzing,
-                Run.execution_slot == EXECUTION_SLOT,
-                Run.lease_owner == claim.owner,
+        current = (
+            await session.execute(
+                select(
+                    Run.config_json,
+                    Run.status,
+                    Run.execution_slot,
+                    Run.lease_owner,
+                    Run.attempt_count,
+                    Run.resume_count,
+                ).where(Run.id == claim.run_id)
             )
-            .values(
-                heartbeat_at=now,
-                lease_expires_at=(
-                    now + timedelta(seconds=REPROCESS_LEASE_SECONDS)
-                ),
-            )
-        )
-        await session.commit()
-        return renewed.rowcount == 1
-
-
-async def _heartbeat_reprocess_lease(claim: ReprocessClaim) -> None:
-    while True:
-        await asyncio.sleep(REPROCESS_HEARTBEAT_SECONDS)
-        if not await _renew_reprocess_lease(claim):
-            raise ReprocessExecutionError(
-                "Потерян общий execution_slot; переанализ остановлен."
-            )
+        ).one_or_none()
+    if current is None:
+        return False
+    return bool(
+        _claim_marker_matches(current.config_json, claim)
+        and current.status in (RunStatus.completed, RunStatus.failed)
+        and current.execution_slot is None
+        and current.lease_owner is None
+        and int(current.attempt_count or 0) == claim.attempt_count
+        and int(current.resume_count or 0) == claim.resume_count
+    )
 
 
 async def _execute_claimed_reprocess(claim: ReprocessClaim) -> None:
+    heartbeat = SQLiteLeaseHeartbeat(
+        database_path=database_path_for_engine(engine),
+        run_id=claim.run_id,
+        owner=claim.owner,
+        lease_seconds=REPROCESS_LEASE_SECONDS,
+        interval_seconds=REPROCESS_HEARTBEAT_SECONDS,
+    )
+    heartbeat.start()
     with bind_run_lease(claim.run_id, claim.owner):
         worker = asyncio.create_task(
             analyzer.reprocess_saved_answers(claim.run_id),
             name=f"operator-reprocess-{claim.run_id}",
         )
-    heartbeat = asyncio.create_task(
-        _heartbeat_reprocess_lease(claim),
-        name=f"operator-reprocess-heartbeat-{claim.run_id}",
+    heartbeat_lost = asyncio.create_task(
+        heartbeat.wait_lost(),
+        name=f"operator-reprocess-lease-watch-{claim.run_id}",
     )
     try:
         done, _pending = await asyncio.wait(
-            {worker, heartbeat},
+            {worker, heartbeat_lost},
             return_when=asyncio.FIRST_COMPLETED,
         )
         if worker in done:
             await worker
             return
-        heartbeat_error = heartbeat.exception()
+        if await _terminal_transition_belongs_to_claim(claim):
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(worker),
+                    timeout=REPROCESS_TERMINAL_GRACE_SECONDS,
+                )
+                return
+            except TimeoutError as error:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+                raise ReprocessExecutionError(
+                    "Переанализ записал terminal state, но worker не завершился."
+                ) from error
+        heartbeat_snapshot = heartbeat.snapshot()
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
-        if isinstance(heartbeat_error, ReprocessExecutionError):
-            raise heartbeat_error
         raise ReprocessExecutionError(
-            "Не удалось продлить общий execution_slot; "
-            "переанализ остановлен."
-        ) from heartbeat_error
+            "Потерян общий execution_slot; переанализ остановлен. "
+            f"Heartbeat: {heartbeat_snapshot.last_error or 'ownership changed'}."
+        )
     except asyncio.CancelledError:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
         raise
     finally:
-        heartbeat.cancel()
-        await asyncio.gather(heartbeat, return_exceptions=True)
+        # Never restore the published state or release the lease while a stale
+        # analyzer task can still write into this run.
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        heartbeat_lost.cancel()
+        await asyncio.gather(heartbeat_lost, return_exceptions=True)
+        await asyncio.to_thread(heartbeat.stop)
 
 
 async def _restore_model_answer_snapshot(claim: ReprocessClaim) -> None:

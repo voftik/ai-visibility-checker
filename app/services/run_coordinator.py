@@ -24,6 +24,10 @@ from app.db import SessionLocal, engine
 from app.models import Run, RunStatus
 from app.services.crawler import run_crawl
 from app.services.event_bus import bus
+from app.services.sqlite_lease_heartbeat import (
+    SQLiteLeaseHeartbeat,
+    database_path_for_engine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ SAVED_ANSWERS_ONLY_MARKER_KEY = "_aiv_saved_answers_only_reprocess"
 SAVED_ANSWERS_ONLY_MARKER_VERSION = "aiv-saved-answers-only-v1"
 SAVED_ANSWERS_ONLY_MODE = "saved_answers_only"
 SAVED_ONLY_TERMINAL_CLEANUP_GRACE_SECONDS = 120
+WORKER_TERMINAL_GRACE_SECONDS = 15.0
 ACTIVE_STATUSES = (
     RunStatus.pending,
     RunStatus.crawling,
@@ -164,6 +169,8 @@ def _utcnow() -> datetime:
 class RunClaim:
     run_id: str
     owner: str
+    attempt_count: int | None = None
+    resume_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -519,41 +526,57 @@ async def _claim_next_run(
                     state_revision=Run.state_revision + 1,
                     state_changed_at=current_time,
                 )
+                .returning(Run.attempt_count, Run.resume_count)
             )
+            claimed_row = claimed.one_or_none()
             await connection.commit()
         except BaseException:
             await connection.rollback()
             raise
-    if claimed.rowcount != 1:
+    if claimed_row is None:
         return None
-    return RunClaim(run_id=candidate_id, owner=owner)
+    attempt_count, resume_count = claimed_row
+    return RunClaim(
+        run_id=candidate_id,
+        owner=owner,
+        attempt_count=int(attempt_count or 0),
+        resume_count=int(resume_count or 0),
+    )
 
 
-async def _renew_lease(
-    claim: RunClaim,
-    *,
-    lease_seconds: int,
-) -> bool:
-    current_time = _utcnow()
+async def _terminal_transition_belongs_to_claim(claim: RunClaim) -> bool:
+    """Recognize the terminal write of this generation, not a recovered run."""
+
     async with SessionLocal() as session:
-        renewed = await session.execute(
-            update(Run)
-            .where(
-                Run.id == claim.run_id,
-                Run.execution_slot == EXECUTION_SLOT,
-                Run.lease_owner == claim.owner,
-                Run.status.in_(ACTIVE_STATUSES),
+        current = (
+            await session.execute(
+                select(
+                    Run.status,
+                    Run.execution_slot,
+                    Run.lease_owner,
+                    Run.attempt_count,
+                    Run.resume_count,
+                ).where(Run.id == claim.run_id)
             )
-            .values(
-                heartbeat_at=current_time,
-                lease_expires_at=(
-                    current_time
-                    + timedelta(seconds=max(15, lease_seconds))
-                ),
-            )
+        ).one_or_none()
+    if current is None:
+        return False
+    generation_matches = bool(
+        (
+            claim.attempt_count is None
+            or current.attempt_count == claim.attempt_count
         )
-        await session.commit()
-        return renewed.rowcount == 1
+        and (
+            claim.resume_count is None
+            or current.resume_count == claim.resume_count
+        )
+    )
+    return bool(
+        generation_matches
+        and current.status in (RunStatus.completed, RunStatus.failed)
+        and current.execution_slot is None
+        and current.lease_owner is None
+    )
 
 
 async def _release_claim(
@@ -679,18 +702,6 @@ class RunCoordinator:
             pass
         self._wake_event.clear()
 
-    async def _heartbeat(self, claim: RunClaim) -> None:
-        interval = max(5.0, self.lease_seconds / 3)
-        while True:
-            await asyncio.sleep(interval)
-            if not await _renew_lease(
-                claim,
-                lease_seconds=self.lease_seconds,
-            ):
-                raise RuntimeError(
-                    f"Run lease lost for {claim.run_id}"
-                )
-
     async def _execute(self, claim: RunClaim) -> None:
         # Defence in depth: even if a future queue query accidentally claims a
         # saved-answer-only row, never hand it to run_crawl/analyze_run. The
@@ -709,33 +720,54 @@ class RunCoordinator:
             await recover_expired_leases()
             return
 
+        heartbeat = SQLiteLeaseHeartbeat(
+            database_path=database_path_for_engine(engine),
+            run_id=claim.run_id,
+            owner=claim.owner,
+            lease_seconds=self.lease_seconds,
+        )
+        heartbeat.start()
         worker = asyncio.create_task(
             run_crawl(claim.run_id, lease_owner=claim.owner),
             name=f"aiv-run-{claim.run_id}",
         )
-        heartbeat = asyncio.create_task(
-            self._heartbeat(claim),
-            name=f"aiv-run-heartbeat-{claim.run_id}",
+        heartbeat_lost = asyncio.create_task(
+            heartbeat.wait_lost(),
+            name=f"aiv-run-lease-watch-{claim.run_id}",
         )
         self._active_worker = worker
         interrupted = False
         try:
             done, _pending = await asyncio.wait(
-                {worker, heartbeat},
+                {worker, heartbeat_lost},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if worker in done:
                 await worker
             else:
-                interrupted = True
-                heartbeat_error = heartbeat.exception()
-                logger.error(
-                    "Lease heartbeat stopped before run %s completed: %s",
-                    claim.run_id,
-                    heartbeat_error,
-                )
-                worker.cancel()
-                await asyncio.gather(worker, return_exceptions=True)
+                if await _terminal_transition_belongs_to_claim(claim):
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(worker),
+                            timeout=WORKER_TERMINAL_GRACE_SECONDS,
+                        )
+                    except TimeoutError:
+                        interrupted = True
+                        logger.error(
+                            "Terminal run worker %s did not return within grace",
+                            claim.run_id,
+                        )
+                        worker.cancel()
+                        await asyncio.gather(worker, return_exceptions=True)
+                else:
+                    interrupted = True
+                    logger.error(
+                        "Lease heartbeat lost ownership before run %s completed: %s",
+                        claim.run_id,
+                        heartbeat.snapshot().last_error or "ownership changed",
+                    )
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
         except asyncio.CancelledError:
             interrupted = True
             worker.cancel()
@@ -748,8 +780,23 @@ class RunCoordinator:
                 claim.run_id,
             )
         finally:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            # No supervisor failure may release the durable claim while its
+            # worker is still running. In particular, terminal-state lookup
+            # itself can fail after the heartbeat has already failed closed.
+            if not worker.done():
+                interrupted = True
+                worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            heartbeat_lost.cancel()
+            await asyncio.gather(heartbeat_lost, return_exceptions=True)
+            try:
+                await asyncio.to_thread(heartbeat.stop)
+            except Exception:
+                interrupted = True
+                logger.exception(
+                    "Lease heartbeat thread did not stop cleanly for %s",
+                    claim.run_id,
+                )
             self._active_worker = None
             detail = (
                 "Сервис перезапускается. Проверка продолжится автоматически."

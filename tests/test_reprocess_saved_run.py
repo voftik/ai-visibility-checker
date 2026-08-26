@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -23,11 +24,11 @@ from app.models import (
     RunStatus,
     VisibilityPrompt,
 )
+from app.services import run_coordinator
 from app.services.analyzer import (
     _reuse_saved_illustration_assets,
     _synchronize_reused_illustration_metadata,
 )
-from app.services import run_coordinator
 from app.services.run_coordinator import SAVED_ANSWERS_ONLY_MARKER_KEY
 from scripts import reprocess_saved_run as reprocess_cli
 
@@ -427,6 +428,239 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(owner)
         self.assertEqual(config_json, {"page_limit": 6, "keep": "value"})
         self.assertNotIn(SAVED_ANSWERS_ONLY_MARKER_KEY, config_json)
+
+    async def test_threaded_heartbeat_survives_cpu_block_and_terminal_race(
+        self,
+    ) -> None:
+        run_id = await self._create_run(
+            status=RunStatus.completed,
+            response_text="Сохранённый ответ.",
+            progress_percent=100,
+            stage_key="report",
+            report_json={"version": "old"},
+        )
+        observed_heartbeat: list[datetime] = []
+
+        async def blocking_complete(value: str) -> None:
+            time.sleep(0.55)  # noqa: ASYNC251 - deliberately starve event loop
+            async with self.SessionLocal() as session:
+                run = (
+                    await session.execute(select(Run).where(Run.id == value))
+                ).scalar_one()
+                heartbeat_at = run.heartbeat_at
+                lease_expires_at = run.lease_expires_at
+                self.assertIsNotNone(heartbeat_at)
+                self.assertIsNotNone(lease_expires_at)
+                assert heartbeat_at is not None
+                assert lease_expires_at is not None
+                comparable_heartbeat = heartbeat_at.replace(
+                    tzinfo=heartbeat_at.tzinfo or timezone.utc
+                )
+                comparable_expiry = lease_expires_at.replace(
+                    tzinfo=lease_expires_at.tzinfo or timezone.utc
+                )
+                observed_heartbeat.append(comparable_heartbeat)
+                self.assertGreater(comparable_expiry, datetime.now(timezone.utc))
+                run.status = RunStatus.completed
+                run.progress_percent = 100
+                run.stage_key = "report"
+                run.report_json = {"version": "new"}
+                run.execution_slot = None
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.heartbeat_at = None
+                await session.commit()
+            # Let the heartbeat observe rowcount=0 before this worker returns.
+            await asyncio.sleep(0.15)
+
+        with (
+            patch.object(
+                reprocess_cli.analyzer,
+                "reprocess_saved_answers",
+                new=AsyncMock(side_effect=blocking_complete),
+            ),
+            patch.object(reprocess_cli, "REPROCESS_LEASE_SECONDS", 0.3),
+            patch.object(reprocess_cli, "REPROCESS_HEARTBEAT_SECONDS", 0.05),
+            patch.object(reprocess_cli, "REPROCESS_TERMINAL_GRACE_SECONDS", 1.0),
+        ):
+            result = await reprocess_cli.reprocess_saved_run(
+                run_id,
+                announce=lambda _message: None,
+            )
+
+        self.assertEqual(result, run_id)
+        self.assertEqual(len(observed_heartbeat), 1)
+        async with self.SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertEqual(run.status, RunStatus.completed)
+        self.assertEqual(run.report_json, {"version": "new"})
+        self.assertIsNone(run.execution_slot)
+        self.assertNotIn(SAVED_ANSWERS_ONLY_MARKER_KEY, run.config_json)
+
+    async def test_claim_lease_starts_after_lossless_snapshot_work(self) -> None:
+        run_id = await self._create_run(
+            status=RunStatus.completed,
+            response_text="Сохранённый ответ.",
+            config_json={"page_limit": 6},
+            progress_percent=100,
+            stage_key="report",
+            report_json={"version": "published"},
+        )
+        fingerprint = reprocess_cli._model_answer_fingerprint_rows
+
+        def slow_fingerprint(rows):
+            time.sleep(0.35)  # noqa: ASYNC251 - emulate an unbounded raw corpus
+            return fingerprint(rows)
+
+        with (
+            patch.object(
+                reprocess_cli,
+                "_model_answer_fingerprint_rows",
+                side_effect=slow_fingerprint,
+            ),
+            patch.object(reprocess_cli, "REPROCESS_LEASE_SECONDS", 0.3),
+        ):
+            claim = await reprocess_cli._claim_eligible_run(run_id)
+
+        async with self.SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertIsNotNone(run.lease_expires_at)
+        assert run.lease_expires_at is not None
+        comparable_expiry = run.lease_expires_at.replace(
+            tzinfo=run.lease_expires_at.tzinfo or timezone.utc
+        )
+        self.assertGreater(
+            comparable_expiry,
+            datetime.now(timezone.utc) + timedelta(seconds=0.15),
+        )
+        released = await reprocess_cli._release_reprocess_claim(
+            claim,
+            successful=False,
+        )
+        self.assertTrue(released)
+
+    async def test_terminal_lookup_failure_cancels_reprocess_worker(
+        self,
+    ) -> None:
+        run_id = await self._create_run(
+            status=RunStatus.completed,
+            response_text="Сохранённый ответ.",
+            config_json={"page_limit": 6},
+            progress_percent=100,
+            stage_key="report",
+            report_json={"version": "published"},
+        )
+        cancelled = asyncio.Event()
+
+        async def terminal_then_wait(value: str) -> None:
+            async with self.SessionLocal() as session:
+                run = (
+                    await session.execute(select(Run).where(Run.id == value))
+                ).scalar_one()
+                run.status = RunStatus.completed
+                run.execution_slot = None
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.heartbeat_at = None
+                await session.commit()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with (
+            patch.object(
+                reprocess_cli.analyzer,
+                "reprocess_saved_answers",
+                new=AsyncMock(side_effect=terminal_then_wait),
+            ),
+            patch.object(
+                reprocess_cli,
+                "_terminal_transition_belongs_to_claim",
+                new=AsyncMock(side_effect=RuntimeError("terminal lookup failed")),
+            ),
+            patch.object(reprocess_cli, "REPROCESS_LEASE_SECONDS", 0.3),
+            patch.object(reprocess_cli, "REPROCESS_HEARTBEAT_SECONDS", 0.05),
+            self.assertRaisesRegex(RuntimeError, "terminal lookup failed"),
+        ):
+            await reprocess_cli.reprocess_saved_run(
+                run_id,
+                announce=lambda _message: None,
+            )
+
+        self.assertTrue(cancelled.is_set())
+        async with self.SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertEqual(run.status, RunStatus.completed)
+        self.assertEqual(run.report_json, {"version": "published"})
+        self.assertEqual(run.config_json, {"page_limit": 6})
+        self.assertIsNone(run.execution_slot)
+
+    async def test_external_terminal_restore_is_not_accepted_as_own_success(
+        self,
+    ) -> None:
+        run_id = await self._create_run(
+            status=RunStatus.completed,
+            response_text="Сохранённый ответ.",
+            config_json={"page_limit": 6},
+            progress_percent=100,
+            stage_key="report",
+            report_json={"version": "published"},
+        )
+        cancelled = asyncio.Event()
+
+        async def externally_recovered(value: str) -> None:
+            async with self.SessionLocal() as session:
+                run = (
+                    await session.execute(select(Run).where(Run.id == value))
+                ).scalar_one()
+                run.status = RunStatus.completed
+                run.config_json = {"page_limit": 6}
+                run.execution_slot = None
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.heartbeat_at = None
+                await session.commit()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with (
+            patch.object(
+                reprocess_cli.analyzer,
+                "reprocess_saved_answers",
+                new=AsyncMock(side_effect=externally_recovered),
+            ),
+            patch.object(reprocess_cli, "REPROCESS_LEASE_SECONDS", 0.3),
+            patch.object(reprocess_cli, "REPROCESS_HEARTBEAT_SECONDS", 0.05),
+            self.assertRaisesRegex(
+                reprocess_cli.ReprocessExecutionError,
+                "Потерян общий execution_slot",
+            ),
+        ):
+            await reprocess_cli.reprocess_saved_run(
+                run_id,
+                announce=lambda _message: None,
+            )
+
+        self.assertTrue(cancelled.is_set())
+        async with self.SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertEqual(run.status, RunStatus.completed)
+        self.assertEqual(run.report_json, {"version": "published"})
+        self.assertIsNone(run.execution_slot)
+        self.assertEqual(run.config_json, {"page_limit": 6})
 
     async def test_expired_claim_restores_terminal_without_touching_raw(
         self,

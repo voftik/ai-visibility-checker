@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
+import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -21,11 +22,11 @@ from app.services import crawler
 from app.services.event_bus import bus
 from app.services.progress import complete_run, fail_run, update_progress
 from app.services.run_coordinator import (
-    RunClaim,
-    RunCoordinator,
     SAVED_ANSWERS_ONLY_MARKER_KEY,
     SAVED_ANSWERS_ONLY_MARKER_VERSION,
     SAVED_ANSWERS_ONLY_MODE,
+    RunClaim,
+    RunCoordinator,
     _claim_next_run,
     _release_claim,
     pending_run_count,
@@ -281,6 +282,139 @@ class DurableQueueTests(unittest.IsolatedAsyncioTestCase):
             ).scalar_one()
         self.assertEqual(run.status, RunStatus.completed)
         self.assertIsNone(run.execution_slot)
+
+    async def test_execute_heartbeat_survives_cpu_block_and_terminal_clear(
+        self,
+    ) -> None:
+        owner = "threaded-heartbeat-owner"
+        run_id = await self._add_run(
+            status=RunStatus.analyzing,
+            execution_slot=1,
+            lease_owner=owner,
+            heartbeat_at=datetime.now(timezone.utc),
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            attempt_count=1,
+            resume_count=0,
+        )
+        observed: list[datetime] = []
+
+        async def blocking_worker(value: str, *, lease_owner: str) -> None:
+            self.assertEqual(value, run_id)
+            self.assertEqual(lease_owner, owner)
+            time.sleep(0.55)  # noqa: ASYNC251 - deliberately starve event loop
+            async with SessionLocal() as session:
+                run = (
+                    await session.execute(select(Run).where(Run.id == value))
+                ).scalar_one()
+                self.assertIsNotNone(run.heartbeat_at)
+                assert run.heartbeat_at is not None
+                observed.append(
+                    run.heartbeat_at.replace(
+                        tzinfo=run.heartbeat_at.tzinfo or timezone.utc
+                    )
+                )
+                run.status = RunStatus.completed
+                run.execution_slot = None
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.heartbeat_at = None
+                await session.commit()
+            await asyncio.sleep(0.2)
+
+        local_coordinator = RunCoordinator(
+            lease_seconds=15,
+            poll_seconds=0.01,
+        )
+        local_coordinator.lease_seconds = 0.3
+        with patch(
+            "app.services.run_coordinator.run_crawl",
+            new=blocking_worker,
+        ):
+            await local_coordinator._execute(
+                RunClaim(
+                    run_id=run_id,
+                    owner=owner,
+                    attempt_count=1,
+                    resume_count=0,
+                )
+            )
+
+        self.assertEqual(len(observed), 1)
+        async with SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertEqual(run.status, RunStatus.completed)
+        self.assertIsNone(run.execution_slot)
+        self.assertIsNone(run.lease_owner)
+
+    async def test_terminal_lookup_failure_cancels_worker_before_release(
+        self,
+    ) -> None:
+        owner = "terminal-lookup-owner"
+        run_id = await self._add_run(
+            status=RunStatus.analyzing,
+            execution_slot=1,
+            lease_owner=owner,
+            heartbeat_at=datetime.now(timezone.utc),
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            attempt_count=1,
+            resume_count=0,
+        )
+        cancelled = asyncio.Event()
+
+        async def terminal_then_wait(value: str, *, lease_owner: str) -> None:
+            self.assertEqual(value, run_id)
+            self.assertEqual(lease_owner, owner)
+            async with SessionLocal() as session:
+                run = (
+                    await session.execute(select(Run).where(Run.id == value))
+                ).scalar_one()
+                run.status = RunStatus.completed
+                run.execution_slot = None
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.heartbeat_at = None
+                await session.commit()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        local_coordinator = RunCoordinator(
+            lease_seconds=15,
+            poll_seconds=0.01,
+        )
+        local_coordinator.lease_seconds = 0.3
+        with (
+            patch(
+                "app.services.run_coordinator.run_crawl",
+                new=terminal_then_wait,
+            ),
+            patch(
+                "app.services.run_coordinator."
+                "_terminal_transition_belongs_to_claim",
+                new=AsyncMock(side_effect=RuntimeError("terminal lookup failed")),
+            ),
+        ):
+            await local_coordinator._execute(
+                RunClaim(
+                    run_id=run_id,
+                    owner=owner,
+                    attempt_count=1,
+                    resume_count=0,
+                )
+            )
+
+        self.assertTrue(cancelled.is_set())
+        async with SessionLocal() as session:
+            run = (
+                await session.execute(select(Run).where(Run.id == run_id))
+            ).scalar_one()
+        self.assertEqual(run.status, RunStatus.completed)
+        self.assertIsNone(run.execution_slot)
+        self.assertIsNone(run.lease_owner)
 
     async def test_terminal_completed_marker_cleanup_preserves_new_report(
         self,
