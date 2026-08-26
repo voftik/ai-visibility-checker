@@ -88,6 +88,7 @@ from app.services.analyzer import (
     FINAL_CONTEXT_MAX_ANSWERS,
     FINAL_REPORT_AUTHOR_ARTIFACT_KEY,
     FINAL_INPUT_EVIDENCE_SCHEMA,
+    FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
     FINAL_REPORT_SCHEMA,
     ILLUSTRATION_CONCEPTS_SCHEMA,
     ILLUSTRATION_GENERATION_VERSION,
@@ -8457,9 +8458,20 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         unique_item_paths: list[str] = []
+        incomplete_required_paths: list[str] = []
+        duplicate_required_paths: list[str] = []
 
         def visit(value: Any, path: str = "") -> None:
             if isinstance(value, dict):
+                properties = value.get("properties")
+                if value.get("type") == "object" and isinstance(properties, dict):
+                    required = value.get("required")
+                    if not isinstance(required, list) or set(required) != set(
+                        properties
+                    ):
+                        incomplete_required_paths.append(path or "/")
+                    elif len(required) != len(set(required)):
+                        duplicate_required_paths.append(path or "/")
                 for key, child in value.items():
                     child_path = f"{path}/{key}"
                     if key == "uniqueItems":
@@ -8469,9 +8481,12 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 for index, child in enumerate(value):
                     visit(child, f"{path}/{index}")
 
-        visit(FINAL_INPUT_EVIDENCE_SCHEMA)
+        visit(FINAL_INPUT_EVIDENCE_SCHEMA, "/mapper")
+        visit(FINAL_INPUT_ROOT_SUMMARY_SCHEMA, "/root_summary")
 
         self.assertEqual(unique_item_paths, [])
+        self.assertEqual(incomplete_required_paths, [])
+        self.assertEqual(duplicate_required_paths, [])
         observation_properties = FINAL_INPUT_EVIDENCE_SCHEMA["properties"][
             "observations"
         ]["items"]["properties"]

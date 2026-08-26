@@ -1667,10 +1667,6 @@ FINAL_INPUT_EVIDENCE_SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "fact_binding_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
                     "evidence_excerpt": {"type": "string"},
                     "importance": {
                         "type": "string",
@@ -1679,6 +1675,8 @@ FINAL_INPUT_EVIDENCE_SCHEMA: dict[str, Any] = {
                 },
                 "required": [
                     "category",
+                    "analysis_dimension",
+                    "domain_context_id",
                     "statement",
                     "source_paths",
                     "source_unit_ids",
