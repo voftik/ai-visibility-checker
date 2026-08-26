@@ -9522,7 +9522,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             "observations": [
                 {
                     "category": "context",
-                    "statement": "Исходная единица учтена.",
+                    "statement": str(claim.get("excerpt") or "")[:40],
                     "source_paths": [str(claim["source_path"])],
                     "source_unit_ids": [str(claim["source_unit_id"])],
                     "source_claim_ids": [str(claim["claim_id"])],
@@ -9771,11 +9771,18 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     sanitized["observations"][0]["category"],
                     "context",
                 )
-                self.assertEqual(
-                    sanitized["_aiv_final_input_grounding_filter"]["operations"][
-                        0
-                    ]["operation"],
-                    "replace_ungrounded_observation_statement",
+                self.assertTrue(
+                    {
+                        "replace_ungrounded_observation_statement",
+                        "mark_generic_observation_quarantined",
+                    }.issubset(
+                        {
+                            item["operation"]
+                            for item in sanitized[
+                                "_aiv_final_input_grounding_filter"
+                            ]["operations"]
+                        }
+                    )
                 )
 
     def test_mapper_source_path_tokens_cannot_launder_assertions(self) -> None:
@@ -10086,10 +10093,16 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 case["assert_sanitized"](normalized)
                 audit = normalized["_aiv_final_input_grounding_filter"]
                 self.assertEqual(audit["quality_state"], "degraded")
-                self.assertEqual(audit["operation_count"], 1)
+                expected_operations = {case["operation"]}
+                if field == "statement":
+                    expected_operations.add(
+                        "mark_generic_observation_quarantined"
+                    )
                 self.assertEqual(
-                    audit["operations"][0]["operation"],
-                    case["operation"],
+                    {
+                        item["operation"] for item in audit["operations"]
+                    },
+                    expected_operations,
                 )
                 self.assertNotIn(
                     "99,9%",
@@ -10126,6 +10139,12 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
 
         packet = self._packet_for_units(units, source_claims=claim_rows)
         packet["observations"][0]["statement"] = "Доля 99,9%."
+        packet["unit_coverage"][0]["disposition"] = "material_observation"
+        packet["claim_coverage"][0]["disposition"] = "material_observation"
+        digest = str(packet["claim_coverage"][0]["excerpt_sha256"])
+        packet["claim_coverage"][0]["excerpt_sha256"] = (
+            digest[:18] + digest[19:]
+        )
         sanitized = _normalize_final_evidence_packet(
             packet,
             allowed_unit_paths=allowed_paths,
@@ -10137,10 +10156,35 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             "Исходный фрагмент сохранён без дополнительной интерпретации.",
         )
         self.assertEqual(
-            sanitized["_aiv_final_input_grounding_filter"]["operations"][0][
-                "operation"
-            ],
-            "replace_ungrounded_observation_statement",
+            sanitized["unit_coverage"][0]["disposition"],
+            "supporting_context",
+        )
+        self.assertEqual(
+            sanitized["claim_coverage"][0]["disposition"],
+            "supporting_context",
+        )
+        operations = {
+            item["operation"]
+            for item in sanitized["_aiv_final_input_grounding_filter"][
+                "operations"
+            ]
+        }
+        self.assertTrue(
+            {
+                "replace_ungrounded_observation_statement",
+                "replace_quarantined_unit_coverage_disposition",
+                "replace_quarantined_claim_coverage_disposition",
+                "replace_invalid_claim_coverage_digest",
+            }.issubset(operations)
+        )
+        self.assertEqual(
+            _normalize_final_evidence_packet(
+                sanitized,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                claim_objects=claim_objects,
+            ),
+            sanitized,
         )
         root_entries = _final_root_semantic_entries(
             {
@@ -10163,6 +10207,243 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "99,9%",
             json.dumps(root_entries, ensure_ascii=False),
+        )
+
+    def test_mapper_rebinds_redundant_claim_digest_to_code_owned_ledger(
+        self,
+    ) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"mode": "web"}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claim = claim_rows[0]
+        claim_id = str(claim["claim_id"])
+        expected_digest = str(claim["excerpt_sha256"])
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["observations"][0].update(
+            statement="web",
+            exact_values=["web"],
+            evidence_excerpt="web",
+        )
+        packet["unit_coverage"][0]["rationale"] = "web"
+        packet["claim_coverage"][0]["rationale"] = "web"
+        packet["claim_coverage"][0]["excerpt_sha256"] = (
+            expected_digest[:18] + expected_digest[19:]
+        )
+
+        normalized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths={
+                str(unit["source_unit_id"]): str(unit["source_path"])
+                for unit in units
+            },
+            allowed_claims={claim_id: claim},
+            claim_objects={claim_id: claim_objects[claim_id]},
+        )
+
+        self.assertEqual(
+            normalized["claim_coverage"][0]["excerpt_sha256"],
+            expected_digest,
+        )
+        audit = normalized["_aiv_final_input_grounding_filter"]
+        self.assertEqual(audit["quality_state"], "degraded")
+        self.assertEqual(audit["operation_count"], 1)
+        self.assertEqual(
+            audit["operations"][0]["operation"],
+            "replace_invalid_claim_coverage_digest",
+        )
+        self.assertNotIn(
+            expected_digest,
+            json.dumps(audit, ensure_ascii=False),
+        )
+        self.assertEqual(
+            _normalize_final_evidence_packet(
+                normalized,
+                allowed_unit_paths={
+                    str(unit["source_unit_id"]): str(unit["source_path"])
+                    for unit in units
+                },
+                allowed_claims={claim_id: claim},
+                claim_objects={claim_id: claim_objects[claim_id]},
+            ),
+            normalized,
+        )
+
+        corrupt_claim = copy.deepcopy(claim)
+        corrupt_claim["excerpt_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "corrupt code-owned claim digest",
+        ):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths={
+                    str(unit["source_unit_id"]): str(unit["source_path"])
+                    for unit in units
+                },
+                allowed_claims={claim_id: corrupt_claim},
+                claim_objects={claim_id: claim_objects[claim_id]},
+            )
+
+    def test_generic_mapper_ack_cannot_retain_material_priority(self) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"mode": "web"}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claim = claim_rows[0]
+        claim_id = str(claim["claim_id"])
+        allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in units
+        }
+        for statement in (
+            "Исходная единица учтена в покрытии.",
+            "Исходный фрагмент учтён в покрытии.",
+            "Фрагмент сохранён без дополнительной интерпретации.",
+            "Claim accounted in coverage.",
+            "Данные успешно сохранены.",
+            "Исходный фрагмент обработан корректно.",
+            "Путь /report_data/mode учтён в покрытии.",
+            "В /report_data/mode данные обработаны корректно.",
+            "Source path /report_data/mode recorded correctly.",
+            "web обработан корректно.",
+            "web успешно сохранён.",
+            "web processed successfully.",
+            "web обработан блестяще.",
+            "web processed rapidly.",
+            ".",
+            "e",
+            "we",
+            "—",
+        ):
+            with self.subTest(statement=statement):
+                packet = self._packet_for_units(
+                    units,
+                    source_claims=claim_rows,
+                )
+                packet["observations"][0].update(
+                    statement=statement,
+                    category="visibility",
+                    importance="critical",
+                    exact_values=["web"],
+                    evidence_excerpt="web",
+                )
+                packet["unit_coverage"][0].update(
+                    disposition="material_observation",
+                    rationale="web",
+                )
+                packet["claim_coverage"][0].update(
+                    disposition="material_observation",
+                    rationale="web",
+                )
+
+                normalized = _normalize_final_evidence_packet(
+                    packet,
+                    allowed_unit_paths=allowed_paths,
+                    allowed_claims={claim_id: claim},
+                    claim_objects={claim_id: claim_objects[claim_id]},
+                )
+
+                self.assertEqual(
+                    normalized["observations"][0]["category"],
+                    "context",
+                )
+                self.assertEqual(
+                    normalized["observations"][0]["importance"],
+                    "supporting",
+                )
+                self.assertEqual(
+                    normalized["unit_coverage"][0]["disposition"],
+                    "supporting_context",
+                )
+                self.assertEqual(
+                    normalized["claim_coverage"][0]["disposition"],
+                    "supporting_context",
+                )
+                self.assertTrue(
+                    {
+                        "mark_generic_observation_quarantined",
+                        "replace_quarantined_observation_category",
+                        "replace_quarantined_observation_importance",
+                        "replace_quarantined_unit_coverage_disposition",
+                        "replace_quarantined_claim_coverage_disposition",
+                    }.issubset(
+                        {
+                            item["operation"]
+                            for item in normalized[
+                                "_aiv_final_input_grounding_filter"
+                            ]["operations"]
+                        }
+                    )
+                )
+                self.assertEqual(
+                    _normalize_final_evidence_packet(
+                        normalized,
+                        allowed_unit_paths=allowed_paths,
+                        allowed_claims={claim_id: claim},
+                        claim_objects={claim_id: claim_objects[claim_id]},
+                    ),
+                    normalized,
+                )
+        material_packet = self._packet_for_units(
+            units,
+            source_claims=claim_rows,
+        )
+        material_packet["observations"][0].update(
+            statement="В /report_data/mode значение web.",
+            category="visibility",
+            importance="critical",
+            exact_values=["web"],
+            evidence_excerpt="web",
+        )
+        material_packet["unit_coverage"][0].update(
+            disposition="material_observation",
+            rationale="web",
+        )
+        material_packet["claim_coverage"][0].update(
+            disposition="material_observation",
+            rationale="web",
+        )
+        material = _normalize_final_evidence_packet(
+            material_packet,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims={claim_id: claim},
+            claim_objects={claim_id: claim_objects[claim_id]},
+        )
+        self.assertEqual(material["observations"][0]["category"], "visibility")
+        self.assertEqual(material["observations"][0]["importance"], "critical")
+        self.assertEqual(
+            material["unit_coverage"][0]["disposition"],
+            "material_observation",
+        )
+        self.assertEqual(
+            material["claim_coverage"][0]["disposition"],
+            "material_observation",
+        )
+        self.assertNotIn("_aiv_final_input_grounding_filter", material)
+        root_entries = _final_root_semantic_entries(
+            {
+                "evidence_digest": normalized,
+                "deterministic_passthrough": {"values": []},
+                "long_input_contract": {"source_claim_count": 1},
+            },
+            source_claim_rows=claim_rows,
+        )
+        self.assertEqual(
+            [
+                entry["value"]
+                for entry in root_entries
+                if entry["kind"] == "exact_source_claim"
+            ],
+            ["web"],
         )
 
     def test_mapper_auxiliary_filter_audit_is_idempotent_through_union(
@@ -10227,7 +10508,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         )
 
         tampered = copy.deepcopy(normalized)
-        tampered["_aiv_final_input_grounding_filter"]["operation_count"] = 2
+        tampered["_aiv_final_input_grounding_filter"]["operation_count"] += 1
         with self.assertRaisesRegex(OpenRouterError, "filter audit is invalid"):
             _normalize_final_evidence_packet(
                 tampered,
@@ -10769,59 +11050,114 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reconstructed, narrative)
         self.assertTrue(reconstructed.endswith(tail_marker))
 
-    async def test_missing_or_tampered_claim_fails_closed(self) -> None:
+    async def test_missing_claim_fails_closed(self) -> None:
         narrative = "x" * 14_000 + "TAIL-CLAIM-FAIL-CLOSED"
 
-        for fault, expected in (
-            ("missing", "incomplete dependent coverage"),
-            ("tampered", "Coverage digest mismatch"),
+        async def broken_mapper(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            source_claims = kwargs["user_payload"]["source_claims"]
+            self.assertGreaterEqual(len(source_claims), 1)
+            packet = self._packet_for_units(
+                kwargs["user_payload"]["source_units"],
+                source_claims=source_claims,
+            )
+            packet["observations"].pop()
+            packet["claim_coverage"].pop()
+            return packet
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=broken_mapper,
+            ),
         ):
-            with self.subTest(fault=fault):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "incomplete dependent coverage",
+            ):
+                await _prepare_final_model_payload(
+                    "run-id",
+                    payload={
+                        "report_data": {
+                            "long_narrative": narrative,
+                        }
+                    },
+                    system="author",
+                    force_hierarchical=True,
+                )
 
-                async def broken_mapper(
-                    *_args: Any,
-                    **kwargs: Any,
-                ) -> dict[str, Any]:
-                    source_claims = kwargs["user_payload"]["source_claims"]
-                    self.assertGreaterEqual(len(source_claims), 1)
-                    packet = self._packet_for_units(
-                        kwargs["user_payload"]["source_units"],
-                        source_claims=source_claims,
-                    )
-                    if fault == "missing":
-                        packet["observations"].pop()
-                        packet["claim_coverage"].pop()
-                    else:
-                        packet["claim_coverage"][-1]["excerpt_sha256"] = "f" * 64
-                    return packet
+    async def test_mapper_digest_echo_typo_is_repaired_in_hierarchical_path(
+        self,
+    ) -> None:
+        narrative = "x" * 14_000 + "TAIL-CLAIM-REBOUND"
+        successful_mapper = self._successful_mapper()
 
-                with (
-                    patch(
-                        "app.services.analyzer._final_model_input_window",
-                        new_callable=AsyncMock,
-                        return_value=self._window(),
-                    ),
-                    patch(
-                        "app.services.analyzer._save_artifact",
-                        new_callable=AsyncMock,
-                    ),
-                    patch(
-                        "app.services.analyzer._structured_artifact",
-                        new_callable=AsyncMock,
-                        side_effect=broken_mapper,
-                    ),
-                ):
-                    with self.assertRaisesRegex(OpenRouterError, expected):
-                        await _prepare_final_model_payload(
-                            "run-id",
-                            payload={
-                                "report_data": {
-                                    "long_narrative": narrative,
-                                }
-                            },
-                            system="author",
-                            force_hierarchical=True,
-                        )
+        async def digest_typo_mapper(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            if "source_units" not in user_payload:
+                return await successful_mapper(*_args, **kwargs)
+            source_claims = user_payload["source_claims"]
+            packet = self._packet_for_units(
+                user_payload["source_units"],
+                source_claims=source_claims,
+            )
+            digest = str(packet["claim_coverage"][-1]["excerpt_sha256"])
+            packet["claim_coverage"][-1]["excerpt_sha256"] = (
+                digest[:18] + digest[19:]
+            )
+            return packet
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=digest_typo_mapper,
+            ),
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload={
+                    "report_data": {
+                        "long_narrative": narrative,
+                    }
+                },
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertTrue(plan["coverage_complete"])
+        self.assertEqual(
+            plan["covered_claim_count"],
+            plan["source_claim_count"],
+        )
+        self.assertIn(
+            "replace_invalid_claim_coverage_digest",
+            json.dumps(model_payload, ensure_ascii=False),
+        )
 
     async def test_compact_overflow_builds_bounded_transitive_root(self) -> None:
         tail_marker = "BOUND-ROOT-TAIL-9d4a"

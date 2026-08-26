@@ -34984,6 +34984,12 @@ _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
         "drop_ungrounded_uncertainty",
         "drop_ungrounded_report_focus",
         "replace_ungrounded_observation_statement",
+        "mark_generic_observation_quarantined",
+        "replace_quarantined_observation_category",
+        "replace_quarantined_observation_importance",
+        "replace_quarantined_unit_coverage_disposition",
+        "replace_quarantined_claim_coverage_disposition",
+        "replace_invalid_claim_coverage_digest",
         "replace_ungrounded_unit_coverage_rationale",
         "replace_ungrounded_claim_coverage_rationale",
         "replace_ungrounded_node_coverage_rationale",
@@ -35001,6 +35007,76 @@ _FINAL_INPUT_CLAIM_COVERAGE_RATIONALE = (
 _FINAL_INPUT_NODE_COVERAGE_RATIONALE = (
     "Дочерний узел учтён в покрытии."
 )
+_FINAL_INPUT_TRANSPORT_ACTION_TOKEN = re.compile(
+    r"^(?:учт[её]н\w*|отраж[её]н\w*|обработ\w*|сохран\w*|запис\w*|"
+    r"accounted|acknowledged|covered|processed|recorded|preserved|retained)$",
+    re.IGNORECASE,
+)
+def _final_input_statement_is_transport_ack(
+    statement: str,
+) -> bool:
+    """Recognize mapper transport prose regardless of flexible modifiers.
+
+    Transport verbs describe the mapper's own work, not the source fact.  The
+    exact claim travels in a separate code-owned root, so downgrading every
+    such sentence is lossless and avoids an endless allow/deny list of adverbs
+    such as ``correctly``, ``quickly`` or their Russian equivalents.
+    """
+
+    if _FINAL_ROOT_GENERIC_ACK.fullmatch(statement):
+        return True
+    statement_tokens = re.findall(
+        r"[A-Za-zА-Яа-яЁё0-9]+",
+        statement.casefold(),
+    )
+    return bool(statement_tokens) and any(
+        _FINAL_INPUT_TRANSPORT_ACTION_TOKEN.fullmatch(token)
+        for token in statement_tokens
+    )
+
+
+def _final_input_statement_has_claim_anchor(
+    statement: str,
+    *,
+    claim_excerpt: str,
+) -> bool:
+    """Return whether mapper prose carries claim-specific semantic content.
+
+    Assertion-literal validation intentionally treats prose without numbers,
+    states or identifiers as grounded. That is correct for paraphrases, but
+    it also means a transport acknowledgement such as ``claim accounted`` can
+    pass vacuously. Such prose must never inherit material/critical priority.
+
+    The exact claim is transported independently, so a conservative downgrade
+    is lossless: a statement is material only when it is an exact claim
+    substring, shares a non-transport content token with the claim, or carries
+    an assertion-grade literal already checked by the grounding validator.
+    """
+
+    normalized = statement.strip()
+    if not normalized or _final_input_statement_is_transport_ack(normalized):
+        return False
+    def meaningful_exact_text(value: str) -> bool:
+        return any(
+            len(token) >= 3 or (len(token) >= 2 and token.isupper())
+            for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", value)
+        )
+
+    normalized_folded = normalized.casefold()
+    excerpt_folded = claim_excerpt.casefold()
+    if (
+        meaningful_exact_text(normalized)
+        and normalized_folded in excerpt_folded
+    ) or (
+        meaningful_exact_text(claim_excerpt)
+        and excerpt_folded in normalized_folded
+    ):
+        return True
+    statement_tokens = set(_final_root_content_tokens(normalized))
+    claim_tokens = set(_final_root_content_tokens(claim_excerpt))
+    if statement_tokens & claim_tokens:
+        return True
+    return bool(_final_root_literal_tokens(normalized))
 
 
 def _final_input_grounding_filter_operation(
@@ -35187,6 +35263,8 @@ def _normalize_final_evidence_packet(
     )
     observed_unit_ids: set[str] = set()
     observed_claim_ids: list[str] = []
+    quarantined_claim_ids: set[str] = set()
+    grounded_observation_unit_ids: set[str] = set()
     for observation_index, observation in enumerate(
         output.get("observations") or []
     ):
@@ -35312,16 +35390,24 @@ def _normalize_final_evidence_packet(
                 )
             observation["exact_values"] = grounded_exact_values
             statement = str(observation.get("statement") or "")
-            if not _final_root_tokens_are_grounded(
+            grounding_statement = (
                 _final_grounding_strip_code_owned_path_locator(
                     statement,
                     source_path=claim_source_path,
-                ),
+                )
+            )
+            statement_is_grounded = _final_root_tokens_are_grounded(
+                grounding_statement,
                 # A source path can be mentioned as a locator, but it is not
                 # factual evidence. Only the exact scalar excerpt may ground
                 # the statement that remains after the locator is masked.
                 source_texts=[claim_excerpt],
-            ):
+            )
+            statement_is_generic = not _final_input_statement_has_claim_anchor(
+                grounding_statement,
+                claim_excerpt=claim_excerpt,
+            )
+            if not statement_is_grounded:
                 # Mapper prose is auxiliary: the exact source claim, scalar
                 # ledger, evidence excerpt and lineage are code-owned and are
                 # transported independently. One unsupported literal must not
@@ -35341,12 +35427,60 @@ def _normalize_final_evidence_packet(
                 observation["statement"] = (
                     _FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK
                 )
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation="mark_generic_observation_quarantined",
+                        path=f"observations[{observation_index}].statement",
+                        binding_sha256=text_sha256(claim_id),
+                        value=_FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK,
+                    )
+                )
+            elif statement_is_generic and (
+                observation.get("category") != "context"
+                or observation.get("importance") != "supporting"
+            ):
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation="mark_generic_observation_quarantined",
+                        path=f"observations[{observation_index}].statement",
+                        binding_sha256=text_sha256(claim_id),
+                        value=statement,
+                    )
+                )
+            if not statement_is_grounded or statement_is_generic:
                 # Quarantined prose must not retain model-authored priority.
                 # The exact claim remains an independent bounded-root source,
                 # so this only prevents a neutral fallback from dominating
                 # the author; it does not remove or down-rank the source fact.
+                if observation.get("category") != "context":
+                    grounding_filter_operations.append(
+                        _final_input_grounding_filter_operation(
+                            scope="mapper",
+                            operation="replace_quarantined_observation_category",
+                            path=f"observations[{observation_index}].category",
+                            binding_sha256=text_sha256(claim_id),
+                            value=str(observation.get("category") or ""),
+                            replacement="context",
+                        )
+                    )
+                if observation.get("importance") != "supporting":
+                    grounding_filter_operations.append(
+                        _final_input_grounding_filter_operation(
+                            scope="mapper",
+                            operation="replace_quarantined_observation_importance",
+                            path=f"observations[{observation_index}].importance",
+                            binding_sha256=text_sha256(claim_id),
+                            value=str(observation.get("importance") or ""),
+                            replacement="supporting",
+                        )
+                    )
                 observation["category"] = "context"
                 observation["importance"] = "supporting"
+                quarantined_claim_ids.add(claim_id)
+            else:
+                grounded_observation_unit_ids.add(claim_unit_id)
             # Keep a one-to-one semantic receipt for every exact source claim.
             # The complete excerpt remains byte-exact in the code-owned claim
             # ledger and the bounded-root path; this packet keeps the model's
@@ -35412,6 +35546,24 @@ def _normalize_final_evidence_packet(
             raise OpenRouterError("Final evidence packet coverage has no rationale")
         if (
             allowed_claims is not None
+            and unit_id not in grounded_observation_unit_ids
+            and disposition != "supporting_context"
+        ):
+            grounding_filter_operations.append(
+                _final_input_grounding_filter_operation(
+                    scope="mapper",
+                    operation=(
+                        "replace_quarantined_unit_coverage_disposition"
+                    ),
+                    path=f"unit_coverage[{coverage_index}].disposition",
+                    binding_sha256=text_sha256(unit_id),
+                    value=str(disposition),
+                    replacement="supporting_context",
+                )
+            )
+            item["disposition"] = "supporting_context"
+        if (
+            allowed_claims is not None
             and rationale != _FINAL_INPUT_UNIT_COVERAGE_RATIONALE
             and not _final_root_tokens_are_grounded(
                 rationale,
@@ -35458,6 +35610,10 @@ def _normalize_final_evidence_packet(
         coverage = output.get("claim_coverage")
         if not isinstance(coverage, list):
             raise OpenRouterError("Final evidence packet has no claim coverage")
+        if claim_objects is None or set(claim_objects) != set(allowed_claims):
+            raise OpenRouterError(
+                "Final evidence packet has no exact code-owned claim objects"
+            )
         for claim_coverage_index, item in enumerate(coverage):
             if not isinstance(item, dict):
                 raise OpenRouterError(
@@ -35480,6 +35636,64 @@ def _normalize_final_evidence_packet(
                 )
             claim_id = str(item.get("claim_id") or "")
             if (
+                claim_id in quarantined_claim_ids
+                and item.get("disposition") != "supporting_context"
+            ):
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation=(
+                            "replace_quarantined_claim_coverage_disposition"
+                        ),
+                        path=(
+                            f"claim_coverage[{claim_coverage_index}].disposition"
+                        ),
+                        binding_sha256=text_sha256(claim_id),
+                        value=str(item.get("disposition") or ""),
+                        replacement="supporting_context",
+                    )
+                )
+                item["disposition"] = "supporting_context"
+            if claim_id in claim_excerpt_by_id:
+                expected_excerpt_sha256 = claim_objects[claim_id].excerpt_sha256
+                if (
+                    not re.fullmatch(r"[0-9a-f]{64}", expected_excerpt_sha256)
+                    or expected_excerpt_sha256
+                    != text_sha256(claim_excerpt_by_id[claim_id])
+                    or str(
+                        allowed_claims[claim_id].get("excerpt_sha256") or ""
+                    )
+                    != expected_excerpt_sha256
+                ):
+                    raise OpenRouterError(
+                        "Final evidence packet has a corrupt code-owned claim digest"
+                    )
+                supplied_excerpt_sha256 = item.get("excerpt_sha256")
+                if not isinstance(supplied_excerpt_sha256, str):
+                    raise OpenRouterError(
+                        "Final evidence packet claim coverage has an invalid digest"
+                    )
+                if supplied_excerpt_sha256 != expected_excerpt_sha256:
+                    # claim_id and the exact excerpt are code-owned. A copied
+                    # checksum is only an acknowledgement receipt from the
+                    # mapper, so a one-character transcription error must not
+                    # veto an otherwise complete packet. Re-attest it from the
+                    # immutable claim ledger and retain a raw-free audit entry.
+                    grounding_filter_operations.append(
+                        _final_input_grounding_filter_operation(
+                            scope="mapper",
+                            operation="replace_invalid_claim_coverage_digest",
+                            path=(
+                                f"claim_coverage[{claim_coverage_index}]."
+                                "excerpt_sha256"
+                            ),
+                            binding_sha256=text_sha256(claim_id),
+                            value=supplied_excerpt_sha256,
+                            replacement=expected_excerpt_sha256,
+                        )
+                    )
+                    item["excerpt_sha256"] = expected_excerpt_sha256
+            if (
                 claim_id in claim_excerpt_by_id
                 and item["rationale"] != _FINAL_INPUT_CLAIM_COVERAGE_RATIONALE
                 and not _final_root_tokens_are_grounded(
@@ -35498,10 +35712,6 @@ def _normalize_final_evidence_packet(
                     )
                 )
                 item["rationale"] = _FINAL_INPUT_CLAIM_COVERAGE_RATIONALE
-        if claim_objects is None or set(claim_objects) != set(allowed_claims):
-            raise OpenRouterError(
-                "Final evidence packet has no exact code-owned claim objects"
-            )
         try:
             validate_claim_coverage(
                 [claim_objects[claim_id] for claim_id in allowed_claims],
@@ -36353,8 +36563,10 @@ _FINAL_ROOT_NON_SEMANTIC_WORDS = frozenset(
 _FINAL_ROOT_GENERIC_ACK = re.compile(
     r"^\s*(?:(?:[A-Za-zА-Яа-яЁё0-9+._-]+)\s+){0,4}"
     r"(?:учт[её]н\w*|отраж[её]н\w*|обработан\w*|сохран[её]н\w*|"
-    r"accounted|acknowledged|covered|processed|recorded)"
-    r"(?:\s+(?:в|in)\s+(?:сводк\w*|summary|observation|отч[её]т\w*|report))?"
+    r"accounted|acknowledged|covered|processed|recorded|preserved|retained)"
+    r"(?:\s+(?:(?:в|in)\s+(?:сводк\w*|summary|observation|отч[её]т\w*|"
+    r"report|покрыт\w*|coverage)|без\s+дополнительн\w*\s+интерпретац\w*|"
+    r"without\s+(?:additional\s+)?interpretation))?"
     r"[.!]?\s*$",
     re.IGNORECASE,
 )
