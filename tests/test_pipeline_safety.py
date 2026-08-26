@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import uuid
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,11 +35,17 @@ from app.models import (
 from app.services import crawler
 from app.services import openrouter as openrouter_service
 from app.services.offer_catalog import (
+    OfferCatalogAdmissionError,
     SourceUnit,
     build_domain_research_payload,
     build_offer_catalog,
     build_offer_clusters,
 )
+from app.services.live_russian_policy import (
+    LIVE_RUSSIAN_POLICY_MANIFEST,
+    lint_reader_copy_tree,
+)
+from app.services.panel_coverage import build_panel_metric_coverage_admission
 from app.services.openrouter import (
     OUTPUT_ENVELOPE_VERSION,
     WEB_ATTESTATION_VERSION,
@@ -75,6 +82,7 @@ from app.services.analyzer import (
     ILLUSTRATION_GENERATION_VERSION,
     ILLUSTRATION_CONCEPT_MODEL,
     ILLUSTRATION_QA_SCHEMA,
+    ILLUSTRATION_QA_VERSION,
     ILLUSTRATION_ROLE_CONCURRENCY,
     LEGACY_PANEL_CONTRACT_VERSION,
     LEGACY_PANEL_EVIDENCE_VERSION,
@@ -86,6 +94,9 @@ from app.services.analyzer import (
     BOUNDED_PANEL_CONTRACT_VERSION,
     PANEL_ATTEMPT_AUDIT_VERSION,
     PANEL_CONTRACT_VERSION,
+    PANEL_CORPUS_EXPECTED_CELL_COUNT,
+    PANEL_CORPUS_RECEIPT_KEY,
+    PANEL_CORPUS_RECEIPT_VERSION,
     PANEL_OUTPUT_POLICY,
     MARKET_RESEARCH_SCHEMA,
     MARKET_RESEARCH_VERSION,
@@ -113,6 +124,7 @@ from app.services.analyzer import (
     _deterministic_entity_catalog_union,
     _deterministic_prompt_fallback,
     _deterministic_site_profile_union,
+    _edit_illustration_copy_language,
     _entity_catalog,
     _entity_alias_entries,
     _evidence_contains_complete_alias,
@@ -146,6 +158,7 @@ from app.services.analyzer import (
     _illustration_concepts,
     _illustration_generation_concept,
     _illustration_prompt,
+    _illustration_receipt_state,
     _illustration_review_errors,
     _legacy_panel_request_sha256,
     _legacy_panel_run_contract,
@@ -168,6 +181,8 @@ from app.services.analyzer import (
     _visibility_slice,
     _normalize_unpaired_memory_illustration,
     _panel_answer_attestation,
+    _seal_or_validate_panel_corpus_receipt,
+    _validate_panel_corpus_receipt_if_present,
     _bounded_panel_request_sha256,
     _panel_request_sha256,
     _panel_web_policy,
@@ -180,13 +195,19 @@ from app.services.analyzer import (
     _processing_artifact,
     _probe_access_outcome,
     _reconcile_annotation,
+    _reader_copy_document,
+    _reader_copy_gate_decision,
+    _reader_copy_publication_contract,
     _recover_prompt_set,
     reprocess_saved_answers,
     _run_panel,
     _rendering_assessment,
     _review_prompt_set_semantics,
     _review_illustration,
+    _render_markdown,
     _reuse_saved_illustration_assets,
+    _reused_illustration_validation_jobs,
+    _saved_illustration_file_path,
     _restrict_partition_annotation_to_core,
     _scope_entity_catalog_to_profile,
     _serialized_llm_request_bytes,
@@ -198,13 +219,20 @@ from app.services.analyzer import (
     _sanitize_headline_emphasis,
     _select_final_answer_context,
     _site_context,
+    _stable_json_sha256,
     _unannotated_answers,
     _validate_final_report,
     _validate_illustration_concepts,
+    _verified_illustration_asset_receipts,
     _validate_prompt_set,
     analyze_run,
     MarketResearchGateError,
     PanelCheckpointMismatchError,
+)
+from app.services.report_editor import (
+    edit_report,
+    illustration_copy_narrative_paths,
+    seal_editorial_audit,
 )
 from app.services.content_extractor import extract_text_signals
 from app.services.robots_parser import parse_robots, robots_path_allowed
@@ -414,6 +442,7 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
             "target_mentioned": True,
             "target_position": 1,
             "target_role": "recommended",
+            "sentiment": "positive",
             "entity_mentions": [
                 {"canonical_name": "Realweb", "evidence": "Realweb"},
                 {
@@ -432,11 +461,28 @@ class LongResponseReducerSafetyTests(unittest.TestCase):
 
         self.assertFalse(restricted["target_mentioned"])
         self.assertIsNone(restricted["target_position"])
+        self.assertEqual(restricted["sentiment"], "unknown")
         self.assertEqual(
             [item["canonical_name"] for item in restricted["entity_mentions"]],
             ["programmatic-реклама"],
         )
         self.assertEqual(restricted["evidence"], ["programmatic-реклама"])
+
+        inconsistent = _restrict_partition_annotation_to_core(
+            {
+                **annotation,
+                "target_mentioned": False,
+                "target_position": 1,
+                "target_role": "recommended",
+                "sentiment": "negative",
+            },
+            unit,
+            target_aliases=["Realweb"],
+        )
+        self.assertFalse(inconsistent["target_mentioned"])
+        self.assertIsNone(inconsistent["target_position"])
+        self.assertEqual(inconsistent["target_role"], "absent")
+        self.assertEqual(inconsistent["sentiment"], "unknown")
 
 
 def _attested_panel_usage(
@@ -5578,6 +5624,14 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(),
             ),
             patch(
+                "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.analyzer._validate_panel_foundation_resume",
+                new_callable=AsyncMock,
+            ) as validate_resume,
+            patch(
                 "app.services.analyzer._finish_saved_answer_analysis",
                 new_callable=AsyncMock,
             ) as finish,
@@ -5593,9 +5647,139 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
             await reprocess_saved_answers("run-id")
 
         finish.assert_awaited_once()
+        validate_resume.assert_awaited_once()
         self.assertFalse(finish.await_args.kwargs["regenerate_illustrations"])
         generate_prompts.assert_not_awaited()
         run_panel.assert_not_awaited()
+
+    async def test_saved_reprocess_seals_raw_corpus_before_any_analysis_write(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        async def seal(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("seal")
+            return {}
+
+        async def progress(*_args: object, **_kwargs: object) -> None:
+            events.append("progress")
+
+        async def prepare(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+            events.append("prepare")
+            return (
+                {"score": 90},
+                {"findings": []},
+                {"brand_name": "Example"},
+                {"requested_site": {}},
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                new=seal,
+            ),
+            patch("app.services.analyzer.update_progress", new=progress),
+            patch(
+                "app.services.analyzer._prepare_analysis_foundation",
+                new=prepare,
+            ),
+            patch(
+                "app.services.analyzer._validate_panel_foundation_resume",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.analyzer._save_answer_set_receipt",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.analyzer._finish_saved_answer_analysis",
+                new=AsyncMock(),
+            ),
+        ):
+            await reprocess_saved_answers("run-id")
+
+        self.assertEqual(events[:3], ["seal", "progress", "prepare"])
+
+    async def test_saved_reprocess_reports_grounding_block_without_panel_retry(
+        self,
+    ) -> None:
+        failure = AsyncMock()
+        panel = AsyncMock()
+        with (
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.services.analyzer._prepare_analysis_foundation",
+                new=AsyncMock(
+                    side_effect=OfferCatalogAdmissionError(
+                        "zero offer admission not proven"
+                    )
+                ),
+            ),
+            patch("app.services.analyzer._run_panel", new=panel),
+            patch("app.services.analyzer.fail_run", new=failure),
+        ):
+            await reprocess_saved_answers("run-id")
+
+        panel.assert_not_awaited()
+        failure.assert_awaited_once()
+        message = failure.await_args.args[1]
+        self.assertIn("проверка источников", message)
+        self.assertIn("не повторный опрос моделей", message)
+        self.assertEqual(
+            failure.await_args.kwargs,
+            {"failure_stage": "source_review_required"},
+        )
+
+    async def test_new_analysis_does_not_offer_retry_for_grounding_block(
+        self,
+    ) -> None:
+        failure = AsyncMock()
+        market = AsyncMock()
+        panel = AsyncMock()
+        with (
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.apply_ua_conditional_block",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._load_panel_resume_checkpoint",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.services.analyzer._prepare_analysis_foundation",
+                new=AsyncMock(
+                    side_effect=OfferCatalogAdmissionError(
+                        "zero offer admission not proven"
+                    )
+                ),
+            ),
+            patch("app.services.analyzer._market_research", new=market),
+            patch("app.services.analyzer._run_panel", new=panel),
+            patch("app.services.analyzer.fail_run", new=failure),
+        ):
+            await analyze_run("run-id")
+
+        market.assert_not_awaited()
+        panel.assert_not_awaited()
+        failure.assert_awaited_once()
+        message = failure.await_args.args[1]
+        self.assertIn("проверка источников", message)
+        self.assertNotIn("Продолжить", message)
+        self.assertEqual(
+            failure.await_args.kwargs,
+            {"failure_stage": "source_review_required"},
+        )
 
     async def test_visual_concepts_use_strong_model_with_independent_artifact(
         self,
@@ -5664,6 +5848,10 @@ class ProcessingModelTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.analyzer._save_artifact",
                 new_callable=AsyncMock,
             ) as save_artifact,
+            patch(
+                "app.services.analyzer._edit_illustration_copy_language",
+                new=AsyncMock(return_value=concepts["illustrations"]),
+            ),
         ):
             result = await _illustration_concepts(
                 "run-id",
@@ -6170,10 +6358,12 @@ class IllustrationRoleConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             generated = Path(temporary_directory) / "run-id"
-            self.assertEqual(
-                sorted(path.name for path in generated.iterdir()),
-                ["01.png", "02.png", "03.png"],
-            )
+            generated_names = sorted(path.name for path in generated.iterdir())
+            self.assertEqual(len(generated_names), 3)
+            self.assertTrue(generated_names[0].startswith("01-"))
+            self.assertTrue(generated_names[1].startswith("02-"))
+            self.assertTrue(generated_names[2].startswith("03-"))
+            self.assertTrue(all(name.endswith(".png") for name in generated_names))
 
         self.assertEqual(ILLUSTRATION_ROLE_CONCURRENCY, 2)
         self.assertEqual(max_active_generations, 2)
@@ -6236,7 +6426,114 @@ class ParallelReportBranchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
-    def test_reuse_refreshes_copy_but_keeps_alt_for_saved_bitmap(self) -> None:
+    def test_saved_bitmap_must_belong_to_the_same_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            static_dir = Path(tmp) / "static"
+            generated_dir = static_dir / "generated"
+            run_dir = generated_dir / "run-id"
+            other_dir = generated_dir / "other-run"
+            run_dir.mkdir(parents=True)
+            other_dir.mkdir(parents=True)
+            owned = run_dir / "01.png"
+            foreign = other_dir / "01.png"
+            owned.write_bytes(b"owned")
+            foreign.write_bytes(b"foreign")
+
+            with (
+                patch("app.services.analyzer.STATIC_DIR", static_dir),
+                patch("app.services.analyzer.GENERATED_DIR", generated_dir),
+            ):
+                self.assertEqual(
+                    _saved_illustration_file_path(
+                        "run-id",
+                        "/static/generated/run-id/01.png",
+                    ),
+                    owned.resolve(),
+                )
+                self.assertIsNone(
+                    _saved_illustration_file_path(
+                        "run-id",
+                        "/static/generated/other-run/01.png",
+                    )
+                )
+                self.assertIsNone(
+                    _saved_illustration_file_path(
+                        "run-id",
+                        "/static/generated/run-id/missing.png",
+                    )
+                )
+
+    async def test_incomplete_illustration_editorial_receipt_blocks_publication(
+        self,
+    ) -> None:
+        concepts = [
+            {
+                "role": "technical_access",
+                "core_claim": "Сайт отдаёт основной текст.",
+                "title": "Как сайт читают ИИ-системы",
+                "caption": "Основной текст доступен в HTML.",
+                "alt_text": "Схема доступа к тексту сайта.",
+                "evidence_paths": ["/technical/score"],
+            }
+        ]
+        edited_document = {
+            "illustrations": [
+                {
+                    "role": "technical_access",
+                    "core_claim": "Сайт отдаёт основной текст.",
+                    "title": "Как сайт читают ИИ-системы",
+                    "caption": "Основной текст доступен в HTML.",
+                    "alt_text": "Схема доступа к тексту сайта.",
+                    "evidence_paths": ["/technical/score"],
+                }
+            ]
+        }
+        with (
+            patch(
+                "app.services.analyzer._artifact_output",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.services.analyzer.edit_report",
+                new=AsyncMock(
+                    return_value=(
+                        edited_document,
+                        {
+                            "coverage_complete": False,
+                            "fallback_units": [{"unit_id": "x"}],
+                        },
+                    )
+                ),
+            ),
+            patch(
+                "app.services.analyzer._validate_illustration_concepts",
+                return_value=[],
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "complete editorial contract",
+            ):
+                await _edit_illustration_copy_language(
+                    "run-id",
+                    concepts=concepts,
+                    public_report={"technical": {"score": 100}},
+                )
+
+        terminal_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == "illustration_copy_editorial"
+            and call.kwargs.get("status") in {"completed", "failed"}
+        ]
+        self.assertEqual(len(terminal_writes), 1)
+        self.assertEqual(terminal_writes[0]["status"], "failed")
+
+    def test_reuse_refreshes_all_reader_copy_and_keeps_only_bitmap(self) -> None:
         saved = [
             {
                 "sequence": 1,
@@ -6270,7 +6567,7 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
                         "Сохранённый корпус не позволяет честно сопоставить "
                         "ответы с веб-поиском и без него."
                     ),
-                    "alt_text": "Старое описание",
+                    "alt_text": "Иллюстрация с пометкой о недостатке данных.",
                     "file_url": "/static/generated/run-id/01.png",
                 }
             ],
@@ -6288,6 +6585,30 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
             fallback[0]["alt_text"],
             "Иллюстрация с пометкой о недостатке данных.",
         )
+
+    def test_reused_bitmap_gap_keeps_the_matching_concept_sequence(self) -> None:
+        refreshed = [
+            {"title": "Концепция 1"},
+            {"title": "Концепция 2"},
+            {"title": "Концепция 3"},
+        ]
+        public_rows = _reuse_saved_illustration_assets(
+            [
+                {
+                    "sequence": 2,
+                    "file_url": "/static/generated/run-id/02.png",
+                }
+            ],
+            refreshed,
+        )
+
+        jobs = _reused_illustration_validation_jobs(public_rows, refreshed)
+
+        self.assertEqual(len(jobs), 1)
+        position, public_item, concept = jobs[0]
+        self.assertEqual(position, 1)
+        self.assertEqual(public_item["sequence"], 2)
+        self.assertEqual(concept["title"], "Концепция 2")
 
     async def test_reanalysis_refreshes_copy_without_generating_images(self) -> None:
         analytics_started = asyncio.Event()
@@ -6322,6 +6643,20 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.analyzer._generate_illustrations",
                 new_callable=AsyncMock,
             ) as generate,
+            patch(
+                "app.services.analyzer._revalidate_reused_illustration_assets",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "sequence": 1,
+                            "title": "Актуальный вывод",
+                            "caption": "Подпись из пересчитанных метрик.",
+                            "alt_text": "Актуальное описание.",
+                            "file_url": "/static/generated/run-id/01.png",
+                        }
+                    ]
+                ),
+            ) as revalidate,
         ):
             final, reused = await asyncio.wait_for(
                 _run_reused_report_branches(
@@ -6346,9 +6681,12 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
             "/static/generated/run-id/01.png",
         )
         concepts.assert_awaited_once()
+        revalidate.assert_awaited_once()
         generate.assert_not_awaited()
 
-    async def test_reanalysis_uses_number_free_copy_fallback(self) -> None:
+    async def test_reanalysis_omits_saved_images_when_copy_is_not_publishable(
+        self,
+    ) -> None:
         saved = [
             {
                 "sequence": sequence,
@@ -6379,17 +6717,458 @@ class ReusedIllustrationMetadataTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(final["sections"], [{}])
-        self.assertEqual(len(reused), 3)
-        self.assertTrue(all(item["file_url"] for item in reused))
-        serialized = json.dumps(reused, ensure_ascii=False)
-        self.assertNotIn("100", serialized)
-        fallback_writes = [
+        self.assertEqual(reused, [])
+        degraded_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
-            if call.kwargs.get("artifact_key") == "illustration_concepts_fallback"
+            if call.kwargs.get("artifact_key") == "illustration_layer_degraded"
         ]
-        self.assertEqual(len(fallback_writes), 1)
-        self.assertEqual(fallback_writes[0]["status"], "completed")
+        self.assertEqual(len(degraded_writes), 1)
+        self.assertEqual(degraded_writes[0]["status"], "completed")
+        self.assertFalse(degraded_writes[0]["output_json"]["illustrations_published"])
+        self.assertEqual(degraded_writes[0]["output_json"]["saved_asset_count"], 3)
+
+
+class IllustrationPublicationSubsetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_file_and_qa_receipts_accept_one_or_two_of_three_roles(
+        self,
+    ) -> None:
+        await init_db()
+        review = {
+            "usable": True,
+            "facts_grounded": True,
+            "claim_readable": True,
+            "scores": {"context_specificity": 5},
+            "unsupported_assertions": [],
+            "hard_blockers": [],
+            "visible_text_problems": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            static_dir = Path(temporary_directory) / "static"
+            generated_dir = static_dir / "generated"
+            with (
+                patch("app.services.analyzer.STATIC_DIR", static_dir),
+                patch("app.services.analyzer.GENERATED_DIR", generated_dir),
+            ):
+                for selected_sequences in ((2,), (1, 3)):
+                    run_id = f"subset-{uuid.uuid4()}"
+                    run_dir = generated_dir / run_id
+                    run_dir.mkdir(parents=True)
+                    public_rows: list[dict[str, Any]] = []
+                    async with SessionLocal() as session:
+                        session.add(
+                            Run(
+                                id=run_id,
+                                domain="subset.example",
+                                status=RunStatus.analyzing,
+                                config_json={},
+                            )
+                        )
+                        await session.flush()
+                        for sequence in selected_sequences:
+                            content = f"image-{sequence}".encode()
+                            image_sha256 = hashlib.sha256(content).hexdigest()
+                            filename = f"{sequence:02d}-{image_sha256}.png"
+                            (run_dir / filename).write_bytes(content)
+                            file_url = f"/static/generated/{run_id}/{filename}"
+                            public_rows.append(
+                                {
+                                    "sequence": sequence,
+                                    "title": f"Схема {sequence}",
+                                    "caption": "Подпись",
+                                    "alt_text": "Описание",
+                                    "file_url": file_url,
+                                }
+                            )
+                            session.add(
+                                ReportIllustration(
+                                    run_id=run_id,
+                                    sequence=sequence,
+                                    title=f"Схема {sequence}",
+                                    caption="Подпись",
+                                    alt_text="Описание",
+                                    file_url=file_url,
+                                    generation_prompt="prompt",
+                                    model="test/image",
+                                    usage_json={
+                                        "image_sha256": image_sha256,
+                                        "quality_version": ILLUSTRATION_QA_VERSION,
+                                        "quality_model": PROCESSING_MODEL,
+                                        "quality_review": review,
+                                    },
+                                )
+                            )
+                            session.add(
+                                RunArtifact(
+                                    run_id=run_id,
+                                    stage_key="report",
+                                    artifact_key=(
+                                        f"illustration_qa_{sequence}_"
+                                        f"{image_sha256[:16]}"
+                                    ),
+                                    status="completed",
+                                    model=PROCESSING_MODEL,
+                                    prompt_version=ILLUSTRATION_QA_VERSION,
+                                    input_json={"image_sha256": image_sha256},
+                                    output_json=review,
+                                )
+                            )
+                        await session.commit()
+                    try:
+                        receipts = await _verified_illustration_asset_receipts(
+                            run_id,
+                            public_rows,
+                        )
+                        self.assertEqual(
+                            [row["sequence"] for row in receipts],
+                            list(selected_sequences),
+                        )
+                        self.assertTrue(all(row["qa_verified"] for row in receipts))
+                    finally:
+                        async with SessionLocal() as session:
+                            await session.execute(delete(Run).where(Run.id == run_id))
+                            await session.commit()
+
+
+class ReaderCopyManifestTests(unittest.TestCase):
+    @staticmethod
+    def _accepted_receipts() -> dict[str, dict[str, object]]:
+        return {
+            "final_report": {"accepted": True, "reasons": []},
+            "technical_review": {"accepted": True, "reasons": []},
+            "illustrations": {"accepted": True, "reasons": []},
+        }
+
+    def test_gate_blocks_lint_findings_and_incomplete_editorial_receipts(
+        self,
+    ) -> None:
+        publication = {"blocking_reasons": []}
+        clean_lint = {
+            "blocking": False,
+            "omitted_issue_count": 0,
+            "issues": [],
+        }
+        accepted = _reader_copy_gate_decision(
+            publication=publication,
+            lint=clean_lint,
+            receipts=self._accepted_receipts(),
+        )
+        self.assertEqual(accepted["decision"], "pass")
+        self.assertTrue(accepted["quality_complete"])
+
+        lint_blocked = _reader_copy_gate_decision(
+            publication=publication,
+            lint={
+                **clean_lint,
+                "blocking": True,
+                "issues": [{"code": "long_dash"}],
+            },
+            receipts=self._accepted_receipts(),
+        )
+        self.assertEqual(lint_blocked["decision"], "block")
+        self.assertIn("blocking_copy_lint", lint_blocked["blocking_reasons"])
+
+        receipts = self._accepted_receipts()
+        receipts["technical_review"] = {
+            "accepted": False,
+            "reasons": ["quality_incomplete"],
+        }
+        receipt_blocked = _reader_copy_gate_decision(
+            publication=publication,
+            lint=clean_lint,
+            receipts=receipts,
+        )
+        self.assertEqual(receipt_blocked["decision"], "block")
+        self.assertIn(
+            "technical_review_receipt_incomplete",
+            receipt_blocked["blocking_reasons"],
+        )
+
+    def test_illustration_copy_receipt_accepts_verified_one_or_two_row_subset(
+        self,
+    ) -> None:
+        audited_rows = [
+            {
+                "role": f"role-{sequence}",
+                "core_claim": f"Факт {sequence}",
+                "title": f"Заголовок {sequence}",
+                "caption": f"Подпись {sequence}",
+                "alt_text": f"Описание {sequence}",
+                "evidence_paths": [],
+            }
+            for sequence in range(1, 4)
+        ]
+        audited_document = {"illustrations": audited_rows}
+
+        async def editor(payload: dict[str, Any]) -> dict[str, Any]:
+            edited = str(payload["core_text"])
+            return {
+                "source_unit_id": payload["source_unit_id"],
+                "source_sha256": payload["source_sha256"],
+                "edited_text": edited,
+                "claim_receipts": [
+                    {
+                        "claim_sha256": claim["claim_sha256"],
+                        "preserved": True,
+                        "target_excerpt": claim["source_excerpt"],
+                        "note": "Смысл сохранён.",
+                    }
+                    for claim in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        async def critic(payload: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "verdict": "pass",
+                "issues": [],
+                "claim_checks": [
+                    {
+                        "claim_sha256": claim["claim_sha256"],
+                        "meaning_preserved": True,
+                        "actor_preserved": True,
+                        "scope_preserved": True,
+                        "numbers_preserved": True,
+                        "actor_or_mechanism_explicit": True,
+                        "number_carrier_explicit": True,
+                        "active_voice": True,
+                        "no_slogan_or_meta": True,
+                        "no_mechanical_triad": True,
+                        "reason": "Смысл совпадает.",
+                    }
+                    for claim in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        edited_document, audit = asyncio.run(
+            edit_report(
+                audited_document,
+                editor_call=editor,
+                critic_call=critic,
+                prose_paths=illustration_copy_narrative_paths(audited_document),
+            )
+        )
+        self.assertEqual(edited_document, audited_document)
+        self.assertTrue(audit["quality_complete"])
+        artifact = RunArtifact(
+            run_id="run-id",
+            stage_key="report",
+            artifact_key="illustration_copy_editorial",
+            status="completed",
+            prompt_version="test",
+            output_json={"copy": audited_document, "audit": audit},
+        )
+
+        for sequences in ((2,), (1, 3)):
+            with self.subTest(sequences=sequences):
+                published = [
+                    {
+                        "sequence": sequence,
+                        "title": audited_rows[sequence - 1]["title"],
+                        "caption": audited_rows[sequence - 1]["caption"],
+                        "alt_text": audited_rows[sequence - 1]["alt_text"],
+                        "file_url": f"/static/generated/run-id/{sequence}.png",
+                    }
+                    for sequence in sequences
+                ]
+                receipt = _illustration_receipt_state(
+                    artifact,
+                    published,
+                    source_document=audited_document,
+                    prose_paths=illustration_copy_narrative_paths(audited_document),
+                    source_artifact_key="illustration_concepts",
+                )
+
+                self.assertTrue(receipt["accepted"])
+                self.assertEqual(receipt["published_count"], len(sequences))
+                self.assertEqual(receipt["audited_count"], 3)
+                self.assertEqual(receipt["published_sequences"], list(sequences))
+
+        zero = _illustration_receipt_state(None, [])
+        self.assertTrue(zero["accepted"])
+        self.assertTrue(zero["publication_policy"]["zero_assets_allowed"])
+
+    def test_registry_covers_dynamic_report_copy_beyond_the_final_narrative(
+        self,
+    ) -> None:
+        final = {
+            "headline": "Сайт доступен моделям",
+            "headline_emphasis": [],
+            "verdict": "Сервер отдаёт основной текст.",
+            "executive_summary": "Бренд встречается в части ответов.",
+            "sections": [{"heading": "Вывод", "body": "Нужна разметка."}],
+            "actions": [
+                {
+                    "priority": "now",
+                    "title": "Добавить сущности",
+                    "why": "Моделям не хватает связи.",
+                    "step": "Опубликовать Schema.org.",
+                    "evidence": "Дословное доказательство.",
+                }
+            ],
+            "limitations": ["Оценка относится к проверенным страницам."],
+        }
+        document = _reader_copy_document(
+            final_report=final,
+            public_report={
+                "brand": {
+                    "site_type": "service",
+                    "category": "Маркетинг",
+                    "positioning": "Агентство performance-маркетинга.",
+                },
+                "technical": {
+                    "summary": {
+                        "facts": [
+                            {
+                                "label": "Содержательные страницы",
+                                "detail": "Проверены восемь страниц сайта.",
+                            }
+                        ]
+                    },
+                    "barriers": [
+                        {
+                            "title": "Не хватает описания сущностей",
+                            "detail": "Schema.org не объясняет продукты сайта.",
+                        }
+                    ],
+                    "review": {
+                        "overall_conclusion": "Основной текст доступен.",
+                        "render_conclusion": "JavaScript не обязателен.",
+                        "findings": [
+                            {
+                                "title": "Не хватает разметки",
+                                "severity": "medium",
+                                "evidence": "Сущности — не связаны разметкой.",
+                                "business_effect": "Модели теряют контекст.",
+                                "action": "Добавить Schema.org.",
+                            }
+                        ],
+                        "limitations": [],
+                    },
+                },
+                "methodology": {
+                    "summary": "Метрики рассчитаны из доказательной разметки.",
+                    "modes": [
+                        {
+                            "name": "С веб-поиском",
+                            "description": "Модели используют актуальные источники.",
+                        }
+                    ],
+                    "offline_limit": "Perplexity не входит в срез памяти.",
+                },
+                "key_metrics": {
+                    "technical_access": {
+                        "label": "Техническая готовность проверенного среза",
+                        "unit": "/ 100",
+                        "coverage_label": "Ограниченный срез",
+                    }
+                },
+            },
+            illustrations=[
+                {
+                    "sequence": 1,
+                    "title": "Как сайт читают модели",
+                    "caption": "Основной текст доступен в HTML.",
+                    "alt_text": "Схема доступа к тексту сайта.",
+                    "file_url": "/static/generated/run-id/01.png",
+                }
+            ],
+        )
+
+        self.assertEqual(document["final_report"], final)
+        self.assertEqual(
+            document["action_basis_copy"],
+            ["Дословное доказательство."],
+        )
+        self.assertEqual(
+            document["technical_finding_basis_copy"],
+            ["Сущности — не связаны разметкой."],
+        )
+        lint = lint_reader_copy_tree(document)
+        self.assertTrue(lint.blocking)
+        self.assertIn(
+            "$.technical_finding_basis_copy[0]",
+            {issue.path for issue in lint.issues},
+        )
+        self.assertEqual(
+            document["published_report"]["technical"]["summary"]["facts"][0]["detail"],
+            "Проверены восемь страниц сайта.",
+        )
+        self.assertEqual(
+            document["published_report"]["technical"]["barriers"][0]["title"],
+            "Не хватает описания сущностей",
+        )
+        self.assertEqual(
+            document["technical_review"]["overall_conclusion"],
+            "Основной текст доступен.",
+        )
+        self.assertEqual(
+            document["methodology"]["modes"][0]["description"],
+            "Модели используют актуальные источники.",
+        )
+        self.assertEqual(
+            document["metric_labels"]["technical_access"]["coverage_label"],
+            "Ограниченный срез",
+        )
+        self.assertEqual(
+            document["illustrations"][0]["alt_text"],
+            "Схема доступа к тексту сайта.",
+        )
+        self.assertNotIn("file_url", document["illustrations"][0])
+
+    def test_publication_contract_binds_markdown_and_json_to_edited_copy(
+        self,
+    ) -> None:
+        final = {
+            "headline": "Сайт доступен моделям",
+            "headline_emphasis": [],
+            "verdict": "Сервер отдаёт основной текст.",
+            "executive_summary": "Бренд встречается в части ответов.",
+            "sections": [{"heading": "Вывод", "body": "Нужна разметка."}],
+            "actions": [],
+            "limitations": [],
+        }
+        public = {"brand": {"name": "Example"}, "technical": {"score": 90}}
+        illustrations: list[dict[str, Any]] = []
+        narrative = {
+            "headline": final["headline"],
+            "headline_emphasis": [],
+            "verdict": final["verdict"],
+            "executive_summary": final["executive_summary"],
+            "actions": [],
+        }
+        report_json = {
+            **public,
+            "narrative": narrative,
+            "illustrations": illustrations,
+        }
+
+        accepted = _reader_copy_publication_contract(
+            final_report=final,
+            public_report=public,
+            illustrations=illustrations,
+            analysis_markdown=_render_markdown(final),
+            report_json=report_json,
+        )
+        self.assertEqual(accepted["blocking_reasons"], [])
+        self.assertTrue(all(accepted["checks"].values()))
+
+        rejected = _reader_copy_publication_contract(
+            final_report=final,
+            public_report=public,
+            illustrations=illustrations,
+            analysis_markdown="# Подменённый текст",
+            report_json={**report_json, "narrative": {**narrative, "verdict": "0"}},
+        )
+        self.assertIn(
+            "analysis_markdown_matches_final_report",
+            rejected["blocking_reasons"],
+        )
+        self.assertIn(
+            "report_json_narrative_matches_final_report",
+            rejected["blocking_reasons"],
+        )
 
 
 class FinalAnswerCorpusTests(unittest.TestCase):
@@ -9573,6 +10352,15 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
             critic_gate = {
                 "passed": True,
                 "corpus_manifest": critic_manifest,
+                "panel_metric_coverage_admission": (
+                    coverage_admission := build_panel_metric_coverage_admission(
+                        expected_cells=expected_cells,
+                        observed_rows=critic_rows,
+                    )
+                ),
+                "panel_metric_coverage_admission_sha256": coverage_admission[
+                    "admission_sha256"
+                ],
                 "provenance": {
                     "rows_sha256": critic_manifest["critic_rows_sha256"],
                 },
@@ -9628,6 +10416,150 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
                     for item in corpus["answers"]
                 )
             )
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_terminal_failed_provider_lane_is_metadata_only_not_missing(
+        self,
+    ) -> None:
+        run_id = f"test-final-partial-provider-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="example.com",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            for prompt_index in range(9):
+                prompt = VisibilityPrompt(
+                    run_id=run_id,
+                    prompt_key=f"prompt-{prompt_index}",
+                    intent_class="I",
+                    role="unbranded_discovery",
+                    text=f"Сценарий {prompt_index}",
+                    rationale="Проверка допустимой недоступности провайдера.",
+                    sequence=prompt_index + 1,
+                )
+                session.add(prompt)
+                await session.flush()
+                for mode in ("web", "memory"):
+                    for panel in panel_models():
+                        model = panel.model if mode == "web" else panel.memory_model
+                        if model is None:
+                            continue
+                        failed_lane = mode == "memory" and panel.key == "claude"
+                        answer_text = (
+                            ""
+                            if failed_lane
+                            else f"Ответ {prompt_index}/{panel.key}/{mode} END"
+                        )
+                        if failed_lane:
+                            usage_json, citations_json = {}, []
+                        else:
+                            usage_json, citations_json = _attested_panel_usage(
+                                prompt_text=prompt.text,
+                                mode=mode,
+                                provider_key=panel.key,
+                                model=model,
+                                response_text=answer_text,
+                            )
+                        answer = ModelAnswer(
+                            run_id=run_id,
+                            prompt_id=prompt.id,
+                            provider_key=panel.key,
+                            model=model,
+                            mode=mode,
+                            status="failed" if failed_lane else "completed",
+                            response_text=answer_text,
+                            citations_json=citations_json,
+                            usage_json=usage_json,
+                            error_message=(
+                                "provider unavailable" if failed_lane else None
+                            ),
+                        )
+                        session.add(answer)
+                        await session.flush()
+                        if not failed_lane:
+                            session.add(
+                                AnswerAnnotation(
+                                    answer_id=answer.id,
+                                    annotation_json={
+                                        "_annotation_version": ANNOTATION_VERSION,
+                                        "_answer_sha256": hashlib.sha256(
+                                            answer_text.encode("utf-8")
+                                        ).hexdigest(),
+                                        "_answer_model": model,
+                                        "_annotation_input_sha256": "context",
+                                        "valid": True,
+                                        "target_mentioned": False,
+                                    },
+                                )
+                            )
+            await session.commit()
+
+        try:
+            critic_rows = await _metric_rows(
+                run_id,
+                annotation_input_sha256="context",
+            )
+            expected_cells = await _expected_corpus_cells(run_id, critic_rows)
+            self.assertEqual(len(critic_rows), 81)
+            self.assertEqual(len(expected_cells), 81)
+            admission = build_panel_metric_coverage_admission(
+                expected_cells=expected_cells,
+                observed_rows=critic_rows,
+            )
+            self.assertTrue(admission["allowed"])
+            self.assertEqual(
+                admission["unavailable_provider_count_by_mode"],
+                {"memory": 1},
+            )
+            manifest = _final_corpus_manifest(
+                critic_rows,
+                expected_cells=expected_cells,
+            )
+            self.assertTrue(manifest["structural_complete"])
+            self.assertTrue(manifest["evidentiary_complete"])
+            self.assertTrue(manifest["complete"])
+            self.assertEqual(len(manifest["unavailable_cells"]), 9)
+            critic_gate = {
+                "passed": True,
+                "corpus_manifest": manifest,
+                "panel_metric_coverage_admission": admission,
+                "panel_metric_coverage_admission_sha256": admission["admission_sha256"],
+                "provenance": {
+                    "rows_sha256": manifest["critic_rows_sha256"],
+                },
+            }
+
+            corpus = await _full_answer_context(
+                run_id,
+                critic_gate=critic_gate,
+                critic_rows=critic_rows,
+                expected_corpus_cells=expected_cells,
+            )
+            selected, selection_manifest = _select_final_answer_context(
+                corpus["answers"],
+                corpus_manifest=corpus["manifest"],
+            )
+            self.assertEqual(len(selected), 81)
+            self.assertEqual(selection_manifest["selected_metadata_only_count"], 9)
+            failed = [item for item in selected if item["status"] == "failed"]
+            self.assertEqual(len(failed), 9)
+            for item in failed:
+                self.assertEqual(item["context_access"], "metadata_only")
+                self.assertEqual(
+                    item["metric_limitation"],
+                    "terminal_panel_failure",
+                )
+                self.assertNotIn("answer_text", item)
+                self.assertNotIn("annotation", item)
+                self.assertNotIn("citations", item)
+                self.assertGreater(item["failure"]["error_utf8_bytes"], 0)
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
@@ -10338,6 +11270,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "RW+ рекомендуется как целевой бренд.",
                 "annotation": {
                     "valid": True,
                     "target_mentioned": False,
@@ -10356,6 +11289,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "В ответе перечислены другие бренды.",
                 "annotation": {
                     "valid": False,
                     "target_mentioned": True,
@@ -10376,6 +11310,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "E",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "RW+ рекомендуется как целевой бренд.",
                 "annotation": {
                     "valid": False,
                     "target_mentioned": True,
@@ -10528,6 +11463,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "RW+ рекомендуется как целевой бренд.",
                 "annotation": {
                     "valid": True,
                     "target_mentioned": False,
@@ -10584,6 +11520,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "В ответе перечислены другие бренды.",
                 "annotation": {
                     "valid": False,
                     "target_mentioned": True,
@@ -10689,6 +11626,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "RW+ рекомендуется как целевой бренд.",
                 "annotation": {
                     "valid": True,
                     "target_mentioned": True,
@@ -10713,6 +11651,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "В ответе перечислены другие бренды.",
                 "annotation": {
                     "valid": True,
                     "target_mentioned": False,
@@ -10731,6 +11670,7 @@ class DeterministicMetricTests(unittest.TestCase):
                 "intent_class": "I",
                 "role": "unbranded_discovery",
                 "status": "completed",
+                "answer_text": "RW+ рекомендуется как целевой бренд.",
                 "annotation": {
                     "valid": True,
                     "target_mentioned": True,
@@ -10941,6 +11881,7 @@ class DeterministicMetricTests(unittest.TestCase):
                     "prompt_key": f"web-{intent}",
                     "intent_class": intent,
                     "role": "unbranded_discovery",
+                    "answer_text": "Цель рекомендуется для этого сценария.",
                     "annotation": {
                         "valid": True,
                         "target_mentioned": True,
@@ -10966,6 +11907,7 @@ class DeterministicMetricTests(unittest.TestCase):
                     "prompt_key": f"memory-{intent}",
                     "intent_class": intent,
                     "role": "unbranded_discovery",
+                    "answer_text": "Ответ описывает другие решения.",
                     "annotation": {
                         "valid": True,
                         "target_mentioned": False,
@@ -13003,6 +13945,81 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
             return run_id, items, [prompt.id for prompt in prompts], answer.id
 
+    async def _create_full_panel_corpus(self) -> tuple[str, list[int]]:
+        run_id = f"test-full-panel-corpus-{uuid.uuid4()}"
+        items = self._checkpoint_prompt_items()
+        answer_ids: list[int] = []
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="example.com",
+                    status=RunStatus.analyzing,
+                    config_json={},
+                )
+            )
+            prompts: list[VisibilityPrompt] = []
+            for sequence, item in enumerate(items, start=1):
+                prompt = VisibilityPrompt(
+                    run_id=run_id,
+                    prompt_key=str(item["prompt_key"]),
+                    intent_class=str(item["intent_class"]),
+                    role=str(item["role"]),
+                    text=str(item["text"]),
+                    rationale=str(item["rationale"]),
+                    sequence=sequence,
+                )
+                session.add(prompt)
+                prompts.append(prompt)
+            await session.flush()
+            session.add(
+                RunArtifact(
+                    run_id=run_id,
+                    stage_key="scenario_design",
+                    artifact_key="prompt_set",
+                    status="completed",
+                    prompt_version=PROMPT_SET_VERSION,
+                    output_json={"prompts": copy.deepcopy(items)},
+                )
+            )
+            cell_index = 0
+            for prompt in prompts:
+                for mode in ("web", "memory"):
+                    for panel in panel_models():
+                        model = panel.model if mode == "web" else panel.memory_model
+                        if model is None:
+                            continue
+                        cell_index += 1
+                        response_text = (
+                            f"Ответ {prompt.sequence}/{panel.key}/{mode}: хвост ✓"
+                        )
+                        answer = ModelAnswer(
+                            run_id=run_id,
+                            prompt_id=prompt.id,
+                            provider_key=panel.key,
+                            model=model,
+                            mode=mode,
+                            status="completed",
+                            response_text=response_text,
+                            citations_json=[
+                                {
+                                    "url": f"https://source.example/{cell_index}",
+                                    "title": f"Источник {cell_index}",
+                                }
+                            ],
+                            usage_json={
+                                "prompt_tokens": cell_index,
+                                "completion_tokens": cell_index + 1,
+                                "total_tokens": cell_index * 2 + 1,
+                            },
+                        )
+                        session.add(answer)
+                        await session.flush()
+                        answer_ids.append(answer.id)
+            await session.commit()
+        self.assertEqual(len(answer_ids), PANEL_CORPUS_EXPECTED_CELL_COUNT)
+        return run_id, answer_ids
+
     @staticmethod
     async def _delete_run(run_id: str) -> None:
         async with SessionLocal() as session:
@@ -13266,6 +14283,28 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             stored_by_url = {page.url: page for page in stored_pages}
             receipt = crawler._site_page_receipt(selected, stored_by_url)
             manifest_input = crawler._site_page_manifest_input("example.com")
+            relevance_receipt = crawler._selection_relevance_receipt(
+                homepage_url=selected[0][0],
+                candidates=[
+                    crawler._candidate_evidence_record(
+                        page.url,
+                        source="test_fixture",
+                        anchor_text=(
+                            "Product service book demo"
+                            if index < crawler.AUDIT_PAGE_DEFAULT
+                            else "Product service"
+                        ),
+                    )
+                    for index, page in enumerate(stored_pages[1:], start=1)
+                ],
+                target=crawler.AUDIT_PAGE_DEFAULT,
+                proposed=selected,
+                attempts=[
+                    crawler._candidate_attempt(page, outcome="usable")
+                    for page in selected
+                ],
+                selected=selected,
+            )
             session.add(
                 RunArtifact(
                     run_id=run_id,
@@ -13291,6 +14330,9 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                         "discovery_state": "complete",
                         "coverage_state": "bounded",
                         "site_page_receipt": receipt,
+                        "commercial_relevance_receipt": (
+                            crawler._selection_relevance_projection(relevance_receipt)
+                        ),
                     },
                 )
             )
@@ -13319,15 +14361,11 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     (page["source_unit_id"], page["source_sha256"])
                     for page in context["pages"]
                 ],
-                [
-                    (page["url"], page["content_sha256"])
-                    for page in receipt["pages"]
-                ],
+                [(page["url"], page["content_sha256"]) for page in receipt["pages"]],
             )
             self.assertTrue(
                 {
-                    page.url
-                    for page in stored_pages[crawler.AUDIT_PAGE_DEFAULT :]
+                    page.url for page in stored_pages[crawler.AUDIT_PAGE_DEFAULT :]
                 }.isdisjoint({page["url"] for page in context["pages"]})
             )
         finally:
@@ -13538,8 +14576,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(discovery["annotated_answers"], 1)
             self.assertEqual(discovery["valid_answers"], 1)
             self.assertEqual(discovery["mention_count"], 1)
-            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v18"))
-            self.assertTrue(METRICS_VERSION.endswith("metrics-v20"))
+            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v19"))
+            self.assertTrue(METRICS_VERSION.endswith("metrics-v21"))
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))
@@ -14849,6 +15887,388 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self._delete_run(run_id)
 
+    async def test_full_panel_corpus_receipt_seals_all_nine_prompts_and_cells(
+        self,
+    ) -> None:
+        run_id, answer_ids = await self._create_full_panel_corpus()
+        try:
+            receipt = await _seal_or_validate_panel_corpus_receipt(
+                run_id,
+                allow_legacy_baseline=False,
+            )
+            self.assertEqual(receipt["version"], PANEL_CORPUS_RECEIPT_VERSION)
+            self.assertEqual(receipt["proof_scope"], "normal_panel_completion")
+            self.assertTrue(receipt["historical_integrity_proven"])
+            self.assertEqual(receipt["prompt_count"], 9)
+            self.assertEqual(receipt["expected_cell_count"], 81)
+            self.assertEqual(receipt["actual_cell_count"], 81)
+            self.assertEqual(len(receipt["prompts"]), 9)
+            self.assertEqual(len(receipt["cells"]), 81)
+            self.assertEqual(
+                {item["role"] for item in receipt["prompts"]},
+                {"unbranded_discovery", "brand_diagnostic"},
+            )
+            first = receipt["cells"][0]
+            self.assertGreater(first["response_utf8_bytes"], 0)
+            self.assertEqual(len(first["response_sha256"]), 64)
+            self.assertEqual(len(first["citations_sha256"]), 64)
+            self.assertEqual(len(first["usage_sha256"]), 64)
+
+            # A second call validates the existing seal; it cannot reseal a
+            # changed corpus under a fresh digest.
+            self.assertEqual(
+                await _seal_or_validate_panel_corpus_receipt(
+                    run_id,
+                    allow_legacy_baseline=False,
+                ),
+                receipt,
+            )
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(ModelAnswer)
+                    .where(ModelAnswer.id == answer_ids[0])
+                    .values(response_text="Подменённый raw-ответ")
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "persisted_corpus_changed",
+            ):
+                await _validate_panel_corpus_receipt_if_present(run_id)
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_sealed_historical_topology_survives_current_memory_lane_swap(
+        self,
+    ) -> None:
+        run_id, _answer_ids = await self._create_full_panel_corpus()
+        original_panels = panel_models()
+        drifted_panels = tuple(
+            PanelModel(
+                key=panel.key,
+                label=panel.label,
+                model=panel.model,
+                memory_model=(
+                    panel.model
+                    if panel.key == "perplexity"
+                    else None
+                    if panel.key == "claude"
+                    else panel.memory_model
+                ),
+            )
+            for panel in original_panels
+        )
+        try:
+            receipt = await _seal_or_validate_panel_corpus_receipt(
+                run_id,
+                allow_legacy_baseline=False,
+            )
+            self.assertEqual(receipt["actual_cell_count"], 81)
+
+            with patch(
+                "app.services.analyzer.panel_models",
+                return_value=drifted_panels,
+            ):
+                checkpoint = await _load_panel_resume_checkpoint(run_id)
+                expected_cells = await _expected_corpus_cells(run_id, [])
+                self.assertTrue(
+                    await _validate_panel_corpus_receipt_if_present(run_id)
+                )
+
+            self.assertEqual(len(checkpoint or []), 9)
+            memory_providers = {
+                str(cell["provider_key"])
+                for cell in expected_cells
+                if cell["mode"] == "memory"
+            }
+            self.assertIn("claude", memory_providers)
+            self.assertNotIn("perplexity", memory_providers)
+            self.assertEqual(len(expected_cells), 81)
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_current_lane_cannot_enter_a_sealed_historical_grid(
+        self,
+    ) -> None:
+        run_id, _answer_ids = await self._create_full_panel_corpus()
+        original_panels = panel_models()
+        drifted_panels = tuple(
+            PanelModel(
+                key=panel.key,
+                label=panel.label,
+                model=panel.model,
+                memory_model=(
+                    panel.model
+                    if panel.key == "perplexity"
+                    else None
+                    if panel.key == "claude"
+                    else panel.memory_model
+                ),
+            )
+            for panel in original_panels
+        )
+        try:
+            await _seal_or_validate_panel_corpus_receipt(
+                run_id,
+                allow_legacy_baseline=False,
+            )
+            async with SessionLocal() as session:
+                prompt_id = (
+                    await session.execute(
+                        select(VisibilityPrompt.id)
+                        .where(VisibilityPrompt.run_id == run_id)
+                        .order_by(VisibilityPrompt.sequence)
+                        .limit(1)
+                    )
+                ).scalar_one()
+                perplexity = next(
+                    panel for panel in drifted_panels if panel.key == "perplexity"
+                )
+                session.add(
+                    ModelAnswer(
+                        run_id=run_id,
+                        prompt_id=prompt_id,
+                        provider_key="perplexity",
+                        model=str(perplexity.memory_model),
+                        mode="memory",
+                        status="completed",
+                        response_text="Неожиданная ячейка новой конфигурации.",
+                    )
+                )
+                await session.commit()
+
+            with (
+                patch(
+                    "app.services.analyzer.panel_models",
+                    return_value=drifted_panels,
+                ),
+                self.assertRaisesRegex(
+                    PanelCheckpointMismatchError,
+                    "sealed_answer_grid_changed",
+                ),
+            ):
+                await _load_panel_resume_checkpoint(run_id)
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_legacy_panel_corpus_baseline_never_claims_historical_proof(
+        self,
+    ) -> None:
+        run_id, _answer_ids = await self._create_full_panel_corpus()
+        try:
+            receipt = await _seal_or_validate_panel_corpus_receipt(
+                run_id,
+                allow_legacy_baseline=True,
+            )
+            self.assertEqual(
+                receipt["proof_scope"],
+                "legacy_reprocess_baseline",
+            )
+            self.assertFalse(receipt["historical_integrity_proven"])
+            async with SessionLocal() as session:
+                artifacts = {
+                    artifact.artifact_key: artifact
+                    for artifact in (
+                        (
+                            await session.execute(
+                                select(RunArtifact).where(
+                                    RunArtifact.run_id == run_id,
+                                    RunArtifact.artifact_key.in_(
+                                        (
+                                            PANEL_CORPUS_RECEIPT_KEY,
+                                            "legacy_panel_corpus_baseline_audit",
+                                        )
+                                    ),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                }
+            self.assertEqual(
+                set(artifacts),
+                {
+                    PANEL_CORPUS_RECEIPT_KEY,
+                    "legacy_panel_corpus_baseline_audit",
+                },
+            )
+            self.assertFalse(
+                artifacts["legacy_panel_corpus_baseline_audit"].output_json[
+                    "historical_integrity_proven"
+                ]
+            )
+            self.assertEqual(
+                artifacts["legacy_panel_corpus_baseline_audit"].output_json[
+                    "panel_corpus_receipt_sha256"
+                ],
+                receipt["receipt_sha256"],
+            )
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == "legacy_panel_corpus_baseline_audit",
+                    )
+                    .values(output_json={"historical_integrity_proven": True})
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "legacy_baseline_audit",
+            ):
+                await _seal_or_validate_panel_corpus_receipt(
+                    run_id,
+                    allow_legacy_baseline=True,
+                )
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_panel_corpus_receipt_detects_citation_and_usage_tampering(
+        self,
+    ) -> None:
+        run_id, answer_ids = await self._create_full_panel_corpus()
+        try:
+            await _seal_or_validate_panel_corpus_receipt(
+                run_id,
+                allow_legacy_baseline=False,
+            )
+            async with SessionLocal() as session:
+                answer = await session.get(ModelAnswer, answer_ids[0])
+                assert answer is not None
+                original_citations = copy.deepcopy(answer.citations_json)
+                original_usage = copy.deepcopy(answer.usage_json)
+                answer.citations_json = [{"url": "https://tampered.example/"}]
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "persisted_corpus_changed",
+            ):
+                await _validate_panel_corpus_receipt_if_present(run_id)
+
+            async with SessionLocal() as session:
+                answer = await session.get(ModelAnswer, answer_ids[0])
+                assert answer is not None
+                answer.citations_json = original_citations
+                answer.usage_json = {"total_tokens": 999_999}
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "persisted_corpus_changed",
+            ):
+                await _validate_panel_corpus_receipt_if_present(run_id)
+
+            async with SessionLocal() as session:
+                answer = await session.get(ModelAnswer, answer_ids[0])
+                assert answer is not None
+                answer.usage_json = original_usage
+                await session.commit()
+            self.assertTrue(await _validate_panel_corpus_receipt_if_present(run_id))
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_analyze_run_never_reopens_a_sealed_panel_corpus(self) -> None:
+        run_id, _answer_ids = await self._create_full_panel_corpus()
+        await _seal_or_validate_panel_corpus_receipt(
+            run_id,
+            allow_legacy_baseline=False,
+        )
+        panel = AsyncMock()
+        finish = AsyncMock()
+        failure = AsyncMock()
+        try:
+            with (
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer.apply_ua_conditional_block",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._prepare_analysis_foundation",
+                    new=AsyncMock(
+                        return_value=(
+                            {"score": 100},
+                            {"summary": "ok"},
+                            {"brand_name": "Example"},
+                            {"requested_site": {"domain": "example.com"}},
+                        )
+                    ),
+                ),
+                patch(
+                    "app.services.analyzer._validate_panel_foundation_resume",
+                    new=AsyncMock(),
+                ),
+                patch("app.services.analyzer._run_panel", new=panel),
+                patch(
+                    "app.services.analyzer._save_answer_set_receipt",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._finish_saved_answer_analysis",
+                    new=finish,
+                ),
+                patch("app.services.analyzer.fail_run", new=failure),
+            ):
+                await analyze_run(run_id)
+
+            panel.assert_not_awaited()
+            finish.assert_awaited_once()
+            failure.assert_not_awaited()
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_panel_checkpoint_rejects_unknown_provider_lane(self) -> None:
+        run_id, _items, _prompt_ids, answer_id = await self._create_panel_checkpoint(
+            answer_status="pending"
+        )
+        try:
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(ModelAnswer)
+                    .where(ModelAnswer.id == answer_id)
+                    .values(provider_key="unknown-provider")
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "unknown_provider_mode",
+            ):
+                await _load_panel_resume_checkpoint(run_id)
+        finally:
+            await self._delete_run(run_id)
+
+    async def test_panel_checkpoint_rejects_mixed_models_inside_one_lane(
+        self,
+    ) -> None:
+        run_id, _items, prompt_ids, _answer_id = await self._create_panel_checkpoint(
+            answer_status="pending"
+        )
+        try:
+            async with SessionLocal() as session:
+                session.add(
+                    ModelAnswer(
+                        run_id=run_id,
+                        prompt_id=prompt_ids[1],
+                        provider_key="openai",
+                        model="another/model",
+                        mode="web",
+                        status="pending",
+                    )
+                )
+                await session.commit()
+            with self.assertRaisesRegex(
+                PanelCheckpointMismatchError,
+                "model_lane_mismatch",
+            ):
+                await _load_panel_resume_checkpoint(run_id)
+        finally:
+            await self._delete_run(run_id)
+
     async def test_panel_checkpoint_resumes_75_completed_and_6_failed_rows(
         self,
     ) -> None:
@@ -14958,8 +16378,6 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         try:
-            checkpoint = await _load_panel_resume_checkpoint(run_id)
-            self.assertEqual(len(checkpoint or []), 9)
             with (
                 patch(
                     "app.services.analyzer.panel_models",
@@ -14975,6 +16393,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     new_callable=AsyncMock,
                 ),
             ):
+                checkpoint = await _load_panel_resume_checkpoint(run_id)
+                self.assertEqual(len(checkpoint or []), 9)
                 await _run_panel(
                     run_id,
                     checkpoint or [],
@@ -15071,6 +16491,14 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.services.analyzer._persist_prompts", new=persist),
                 patch("app.services.analyzer._run_panel", new=panel),
                 patch(
+                    "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._save_answer_set_receipt",
+                    new=AsyncMock(),
+                ),
+                patch(
                     "app.services.analyzer._finish_saved_answer_analysis",
                     new=finish,
                 ),
@@ -15131,6 +16559,14 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.services.analyzer._persist_prompts", new=persist),
                 patch("app.services.analyzer._run_panel", new=panel),
                 patch(
+                    "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._save_answer_set_receipt",
+                    new=AsyncMock(),
+                ),
+                patch(
                     "app.services.analyzer._finish_saved_answer_analysis",
                     new=finish,
                 ),
@@ -15146,6 +16582,10 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             finish.assert_not_awaited()
             fail.assert_awaited_once()
             self.assertIn("проверку целостности", fail.await_args.args[1])
+            self.assertEqual(
+                fail.await_args.kwargs,
+                {"failure_stage": "integrity_review_required"},
+            )
 
             async with SessionLocal() as session:
                 saved_prompt = (
@@ -15222,6 +16662,14 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
                     new=save_foundation,
                 ),
                 patch("app.services.analyzer._run_panel", new=panel),
+                patch(
+                    "app.services.analyzer._seal_or_validate_panel_corpus_receipt",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.services.analyzer._save_answer_set_receipt",
+                    new=AsyncMock(),
+                ),
                 patch(
                     "app.services.analyzer._finish_saved_answer_analysis",
                     new=finish,
@@ -15665,6 +17113,66 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 
+    async def test_operator_review_run_cannot_enter_automatic_retry(self) -> None:
+        run_id = f"test-review-retry-{uuid.uuid4()}"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="review.example.com",
+                    status=RunStatus.failed,
+                    stage_key="source_review_required",
+                    stage_label="Нужна проверка источников",
+                    stage_detail="Каталог не подтверждён.",
+                    error_message="Каталог не подтверждён.",
+                    config_json={"pipeline_version": "immutable-test"},
+                    state_revision=7,
+                )
+            )
+            await session.commit()
+
+        async def snapshot() -> tuple[object, ...]:
+            async with SessionLocal() as session:
+                return (
+                    await session.execute(
+                        select(
+                            Run.status,
+                            Run.stage_key,
+                            Run.stage_label,
+                            Run.stage_detail,
+                            Run.error_message,
+                            Run.resume_count,
+                            Run.state_revision,
+                        ).where(Run.id == run_id)
+                    )
+                ).one()
+
+        try:
+            before = await snapshot()
+            with (
+                patch("app.routes.runs.coordinator.wake") as wake,
+                patch("app.routes.runs.bus.reset") as reset_bus,
+                patch(
+                    "app.routes.runs.pending_run_count",
+                    new_callable=AsyncMock,
+                ) as pending_count,
+            ):
+                response = await self.client.post(f"/api/runs/{run_id}/retry")
+            after = await snapshot()
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIn(
+                "нельзя безопасно продолжить автоматически", response.json()["detail"]
+            )
+            self.assertEqual(after, before)
+            wake.assert_not_called()
+            reset_bus.assert_not_called()
+            pending_count.assert_not_awaited()
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
     async def test_public_history_returns_every_run_newest_first(self) -> None:
         first_id = f"test-lookup-a-{uuid.uuid4()}"
         second_id = f"test-lookup-b-{uuid.uuid4()}"
@@ -15713,6 +17221,57 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await session.commit()
 
+    async def test_public_history_uses_stable_bounded_cursor_pages(self) -> None:
+        first_id = f"cursor-a-{uuid.uuid4()}"
+        second_id = f"cursor-b-{uuid.uuid4()}"
+        first_created = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        second_created = first_created + timedelta(seconds=1)
+        async with SessionLocal() as session:
+            session.add_all(
+                [
+                    Run(
+                        id=first_id,
+                        domain="cursor-first.example",
+                        status=RunStatus.completed,
+                        config_json={},
+                        created_at=first_created,
+                        report_json={"large": "x" * 100_000},
+                    ),
+                    Run(
+                        id=second_id,
+                        domain="cursor-second.example",
+                        status=RunStatus.completed,
+                        config_json={},
+                        created_at=second_created,
+                        report_json={"large": "y" * 100_000},
+                    ),
+                ]
+            )
+            await session.commit()
+        try:
+            first_page = await self.client.get("/api/runs", params={"limit": 1})
+            self.assertEqual(first_page.status_code, 200)
+            self.assertEqual([row["id"] for row in first_page.json()], [second_id])
+            cursor = first_page.json()[0]
+            second_page = await self.client.get(
+                "/api/runs",
+                params={
+                    "limit": 1,
+                    "before_created_at": cursor["created_at"],
+                    "before_id": cursor["id"],
+                },
+            )
+            self.assertEqual(second_page.status_code, 200)
+            self.assertEqual([row["id"] for row in second_page.json()], [first_id])
+            self.assertNotIn("report_json", first_page.text)
+            self.assertLess(len(first_page.content), 2_000)
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(Run).where(Run.id.in_([first_id, second_id]))
+                )
+                await session.commit()
+
     async def test_public_detail_hides_internal_pipeline_data(self) -> None:
         run_id = f"test-public-{uuid.uuid4()}"
         async with SessionLocal() as session:
@@ -15744,6 +17303,138 @@ class PublicApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(forbidden, body)
         finally:
             async with SessionLocal() as session:
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_public_illustrations_come_only_from_report_snapshot(self) -> None:
+        run_id = f"test-public-illustrations-{uuid.uuid4()}"
+        share_token = f"share-{uuid.uuid4().hex}"
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        static_dir = Path(temporary_directory.name) / "static"
+        generated_dir = static_dir / "generated"
+        run_dir = generated_dir / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "01.png").write_bytes(b"canonical-image")
+        static_patch = patch(
+            "app.services.publication_contract.STATIC_DIR",
+            static_dir,
+        )
+        generated_patch = patch(
+            "app.services.publication_contract.GENERATED_DIR",
+            generated_dir,
+        )
+        static_patch.start()
+        generated_patch.start()
+        self.addCleanup(static_patch.stop)
+        self.addCleanup(generated_patch.stop)
+        canonical = {
+            "sequence": 1,
+            "title": "Актуальный вывод",
+            "caption": "Подпись из канонического снимка отчёта.",
+            "alt_text": "Актуальное описание иллюстрации.",
+            "file_url": f"/static/generated/{run_id}/01.png",
+        }
+        stale_marker = "УСТАРЕВШАЯ ORM-ПОДПИСЬ"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="illustrations.example.com",
+                    status=RunStatus.completed,
+                    config_json={},
+                    progress_current=100,
+                    progress_total=100,
+                    progress_percent=100,
+                    share_token=share_token,
+                    report_json={"illustrations": [canonical]},
+                )
+            )
+            await session.flush()
+            session.add(
+                ReportIllustration(
+                    run_id=run_id,
+                    sequence=1,
+                    title=stale_marker,
+                    caption="Старые расчёты из ORM.",
+                    alt_text="Старое описание из ORM.",
+                    file_url="/static/generated/stale/01.png",
+                    generation_prompt="old-generation-prompt",
+                    model="test/image-model",
+                )
+            )
+            await session.commit()
+
+        try:
+            detail = await self.client.get(f"/api/runs/{run_id}")
+            shared = await self.client.get(f"/api/shared/{share_token}")
+            history = await self.client.get("/api/runs")
+
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(shared.status_code, 200)
+            self.assertEqual(history.status_code, 200)
+            self.assertEqual(detail.json()["illustrations"], [canonical])
+            self.assertEqual(shared.json()["illustrations"], [canonical])
+            self.assertNotIn(stale_marker, detail.text)
+            self.assertNotIn(stale_marker, shared.text)
+
+            history_row = next(item for item in history.json() if item["id"] == run_id)
+            self.assertNotIn("illustrations", history_row)
+            self.assertNotIn(stale_marker, history.text)
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(ReportIllustration).where(
+                        ReportIllustration.run_id == run_id
+                    )
+                )
+                await session.execute(delete(Run).where(Run.id == run_id))
+                await session.commit()
+
+    async def test_public_detail_never_falls_back_to_orm_illustrations(self) -> None:
+        run_id = f"test-public-empty-illustrations-{uuid.uuid4()}"
+        stale_marker = "УСТАРЕВШИЙ ORM-ALT"
+        async with SessionLocal() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    domain="empty-illustrations.example.com",
+                    status=RunStatus.completed,
+                    config_json={},
+                    progress_current=100,
+                    progress_total=100,
+                    progress_percent=100,
+                    report_json={"illustrations": []},
+                )
+            )
+            await session.flush()
+            session.add(
+                ReportIllustration(
+                    run_id=run_id,
+                    sequence=1,
+                    title="Старый заголовок",
+                    caption="Старая подпись.",
+                    alt_text=stale_marker,
+                    file_url="/static/generated/stale/01.png",
+                    generation_prompt="old-generation-prompt",
+                    model="test/image-model",
+                )
+            )
+            await session.commit()
+
+        try:
+            response = await self.client.get(f"/api/runs/{run_id}")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["illustrations"], [])
+            self.assertNotIn(stale_marker, response.text)
+        finally:
+            async with SessionLocal() as session:
+                await session.execute(
+                    delete(ReportIllustration).where(
+                        ReportIllustration.run_id == run_id
+                    )
+                )
                 await session.execute(delete(Run).where(Run.id == run_id))
                 await session.commit()
 

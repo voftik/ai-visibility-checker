@@ -30,9 +30,9 @@ from app.services.openrouter import (
     web_request_policy,
 )
 
-CRITIC_VERSION = "aiv-analysis-critic-v24"
+CRITIC_VERSION = "aiv-analysis-critic-v26"
 CRITIC_TRANSPORT_CONTRACT_VERSION = "aiv-analysis-critic-transport-v1"
-CRITIC_MAP_REDUCE_VERSION = "aiv-analysis-critic-map-reduce-v4"
+CRITIC_MAP_REDUCE_VERSION = "aiv-analysis-critic-map-reduce-v5"
 CRITIC_CALL_AUDIT_VERSION = "aiv-analysis-critic-call-audit-v1"
 MAX_CRITIC_ITERATIONS = 2
 MAX_CRITIC_RECOVERY_FINAL_REVIEWS = 1
@@ -155,6 +155,7 @@ CRITIC_SCHEMA: dict[str, Any] = {
                             "unsupported_membership",
                             "fabricated_evidence",
                             "annotation_evidence_mismatch",
+                            "target_mention_false_negative",
                             "brand_knowledge_false_negative",
                             "provider_uniformity",
                             "denominator_error",
@@ -199,6 +200,7 @@ CRITIC_SCHEMA: dict[str, Any] = {
                             "require_alias_attribution",
                             "require_literal_attribution_evidence",
                             "require_literal_brand_knowledge_evidence",
+                            "require_literal_target_mention_evidence",
                         ],
                     },
                     "entity_name": {"type": "string"},
@@ -328,6 +330,19 @@ raw-контекста: выбери block.
 числителя корректны. Не требуй синтезировать доказательство и не выбирай
 revise лишь потому, что услуга и владелец встречаются где-то в одном ответе.
 
+Отдельно проверяй ложные отрицания материнского бренда в безбрендовых
+сценариях. Если raw-ответ буквально называет exact target под алиасом из его
+entity_catalog, но annotation.target_mentioned=false, предложи
+require_literal_target_mention_evidence только при одновременном выполнении
+всех условий: alias дословно присутствует в raw, отсутствует в тексте
+сценария, ответ имеет scenario_role=unbranded_discovery, а citation_sources
+содержит URL официального client_domain исследуемого сайта. Это действие
+создаёт code-owned receipt только для перечисленных answer_id и не добавляет
+alias в глобальный список target_aliases. Оно подтверждает факт упоминания,
+но не назначает вручную recommendation, top-3, sentiment или готовую метрику:
+семантическую роль заново определяет разметчик, а затем проверяет финальный
+critic. Если хотя бы одного условия нет, выбери block, а не расширяй identity.
+
 Отдельно проверь branded-сценарии. Если raw-ответ действительно сообщает
 конкретные факты о целевом бренде, а brand_answer ошибочно помечен generic,
 none или not_applicable, предложи require_literal_brand_knowledge_evidence
@@ -343,11 +358,14 @@ attributed_to_target=true, но буквальная проверка evidence �
 evidence, либо ложное отрицание из-за слишком короткого или неточного
 фрагмента. Не ставь pass, пока важное расхождение не объяснено и не устранено.
 
-Ты можешь только УЖЕСТОЧАТЬ текущую исследовательскую политику:
+Ты можешь УЖЕСТОЧАТЬ текущую исследовательскую политику:
 исключить неподтверждённую portfolio-сущность, потребовать явную атрибуцию
 для сущности или отдельного alias либо потребовать полный буквальный фрагмент
 атрибуции при повторной разметке. Для branded-сценария можно потребовать
-повторную буквальную проверку конкретных фактов о бренде. Не предлагай менять
+повторную буквальную проверку конкретных фактов о бренде. Единственное
+разрешённое исправление ложного отрицания identity — строго scoped
+require_literal_target_mention_evidence с официальной citation по правилам
+выше. Не предлагай менять
 raw-ответы, знаменатели, числители или готовые цифры вручную. Не расширяй
 portfolio scope. Каждая правка должна ссылаться на конкретные answer_id; при
 отсутствии достаточных данных выбери block.
@@ -404,6 +422,11 @@ CRITIC_REPAIR_SYSTEM = """
   непустую annotation_guidance;
 - не расширяй scope и не добавляй сущности. Не меняй raw-ответы, числители,
   знаменатели или готовые цифры вручную;
+- require_literal_target_mention_evidence разрешён только для exact target в
+  unbranded_discovery: alias должен быть дословно в raw, отсутствовать в
+  scenario и подтверждаться citation_sources с официальным client_domain.
+  Это per-answer receipt, а не глобальное добавление alias; без всех условий
+  выбери block;
 - attributed_to_target=false у подтверждённого сайтом standalone-продукта
   допустим без имени материнского бренда в raw и не отменяет портфельное
   попадание. require_target_attribution — сужение против ложноположительных
@@ -3588,6 +3611,16 @@ def _json_pointer_part(value: Any) -> str:
     return str(value).replace("~", "~0").replace("/", "~1")
 
 
+def _json_pointer_unescape(value: str) -> str:
+    """Decode one JSON Pointer component without normalising its identity."""
+
+    return value.replace("~1", "/").replace("~0", "~")
+
+
+def _context_entity_key(value: Any) -> str:
+    return str(value or "").casefold().replace("ё", "е").strip()
+
+
 def _shared_context_fact_priority(path: str) -> tuple[int, int, str]:
     """Put identity/scope rules before bulky narrative and metric evidence."""
 
@@ -4231,6 +4264,7 @@ def _context_fact_units_relevant_to_base(
     assigned = set(assigned_answer_ids)
 
     entity_groups: dict[int, list[int]] = {}
+    entity_attribution_groups: dict[str, list[int]] = {}
     scoped_groups: dict[tuple[str, int], list[int]] = {}
     for fact_index, fact in enumerate(facts):
         path = str(fact.get("path") or "") if isinstance(fact, dict) else ""
@@ -4239,6 +4273,16 @@ def _context_fact_units_relevant_to_base(
         )
         if entity_match:
             entity_groups.setdefault(int(entity_match.group(1)), []).append(
+                fact_index
+            )
+        attribution_match = re.match(
+            r"^/entity_attribution_aliases/([^/]+)(?:/|$)", path
+        )
+        if attribution_match:
+            canonical_key = _context_entity_key(
+                _json_pointer_unescape(attribution_match.group(1))
+            )
+            entity_attribution_groups.setdefault(canonical_key, []).append(
                 fact_index
             )
         scoped_match = re.match(
@@ -4290,6 +4334,24 @@ def _context_fact_units_relevant_to_base(
         if any(value in base_text for value in literal_values):
             for fact_index in group_indices:
                 select(fact_index, "literal_entity_binding")
+            # Owner attribution is scoped per exact catalog entity.  The
+            # global upstream-owner list is useful context, but it must never
+            # stand in for this canonical-specific allowlist.  Attach the
+            # whole exact group (including an explicit empty-list fact) to the
+            # same raw answer whenever its catalog entity is selected.
+            canonical_values = [
+                _context_entity_key(facts[index].get("value"))
+                for index in group_indices
+                if str(facts[index].get("path") or "").endswith(
+                    "/canonical_name"
+                )
+                and isinstance(facts[index].get("value"), str)
+            ]
+            for canonical_key in canonical_values:
+                for fact_index in entity_attribution_groups.get(
+                    canonical_key, []
+                ):
+                    select(fact_index, "entity_attribution_binding")
 
     for group_indices in scoped_groups.values():
         scoped_answer_ids = {

@@ -1,4 +1,5 @@
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -9,12 +10,12 @@ class FrontendStaticTests(unittest.TestCase):
         cls.html = Path("static/index.html").read_text(encoding="utf-8")
         cls.pages = Path("app/routes/pages.py").read_text(encoding="utf-8")
         cls.analyzer = Path("app/services/analyzer.py").read_text(encoding="utf-8")
-        cls.analysis_critic = Path(
-            "app/services/analysis_critic.py"
-        ).read_text(encoding="utf-8")
-        cls.deepseek_icon = Path(
-            "static/brand/providers/deepseek.svg"
-        ).read_text(encoding="utf-8")
+        cls.analysis_critic = Path("app/services/analysis_critic.py").read_text(
+            encoding="utf-8"
+        )
+        cls.deepseek_icon = Path("static/brand/providers/deepseek.svg").read_text(
+            encoding="utf-8"
+        )
 
     def test_homepage_has_one_domain_input_and_no_analysis_controls(self) -> None:
         self.assertIn('id="domain-input"', self.html)
@@ -24,8 +25,8 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertNotIn('name="concurrency"', self.html)
         self.assertNotIn("Выберите домены", self.html)
         self.assertNotIn("rwplus-aiv-run-ids", self.html)
-        self.assertNotIn('fetchJSON("/api/runs/lookup"', self.html)
-        self.assertIn('fetchJSON("/api/runs")', self.html)
+        self.assertIn('fetchJSON("/api/runs/lookup"', self.html)
+        self.assertIn("fetchJSON(`/api/runs?${params.toString()}`)", self.html)
 
     def test_progress_has_six_named_public_stages(self) -> None:
         for label in (
@@ -58,18 +59,37 @@ class FrontendStaticTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.html)
         progress_renderer = self.html[
-            self.html.index("const renderProgress = () =>")
-            : self.html.index("const metricHTML =")
+            self.html.index("const renderProgress = () =>") : self.html.index(
+                "const metricHTML ="
+            )
         ]
         self.assertIn("const currentIndex = stages.findIndex(", progress_renderer)
         self.assertIn("const hasActiveStage = (", progress_renderer)
         self.assertNotIn("const currentIndex = Math.max(", progress_renderer)
         self.assertNotIn("исполнительный слот", self.html)
 
+    def test_terminal_review_state_is_not_presented_as_retryable(self) -> None:
+        for marker in (
+            "const operatorReviewStages = new Set([",
+            '"source_review_required"',
+            '"integrity_review_required"',
+            '"panel_review_required"',
+            "const runNeedsOperatorReview =",
+            "Автоматическое продолжение отключено",
+            'if (runNeedsOperatorReview(run)) return "Подробнее";',
+            "const needsReview = runNeedsOperatorReview(run);",
+            '${needsReview ? "" : `',
+        ):
+            self.assertIn(marker, self.html)
+        self.assertIn("Нужна проверка источников", self.html)
+        self.assertIn("Нужна проверка данных", self.html)
+        self.assertIn("Нужна проверка ответов", self.html)
+
     def test_progress_never_invents_an_eta(self) -> None:
         eta_formatter = self.html[
-            self.html.index("const formatEta =")
-            : self.html.index("const runLifecycleState =")
+            self.html.index("const formatEta =") : self.html.index(
+                "const runLifecycleState ="
+            )
         ]
         self.assertIn("const value = finiteNumber(seconds);", eta_formatter)
         self.assertIn(
@@ -96,8 +116,9 @@ class FrontendStaticTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.html)
         watch_block = self.html[
-            self.html.index("const watchRun =")
-            : self.html.index("const refreshHistory =")
+            self.html.index("const watchRun =") : self.html.index(
+                "const refreshHistory ="
+            )
         ]
         self.assertGreaterEqual(
             watch_block.count(
@@ -106,22 +127,23 @@ class FrontendStaticTests(unittest.TestCase):
             2,
         )
         refresh_block = self.html[
-            self.html.index("const refreshRun =")
-            : self.html.index("const watchRun =")
+            self.html.index("const refreshRun =") : self.html.index("const watchRun =")
         ]
         self.assertIn("updateRunView(run);", refresh_block)
 
     def test_rw_plus_visual_tokens_are_present(self) -> None:
         self.assertIn("--canvas: #cdd5de", self.html.lower())
         self.assertIn("--accent: #ff324b", self.html.lower())
-        self.assertIn('--ink: #101011', self.html.lower())
-        self.assertIn('family=Manrope', self.html)
+        self.assertIn("--ink: #101011", self.html.lower())
+        self.assertIn("family=Manrope", self.html)
         self.assertIn("/static/brand/logo-rw-plus.svg", self.html)
         self.assertIn('class="brand-logo"', self.html)
         self.assertIn('alt="RW+"', self.html)
         self.assertNotIn('class="brand-name"', self.html)
 
-    def test_homepage_rotates_the_subject_with_gsap_and_keeps_the_question(self) -> None:
+    def test_homepage_rotates_the_subject_with_gsap_and_keeps_the_question(
+        self,
+    ) -> None:
         self.assertIn("gsap@3.15.0/dist/gsap.min.js", self.html)
         self.assertIn('data-words="бренд,сайт,продукт"', self.html)
         self.assertIn('class="rotating-word-current">бренд</span>', self.html)
@@ -180,11 +202,11 @@ class FrontendStaticTests(unittest.TestCase):
             "Упоминание не означает рекомендацию, высокую позицию или долю рынка.",
             "диаграммы не обязаны складываться в 100%.",
             "Доля валидных ответов",
-            "triggerOn: \"mousemove|click\"",
+            'triggerOn: "mousemove|click"',
         ):
             self.assertIn(marker, self.html)
         self.assertNotIn(
-            "<h3 class=\"chart-title\">Целевой бренд, продукты группы и альтернативы</h3>",
+            '<h3 class="chart-title">Целевой бренд, продукты группы и альтернативы</h3>',
             self.html,
         )
 
@@ -209,12 +231,14 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("visualMap: {", self.html)
         self.assertIn("show: false", self.html)
 
-    def test_observational_memory_is_visible_but_never_presented_as_attested(self) -> None:
+    def test_observational_memory_is_visible_but_never_presented_as_attested(
+        self,
+    ) -> None:
         for marker in (
             "const observationalMemoryLimitation =",
             "const isObservationalMemoryMetric =",
             "const memorySlicePresentation =",
-            'metric.strict_no_web_verified === true',
+            "metric.strict_no_web_verified === true",
             '"legacy_observational", "mixed"',
             '=== "legacy_memory_request_not_enforced"',
             '? "is-observational"',
@@ -248,7 +272,7 @@ class FrontendStaticTests(unittest.TestCase):
             'alt=""',
             'aria-hidden="true"',
             ".provider-comparison-table thead",
-            'content: attr(data-label)',
+            "content: attr(data-label)",
         ):
             self.assertIn(marker, self.html)
         for obsolete in (
@@ -348,6 +372,7 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertNotIn("calculatedLift", self.html)
 
     def test_report_avoids_obvious_interface_meta_narration(self) -> None:
+        self.assertNotIn("\u2014", self.html)
         for redundant_copy in (
             "Три независимых среза",
             "Доля ответов и фактический числитель",
@@ -396,6 +421,8 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("technicalAccessMatrixHTML(technical)", self.html)
         self.assertIn("technicalPagesHTML(technical.pages)", self.html)
         self.assertIn("technicalFindingsHTML(technical)", self.html)
+        self.assertIn("const reviewedFindings =", self.html)
+        self.assertIn("const candidates = reviewedFindings.length", self.html)
         self.assertIn('class="data-table audit-matrix-table"', self.html)
         self.assertIn('class="data-table page-audit-table"', self.html)
         self.assertIn('class="data-table audit-actions-table"', self.html)
@@ -410,7 +437,9 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertGreaterEqual(self.html.count('"Не проверяем"'), 3)
         self.assertIn('"Не оценивается"', self.html)
 
-    def test_page_audit_table_has_readable_columns_and_accessible_tooltips(self) -> None:
+    def test_page_audit_table_has_readable_columns_and_accessible_tooltips(
+        self,
+    ) -> None:
         for marker in (
             "min-width: 900px",
             ".page-audit-table col:nth-child(7)",
@@ -431,7 +460,8 @@ class FrontendStaticTests(unittest.TestCase):
             "renderingTooltipCopy",
             "accessTooltipCopy",
             "checksTooltipCopy",
-            "schemaTooltipCopy",
+            "schemaStateForPage",
+            "schemaStatePresentation",
             "scoreInclusionTooltipCopy",
             'data-label="Schema.org"',
             '"Schema.org"',
@@ -440,12 +470,140 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("<colgroup>", self.html)
         self.assertNotIn("Schema.or<br", self.html)
 
+    def test_schema_state_matrix_fails_closed_for_incomplete_pages(self) -> None:
+        def declaration_for(name: str) -> str:
+            marker = f"      const {name} ="
+            start = self.html.find(marker)
+            self.assertNotEqual(start, -1)
+            end = self.html.find("\n\n      const ", start + len(marker))
+            self.assertNotEqual(end, -1)
+            return self.html[start:end].strip()
+
+        script = "\n".join(
+            (
+                '"use strict";',
+                'const assert = require("node:assert/strict");',
+                declaration_for("schemaStateForPage"),
+                declaration_for("schemaStatePresentation"),
+                r"""
+const state = (page) => schemaStateForPage(page);
+assert.equal(
+  state({is_utility: true, structured_data_types: ["WebPage"]}),
+  "excluded"
+);
+assert.equal(state({schema_evaluation_excluded: true}), "excluded");
+assert.equal(state({is_excluded: true}), "excluded");
+assert.equal(
+  state({
+    structured_data_types: ["Organization"],
+    body_truncated: true,
+    structured_data_complete: false
+  }),
+  "found"
+);
+assert.equal(
+  state({
+    structured_data_types: [],
+    body_truncated: false,
+    structured_data_complete: true
+  }),
+  "absent"
+);
+assert.equal(
+  state({
+    structured_data_types: [],
+    body_truncated: true,
+    structured_data_complete: true
+  }),
+  "unknown"
+);
+assert.equal(
+  state({
+    structured_data_types: [],
+    body_truncated: false,
+    structured_data_complete: false
+  }),
+  "unknown"
+);
+assert.equal(state({structured_data_types: []}), "unknown");
+assert.equal(
+  state({body_truncated: false, structured_data_complete: true}),
+  "absent"
+);
+
+const found = schemaStatePresentation({
+  structured_data_types: ["Organization"],
+  body_truncated: false,
+  structured_data_complete: true
+});
+assert.equal(found.label, "Найдена");
+assert.match(found.copy, /Organization/);
+
+const absent = schemaStatePresentation({
+  structured_data_types: [],
+  body_truncated: false,
+  structured_data_complete: true
+});
+assert.equal(absent.label, "Не найдена");
+assert.match(absent.copy, /проверены полностью/);
+
+const truncated = schemaStatePresentation({
+  structured_data_types: [],
+  body_truncated: true,
+  structured_data_complete: false
+});
+assert.equal(truncated.label, "Данных недостаточно");
+assert.match(truncated.copy, /Получен только фрагмент HTML/);
+assert.match(truncated.copy, /отсутствие Schema\.org подтвердить нельзя/);
+
+const unknown = schemaStatePresentation({structured_data_types: []});
+assert.equal(unknown.label, "Данных недостаточно");
+assert.match(unknown.copy, /Полнота HTML.+не подтверждена/);
+
+const excluded = schemaStatePresentation({is_utility: true});
+assert.equal(excluded.label, "Не проверяем");
+assert.match(excluded.copy, /Служебные страницы/);
+""",
+            )
+        )
+        completed = subprocess.run(
+            ["node", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"Schema state runtime matrix failed:\n{completed.stderr}",
+        )
+
+    def test_schema_cell_explains_found_absent_unknown_and_excluded_states(
+        self,
+    ) -> None:
+        for marker in (
+            'return "excluded";',
+            'return "found";',
+            'return "absent";',
+            'return "unknown";',
+            'label: "Найдена"',
+            'label: "Не найдена"',
+            'label: "Данных недостаточно"',
+            'label: "Не проверяем"',
+            "schemaPresentation.copy",
+            "schemaPresentation.schemaTypes.join",
+            "поэтому отсутствие Schema.org подтвердить нельзя",
+        ):
+            self.assertIn(marker, self.html)
+
     def test_completed_report_does_not_render_unexplained_missing_metrics(self) -> None:
         self.assertIn('let formatted = "Нет данных";', self.html)
         self.assertIn('metric.state = "unavailable"', self.html)
         self.assertIn("completedRequiredMissing", self.html)
-        self.assertIn("Завершённый отчёт пришёл без обязательной части данных.", self.html)
-        self.assertIn('data-hard-refresh', self.html)
+        self.assertIn(
+            "Завершённый отчёт пришёл без обязательной части данных.", self.html
+        )
+        self.assertIn("data-hard-refresh", self.html)
         self.assertIn('cache: options.cache || "no-store"', self.html)
         self.assertIn('const uiBuildId = "2026-07-31.29"', self.html)
         self.assertIn('"2026-07-v3"', self.html)
@@ -477,7 +635,7 @@ class FrontendStaticTests(unittest.TestCase):
             'label: "Доступ закрыт"',
             'label: "Не подтверждён"',
             'label: "Не проверен"',
-            "Лампа горит — доступ открыт",
+            "Лампа горит: доступ открыт",
             'modifier: "family-status-tooltip"',
             "Как проверен доступ для ${row.name}",
             "Индикатор показывает",
@@ -540,8 +698,9 @@ class FrontendStaticTests(unittest.TestCase):
             self.assertIn(marker, self.html)
         self.assertEqual(self.html.count("technicalTableDisclosureHTML({"), 4)
         disclosure_helper = self.html[
-            self.html.index("const technicalTableDisclosureHTML =")
-            : self.html.index("const illustrationHTML =")
+            self.html.index("const technicalTableDisclosureHTML =") : self.html.index(
+                "const illustrationHTML ="
+            )
         ]
         self.assertNotIn("chart-technical-families", disclosure_helper)
         self.assertNotIn(" open", disclosure_helper)
@@ -559,14 +718,15 @@ class FrontendStaticTests(unittest.TestCase):
 
     def test_history_is_a_separate_responsive_routed_screen(self) -> None:
         home_renderer = self.html[
-            self.html.index("const renderHome = () =>")
-            : self.html.index("const renderHistory = () =>")
+            self.html.index("const renderHome = () =>") : self.html.index(
+                "const renderHistory = () =>"
+            )
         ]
         self.assertNotIn('id="history"', home_renderer)
         for marker in (
-            'data-history-link',
-            'const renderHistory = () =>',
-            'document.title = "История проверок — RW+"',
+            "data-history-link",
+            "const renderHistory = () =>",
+            'document.title = "История проверок · RW+"',
             'class="history-table"',
             '<th scope="col">Сайт</th>',
             '<th scope="col">Запущена</th>',
@@ -579,8 +739,11 @@ class FrontendStaticTests(unittest.TestCase):
             'window.location.hash === "#history"',
             'window.addEventListener("popstate", scheduleLocationRoute)',
             'window.addEventListener("hashchange", scheduleLocationRoute)',
-            'const runs = await loadPublicRuns()',
-            'const payload = await fetchJSON("/api/runs")',
+            "const HISTORY_PAGE_SIZE = 100",
+            "before_created_at",
+            "data-load-more-history",
+            "Показать более ранние проверки",
+            'fetchJSON("/api/runs/lookup"',
             "Здесь собраны все проверки сервиса.",
         ):
             self.assertIn(marker, self.html)
@@ -610,13 +773,16 @@ class FrontendStaticTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.html)
         loader = self.html[
-            self.html.index("const loadPublicRuns =")
-            : self.html.index("const runStatusLabel =")
+            self.html.index("const loadPublicRuns =") : self.html.index(
+                "const runStatusLabel ="
+            )
         ]
         self.assertNotIn("catch", loader)
         self.assertNotIn("return []", loader)
 
-    def test_full_opus_analysis_is_preserved_but_not_duplicated_in_main_flow(self) -> None:
+    def test_full_opus_analysis_is_preserved_but_not_duplicated_in_main_flow(
+        self,
+    ) -> None:
         for marker in (
             "sanitizeMarkdownFragment",
             "analysisDocumentSections",
@@ -624,8 +790,6 @@ class FrontendStaticTests(unittest.TestCase):
             "analysisDisclosureHTML",
             "appendAnalysisBody",
             "analysisIllustrationSVG",
-            "localizeAnalysisEvidence",
-            "localizeAnalysisText",
             'className = "analysis-card-grid"',
             'className = "analysis-card-visual"',
             'title.textContent = "Выводы и доказательства"',
@@ -641,8 +805,9 @@ class FrontendStaticTests(unittest.TestCase):
             "if (sections.length === 1 && index === 0) details.open = true",
             self.html,
         )
-        self.assertIn('"текст в серверном HTML"', self.html)
-        self.assertIn('"ответы с расхождениями в фактах"', self.html)
+        self.assertNotIn("localizeAnalysisEvidence", self.html)
+        self.assertNotIn("localizeAnalysisText", self.html)
+        self.assertIn("deck.textContent = lead", self.html)
         self.assertNotIn("final-v6", self.analyzer)
         self.assertIn("final-v28", self.analyzer)
 
@@ -679,8 +844,9 @@ class FrontendStaticTests(unittest.TestCase):
 
     def test_intent_labels_follow_the_canonical_methodology(self) -> None:
         intent_block = self.html[
-            self.html.index("const canonicalIntentNames =")
-            : self.html.index("const state =")
+            self.html.index("const canonicalIntentNames =") : self.html.index(
+                "const state ="
+            )
         ]
         for marker in (
             'E: "Сравнение"',
@@ -724,8 +890,9 @@ class FrontendStaticTests(unittest.TestCase):
             self.assertIn(declaration, segment_rule.group(1))
 
         modifier_rules = self.html[
-            self.html.index(".headline-segment--accent,"):
-            self.html.index(".report-verdict")
+            self.html.index(".headline-segment--accent,") : self.html.index(
+                ".report-verdict"
+            )
         ]
         self.assertNotRegex(modifier_rules, r"font-(?:size|weight)\s*:")
         self.assertNotRegex(modifier_rules, r"letter-spacing\s*:")
@@ -748,7 +915,7 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("content: attr(data-label)", self.html)
         self.assertIn("@media (max-width: 460px)", self.html)
         self.assertIn("grid-template-columns: minmax(0, 1fr);", self.html)
-        self.assertIn(".data-table tbody th[scope=\"row\"]", self.html)
+        self.assertIn('.data-table tbody th[scope="row"]', self.html)
         self.assertIn(".data-table.audit-matrix-table tbody td", self.html)
         self.assertIn("max-width: 100%;", self.html)
         self.assertIn("overflow-wrap: break-word;", self.html)
@@ -767,16 +934,21 @@ class FrontendStaticTests(unittest.TestCase):
 
     def test_competitor_axis_is_compact_and_readable_on_mobile(self) -> None:
         layout_block = self.html[
-            self.html.index("const competitorChartLayout =")
-            : self.html.index("const competitorChartExplainerHTML =")
+            self.html.index("const competitorChartLayout =") : self.html.index(
+                "const competitorChartExplainerHTML ="
+            )
         ]
         chart_block = self.html[
-            self.html.index('const competitorChart = mountReportChart("chart-competitors"')
-            : self.html.index("const intents = orderedIntentRows")
+            self.html.index(
+                'const competitorChart = mountReportChart("chart-competitors"'
+            ) : self.html.index("const intents = orderedIntentRows")
         ]
         chart_setup = self.html[
-            self.html.index("const initReportCharts = (viewModel) =>")
-            : self.html.index('const competitorChart = mountReportChart("chart-competitors"')
+            self.html.index(
+                "const initReportCharts = (viewModel) =>"
+            ) : self.html.index(
+                'const competitorChart = mountReportChart("chart-competitors"'
+            )
         ]
         for marker in (
             'const competitorChartMedia = window.matchMedia(\n            "(max-width: 700px)"',
@@ -812,8 +984,7 @@ class FrontendStaticTests(unittest.TestCase):
             compact = viewport_width <= 700
             height = max(
                 280 if compact else 320,
-                max(1, row_count) * (40 if compact else 36)
-                + (68 if compact else 78),
+                max(1, row_count) * (40 if compact else 36) + (68 if compact else 78),
             )
             return compact, height
 
@@ -828,16 +999,13 @@ class FrontendStaticTests(unittest.TestCase):
             (701, 30): (False, 1158),
         }
         self.assertEqual(
-            {
-                case: expected_layout(*case)
-                for case in expected_cases
-            },
+            {case: expected_layout(*case) for case in expected_cases},
             expected_cases,
         )
         self.assertIn("const reportChartDisposers = [];", self.html)
         self.assertIn("while (reportChartDisposers.length)", self.html)
         self.assertIn(
-            "<strong>${escapeHTML(row.name || \"Без названия\")}</strong>",
+            '<strong>${escapeHTML(row.name || "Без названия")}</strong>',
             self.html,
         )
         self.assertIn("competitorChartDataTableHTML(competitorRows)", self.html)
@@ -876,7 +1044,7 @@ class FrontendStaticTests(unittest.TestCase):
         self.assertIn("@media (prefers-reduced-motion: reduce)", self.html)
         self.assertIn('aria-live="polite"', self.html)
         self.assertIn("sanitizeMarkdown", self.html)
-        self.assertIn('const allowed = new Set([', self.html)
+        self.assertIn("const allowed = new Set([", self.html)
         self.assertIn('["http:", "https:"]', self.html)
         self.assertIn('aria-label="Поделиться отчётом"', self.html)
         self.assertIn('aria-label="Начать новую проверку"', self.html)

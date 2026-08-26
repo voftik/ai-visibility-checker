@@ -46,8 +46,7 @@ ACTIVE_STATUSES = (
 
 def _saved_answers_only_marker_present(config_json: object) -> bool:
     return bool(
-        isinstance(config_json, dict)
-        and SAVED_ANSWERS_ONLY_MARKER_KEY in config_json
+        isinstance(config_json, dict) and SAVED_ANSWERS_ONLY_MARKER_KEY in config_json
     )
 
 
@@ -90,9 +89,9 @@ def _terminal_cleanup_due(value: datetime | None, now: datetime) -> bool:
     comparable = value
     if comparable.tzinfo is None and now.tzinfo is not None:
         comparable = comparable.replace(tzinfo=timezone.utc)
-    return comparable + timedelta(
-        seconds=SAVED_ONLY_TERMINAL_CLEANUP_GRACE_SECONDS
-    ) <= now
+    return (
+        comparable + timedelta(seconds=SAVED_ONLY_TERMINAL_CLEANUP_GRACE_SECONDS) <= now
+    )
 
 
 def _saved_only_terminal_restore_values(
@@ -100,11 +99,12 @@ def _saved_only_terminal_restore_values(
     *,
     now: datetime,
 ) -> tuple[dict[str, Any], RunStatus] | None:
-    """Validate a durable operator marker and restore its terminal state.
+    """Validate a durable operator marker and settle its terminal state.
 
-    The published report fields are deliberately absent from the returned
-    values. Recovery only releases the abandoned operator lease and restores
-    queue/progress metadata; it never rewrites ``report_json`` or raw answers.
+    A completed state is committed atomically with the new publication and is
+    therefore a successful promotion even if the CLI dies before removing its
+    marker.  Failed attempts restore the previous terminal metadata.  Public
+    report fields and raw answers are never rewritten here.
     """
 
     config_json = run.config_json if isinstance(run.config_json, dict) else {}
@@ -136,20 +136,31 @@ def _saved_only_terminal_restore_values(
         finished_at = _marker_datetime(previous.get("finished_at"))
     except (KeyError, TypeError, ValueError):
         return None
+    promoted = run.status == RunStatus.completed
     return (
         {
-            "status": previous_status,
+            "status": RunStatus.completed if promoted else previous_status,
             "config_json": previous_config,
-            "progress_current": progress_current,
-            "progress_total": progress_total,
-            "progress_percent": progress_percent,
-            "stage_key": previous.get("stage_key"),
-            "stage_label": previous.get("stage_label"),
-            "stage_detail": previous.get("stage_detail"),
-            "eta_seconds": previous.get("eta_seconds"),
-            "error_message": previous.get("error_message"),
-            "checkpointed_at": checkpointed_at,
-            "finished_at": finished_at,
+            "progress_current": (
+                run.progress_current if promoted else progress_current
+            ),
+            "progress_total": run.progress_total if promoted else progress_total,
+            "progress_percent": (
+                run.progress_percent if promoted else progress_percent
+            ),
+            "stage_key": run.stage_key if promoted else previous.get("stage_key"),
+            "stage_label": (
+                run.stage_label if promoted else previous.get("stage_label")
+            ),
+            "stage_detail": (
+                run.stage_detail if promoted else previous.get("stage_detail")
+            ),
+            "eta_seconds": run.eta_seconds if promoted else previous.get("eta_seconds"),
+            "error_message": (
+                run.error_message if promoted else previous.get("error_message")
+            ),
+            "checkpointed_at": run.checkpointed_at if promoted else checkpointed_at,
+            "finished_at": run.finished_at if promoted else finished_at,
             "execution_slot": None,
             "lease_owner": None,
             "lease_expires_at": None,
@@ -197,10 +208,7 @@ async def queue_positions(
             .order_by(Run.created_at.asc(), Run.id.asc())
         )
     ).scalars()
-    return {
-        run_id: position
-        for position, run_id in enumerate(ids, start=1)
-    }
+    return {run_id: position for position, run_id in enumerate(ids, start=1)}
 
 
 async def pending_run_count(session: AsyncSession) -> int:
@@ -231,9 +239,7 @@ async def recover_expired_leases(
             (
                 await session.execute(
                     select(Run).where(
-                        Run.status.in_(
-                            (RunStatus.completed, RunStatus.failed)
-                        ),
+                        Run.status.in_((RunStatus.completed, RunStatus.failed)),
                         Run.execution_slot.is_(None),
                         _saved_answers_only_marker_clause(),
                     )
@@ -243,17 +249,11 @@ async def recover_expired_leases(
             .all()
         )
         active_rows = list(
-            (
-                await session.execute(
-                    select(Run).where(Run.status.in_(ACTIVE_STATUSES))
-                )
-            )
+            (await session.execute(select(Run).where(Run.status.in_(ACTIVE_STATUSES))))
             .scalars()
             .all()
         )
-        saved_only_recovered: list[
-            tuple[str, RunStatus, int, int]
-        ] = []
+        saved_only_recovered: list[tuple[str, RunStatus, int, int]] = []
         generic_expired_ids: list[str] = []
         for run in terminal_rows:
             if not _terminal_cleanup_due(
@@ -278,9 +278,7 @@ async def recover_expired_leases(
                     "lease_owner": None,
                     "lease_expires_at": None,
                     "heartbeat_at": None,
-                    "state_revision": (
-                        func.coalesce(Run.state_revision, 0) + 1
-                    ),
+                    "state_revision": (func.coalesce(Run.state_revision, 0) + 1),
                     "state_changed_at": current_time,
                 }
                 restored_status = RunStatus.completed
@@ -340,9 +338,7 @@ async def recover_expired_leases(
                         ),
                         "finished_at": current_time,
                         "checkpointed_at": current_time,
-                        "state_revision": (
-                            func.coalesce(Run.state_revision, 0) + 1
-                        ),
+                        "state_revision": (func.coalesce(Run.state_revision, 0) + 1),
                         "state_changed_at": current_time,
                     }
                 else:
@@ -353,8 +349,21 @@ async def recover_expired_leases(
                         Run.id == run.id,
                         Run.status == run.status,
                         Run.state_revision == run.state_revision,
+                        Run.execution_slot == run.execution_slot,
+                        Run.lease_owner == run.lease_owner,
+                        Run.attempt_count == run.attempt_count,
+                        Run.resume_count == run.resume_count,
+                        _saved_answers_only_marker_clause(),
+                        or_(
+                            Run.status == RunStatus.pending,
+                            Run.execution_slot.is_(None),
+                            Run.lease_owner.is_(None),
+                            Run.lease_expires_at.is_(None),
+                            Run.lease_expires_at <= current_time,
+                        ),
                     )
                     .values(**values)
+                    .execution_options(synchronize_session=False)
                     .returning(Run.state_revision, Run.resume_count)
                 )
                 changed_row = changed.one_or_none()
@@ -369,7 +378,7 @@ async def recover_expired_leases(
                         )
                     )
                 continue
-            if (
+            if (run.status != RunStatus.pending and run.execution_slot is None) or (
                 run.execution_slot is not None
                 and (
                     run.lease_owner is None
@@ -385,10 +394,10 @@ async def recover_expired_leases(
             update(Run)
             .where(
                 Run.id.in_(generic_expired_ids),
-                Run.execution_slot.is_not(None),
                 Run.status.in_(ACTIVE_STATUSES),
                 _generic_queue_eligible_clause(),
                 or_(
+                    Run.execution_slot.is_(None),
                     Run.lease_owner.is_(None),
                     Run.lease_expires_at.is_(None),
                     Run.lease_expires_at <= current_time,
@@ -402,9 +411,7 @@ async def recover_expired_leases(
                 heartbeat_at=None,
                 stage_key="recovering",
                 stage_label="Восстанавливаем проверку",
-                stage_detail=(
-                    "Возобновляем проверку с уже сохранённых данных."
-                ),
+                stage_detail=("Возобновляем проверку с уже сохранённых данных."),
                 eta_seconds=None,
                 error_message=None,
                 resume_count=func.coalesce(Run.resume_count, 0) + 1,
@@ -562,14 +569,8 @@ async def _terminal_transition_belongs_to_claim(claim: RunClaim) -> bool:
     if current is None:
         return False
     generation_matches = bool(
-        (
-            claim.attempt_count is None
-            or current.attempt_count == claim.attempt_count
-        )
-        and (
-            claim.resume_count is None
-            or current.resume_count == claim.resume_count
-        )
+        (claim.attempt_count is None or current.attempt_count == claim.attempt_count)
+        and (claim.resume_count is None or current.resume_count == claim.resume_count)
     )
     return bool(
         generation_matches
@@ -641,10 +642,7 @@ class RunCoordinator:
         lease_seconds: int | None = None,
         poll_seconds: float | None = None,
     ) -> None:
-        identity = (
-            f"{socket.gethostname()}:{os.getpid()}:"
-            f"{uuid.uuid4().hex[:10]}"
-        )
+        identity = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:10]}"
         self.instance_id = identity[:72]
         self.lease_seconds = max(
             15,
@@ -801,10 +799,7 @@ class RunCoordinator:
             detail = (
                 "Сервис перезапускается. Проверка продолжится автоматически."
                 if self._stopping
-                else (
-                    "Проверка продолжится автоматически с уже сохранённых "
-                    "данных."
-                )
+                else ("Проверка продолжится автоматически с уже сохранённых данных.")
             )
             released = await _release_claim(
                 claim,
@@ -813,9 +808,7 @@ class RunCoordinator:
                     "service_restart"
                     if self._stopping
                     else (
-                        "lease_interrupted"
-                        if interrupted
-                        else "worker_returned_active"
+                        "lease_interrupted" if interrupted else "worker_returned_active"
                     )
                 ),
             )
@@ -839,9 +832,7 @@ class RunCoordinator:
     async def _run(self) -> None:
         while not self._stopping:
             await recover_expired_leases()
-            claim_owner = (
-                f"{self.instance_id}:{uuid.uuid4().hex[:12]}"
-            )[:96]
+            claim_owner = (f"{self.instance_id}:{uuid.uuid4().hex[:12]}")[:96]
             claim = await _claim_next_run(
                 claim_owner,
                 lease_seconds=self.lease_seconds,

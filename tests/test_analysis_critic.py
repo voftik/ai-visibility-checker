@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -69,17 +70,23 @@ from app.services.analyzer import (
     _critic_payload,
     _critic_provenance_digests,
     _critic_review_errors,
+    _critic_review_validation_errors,
     _critic_analysis_state_digest,
+    _compute_metrics,
     _current_annotation_input_digests,
+    _deterministic_annotation_warnings,
     _literal_target_attribution_evidence,
     _reconcile_annotation,
     _recover_analysis_critic_exhaustion,
+    _row_target_mention_is_grounded,
     _raw_corpus_digest,
     _run_analysis_critic_loop,
     _save_critic_gate,
     _save_targeted_recovery_annotations,
     _scope_entity_catalog_to_profile,
+    _target_mention_receipt,
     _terminal_analysis_critic_recovery_reason,
+    _visibility_slice,
 )
 from app.services.openrouter import (
     OpenRouterError,
@@ -96,7 +103,7 @@ from app.services.recovery_orchestrator import (
     CHECK_RAW_CORPUS_UNCHANGED,
     OrchestratorContractError,
 )
-from app.services.recovery_state import stable_digest
+from app.services.recovery_state import recovery_scope_digest, stable_digest
 from app.services.run_lease import (
     RunLeaseLostError,
     bind_run_lease,
@@ -162,6 +169,8 @@ ROWS = [
         "role": "unbranded_discovery",
         "intent_class": "T",
         "status": "completed",
+        "metric_eligible": True,
+        "context_eligible": True,
         "annotation_state": "current",
         "citations_count": 2,
         "answer_text": "Для этой задачи подходит Campaign 360.",
@@ -194,6 +203,120 @@ METRICS = {
         }
     },
     "providers": [],
+}
+
+
+MAKAR_PROFILE = {
+    "brand_name": "Makarska Tattoo & Piercing Studio",
+    "brand_aliases": ["Makarska Tattoo & Piercing Salon"],
+    "entity_scope": [
+        {
+            "canonical_name": "Makarska Tattoo & Piercing Studio",
+            "aliases": ["Makarska Tattoo & Piercing Salon"],
+            "relationship": "self",
+            "entity_type": "primary_brand",
+            "commercially_relevant": True,
+            "confidence": "high",
+        }
+    ],
+    "offer_catalog": {
+        "client_domain": "makarskatattoo.com",
+        "accepted_offers": [],
+    },
+}
+MAKAR_CATALOG = {
+    "entities": [
+        {
+            "canonical_name": "Makarska Tattoo & Piercing Studio",
+            "aliases": [
+                "Makarska Tattoo",
+                "Tattoo & Piercing Makarska",
+            ],
+            "category": "target",
+            "target_relationship": "exact_target",
+            "commercially_relevant": True,
+            "mention_policy": "standalone",
+        }
+    ]
+}
+MAKAR_RAW = (
+    "В центре Макарски можно записаться в **Tattoo & Piercing Makarska "
+    "(Makarska Tattoo)** на улице Lištun.[2][3]\n\n"
+    "Другая студия приведена ниже.[1]"
+)
+MAKAR_ROW = {
+    "answer_id": 580,
+    "mode": "web",
+    "provider_key": "perplexity",
+    "model": "perplexity/sonar-pro-search",
+    "prompt_id": 17,
+    "prompt_key": "intent-nav",
+    "scenario": (
+        "Я в Макарске и хочу записаться на татуировку. "
+        "Какие студии в центре принимают заявки?"
+    ),
+    "role": "unbranded_discovery",
+    "intent_class": "NAV",
+    "status": "completed",
+    "metric_eligible": True,
+    "annotation_state": "current",
+    "citations_count": 3,
+    "citations": [
+        {"url": "https://example.org/directory", "title": "Directory"},
+        {
+            "url": "https://makarskatattoo.com/",
+            "title": "Makarska Tattoo & Piercing Studio",
+        },
+        {
+            "url": "https://makarskatattoo.com/contacts",
+            "title": "Contacts",
+        },
+    ],
+    "response_annotations": [
+        {
+            "type": "url_citation",
+            "url_citation": {
+                "url": "https://example.org/directory",
+                "title": "Directory",
+                "start_index": 0,
+                "end_index": 0,
+            },
+        },
+        {
+            "type": "url_citation",
+            "url_citation": {
+                "url": "https://makarskatattoo.com/",
+                "title": "Makarska Tattoo & Piercing Studio",
+                "start_index": 0,
+                "end_index": 0,
+            },
+        },
+        {
+            "type": "url_citation",
+            "url_citation": {
+                "url": "https://makarskatattoo.com/contacts",
+                "title": "Contacts",
+                "start_index": 0,
+                "end_index": 0,
+            },
+        },
+    ],
+    "answer_text": MAKAR_RAW,
+    "annotation": {
+        "valid": True,
+        "target_mentioned": False,
+        "target_position": None,
+        "target_role": "absent",
+        "sentiment": "unknown",
+        "entity_mentions": [],
+        "evidence": [],
+        "brand_answer": {
+            "directness": "not_applicable",
+            "specificity": "not_applicable",
+            "supported_facets": [],
+            "contradictions": [],
+        },
+    },
 }
 
 
@@ -445,7 +568,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(payload["iteration"], 1)
         self.assertEqual(payload["max_iterations"], MAX_CRITIC_ITERATIONS)
-        self.assertEqual(CRITIC_VERSION, "aiv-analysis-critic-v24")
+        self.assertEqual(CRITIC_VERSION, "aiv-analysis-critic-v26")
         self.assertEqual(
             usage["_aiv_critic_contract"]["semantic_verdict_status"],
             "pending_deterministic_validation",
@@ -1430,6 +1553,101 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                 for task in tasks
             )
         )
+
+    def test_context_join_binds_exact_entity_owner_scope_to_same_answer(
+        self,
+    ) -> None:
+        inventory = _shared_context_semantic_inventory(
+            {
+                "site_profile": {"brand_name": "Example"},
+                "entity_catalog": {
+                    "target_aliases": ["Example"],
+                    "entities": [
+                        {
+                            "canonical_name": "Campaign 360",
+                            "aliases": ["Campaign360"],
+                        },
+                        {
+                            "canonical_name": "Sibling Service",
+                            "aliases": ["Sibling"],
+                        },
+                    ],
+                },
+                # This global owner is context, not permission to attribute
+                # every entity in the catalog to that owner.
+                "attribution_owner_aliases": ["MR Group"],
+                "entity_attribution_aliases": {
+                    "campaign 360": ["Example", "MR Group"],
+                    "sibling service": ["Example"],
+                },
+                "answers": [],
+            }
+        )
+        campaign = _context_join_base(1, "campaign")
+        campaign["payload"]["answers"][0]["raw_answer"] = (
+            "Campaign 360 — продукт MR Group."
+        )
+        sibling = _context_join_base(2, "sibling")
+        sibling["payload"]["answers"][0]["raw_answer"] = (
+            "Sibling Service ошибочно назван продуктом MR Group."
+        )
+        tasks, manifest = _build_context_join_tasks(
+            base_entries=[campaign, sibling],
+            semantic_inventory=inventory,
+            context_receipt=_context_receipt(),
+            iteration=1,
+            max_iterations=MAX_CRITIC_ITERATIONS,
+            recovery_final=False,
+            input_budget_bytes=28_416,
+            context_envelope=_model_envelope(
+                context_length=32_768,
+                max_completion_tokens=4_096,
+            ),
+            per_call_reserve_bytes=12_000,
+        )
+
+        paths_by_answer: dict[int, set[str]] = {1: set(), 2: set()}
+        values_by_answer: dict[int, dict[str, object]] = {1: {}, 2: {}}
+        for task in tasks:
+            answer_id = task["assigned_answer_ids"][0]
+            for unit in task["payload"]["shared_context_facts"]:
+                self.assertEqual(unit["mode"], "complete_fact")
+                fact = unit["fact"]
+                path = fact["path"]
+                paths_by_answer[answer_id].add(path)
+                values_by_answer[answer_id][path] = fact["value"]
+
+        campaign_owner_path = (
+            "/entity_attribution_aliases/campaign 360/1"
+        )
+        sibling_owner_path = (
+            "/entity_attribution_aliases/sibling service/0"
+        )
+        self.assertEqual(values_by_answer[1][campaign_owner_path], "MR Group")
+        self.assertIn(sibling_owner_path, paths_by_answer[2])
+        self.assertNotIn(campaign_owner_path, paths_by_answer[2])
+        self.assertFalse(
+            any(
+                path.startswith(
+                    "/entity_attribution_aliases/sibling service/"
+                )
+                and value == "MR Group"
+                for path, value in values_by_answer[2].items()
+            )
+        )
+        # The owner remains globally visible, but the exact sibling allowlist
+        # proves that global visibility does not authorize attribution.
+        self.assertEqual(
+            values_by_answer[2]["/attribution_owner_aliases/0"],
+            "MR Group",
+        )
+        for base_manifest in manifest["base_manifests"]:
+            selected_reasons = set(
+                base_manifest["relevance_manifest"][
+                    "selection_reasons"
+                ].values()
+            )
+            self.assertIn("entity_attribution_binding", selected_reasons)
 
     def test_context_join_fails_closed_on_missing_cross_bound_or_tampered_data(
         self,
@@ -3528,7 +3746,11 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
 
         second_repair.assert_not_awaited()
         self.assertEqual(result["verdict"], "block")
-        self.assertEqual(result["fallback"]["kind"], "deterministic_block")
+        self.assertEqual(
+            result["fallback"]["kind"],
+            "deterministic_actionability_block",
+        )
+        self.assertEqual(result["anomalies"], still_invalid["anomalies"])
         fallback_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
@@ -3648,8 +3870,9 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["verdict"], "block")
         self.assertEqual(
             result["fallback"]["kind"],
-            "deterministic_block",
+            "deterministic_actionability_block",
         )
+        self.assertEqual(result["anomalies"], incomplete["anomalies"])
         failed_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
@@ -4349,6 +4572,170 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             required_checks,
         )
 
+    async def test_r1_target_receipt_survives_different_r2_recovery_action(
+        self,
+    ) -> None:
+        base_row = copy.deepcopy(MAKAR_ROW)
+        base_row["annotation"].update(
+            {
+                "_annotation_version": ANNOTATION_VERSION,
+                "_answer_sha256": hashlib.sha256(
+                    MAKAR_RAW.encode("utf-8")
+                ).hexdigest(),
+                "_answer_model": MAKAR_ROW["model"],
+                "_annotation_input_sha256": "base-makar-context",
+            }
+        )
+        r1_adjustment = {
+            "action": "require_literal_target_mention_evidence",
+            "entity_name": "Makarska Tattoo & Piercing Studio",
+            "alias": "Tattoo & Piercing Makarska",
+            "reason": "Исправить доказанное ложное отрицание.",
+            "answer_ids": [580],
+        }
+        r2_adjustment = {
+            "action": "require_literal_brand_knowledge_evidence",
+            "entity_name": "Makarska Tattoo & Piercing Studio",
+            "alias": None,
+            "reason": "Отдельно перепроверить факты знания бренда.",
+            "answer_ids": [580],
+        }
+        r2_anomaly = {
+            "code": "annotation_evidence_mismatch",
+            "severity": "important",
+            "finding": "Факты о бренде требуют повторной разметки.",
+            "answer_ids": [580],
+            "entities": ["Makarska Tattoo & Piercing Studio"],
+        }
+        recovered_row = copy.deepcopy(base_row)
+        recovered_row["annotation"].update(
+            {
+                "target_mentioned": True,
+                "target_role": "mentioned",
+                "uncertainties": ["targeted recovery changed state"],
+            }
+        )
+        recovered_metrics = {
+            "providers": [{"provider_key": "perplexity"}],
+            "target_visibility": {"web": {"mention_count": 1}},
+        }
+        required_checks = {
+            CHECK_RAW_CORPUS_UNCHANGED,
+            CHECK_DERIVED_METRICS_RECOMPUTED,
+            CHECK_CRITIC_GATE_PASSED,
+        }
+        plan = SimpleNamespace(
+            epoch=3,
+            plan_digest="d" * 64,
+            decision={
+                "action": ACTION_TARGETED_ANNOTATION_REPAIR,
+                "rationale": "Повторить разметку только строки 580.",
+                "guidance": "Проверь буквальные факты только в answer_id 580.",
+                "target_answer_ids": [580],
+                "invalidate_artifact_keys": [],
+                "acceptance_checks": sorted(required_checks),
+            },
+        )
+        gate = {"passed": True, "iteration": 3}
+
+        with (
+            patch(
+                "app.services.analyzer.settings.PIPELINE_ORCHESTRATOR_ENABLED",
+                True,
+            ),
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+                side_effect=[
+                    _critic_review(
+                        "revise",
+                        adjustments=[r1_adjustment],
+                        guidance="Исправить упоминание exact target.",
+                    ),
+                    _critic_review(
+                        "revise",
+                        adjustments=[r2_adjustment],
+                        anomalies=[r2_anomaly],
+                    ),
+                    _critic_review("pass"),
+                ],
+            ),
+            patch(
+                "app.services.analyzer.plan_durable_recovery",
+                new=AsyncMock(return_value=plan),
+            ),
+            patch(
+                "app.services.analyzer.mark_recovery_executing",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.finish_recovery",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._save_critic_gate",
+                new_callable=AsyncMock,
+                return_value=gate,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._annotate_answers",
+                new_callable=AsyncMock,
+            ) as annotate,
+            patch(
+                "app.services.analyzer._metric_rows",
+                new_callable=AsyncMock,
+                side_effect=[[base_row], [recovered_row]],
+            ),
+            patch(
+                "app.services.analyzer._compute_metrics",
+                side_effect=[{"providers": []}, recovered_metrics],
+            ),
+        ):
+            _catalog, rows, metrics, returned_gate = (
+                await _run_analysis_critic_loop(
+                    "run-makar-receipt-recovery",
+                    profile=MAKAR_PROFILE,
+                    catalog=MAKAR_CATALOG,
+                    rows=[base_row],
+                    metrics={"providers": []},
+                )
+            )
+
+        self.assertEqual(rows, [recovered_row])
+        self.assertEqual(metrics, recovered_metrics)
+        self.assertEqual(returned_gate, gate)
+        self.assertEqual(annotate.await_count, 2)
+        r1_receipts = annotate.await_args_list[0].kwargs[
+            "target_mention_receipts"
+        ]
+        recovery_receipts = annotate.await_args_list[1].kwargs[
+            "target_mention_receipts"
+        ]
+        self.assertEqual(len(r1_receipts), 1)
+        self.assertEqual(recovery_receipts, r1_receipts)
+        self.assertEqual(recovery_receipts[0]["answer_id"], 580)
+        provenance = annotate.await_args_list[1].kwargs[
+            "annotation_repair_provenance"
+        ]
+        self.assertEqual(
+            provenance["target_mention_receipts_sha256"],
+            stable_digest(recovery_receipts),
+        )
+        self.assertEqual(
+            provenance["recovery_policy_step"][
+                "target_mention_receipts_sha256"
+            ],
+            stable_digest(recovery_receipts),
+        )
+
     async def test_r2_targeted_repair_fails_closed_when_final_critic_blocks(
         self,
     ) -> None:
@@ -4983,6 +5370,591 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(applied), 1)
 
+    def test_makarska_false_negative_compiles_answer_bound_receipt(self) -> None:
+        warnings = _deterministic_annotation_warnings(
+            profile=MAKAR_PROFILE,
+            catalog=MAKAR_CATALOG,
+            rows=[copy.deepcopy(MAKAR_ROW)],
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["code"], "target_mention_false_negative")
+        self.assertEqual(warnings[0]["answer_ids"], [580])
+
+        review = _critic_review(
+            "revise",
+            anomalies=[
+                {
+                    "code": "target_mention_false_negative",
+                    "severity": "important",
+                    "finding": (
+                        "Raw буквально называет exact target и связывает "
+                        "его с официальным источником, но разметка дала false."
+                    ),
+                    "answer_ids": [580],
+                    "entities": ["Makarska Tattoo & Piercing Studio"],
+                }
+            ],
+            adjustments=[
+                {
+                    "action": "require_literal_target_mention_evidence",
+                    "entity_name": "Makarska Tattoo & Piercing Studio",
+                    "alias": "Tattoo & Piercing Makarska",
+                    "reason": "Нужно исправить доказанное ложное отрицание.",
+                    "answer_ids": [580],
+                }
+            ],
+            guidance="Повторно разметить только ответ 580.",
+        )
+        payload = _critic_payload(
+            profile=MAKAR_PROFILE,
+            catalog=MAKAR_CATALOG,
+            rows=[copy.deepcopy(MAKAR_ROW)],
+            metrics={"providers": []},
+            policy_history=[],
+        )
+        self.assertEqual(payload["client_domain"], "makarskatattoo.com")
+        self.assertEqual(
+            payload["answers"][0]["citation_sources"][1]["host"],
+            "makarskatattoo.com",
+        )
+        self.assertEqual(
+            _critic_review_validation_errors(review, payload=payload),
+            [],
+        )
+
+        original_catalog_digest = stable_digest(MAKAR_CATALOG)
+        tightened, applied, guidance = _apply_critic_policy(
+            MAKAR_CATALOG,
+            review,
+            valid_answer_ids={580},
+            profile=MAKAR_PROFILE,
+            answer_rows=[copy.deepcopy(MAKAR_ROW)],
+        )
+        self.assertEqual(stable_digest(tightened), original_catalog_digest)
+        self.assertEqual(len(applied), 1)
+        receipt = applied[0]["target_mention_receipts"][0]
+        self.assertEqual(receipt["answer_id"], 580)
+        self.assertEqual(receipt["official_citation_index"], 2)
+        self.assertIn("не переносится в другие строки", guidance)
+
+        pending = {
+            "answer_id": 580,
+            "status": "completed",
+            "metric_eligible": True,
+            "scenario": MAKAR_ROW["scenario"],
+            "scenario_role": "unbranded_discovery",
+            "citations": copy.deepcopy(MAKAR_ROW["citations"]),
+            "response_annotations": copy.deepcopy(
+                MAKAR_ROW["response_annotations"]
+            ),
+            "answer": MAKAR_RAW,
+            "answer_sha256": hashlib.sha256(MAKAR_RAW.encode()).hexdigest(),
+            "answer_model": MAKAR_ROW["model"],
+        }
+        reconciled = _reconcile_annotation(
+            copy.deepcopy(MAKAR_ROW["annotation"]),
+            pending,
+            MAKAR_PROFILE,
+            MAKAR_CATALOG,
+            annotation_input_sha256="receipt-context",
+            target_mention_receipts=[receipt],
+        )
+        self.assertTrue(reconciled["target_mentioned"])
+        self.assertEqual(reconciled["target_role"], "mentioned")
+        self.assertEqual(reconciled["target_position"], None)
+        self.assertEqual(
+            reconciled["_critic_target_mention_receipts"],
+            [receipt],
+        )
+
+        grounded_row = {
+            **copy.deepcopy(MAKAR_ROW),
+            "annotation": reconciled,
+        }
+        self.assertTrue(
+            _row_target_mention_is_grounded(
+                grounded_row,
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+            )
+        )
+
+    def test_target_receipt_rejects_echo_remote_source_and_transfer(self) -> None:
+        entity = MAKAR_CATALOG["entities"][0]
+        alias = "Tattoo & Piercing Makarska"
+        receipt = _target_mention_receipt(
+            profile=MAKAR_PROFILE,
+            catalog=MAKAR_CATALOG,
+            entity=entity,
+            alias=alias,
+            row=copy.deepcopy(MAKAR_ROW),
+        )
+        self.assertIsNotNone(receipt)
+
+        prompt_echo = {
+            **copy.deepcopy(MAKAR_ROW),
+            "scenario": MAKAR_ROW["scenario"] + " Tattoo & Piercing Makarska",
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=prompt_echo,
+            )
+        )
+
+        url_prompt_echo = {
+            **copy.deepcopy(MAKAR_ROW),
+            "scenario": (
+                "Суммируй страницу https://directory.example/vendors/"
+                "tattoo-and-piercing-makarska"
+            ),
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=url_prompt_echo,
+            )
+        )
+
+        url_prompt_echo_without_connector = {
+            **copy.deepcopy(MAKAR_ROW),
+            "scenario": (
+                "Суммируй https://directory.example/vendors/"
+                "tattoo-piercing-makarska"
+            ),
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=url_prompt_echo_without_connector,
+            )
+        )
+
+        encoded_url_prompt_echo = {
+            **copy.deepcopy(MAKAR_ROW),
+            "scenario": (
+                "Суммируй https://directory.example/vendors/"
+                "tattoo-%2526-piercing-makarska"
+            ),
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=encoded_url_prompt_echo,
+            )
+        )
+
+        html_entity_prompt_echo = {
+            **copy.deepcopy(MAKAR_ROW),
+            "scenario": "Суммируй Tattoo &amp; Piercing Makarska",
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=html_entity_prompt_echo,
+            )
+        )
+
+        for encoded_domain in (
+            "https://makarska%74attoo.com",
+            "https%3A%2F%2Fmakarska%2574attoo.com",
+        ):
+            with self.subTest(encoded_domain=encoded_domain):
+                domain_prompt_echo = {
+                    **copy.deepcopy(MAKAR_ROW),
+                    "scenario": f"Какие студии? {encoded_domain}",
+                }
+                self.assertIsNone(
+                    _target_mention_receipt(
+                        profile=MAKAR_PROFILE,
+                        catalog=MAKAR_CATALOG,
+                        entity=entity,
+                        alias=alias,
+                        row=domain_prompt_echo,
+                    )
+                )
+
+        cross_alias_prompt_echo = {
+            **copy.deepcopy(MAKAR_ROW),
+            "scenario": "Что известно о Makarska Tattoo?",
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=cross_alias_prompt_echo,
+            )
+        )
+
+        remote_marker = {
+            **copy.deepcopy(MAKAR_ROW),
+            "answer_text": (
+                "Здесь названа Tattoo & Piercing Makarska.\n\n"
+                "Официальный источник приведён отдельно.[2]"
+            ),
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=remote_marker,
+            )
+        )
+
+        unrelated_same_line = {
+            **copy.deepcopy(MAKAR_ROW),
+            "answer_text": (
+                "Tattoo & Piercing Makarska здесь означает лишь поисковую "
+                "фразу. Отдельный факт о сетевой доступности подтверждён [2]."
+            ),
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=unrelated_same_line,
+            )
+        )
+
+        transferred = {
+            **copy.deepcopy(MAKAR_ROW),
+            "answer_id": 581,
+            "annotation": {
+                **copy.deepcopy(MAKAR_ROW["annotation"]),
+                "target_mentioned": True,
+                "target_role": "mentioned",
+                "_critic_target_mention_receipts": [receipt],
+            },
+        }
+        self.assertFalse(
+            _row_target_mention_is_grounded(
+                transferred,
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+            )
+        )
+
+        changed_raw = copy.deepcopy(MAKAR_ROW)
+        changed_raw["answer_text"] += " Изменённый хвост."
+        changed_raw["annotation"] = {
+            **copy.deepcopy(MAKAR_ROW["annotation"]),
+            "target_mentioned": True,
+            "target_role": "mentioned",
+            "_critic_target_mention_receipts": [receipt],
+        }
+        self.assertFalse(
+            _row_target_mention_is_grounded(
+                changed_raw,
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+            )
+        )
+
+        external_only = copy.deepcopy(MAKAR_ROW)
+        external_only["citations"] = [
+            {"url": "https://example.org/2", "title": "External"},
+            {"url": "https://example.org/3", "title": "External"},
+        ]
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=external_only,
+            )
+        )
+
+        deduplicated_sources = copy.deepcopy(MAKAR_ROW)
+        deduplicated_sources["response_annotations"].insert(
+            1,
+            copy.deepcopy(deduplicated_sources["response_annotations"][1]),
+        )
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=deduplicated_sources,
+            )
+        )
+
+        evil_substring = {
+            **copy.deepcopy(MAKAR_ROW),
+            "answer_text": (
+                "Рекомендую Tattoo & Piercing Makarska "
+                "(https://evil-makarskatattoo.com/fake)."
+            ),
+            "response_annotations": [],
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=evil_substring,
+            )
+        )
+
+        unicode_prefixed_domain = {
+            **copy.deepcopy(MAKAR_ROW),
+            "answer_text": (
+                "Tattoo & Piercing Makarska (жmakarskatattoo.com)."
+            ),
+            "response_annotations": [],
+        }
+        self.assertIsNone(
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=MAKAR_CATALOG,
+                entity=entity,
+                alias=alias,
+                row=unicode_prefixed_domain,
+            )
+        )
+
+        repeated_alias = {
+            **copy.deepcopy(MAKAR_ROW),
+            "answer_text": (
+                "Список: Tattoo & Piercing Makarska.\n\n"
+                "Подробнее: Tattoo & Piercing Makarska [2] принимает заявки."
+            ),
+        }
+        repeated_receipt = _target_mention_receipt(
+            profile=MAKAR_PROFILE,
+            catalog=MAKAR_CATALOG,
+            entity=entity,
+            alias=alias,
+            row=repeated_alias,
+        )
+        self.assertIsNotNone(repeated_receipt)
+        self.assertEqual(
+            repeated_receipt["alias_start_char"],
+            repeated_alias["answer_text"].rindex(alias),
+        )
+
+    def test_target_receipt_never_promotes_recommendation_or_position(self) -> None:
+        receipt = _target_mention_receipt(
+            profile=MAKAR_PROFILE,
+            catalog=MAKAR_CATALOG,
+            entity=MAKAR_CATALOG["entities"][0],
+            alias="Tattoo & Piercing Makarska",
+            row=copy.deepcopy(MAKAR_ROW),
+        )
+        self.assertIsNotNone(receipt)
+        pending = {
+            "answer_id": 580,
+            "status": "completed",
+            "metric_eligible": True,
+            "scenario": MAKAR_ROW["scenario"],
+            "scenario_role": "unbranded_discovery",
+            "citations": copy.deepcopy(MAKAR_ROW["citations"]),
+            "response_annotations": copy.deepcopy(
+                MAKAR_ROW["response_annotations"]
+            ),
+            "answer": MAKAR_RAW,
+            "answer_sha256": hashlib.sha256(MAKAR_RAW.encode()).hexdigest(),
+            "answer_model": MAKAR_ROW["model"],
+        }
+        overstated = copy.deepcopy(MAKAR_ROW["annotation"])
+        overstated.update(
+            {
+                "target_mentioned": True,
+                "target_role": "recommended",
+                "target_position": 1,
+                "sentiment": "positive",
+            }
+        )
+
+        reconciled = _reconcile_annotation(
+            overstated,
+            pending,
+            MAKAR_PROFILE,
+            MAKAR_CATALOG,
+            annotation_input_sha256="receipt-does-not-prove-role",
+            target_mention_receipts=[receipt],
+        )
+
+        self.assertTrue(reconciled["target_mentioned"])
+        self.assertEqual(reconciled["target_role"], "mentioned")
+        self.assertIsNone(reconciled["target_position"])
+        self.assertEqual(reconciled["sentiment"], "neutral")
+        absent_control = copy.deepcopy(MAKAR_ROW)
+        absent_control.update(
+            {
+                "answer_id": 581,
+                "answer_text": "В ответе перечислены другие студии.",
+                "annotation": {
+                    **copy.deepcopy(MAKAR_ROW["annotation"]),
+                    "target_mentioned": False,
+                    "target_role": "absent",
+                    "target_position": None,
+                    "sentiment": "neutral",
+                },
+            }
+        )
+        metric = _visibility_slice(
+            [
+                {**copy.deepcopy(MAKAR_ROW), "annotation": reconciled},
+                absent_control,
+            ],
+            mode="web",
+        )
+        self.assertEqual(metric["mention_count"], 1)
+        self.assertEqual(metric["recommendation_count"], 0)
+        self.assertEqual(metric["top3_count"], 0)
+
+    def test_target_receipt_does_not_expand_other_answers(self) -> None:
+        receipt = _target_mention_receipt(
+            profile=MAKAR_PROFILE,
+            catalog=MAKAR_CATALOG,
+            entity=MAKAR_CATALOG["entities"][0],
+            alias="Tattoo & Piercing Makarska",
+            row=copy.deepcopy(MAKAR_ROW),
+        )
+        self.assertIsNotNone(receipt)
+        pending = {
+            "answer_id": 581,
+            "status": "completed",
+            "metric_eligible": True,
+            "scenario": MAKAR_ROW["scenario"],
+            "scenario_role": "unbranded_discovery",
+            "citations": copy.deepcopy(MAKAR_ROW["citations"]),
+            "response_annotations": copy.deepcopy(
+                MAKAR_ROW["response_annotations"]
+            ),
+            "answer": MAKAR_RAW,
+            "answer_sha256": hashlib.sha256(MAKAR_RAW.encode()).hexdigest(),
+            "answer_model": MAKAR_ROW["model"],
+        }
+        reconciled = _reconcile_annotation(
+            copy.deepcopy(MAKAR_ROW["annotation"]),
+            pending,
+            MAKAR_PROFILE,
+            MAKAR_CATALOG,
+            annotation_input_sha256="other-answer-context",
+            target_mention_receipts=[receipt],
+        )
+        self.assertFalse(reconciled["target_mentioned"])
+        self.assertNotIn("_critic_target_mention_receipts", reconciled)
+
+    def test_target_receipt_binds_final_catalog_after_other_adjustments(self) -> None:
+        catalog = copy.deepcopy(MAKAR_CATALOG)
+        catalog["entities"].append(
+            {
+                "canonical_name": "Booking",
+                "aliases": ["appointment"],
+                "category": "target",
+                "target_relationship": "portfolio_entity",
+                "commercially_relevant": True,
+                "mention_policy": "standalone",
+            }
+        )
+        review = _critic_review(
+            "revise",
+            adjustments=[
+                {
+                    "action": "require_literal_target_mention_evidence",
+                    "entity_name": "Makarska Tattoo & Piercing Studio",
+                    "alias": "Tattoo & Piercing Makarska",
+                    "reason": "Исправить ложное отрицание.",
+                    "answer_ids": [580],
+                },
+                {
+                    "action": "require_target_attribution",
+                    "entity_name": "Booking",
+                    "alias": None,
+                    "reason": "Общая услуга требует явной связи.",
+                    "answer_ids": [580],
+                },
+            ],
+            guidance="Применить обе проверки.",
+            anomalies=[
+                {
+                    "code": "target_mention_false_negative",
+                    "severity": "important",
+                    "finding": "Нужно исправить ложное отрицание exact target.",
+                    "answer_ids": [580],
+                    "entities": ["Makarska Tattoo & Piercing Studio"],
+                }
+            ],
+        )
+
+        tightened, applied, _guidance = _apply_critic_policy(
+            catalog,
+            review,
+            valid_answer_ids={580},
+            profile=MAKAR_PROFILE,
+            answer_rows=[copy.deepcopy(MAKAR_ROW)],
+        )
+        receipt_adjustment = next(
+            item
+            for item in applied
+            if item["action"] == "require_literal_target_mention_evidence"
+        )
+        receipt = receipt_adjustment["target_mention_receipts"][0]
+        final_target = next(
+            entity
+            for entity in tightened["entities"]
+            if entity["canonical_name"]
+            == "Makarska Tattoo & Piercing Studio"
+        )
+        self.assertEqual(
+            receipt,
+            _target_mention_receipt(
+                profile=MAKAR_PROFILE,
+                catalog=tightened,
+                entity=final_target,
+                alias="Tattoo & Piercing Makarska",
+                row=copy.deepcopy(MAKAR_ROW),
+            ),
+        )
+
+    def test_ungrounded_target_cannot_keep_recommendation_or_position(self) -> None:
+        row = {
+            **copy.deepcopy(ROWS[0]),
+            "answer_text": "В ответе рекомендуется только OtherCo.",
+            "citations": [],
+            "annotation": {
+                **copy.deepcopy(ROWS[0]["annotation"]),
+                "target_mentioned": True,
+                "target_position": 1,
+                "target_role": "recommended",
+                "entity_mentions": [],
+            },
+        }
+
+        metrics = _compute_metrics([row], PROFILE, CATALOG)
+        parent = metrics["parent_discovery"]["web"]
+
+        self.assertEqual(parent["mention_count"], 0)
+        self.assertEqual(parent["top3_count"], 0)
+        self.assertEqual(parent["recommendation_count"], 0)
+        self.assertEqual(parent["recommendation_rate"], 0.0)
+
     def test_pass_with_unresolved_work_is_rejected(self) -> None:
         inconsistent = _critic_review(
             "pass",
@@ -5147,6 +6119,18 @@ class AnalysisCriticRecoveryPersistenceTests(
             ),
         }
         plan_digest = stable_digest(plan)
+        target_receipts_sha256 = stable_digest([])
+        resume_annotation_digest = _annotation_context_sha256(
+            PROFILE,
+            scoped_catalog,
+        )
+        repair_annotation_digest = _annotation_context_sha256(
+            PROFILE,
+            scoped_catalog,
+            plan["guidance"],
+            repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+            target_mention_receipts=[],
+        )
         recovery_step = {
             "iteration": MAX_CRITIC_ITERATIONS + 1,
             "kind": "orchestrated_targeted_annotation_repair",
@@ -5155,6 +6139,7 @@ class AnalysisCriticRecoveryPersistenceTests(
             "critic_adjustments": [],
             "annotation_guidance": plan["guidance"],
             "raw_corpus_sha256": "",
+            "target_mention_receipts_sha256": target_receipts_sha256,
         }
         repaired_rows = copy.deepcopy(ROWS)
         recovery_step["raw_corpus_sha256"] = _raw_corpus_digest(
@@ -5167,8 +6152,17 @@ class AnalysisCriticRecoveryPersistenceTests(
             "orchestrator_epoch": epoch,
             "orchestrator_plan_digest": plan_digest,
             "target_answer_ids": [11],
+            "repair_annotation_input_sha256": repair_annotation_digest,
+            "resume_annotation_input_sha256": resume_annotation_digest,
+            "guidance_sha256": hashlib.sha256(
+                plan["guidance"].encode("utf-8")
+            ).hexdigest(),
+            "target_mention_receipts_sha256": target_receipts_sha256,
             "recovery_policy_step": copy.deepcopy(recovery_step),
         }
+        repaired_rows[0]["annotation"][
+            "_annotation_input_sha256"
+        ] = repair_annotation_digest
         repaired_rows[0]["annotation"]["uncertainties"] = [
             "targeted repair completed"
         ]
@@ -5213,6 +6207,26 @@ class AnalysisCriticRecoveryPersistenceTests(
                     "successful_gate_sha256": stable_digest(gate),
                 },
             }
+        facts = {
+            "analysis_state_sha256": before_digest,
+            "raw_corpus_sha256": _raw_corpus_digest(rows),
+            "prior_policy_history": [],
+            "target_mention_receipts_sha256": plan.get(
+                "target_mention_receipts_sha256",
+                stable_digest([]),
+            ),
+        }
+        allowed_actions = {
+            ACTION_STOP,
+            ACTION_TARGETED_ANNOTATION_REPAIR,
+        }
+        permitted_answer_ids = set(plan["target_answer_ids"])
+        facts_digest = recovery_scope_digest(
+            facts=facts,
+            allowed_actions=allowed_actions,
+            permitted_answer_ids=permitted_answer_ids,
+            permitted_artifact_keys=set(),
+        )
         async with self.SessionLocal() as session:
             session.add(
                 RecoveryEpoch(
@@ -5222,16 +6236,22 @@ class AnalysisCriticRecoveryPersistenceTests(
                     failure_class="repairable_semantic",
                     failure_code="analysis_critic_non_convergent",
                     failure_fingerprint="f" * 64,
-                    facts_digest="a" * 64,
+                    facts_digest=facts_digest,
                     status=status,
                     input_json={
                         "incident": {
-                            "facts": {
-                                "analysis_state_sha256": before_digest,
-                                "raw_corpus_sha256": _raw_corpus_digest(rows),
-                                "prior_policy_history": [],
-                            }
-                        }
+                            "run_id": self.run_id,
+                            "stage": "analysis_critic",
+                            "failure_class": "repairable_semantic",
+                            "code": "analysis_critic_non_convergent",
+                            "fingerprint": "f" * 64,
+                            "facts_digest": facts_digest,
+                            "diagnostics": {},
+                            "facts": facts,
+                        },
+                        "allowed_actions": sorted(allowed_actions),
+                        "permitted_answer_ids": sorted(permitted_answer_ids),
+                        "permitted_artifact_keys": [],
                     },
                     plan_json=copy.deepcopy(plan),
                     plan_digest=stable_digest(plan),
@@ -5806,6 +6826,117 @@ class AnalysisCriticRecoveryPersistenceTests(
             ).scalar_one()
         self.assertEqual(status, "succeeded")
 
+    async def test_crash_resume_rejects_tampered_receipt_manifest_before_r3(
+        self,
+    ) -> None:
+        (
+            _scoped_catalog,
+            repaired_rows,
+            plan,
+            _recovery_step,
+            before_digest,
+            _state_digest,
+        ) = self._recovered_fixture()
+        repaired_rows[0]["annotation"]["_annotation_repair_provenance"][
+            "target_mention_receipts_sha256"
+        ] = "0" * 64
+        tampered_state_digest = _critic_analysis_state_digest(
+            repaired_rows,
+            METRICS,
+        )
+        await self._insert_recovery_epoch(
+            status="executing",
+            plan=plan,
+            before_digest=before_digest,
+            state_digest=tampered_state_digest,
+            rows=repaired_rows,
+        )
+
+        with (
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+            ) as critic,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ) as progress,
+            bind_run_lease(self.run_id, "current-owner"),
+        ):
+            with self.assertRaisesRegex(
+                _AnalysisCriticRecoveryBlocked,
+                "receipt or annotation provenance",
+            ):
+                await _run_analysis_critic_loop(
+                    self.run_id,
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=repaired_rows,
+                    metrics=METRICS,
+                )
+
+        critic.assert_not_awaited()
+        progress.assert_not_awaited()
+
+    async def test_crash_resume_rejects_tampered_facts_scope_before_r3(
+        self,
+    ) -> None:
+        (
+            _scoped_catalog,
+            repaired_rows,
+            plan,
+            _recovery_step,
+            before_digest,
+            state_digest,
+        ) = self._recovered_fixture()
+        await self._insert_recovery_epoch(
+            status="executing",
+            plan=plan,
+            before_digest=before_digest,
+            state_digest=state_digest,
+            rows=repaired_rows,
+        )
+        async with self.SessionLocal() as session:
+            epoch = (
+                await session.execute(
+                    select(RecoveryEpoch).where(
+                        RecoveryEpoch.run_id == self.run_id
+                    )
+                )
+            ).scalar_one()
+            tampered_input = copy.deepcopy(epoch.input_json)
+            tampered_input["incident"]["facts"]["prior_policy_history"] = [
+                {"kind": "tampered-after-crash"}
+            ]
+            epoch.input_json = tampered_input
+            await session.commit()
+
+        with (
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+            ) as critic,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ) as progress,
+            bind_run_lease(self.run_id, "current-owner"),
+        ):
+            with self.assertRaisesRegex(
+                _AnalysisCriticRecoveryBlocked,
+                "facts scope digest",
+            ):
+                await _run_analysis_critic_loop(
+                    self.run_id,
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=repaired_rows,
+                    metrics=METRICS,
+                )
+
+        critic.assert_not_awaited()
+        progress.assert_not_awaited()
+
     async def test_crash_during_r3_reservation_fails_closed_without_call(
         self,
     ) -> None:
@@ -5885,10 +7016,11 @@ class AnalysisCriticRecoveryPersistenceTests(
         self.assertEqual(epoch_status, "failed")
         self.assertEqual(gate_status, "failed")
 
-    async def test_terminal_post_repair_state_blocks_resume_before_r1(
+    async def _insert_terminal_analysis_block(
         self,
+        *,
+        state_digest: str,
     ) -> None:
-        state_digest = _critic_analysis_state_digest(ROWS, METRICS)
         async with self.SessionLocal() as session:
             session.add(
                 RecoveryEpoch(
@@ -5911,6 +7043,14 @@ class AnalysisCriticRecoveryPersistenceTests(
                 )
             )
             await session.commit()
+
+    async def test_terminal_post_repair_state_blocks_resume_before_r1(
+        self,
+    ) -> None:
+        state_digest = _critic_analysis_state_digest(ROWS, METRICS)
+        await self._insert_terminal_analysis_block(
+            state_digest=state_digest,
+        )
 
         self.assertIsNone(
             await _terminal_analysis_critic_recovery_reason(
@@ -5941,6 +7081,100 @@ class AnalysisCriticRecoveryPersistenceTests(
                 )
         critic.assert_not_awaited()
         progress.assert_not_awaited()
+
+    async def test_terminal_scope_upgrade_permits_a_fresh_r1(self) -> None:
+        baseline_state = _critic_analysis_state_digest(ROWS, METRICS)
+        await self._insert_terminal_analysis_block(
+            state_digest=baseline_state,
+        )
+        changed_panel_contract = [
+            {
+                "prompt_id": 7,
+                "provider_key": "openai",
+                "model": "openai/gpt-chat-latest",
+                "mode": "web",
+            },
+            {
+                "prompt_id": 7,
+                "provider_key": "gemini",
+                "model": "google/gemini-next",
+                "mode": "web",
+            },
+        ]
+        variants = (
+            (
+                "critic_version",
+                patch(
+                    "app.services.analyzer.ANALYSIS_CRITIC_VERSION",
+                    ANALYSIS_CRITIC_VERSION + "-next",
+                ),
+                None,
+            ),
+            (
+                "critic_model",
+                patch(
+                    "app.services.analyzer.CRITIC_MODEL",
+                    CRITIC_MODEL + "-next",
+                ),
+                None,
+            ),
+            (
+                "map_reduce_policy",
+                patch(
+                    "app.services.analyzer.CRITIC_MAP_REDUCE_VERSION",
+                    CRITIC_MAP_REDUCE_VERSION + "-next",
+                ),
+                None,
+            ),
+            (
+                "recovery_policy",
+                patch(
+                    "app.services.analyzer."
+                    "ANALYSIS_CRITIC_RECOVERY_POLICY_VERSION",
+                    "aiv-analysis-critic-recovery-policy-next",
+                ),
+                None,
+            ),
+            (
+                "expected_panel_contract",
+                nullcontext(),
+                changed_panel_contract,
+            ),
+        )
+
+        for label, scope_patch, expected_cells in variants:
+            with (
+                self.subTest(scope_change=label),
+                scope_patch,
+                patch(
+                    "app.services.analyzer._analysis_critic_artifact",
+                    new_callable=AsyncMock,
+                    return_value=_critic_review("pass"),
+                ) as critic,
+                patch(
+                    "app.services.analyzer._save_critic_gate",
+                    new_callable=AsyncMock,
+                    return_value={"passed": True, "iteration": 1},
+                ),
+                patch(
+                    "app.services.analyzer.update_progress",
+                    new_callable=AsyncMock,
+                ),
+            ):
+                _catalog, _rows, _metrics, gate = (
+                    await _run_analysis_critic_loop(
+                        self.run_id,
+                        profile=PROFILE,
+                        catalog=CATALOG,
+                        rows=ROWS,
+                        metrics=METRICS,
+                        expected_corpus_cells=expected_cells,
+                    )
+                )
+
+            self.assertTrue(gate["passed"])
+            self.assertEqual(critic.await_count, 1)
+            self.assertEqual(critic.await_args.kwargs["iteration"], 1)
 
 
 if __name__ == "__main__":

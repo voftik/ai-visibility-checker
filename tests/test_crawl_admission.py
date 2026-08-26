@@ -1,3 +1,4 @@
+import copy
 import unittest
 import uuid
 from unittest.mock import AsyncMock, patch
@@ -5,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import delete, select
 
 from app.db import SessionLocal, init_db
-from app.models import DomainProbe, ProbeType, Run, RunStatus, SitePage
+from app.models import DomainProbe, ProbeType, Run, RunArtifact, RunStatus, SitePage
 from app.services import crawler
 from app.services.analyzer import _site_context
 
@@ -109,6 +110,26 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
             }
         receipt = crawler._site_page_receipt(pages, stored)
         input_json = crawler._site_page_manifest_input("example.com")
+        candidates = [
+            crawler._candidate_evidence_record(url, source="test_fixture")
+            for url, _page_kind in pages[1:]
+        ]
+        relevance_receipt = crawler._selection_relevance_receipt(
+            homepage_url=pages[0][0],
+            candidates=candidates,
+            target=crawler.AUDIT_PAGE_DEFAULT,
+            proposed=pages,
+            attempts=[
+                crawler._candidate_attempt(page, outcome="usable")
+                for page in pages
+            ],
+            selected=pages,
+        )
+        await crawler._save_page_relevance_artifact(
+            run_id,
+            domain="example.com",
+            receipt=relevance_receipt,
+        )
         await crawler._save_site_page_manifest(
             run_id,
             status="completed",
@@ -128,6 +149,9 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 "discovery_state": "complete",
                 "coverage_state": "complete",
                 "site_page_receipt": receipt,
+                "commercial_relevance_receipt": (
+                    crawler._selection_relevance_projection(relevance_receipt)
+                ),
             },
         )
 
@@ -207,6 +231,10 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admission["expected_cell_count"], 4)
         self.assertEqual(admission["terminal_cell_count"], 4)
         self.assertEqual(admission["page_count"], 2)
+        self.assertRegex(
+            admission["commercial_relevance_receipt_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
 
     async def test_three_transient_attempts_become_explicit_terminal_cell(self) -> None:
         run_id = await self._run()
@@ -226,6 +254,121 @@ class CrawlAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["terminal_blocked_cell_count"], 1)
         self.assertEqual(receipt["cells"][0]["attempt_count"], 3)
         self.assertEqual(receipt["cells"][0]["terminal_reason"], "retry_exhausted")
+
+    async def test_every_consumed_site_page_field_is_bound_before_analysis(
+        self,
+    ) -> None:
+        run_id = await self._run()
+        pages = [("https://example.com/", "home")]
+        page = await self._page(run_id, pages[0][0], "home")
+        async with SessionLocal() as session:
+            stored = await session.get(SitePage, page.id)
+            stored.title = "Example home"
+            stored.meta_description = "Original description"
+            await session.commit()
+        await self._manifest(run_id, pages)
+        await self._probe(run_id, pages[0][0], "GPTBot")
+        await crawler.save_technical_matrix_receipt(
+            run_id,
+            domain="example.com",
+            pages=pages,
+            user_agents=["GPTBot"],
+        )
+        await crawler.require_crawl_admission(
+            run_id,
+            domain="example.com",
+            user_agents=["GPTBot"],
+        )
+
+        async with SessionLocal() as session:
+            original = await session.get(SitePage, page.id)
+            original_values = {
+                "title": original.title,
+                "meta_description": original.meta_description,
+                "content_signals": copy.deepcopy(original.content_signals),
+            }
+
+        mutations = {
+            "title": "Different identity",
+            "meta_description": "Different offer description",
+            "content_signals": {
+                **original_values["content_signals"],
+                "structured_data_types": ["Product"],
+            },
+        }
+        for field, changed_value in mutations.items():
+            with self.subTest(field=field):
+                async with SessionLocal() as session:
+                    stored = await session.get(SitePage, page.id)
+                    setattr(stored, field, copy.deepcopy(changed_value))
+                    await session.commit()
+                with self.assertRaisesRegex(
+                    crawler.CrawlAdmissionIncomplete,
+                    "SitePage rows no longer match manifest",
+                ):
+                    await crawler.require_crawl_admission(
+                        run_id,
+                        domain="example.com",
+                        user_agents=["GPTBot"],
+                    )
+                with self.assertRaisesRegex(
+                    crawler.CrawlAdmissionIncomplete,
+                    "SitePage lineage no longer matches manifest",
+                ):
+                    await _site_context(run_id)
+                async with SessionLocal() as session:
+                    stored = await session.get(SitePage, page.id)
+                    setattr(stored, field, copy.deepcopy(original_values[field]))
+                    await session.commit()
+                await crawler.require_crawl_admission(
+                    run_id,
+                    domain="example.com",
+                    user_agents=["GPTBot"],
+                )
+
+    async def test_terminal_partial_discovery_admits_bounded_technical_corpus(
+        self,
+    ) -> None:
+        run_id = await self._run()
+        pages = [
+            ("https://example.com/", "home"),
+            ("https://example.com/services", "product"),
+        ]
+        for url, kind in pages:
+            await self._page(run_id, url, kind)
+        await self._manifest(run_id, pages)
+        async with SessionLocal() as session:
+            manifest = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                    )
+                )
+            ).scalar_one()
+            output = dict(manifest.output_json)
+            output["discovery_state"] = "terminal_partial"
+            output["coverage_state"] = "bounded"
+            manifest.output_json = output
+            await session.commit()
+        for url, _kind in pages:
+            await self._probe(run_id, url, "GPTBot")
+        await crawler.save_technical_matrix_receipt(
+            run_id,
+            domain="example.com",
+            pages=pages,
+            user_agents=["GPTBot"],
+        )
+
+        admission = await crawler.require_crawl_admission(
+            run_id,
+            domain="example.com",
+            user_agents=["GPTBot"],
+        )
+
+        self.assertEqual(admission["coverage_state"], "bounded")
+        self.assertEqual(admission["page_count"], 2)
 
     async def test_legacy_bootstrap_is_network_free_and_visibly_limited(self) -> None:
         run_id = await self._run(config={"user_agents": ["GPTBot", "ClaudeBot"]})

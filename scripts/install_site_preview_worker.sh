@@ -30,6 +30,16 @@ install -m 0755 \
   "${project_root}/scripts/aiv-site-preview" \
   /usr/local/bin/aiv-site-preview
 
+installed_protocol="$(
+  "${worker_root}/venv/bin/python" \
+    "${worker_root}/site_preview_worker.py" \
+    --protocol-version
+)"
+if [[ "${installed_protocol}" != *'"worker_protocol_version": "aiv-site-preview-worker-v2"'* ]]; then
+  echo "Installed preview worker does not expose the required v2 protocol." >&2
+  exit 1
+fi
+
 PLAYWRIGHT_BROWSERS_PATH="${worker_home}/browsers" \
   "${worker_root}/venv/bin/python" -m playwright install --with-deps chromium
 chown -R aiv-preview:aiv-preview "${worker_home}"

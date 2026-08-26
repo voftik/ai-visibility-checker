@@ -19,6 +19,9 @@ from urllib.parse import urlparse
 MAX_VIEWPORT_WIDTH = 1920
 MAX_VIEWPORT_HEIGHT = 1440
 MAX_TIMEOUT_SECONDS = 45
+WORKER_PROTOCOL_VERSION = "aiv-site-preview-worker-v2"
+MAX_NAVIGATION_ANCHORS = 1_000
+MAX_NAVIGATION_TEXT_CHARS = 420
 
 
 async def validate_public_url(url: str) -> None:
@@ -140,6 +143,8 @@ async def capture_preview(
                 timeout=min(timeout_ms, 15_000),
             )
             return {
+                "worker_protocol_version": WORKER_PROTOCOL_VERSION,
+                "mode": "preview",
                 "image_base64": base64.b64encode(jpeg).decode("ascii"),
                 "width": width,
                 "height": height,
@@ -150,9 +155,121 @@ async def capture_preview(
             await browser.close()
 
 
+async def discover_navigation(
+    url: str,
+    *,
+    timeout_seconds: int = 20,
+) -> dict[str, Any]:
+    """Return bounded, source-level evidence for rendered internal links."""
+
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import async_playwright
+
+    timeout_seconds = max(10, min(MAX_TIMEOUT_SECONDS, int(timeout_seconds)))
+    timeout_ms = timeout_seconds * 1000
+    await validate_public_url(url)
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                device_scale_factor=1,
+                color_scheme="light",
+                reduced_motion="reduce",
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                service_workers="block",
+                accept_downloads=False,
+            )
+            validation_slots = asyncio.Semaphore(16)
+
+            async def guarded_route(route: Any) -> None:
+                request = route.request
+                parsed = urlparse(request.url)
+                if parsed.scheme not in {"http", "https"}:
+                    await route.abort("blockedbyclient")
+                    return
+                if request.resource_type in {"media", "font"}:
+                    await route.abort("blockedbyclient")
+                    return
+                try:
+                    async with validation_slots:
+                        await validate_public_url(request.url)
+                except (ValueError, OSError):
+                    await route.abort("blockedbyclient")
+                    return
+                await route.continue_()
+
+            await context.route("**/*", guarded_route)
+            page = await context.new_page()
+            response = await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+            await validate_public_url(page.url)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=4_500)
+            except PlaywrightTimeoutError:
+                pass
+            anchors = await page.eval_on_selector_all(
+                "a[href]",
+                """(elements, limits) => elements
+                    .slice(0, limits.maxAnchors + 1)
+                    .map(element => {
+                        const compact = value => String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim()
+                            .slice(0, limits.maxTextChars);
+                        const container = element.closest('li, article, section')
+                            || element.parentElement;
+                        return {
+                            href: element.href,
+                            anchor_text: compact(
+                                element.innerText || element.textContent
+                            ),
+                            title: compact(
+                                element.getAttribute('title')
+                                || element.getAttribute('aria-label')
+                            ),
+                            primary_snippet: compact(
+                                container
+                                    ? (container.innerText || container.textContent)
+                                    : ''
+                            )
+                        };
+                    })""",
+                {
+                    "maxAnchors": MAX_NAVIGATION_ANCHORS,
+                    "maxTextChars": MAX_NAVIGATION_TEXT_CHARS,
+                },
+            )
+            raw_anchors = anchors if isinstance(anchors, list) else []
+            truncated = len(raw_anchors) > MAX_NAVIGATION_ANCHORS
+            bounded_anchors = raw_anchors[:MAX_NAVIGATION_ANCHORS]
+            return {
+                "worker_protocol_version": WORKER_PROTOCOL_VERSION,
+                "mode": "navigation",
+                "final_url": page.url,
+                "http_status": response.status if response is not None else None,
+                "anchors": bounded_anchors,
+                "anchor_count": len(bounded_anchors),
+                "truncated": truncated,
+            }
+        finally:
+            await browser.close()
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("preview", "navigation"),
+        default="preview",
+    )
+    parser.add_argument("--protocol-version", action="store_true")
+    parser.add_argument("--url")
     parser.add_argument("--width", type=int, default=1440)
     parser.add_argument("--height", type=int, default=900)
     parser.add_argument("--timeout", type=int, default=40)
@@ -161,13 +278,33 @@ def _parse_args() -> argparse.Namespace:
 
 async def _main() -> None:
     args = _parse_args()
-    try:
-        result = await capture_preview(
-            args.url,
-            width=args.width,
-            height=args.height,
-            timeout_seconds=args.timeout,
+    if args.protocol_version:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "worker_protocol_version": WORKER_PROTOCOL_VERSION,
+                    "modes": ["preview", "navigation"],
+                },
+                ensure_ascii=False,
+            )
         )
+        return
+    if not args.url:
+        raise SystemExit("--url is required unless --protocol-version is used")
+    try:
+        if args.mode == "navigation":
+            result = await discover_navigation(
+                args.url,
+                timeout_seconds=args.timeout,
+            )
+        else:
+            result = await capture_preview(
+                args.url,
+                width=args.width,
+                height=args.height,
+                timeout_seconds=args.timeout,
+            )
     except Exception as exc:
         print(
             json.dumps(

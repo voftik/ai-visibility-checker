@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
-import hashlib
-import json
 import os
 import signal
 import sys
@@ -23,8 +21,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.db import SessionLocal, engine
-from app.models import ModelAnswer, Run, RunStatus, VisibilityPrompt
+from app.models import ModelAnswer, Run, RunArtifact, RunStatus, VisibilityPrompt
 from app.services import analyzer
+from app.services.publication_contract import (
+    PublicationContractError,
+    ensure_publication_contract,
+    publication_snapshot,
+    publication_snapshot_digest,
+)
+from app.services.raw_answer_integrity import model_answer_fingerprint_rows
 from app.services.run_coordinator import (
     SAVED_ANSWERS_ONLY_MARKER_KEY,
     SAVED_ANSWERS_ONLY_MARKER_VERSION,
@@ -48,12 +53,6 @@ ACTIVE_QUEUE_STATUSES = (
 EXPECTED_PROMPT_COUNT = 9
 EXPECTED_DISCOVERY_PROMPT_COUNT = 6
 EXPECTED_BRAND_PROMPT_COUNT = 3
-EXPECTED_WEB_PROVIDERS = frozenset(
-    {"openai", "gemini", "perplexity", "deepseek", "claude"}
-)
-EXPECTED_MEMORY_PROVIDERS = frozenset(
-    {"openai", "gemini", "deepseek", "claude"}
-)
 EXPECTED_PANEL_CELL_COUNT = 81
 
 
@@ -164,40 +163,9 @@ def _claim_marker_matches(
 def _model_answer_fingerprint_rows(
     rows: list[ModelAnswer] | list[Mapping[str, object]],
 ) -> str:
-    """Hash every persisted panel-answer field in a canonical order."""
+    """Compatibility wrapper around the shared publication-boundary digest."""
 
-    def value(row: ModelAnswer | Mapping[str, object], key: str) -> object:
-        return row.get(key) if isinstance(row, Mapping) else getattr(row, key)
-
-    payload = [
-        {
-            "id": value(row, "id"),
-            "run_id": value(row, "run_id"),
-            "prompt_id": value(row, "prompt_id"),
-            "provider_key": value(row, "provider_key"),
-            "model": value(row, "model"),
-            "mode": value(row, "mode"),
-            "status": value(row, "status"),
-            "response_text": value(row, "response_text"),
-            "citations_json": value(row, "citations_json"),
-            "usage_json": value(row, "usage_json"),
-            "error_message": value(row, "error_message"),
-            "created_at": (
-                value(row, "created_at").isoformat()
-                if value(row, "created_at") is not None
-                else None
-            ),
-        }
-        for row in sorted(rows, key=lambda item: int(value(item, "id")))
-    ]
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    return model_answer_fingerprint_rows(rows)
 
 
 async def _model_answer_fingerprint(run_id: str) -> tuple[int, str]:
@@ -219,17 +187,26 @@ async def _model_answer_fingerprint(run_id: str) -> tuple[int, str]:
 def _validate_complete_saved_panel(
     prompt_rows: list[Mapping[str, object]],
     answer_rows: list[Mapping[str, object]],
+    *,
+    sealed_expected_cells: list[Mapping[str, object]] | None = None,
 ) -> None:
-    """Reject partial panels before any downstream LLM token is spent."""
+    """Require the exact saved topology while preserving unavailable cells.
+
+    A bounded whole-provider outage is a valid, explicitly represented panel
+    state.  Coverage admission in the analyzer decides whether those terminal
+    unavailable cells still leave enough evidence for public metrics; this
+    operator guard must only reject a missing/duplicate/non-terminal grid.
+    """
 
     if len(prompt_rows) != EXPECTED_PROMPT_COUNT:
         raise ReprocessGuardError(
             "Saved-answer reprocess requires exactly nine persisted prompts."
         )
     roles = [str(row.get("role") or "") for row in prompt_rows]
-    if roles.count("unbranded_discovery") != EXPECTED_DISCOVERY_PROMPT_COUNT or roles.count(
-        "brand_diagnostic"
-    ) != EXPECTED_BRAND_PROMPT_COUNT:
+    if (
+        roles.count("unbranded_discovery") != EXPECTED_DISCOVERY_PROMPT_COUNT
+        or roles.count("brand_diagnostic") != EXPECTED_BRAND_PROMPT_COUNT
+    ):
         raise ReprocessGuardError(
             "Persisted prompt roles do not match the 6 discovery + 3 brand contract."
         )
@@ -239,41 +216,99 @@ def _validate_complete_saved_panel(
             "Saved-answer reprocess requires the complete 81-cell panel; "
             f"found {len(answer_rows)} cells."
         )
-    cells_by_prompt: dict[int, dict[str, set[str]]] = {
-        prompt_id: {"web": set(), "memory": set()}
-        for prompt_id in prompt_ids
-    }
+    actual_grid: set[tuple[int, str, str, str]] = set()
+    physical_cells: set[tuple[int, str, str]] = set()
+    lane_models: dict[tuple[str, str], set[str]] = {}
     for row in answer_rows:
         prompt_id = int(row.get("prompt_id") or 0)
-        provider = str(row.get("provider_key") or "")
-        mode = str(row.get("mode") or "")
-        response_text = str(row.get("response_text") or "").strip()
-        if prompt_id not in cells_by_prompt or mode not in {"web", "memory"}:
+        provider = str(row.get("provider_key") or "").strip()
+        model = str(row.get("model") or "").strip()
+        mode = str(row.get("mode") or "").strip()
+        if (
+            prompt_id not in prompt_ids
+            or mode not in {"web", "memory"}
+            or not provider
+            or not model
+        ):
             raise ReprocessGuardError(
                 "Saved panel contains a cell outside the persisted 9-prompt grid."
             )
-        if str(row.get("status") or "") != "completed" or not response_text:
+        if str(row.get("status") or "") not in {"completed", "failed"}:
             raise ReprocessGuardError(
-                "Every saved panel cell must be completed and contain raw text."
+                "Every saved panel cell must be terminal before reprocessing."
             )
-        if provider in cells_by_prompt[prompt_id][mode]:
+        physical_cell = (prompt_id, provider, mode)
+        if physical_cell in physical_cells:
             raise ReprocessGuardError(
                 "Saved panel contains a duplicate provider/mode cell."
             )
-        cells_by_prompt[prompt_id][mode].add(provider)
-    for prompt_id, modes in cells_by_prompt.items():
-        if modes["web"] != EXPECTED_WEB_PROVIDERS or modes[
-            "memory"
-        ] != EXPECTED_MEMORY_PROVIDERS:
+        physical_cells.add(physical_cell)
+        actual_grid.add((prompt_id, provider, mode, model))
+        lane_models.setdefault((provider, mode), set()).add(model)
+
+    if any(len(models) != 1 for models in lane_models.values()):
+        raise ReprocessGuardError(
+            "Saved panel binds more than one model to a provider/mode lane."
+        )
+    bound_lanes = {
+        lane: next(iter(models)) for lane, models in lane_models.items()
+    }
+    inferred_grid = {
+        (prompt_id, provider, mode, model)
+        for prompt_id in prompt_ids
+        for (provider, mode), model in bound_lanes.items()
+    }
+    if actual_grid != inferred_grid:
+        raise ReprocessGuardError(
+            "Saved panel is not a complete rectangular prompt/lane grid."
+        )
+
+    if sealed_expected_cells is not None:
+        sealed_grid: set[tuple[int, str, str, str]] = set()
+        for cell in sealed_expected_cells:
+            prompt_id = cell.get("prompt_id")
+            if isinstance(prompt_id, bool) or not isinstance(prompt_id, int):
+                raise ReprocessGuardError(
+                    "Persisted panel corpus receipt has an invalid prompt cell."
+                )
+            sealed_grid.add(
+                (
+                    prompt_id,
+                    str(cell.get("provider_key") or "").strip(),
+                    str(cell.get("mode") or "").strip(),
+                    str(cell.get("model") or "").strip(),
+                )
+            )
+        if len(sealed_grid) != len(sealed_expected_cells):
             raise ReprocessGuardError(
-                "Saved panel is incomplete for prompt "
-                f"{prompt_id}: web={sorted(modes['web'])}, "
-                f"memory={sorted(modes['memory'])}."
+                "Persisted panel corpus receipt contains duplicate cells."
+            )
+        if actual_grid != sealed_grid:
+            raise ReprocessGuardError(
+                "Saved panel contains cells outside its sealed historical grid."
             )
 
 
 async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
     """Check the whole durable queue and reserve its only execution slot."""
+
+    previous_publication_digest: str | None = None
+    async with SessionLocal() as session:
+        candidate = await session.get(Run, run_id)
+        if candidate is not None and candidate.status == RunStatus.completed:
+            try:
+                await ensure_publication_contract(session, candidate)
+            except PublicationContractError as exc:
+                raise ReprocessGuardError(
+                    "Текущий опубликованный отчёт не прошёл проверку "
+                    "целостности; безопасный переанализ остановлен."
+                ) from exc
+            previous_publication_digest = publication_snapshot_digest(
+                publication_snapshot(
+                    report_json=candidate.report_json,
+                    analysis_markdown=candidate.analysis_markdown,
+                )
+            )
 
     owner = _operator_owner()
     async with engine.connect() as connection:
@@ -305,6 +340,20 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
             if run is None:
                 await connection.rollback()
                 raise ReprocessGuardError(f"Проверка {run_id} не найдена.")
+            if (
+                previous_publication_digest is not None
+                and publication_snapshot_digest(
+                    publication_snapshot(
+                        report_json=run.report_json,
+                        analysis_markdown=run.analysis_markdown,
+                    )
+                )
+                != previous_publication_digest
+            ):
+                await connection.rollback()
+                raise ReprocessGuardError(
+                    "Публикация изменилась во время подготовки переанализа."
+                )
             original_config = (
                 copy.deepcopy(run.config_json)
                 if isinstance(run.config_json, dict)
@@ -346,9 +395,7 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
             if blocker is not None:
                 blocker_id, blocker_status, blocker_slot = blocker
                 slot_detail = (
-                    ", execution_slot занят"
-                    if blocker_slot is not None
-                    else ""
+                    ", execution_slot занят" if blocker_slot is not None else ""
                 )
                 await connection.rollback()
                 raise ReprocessGuardError(
@@ -365,10 +412,7 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
                             ModelAnswer.run_id == run_id,
                             ModelAnswer.status == "completed",
                             ModelAnswer.response_text.is_not(None),
-                            func.length(
-                                func.trim(ModelAnswer.response_text)
-                            )
-                            > 0,
+                            func.length(func.trim(ModelAnswer.response_text)) > 0,
                         )
                     )
                 ).scalar_one()
@@ -422,7 +466,74 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
                 .mappings()
                 .all()
             )
-            _validate_complete_saved_panel(prompt_rows, answer_rows)
+            panel_receipt_artifact = (
+                await connection.execute(
+                    select(
+                        RunArtifact.status,
+                        RunArtifact.model,
+                        RunArtifact.prompt_version,
+                        RunArtifact.input_json,
+                        RunArtifact.output_json,
+                        RunArtifact.usage_json,
+                    ).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key
+                        == analyzer.PANEL_CORPUS_RECEIPT_KEY,
+                    )
+                )
+            ).one_or_none()
+            sealed_expected_cells: list[Mapping[str, object]] | None = None
+            if panel_receipt_artifact is not None:
+                persisted_receipt = panel_receipt_artifact.output_json
+                try:
+                    if (
+                        panel_receipt_artifact.status != "completed"
+                        or panel_receipt_artifact.model is not None
+                        or panel_receipt_artifact.prompt_version
+                        != analyzer.PANEL_CORPUS_RECEIPT_VERSION
+                        or not isinstance(persisted_receipt, dict)
+                        or persisted_receipt.get("run_id") != run_id
+                    ):
+                        raise analyzer.PanelCheckpointMismatchError(
+                            "invalid_artifact_envelope"
+                        )
+                    analyzer._validate_panel_corpus_receipt_shape(
+                        persisted_receipt
+                    )
+                    expected_input = {
+                        "run_id": run_id,
+                        "proof_scope": persisted_receipt["proof_scope"],
+                        "historical_integrity_proven": persisted_receipt[
+                            "historical_integrity_proven"
+                        ],
+                    }
+                    expected_usage = {
+                        "prompt_count": analyzer.PANEL_CORPUS_PROMPT_COUNT,
+                        "cell_count": analyzer.PANEL_CORPUS_EXPECTED_CELL_COUNT,
+                        "scope": "all_panel_prompts_and_modes",
+                    }
+                    if (
+                        panel_receipt_artifact.input_json != expected_input
+                        or panel_receipt_artifact.usage_json != expected_usage
+                    ):
+                        raise analyzer.PanelCheckpointMismatchError(
+                            "artifact_envelope_changed"
+                        )
+                    sealed_expected_cells = (
+                        analyzer._panel_expected_corpus_cells_from_receipt(
+                            persisted_receipt
+                        )
+                    )
+                except analyzer.PanelCheckpointMismatchError as exc:
+                    await connection.rollback()
+                    raise ReprocessGuardError(
+                        "Persisted panel corpus receipt failed topology validation."
+                    ) from exc
+            _validate_complete_saved_panel(
+                prompt_rows,
+                answer_rows,
+                sealed_expected_cells=sealed_expected_cells,
+            )
             raw_answers_sha256 = _model_answer_fingerprint_rows(answer_rows)
 
             previous = PreviousRunState(
@@ -444,30 +555,24 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
             claim_attempt_count = int(run.attempt_count or 0) + 1
             claim_resume_count = int(run.resume_count or 0)
             marked_config = copy.deepcopy(original_config)
-            marked_config[SAVED_ANSWERS_ONLY_MARKER_KEY] = (
-                _saved_answers_only_marker(
-                    run_id=run_id,
-                    owner=owner,
-                    attempt_count=claim_attempt_count,
-                    raw_answers_sha256=raw_answers_sha256,
-                    previous=previous,
-                )
+            marked_config[SAVED_ANSWERS_ONLY_MARKER_KEY] = _saved_answers_only_marker(
+                run_id=run_id,
+                owner=owner,
+                attempt_count=claim_attempt_count,
+                raw_answers_sha256=raw_answers_sha256,
+                previous=previous,
             )
             # The lossless snapshot and fingerprint above may process an
             # arbitrarily large saved corpus. Start the lease clock only after
             # that work, immediately before the ownership write.
             claimed_at = datetime.now(timezone.utc)
-            lease_expires_at = claimed_at + timedelta(
-                seconds=REPROCESS_LEASE_SECONDS
-            )
+            lease_expires_at = claimed_at + timedelta(seconds=REPROCESS_LEASE_SECONDS)
             claimed = await connection.execute(
                 update(Run)
                 .where(
                     Run.id == run_id,
                     Run.status == run.status,
-                    Run.status.in_(
-                        [RunStatus.failed, RunStatus.completed]
-                    ),
+                    Run.status.in_([RunStatus.failed, RunStatus.completed]),
                     Run.execution_slot.is_(None),
                     Run.config_json == original_config,
                 )
@@ -486,16 +591,14 @@ async def _claim_eligible_run(run_id: str) -> ReprocessClaim:
                     stage_key="knowledge_gap",
                     stage_label="Переанализируем сохранённые ответы",
                     stage_detail=(
-                        "Исходные ответы сохранены; модельная панель "
-                        "не вызывается."
+                        "Исходные ответы сохранены; модельная панель не вызывается."
                     ),
                 )
             )
             if claimed.rowcount != 1:
                 await connection.rollback()
                 raise ReprocessGuardError(
-                    "Проверку уже забрал другой процесс. "
-                    "Повторный запуск отменён."
+                    "Проверку уже забрал другой процесс. Повторный запуск отменён."
                 )
             await connection.commit()
         except BaseException:
@@ -607,17 +710,12 @@ async def _execute_claimed_reprocess(claim: ReprocessClaim) -> None:
 async def _restore_model_answer_snapshot(claim: ReprocessClaim) -> None:
     """Restore the immutable raw corpus after an unexpected write."""
 
-    snapshot_ids = {
-        int(item["id"])
-        for item in claim.raw_answer_snapshot
-    }
+    snapshot_ids = {int(item["id"]) for item in claim.raw_answer_snapshot}
     async with SessionLocal() as session:
         current_ids = set(
             (
                 await session.execute(
-                    select(ModelAnswer.id).where(
-                        ModelAnswer.run_id == claim.run_id
-                    )
+                    select(ModelAnswer.id).where(ModelAnswer.run_id == claim.run_id)
                 )
             ).scalars()
         )
@@ -660,18 +758,14 @@ async def _restore_model_answer_snapshot(claim: ReprocessClaim) -> None:
 
 
 async def _assert_raw_answers_unchanged(claim: ReprocessClaim) -> None:
-    answer_count, raw_answers_sha256 = await _model_answer_fingerprint(
-        claim.run_id
-    )
+    answer_count, raw_answers_sha256 = await _model_answer_fingerprint(claim.run_id)
     if (
         answer_count == claim.total_answers
         and raw_answers_sha256 == claim.raw_answers_sha256
     ):
         return
     await _restore_model_answer_snapshot(claim)
-    restored_count, restored_sha256 = await _model_answer_fingerprint(
-        claim.run_id
-    )
+    restored_count, restored_sha256 = await _model_answer_fingerprint(claim.run_id)
     if (
         restored_count != claim.total_answers
         or restored_sha256 != claim.raw_answers_sha256
@@ -847,14 +941,11 @@ async def reprocess_saved_run(
                 await session.execute(select(Run).where(Run.id == run_id))
             ).scalar_one_or_none()
             if run is None:
-                raise ReprocessExecutionError(
-                    "Проверка исчезла во время переанализа."
-                )
+                raise ReprocessExecutionError("Проверка исчезла во время переанализа.")
             if run.status != RunStatus.completed:
                 detail = (run.error_message or "").strip()
-                message = (
-                    f"Переанализ завершился со статусом {run.status.value}."
-                    + (f" {detail}" if detail else "")
+                message = f"Переанализ завершился со статусом {run.status.value}." + (
+                    f" {detail}" if detail else ""
                 )
                 raise ReprocessExecutionError(message)
         await _assert_raw_answers_unchanged(claim)

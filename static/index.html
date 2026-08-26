@@ -8,7 +8,7 @@
     name="description"
     content="RW+ AIV проверяет техническую доступность сайта для ИИ и видимость бренда в ответах популярных моделей."
   >
-  <title>AI Visibility — RW+</title>
+  <title>AI Visibility · RW+</title>
   <link rel="icon" href="/static/brand/favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -582,6 +582,12 @@
       border: 1px solid rgba(255, 255, 255, 0.72);
       border-radius: var(--radius-lg);
       box-shadow: 0 24px 80px rgba(49, 63, 78, 0.08);
+    }
+
+    .history-load-more {
+      display: flex;
+      justify-content: center;
+      padding-top: 20px;
     }
 
     .history-table {
@@ -5078,11 +5084,33 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
+  <script
+    src="/static/reader-copy-registry.ru.v2026-08-26.js"
+    integrity="sha256-vofwWlBVDFfMnBuJrbEZRwFOXbJvfqUSemMERTgAdDU="
+    crossorigin="anonymous"
+  ></script>
   <script>
     window.addEventListener("DOMContentLoaded", () => {
       const app = document.getElementById("app");
       const topbarActions = document.getElementById("topbar-actions");
       const toast = document.getElementById("toast");
+      const readerCopyRegistry = window.AIV_READER_COPY_REGISTRY;
+      if (readerCopyRegistry?.version !== "aiv-reader-copy-registry-ru-v1") {
+        throw new Error("Reader-copy registry is unavailable or stale");
+      }
+      const readerCopy = (path) => {
+        let value = readerCopyRegistry.copy;
+        for (const segment of String(path || "").split(".")) {
+          if (!segment || !value || typeof value !== "object" || !(segment in value)) {
+            throw new Error(`Unknown reader-copy registry path: ${path}`);
+          }
+          value = value[segment];
+        }
+        if (typeof value !== "string" || !value.trim()) {
+          throw new Error(`Reader-copy registry path is not text: ${path}`);
+        }
+        return value;
+      };
       let headlineRotationTimeline = null;
       let headlineRotationDelay = null;
 
@@ -5285,6 +5313,9 @@
         historyError: "",
         historyRefreshInFlight: false,
         historyFetchToken: 0,
+        historyHasMore: false,
+        historyLoadingMore: false,
+        historyLastFullRefreshAt: 0,
         toastTimer: null,
         uiVersionTimer: null
       };
@@ -5335,7 +5366,7 @@
 
       const safeNumber = (value, digits = 0) => {
         const number = finiteNumber(value);
-        if (number === null) return "—";
+        if (number === null) return "Нет данных";
         return new Intl.NumberFormat("ru-RU", {
           maximumFractionDigits: digits,
           minimumFractionDigits: digits
@@ -5379,6 +5410,25 @@
         return "queued";
       };
 
+      const operatorReviewStages = new Set([
+        "source_review_required",
+        "integrity_review_required",
+        "panel_review_required"
+      ]);
+
+      const runNeedsOperatorReview = (run) =>
+        runLifecycleState(run) === "failed"
+        && operatorReviewStages.has(String(run?.stage_key || ""));
+
+      const operatorReviewLabel = (run) => {
+        const labels = {
+          source_review_required: "Нужна проверка источников",
+          integrity_review_required: "Нужна проверка данных",
+          panel_review_required: "Нужна проверка ответов"
+        };
+        return labels[run?.stage_key] || "Нужна проверка данных";
+      };
+
       const runRevision = (run) => finiteNumber(run?.state_revision);
 
       const canApplyRunUpdate = (currentRun, nextRun) => {
@@ -5398,15 +5448,22 @@
       };
 
       const mergeRunListsByRevision = (currentRuns, nextRuns) => {
-        const currentById = new Map(
+        const mergedById = new Map(
           currentRuns.map((run) => [run.id, run])
         );
-        return nextRuns.map((nextRun) => {
-          const currentRun = currentById.get(nextRun.id);
+        nextRuns.forEach((nextRun) => {
+          const currentRun = mergedById.get(nextRun.id);
           if (!currentRun || canApplyRunUpdate(currentRun, nextRun)) {
-            return { ...currentRun, ...nextRun };
+            mergedById.set(nextRun.id, { ...currentRun, ...nextRun });
           }
-          return currentRun;
+        });
+        return Array.from(mergedById.values()).sort((left, right) => {
+          const createdDelta = (
+            new Date(right.created_at || 0).getTime()
+            - new Date(left.created_at || 0).getTime()
+          );
+          if (createdDelta) return createdDelta;
+          return String(right.id || "").localeCompare(String(left.id || ""));
         });
       };
 
@@ -5491,14 +5548,28 @@
         }
       };
 
-      const loadPublicRuns = async () => {
-        const payload = await fetchJSON("/api/runs");
+      const HISTORY_PAGE_SIZE = 100;
+
+      const loadPublicRuns = async ({ beforeCreatedAt, beforeId } = {}) => {
+        const params = new URLSearchParams({ limit: String(HISTORY_PAGE_SIZE) });
+        if (beforeCreatedAt) params.set("before_created_at", beforeCreatedAt);
+        if (beforeId) params.set("before_id", beforeId);
+        const payload = await fetchJSON(`/api/runs?${params.toString()}`);
+        return Array.isArray(payload) ? payload : [];
+      };
+
+      const loadPublicRunUpdates = async (ids) => {
+        const payload = await fetchJSON("/api/runs/lookup", {
+          method: "POST",
+          body: JSON.stringify({ ids: ids.slice(0, 8) })
+        });
         return Array.isArray(payload) ? payload : [];
       };
 
       const runStatusLabel = (run) => {
         const lifecycle = runLifecycleState(run);
         if (lifecycle === "completed") return "Проверка завершена";
+        if (runNeedsOperatorReview(run)) return operatorReviewLabel(run);
         if (lifecycle === "failed") return "Нужно продолжить";
         if (lifecycle === "queued") return "В очереди";
         if (lifecycle === "recovering") return "Восстанавливаем проверку";
@@ -5524,6 +5595,9 @@
             ? "Выполняется сейчас"
             : `Готово ${Math.max(0, Math.min(100, Math.round(percent)))}%`;
         }
+        if (runNeedsOperatorReview(run)) {
+          return "Автоматическое продолжение отключено";
+        }
         if (lifecycle === "failed") return "Готовые данные сохранены";
         return "Отчёт доступен";
       };
@@ -5539,6 +5613,7 @@
       const runActionLabel = (run) => {
         const lifecycle = runLifecycleState(run);
         if (lifecycle === "completed") return "Открыть отчёт";
+        if (runNeedsOperatorReview(run)) return "Подробнее";
         if (lifecycle === "failed") return "Продолжить";
         return "Смотреть ход";
       };
@@ -5821,42 +5896,6 @@
         });
       };
 
-      const localizeAnalysisText = (value) => {
-        const replacements = [
-          [/помечены как server_rendered/giu, "отдают текст в серверном HTML"],
-          [/помечена как utility/giu, "отнесена к служебным"],
-          [/стратегия рендеринга unknown при низкой уверенности/giu, "способ рендеринга не определён; уверенность низкая"],
-          [/brand_knowledge\.web\.facets/giu, "аспекты ответов о названном бренде с веб-поиском"],
-          [/brand_knowledge\.web/giu, "ответы о названном бренде с веб-поиском"],
-          [/intents:\s*portfolio_capture/giu, "видимость продуктов по сценариям"],
-          [/content_pages_evaluated/giu, "проверенные содержательные страницы"],
-          [/utility_pages_excluded/giu, "исключённые служебные страницы"],
-          [/render_confidence/giu, "уверенность определения рендеринга"],
-          [/contradiction_count/giu, "ответы с расхождениями в фактах"],
-          [/structured_pages/giu, "страницы со структурированными данными"],
-          [/competitors:/giu, "упоминания брендов:"],
-          [/server_rendered/giu, "текст в серверном HTML"],
-          [/\bportfolio_capture\b/giu, "видимость продуктов"],
-          [/\butility\b/giu, "служебная страница"],
-          [/\bmedium\b/giu, "средняя"],
-          [/\bunknown\b/giu, "данных недостаточно"]
-        ];
-        return replacements.reduce(
-          (text, [pattern, replacement]) => text.replace(pattern, replacement),
-          String(value || "")
-        );
-      };
-
-      const localizeAnalysisEvidence = (root) => {
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-        const textNodes = [];
-        while (walker.nextNode()) textNodes.push(walker.currentNode);
-        textNodes.forEach((node) => {
-          if (node.parentElement?.closest("code, pre, a")) return;
-          node.nodeValue = localizeAnalysisText(node.nodeValue);
-        });
-      };
-
       const appendAnalysisBody = (panel, nodes) => {
         const introNodes = [];
         const subSections = [];
@@ -5900,7 +5939,6 @@
           });
           if (grid.childNodes.length) panel.appendChild(grid);
         }
-        localizeAnalysisEvidence(panel);
         wrapAnalysisTables(panel);
       };
 
@@ -5952,7 +5990,7 @@
           if (lead) {
             const deck = document.createElement("span");
             deck.className = "analysis-card-lead";
-            deck.textContent = localizeAnalysisText(lead);
+            deck.textContent = lead;
             heading.appendChild(deck);
           }
 
@@ -6045,7 +6083,7 @@
       };
 
       const renderHome = () => {
-        document.title = "AI Visibility — RW+";
+        document.title = "AI Visibility · RW+";
 
         app.innerHTML = `
           <div class="site-shell">
@@ -6157,7 +6195,7 @@
       };
 
       const renderHistory = () => {
-        document.title = "История проверок — RW+";
+        document.title = "История проверок · RW+";
         const rows = state.runs.map((run, index) => {
           const domain = compactDomainLabel(run.domain) || "Домен не указан";
           const status = runStatusLabel(run);
@@ -6214,13 +6252,25 @@
               <tbody>${rows}</tbody>
             </table>
           </section>
+          ${state.historyHasMore ? `
+            <div class="history-load-more">
+              <button
+                class="button button-light"
+                type="button"
+                data-load-more-history
+                ${state.historyLoadingMore ? "disabled" : ""}
+              >
+                ${state.historyLoadingMore ? "Загружаем…" : "Показать более ранние проверки"}
+              </button>
+            </div>
+          ` : ""}
         `;
         const empty = `
           <section class="history-table-shell empty-history" aria-labelledby="empty-history-title">
             <div class="empty-history-copy">
               <h2 id="empty-history-title">Проверок пока нет</h2>
               <p>
-                Укажите адрес сайта — первая проверка появится здесь
+                Укажите адрес сайта: первая проверка появится здесь
                 сразу после запуска.
               </p>
               <button class="button button-accent" type="button" data-new-run>
@@ -6341,7 +6391,7 @@
         if (lifecycle === "queued") {
           return {
             lifecycle,
-            value: position === null ? "—" : `№ ${position}`,
+            value: position === null ? "Нет данных" : `№ ${position}`,
             suffix: "",
             title: "В очереди",
             detail: positionLabel
@@ -6379,7 +6429,7 @@
       const renderProgress = () => {
         const run = state.run || {};
         const presentation = progressPresentation(run);
-        document.title = `${presentation.title} — RW+`;
+        document.title = `${presentation.title} · RW+`;
         const currentIndex = stages.findIndex(
           (stage) => stage.key === run.stage_key
         );
@@ -6498,7 +6548,7 @@
 
       const formatPercent = (value, digits = 1) => {
         const number = finiteNumber(value);
-        return number === null ? "—" : `${safeNumber(number, digits)}%`;
+        return number === null ? "Нет данных" : `${safeNumber(number, digits)}%`;
       };
 
       const barRows = (rows, valueKey, targetName = null, options = {}) => {
@@ -7163,7 +7213,7 @@
       const auditFactHTML = (fact) => {
         const numeric = finiteNumber(fact?.value);
         const value = numeric === null
-          ? String(fact?.value || "—")
+          ? String(fact?.value || "Нет данных")
           : `${safeNumber(numeric, numeric % 1 ? 1 : 0)}${fact?.unit || ""}`;
         return `
           <article class="audit-fact">
@@ -7370,7 +7420,7 @@
               ? `${safeNumber(robotsAllowedChecks)} из ${safeNumber(robotsKnownChecks)} проверок URL разрешены`
               : families.length
               ? `${familyPassed} из ${families.length} семейств проходят проверку`
-              : "Нет результатов по семействам",
+              : readerCopy("technical_ui.matrix_families_missing"),
             impact: robotsOpen
               ? "Краулеры могут открыть публичные страницы"
               : checkedRobotsPathsOpen
@@ -7398,7 +7448,7 @@
               ? `${safeNumber(passedChecks)} из ${safeNumber(totalChecks)} проверок доступа`
               : totalChecks
               ? `${safeNumber(passedChecks)} из ${safeNumber(totalChecks)} проверок`
-              : "Охват не определён",
+              : readerCopy("technical_ui.matrix_coverage_missing"),
             impact: "Модель получает содержимое только после успешного ответа сервера",
             action: httpPassed === contentPages.length && contentPages.length
               ? "Контролировать коды ответа после выкладок"
@@ -7432,7 +7482,7 @@
               ? `${safeNumber(renderKnownPages)} проверено · ${safeNumber(renderUnknownPages)} не определено`
               : contentPages.length
               ? `${contentPages.length} содержательных стр. проверено`
-              : "Нет подтверждённых страниц",
+              : readerCopy("technical_ui.matrix_pages_missing"),
             impact: serverShare !== null && serverShare >= 90 && renderingComplete
               ? "JavaScript не нужен, чтобы дойти до основного смысла на проверенных страницах"
               : serverShare !== null && serverShare >= 90
@@ -7453,8 +7503,8 @@
               ? "Публичный контент доступен без входа"
               : technical?.auth?.interpretation || "Состояние не определено",
             evidence: technical?.auth?.forms_present
-              ? "Форма входа найдена; проверено, перекрывает ли она контент"
-              : "Стена авторизации не обнаружена",
+              ? readerCopy("technical_ui.matrix_auth_form_found")
+              : readerCopy("technical_ui.matrix_auth_wall_absent"),
             impact: authOpen
               ? "ИИ читает тот же открытый материал, что и пользователь"
               : "Контент за стеной входа не участвует в обнаружении",
@@ -7481,8 +7531,8 @@
             evidence: structuredTotal
               ? auxiliaryStructuredPages
                 ? `На ${safeNumber(auxiliaryStructuredPages)} стр. есть только вспомогательная разметка; проверены Organization, Product, Service и Article`
-                : "Проверены типы Organization, Product, Service и Article"
-              : "Охват не определён",
+                : readerCopy("technical_ui.matrix_schema_types_checked")
+              : readerCopy("technical_ui.matrix_coverage_missing"),
             impact: structuredPages
               ? "Сущности получают явные машинные связи"
               : "Модель вынуждена угадывать бренд, продукты и их отношения по тексту",
@@ -7512,7 +7562,7 @@
               ? `Охват ${formatPercent(coverageRate, 1)} · ${pages.length - contentPages.length} служебных исключено`
               : contentPages.length
               ? contentPages.map((page) => compactURL(page?.url)).filter(Boolean).join(", ")
-              : "Список URL пуст",
+              : readerCopy("technical_ui.matrix_url_list_empty"),
             impact: coverageState === "complete"
               ? "Выводы относятся ко всем найденным страницам"
               : "Оценка описывает только проверенную часть сайта",
@@ -7565,7 +7615,7 @@
           ? technical.families.map((family) => String(family?.name || "")).filter(Boolean)
           : [];
         if (!pages.length || !families.length) {
-          return `<p class="bar-unknown">Матрица доступа не измерялась.</p>`;
+          return `<p class="bar-unknown">${escapeHTML(readerCopy("technical_ui.access_matrix_missing"))}</p>`;
         }
         return `
           <div class="data-table-wrap">
@@ -7728,20 +7778,77 @@
         return "Для этой страницы набор технических проверок не завершён";
       };
 
-      const schemaTooltipCopy = ({ isUtility, schemaTypes }) => {
-        if (isUtility) {
-          return "Служебную страницу не оцениваем по структурированной разметке";
+      const schemaStateForPage = (page) => {
+        const schemaTypes = Array.isArray(page?.structured_data_types)
+          ? page.structured_data_types.filter(Boolean)
+          : [];
+        if (
+          page?.is_utility === true
+          || page?.is_excluded === true
+          || page?.schema_evaluation_excluded === true
+        ) {
+          return "excluded";
         }
-        if (schemaTypes.length) {
-          return (
-            "Schema.org явно объясняет ИИ, какие сущности находятся на странице. "
-            + `Найдены типы: ${schemaTypes.join(", ")}`
-          );
+        if (schemaTypes.length) return "found";
+        if (
+          page?.structured_data_complete === true
+          && page?.body_truncated === false
+        ) {
+          return "absent";
         }
-        return (
-          "Schema.org не найдена. Страница остаётся доступной, "
-          + "но ИИ получает меньше явных подсказок о её содержании"
-        );
+        return "unknown";
+      };
+
+      const schemaStatePresentation = (page) => {
+        const schemaTypes = Array.isArray(page?.structured_data_types)
+          ? page.structured_data_types.filter(Boolean)
+          : [];
+        const state = schemaStateForPage(page);
+        if (state === "excluded") {
+          return {
+            state,
+            label: "Не проверяем",
+            title: "Страница исключена из проверки",
+            copy: "Служебные страницы не оцениваем по структурированной разметке",
+            schemaTypes
+          };
+        }
+        if (state === "found") {
+          return {
+            state,
+            label: "Найдена",
+            title: "Разметка найдена",
+            copy: (
+              "Schema.org помогает ИИ распознать сущности на странице. "
+              + `Найдены типы: ${schemaTypes.join(", ")}`
+            ),
+            schemaTypes
+          };
+        }
+        if (state === "absent") {
+          return {
+            state,
+            label: "Не найдена",
+            title: "Разметка не найдена",
+            copy: (
+              "HTML и структурированные данные проверены полностью. "
+              + "Schema.org не обнаружена, поэтому ИИ получает меньше явных подсказок о содержании страницы"
+            ),
+            schemaTypes
+          };
+        }
+        const incompleteReason = page?.body_truncated === true
+          ? "Получен только фрагмент HTML"
+          : page?.structured_data_complete === false
+          ? "Разбор структурированных данных не завершён"
+          : "Полнота HTML и структурированных данных не подтверждена";
+        return {
+          state,
+          label: "Данных недостаточно",
+          title: "Недостаточно данных о разметке",
+          copy: `${incompleteReason}, поэтому отсутствие Schema.org подтвердить нельзя`,
+          schemaTypes
+        };
       };
 
       const scoreInclusionTooltipCopy = (isUtility) => (
@@ -7752,7 +7859,7 @@
 
       const technicalPagesHTML = (pages) => {
         if (!Array.isArray(pages) || !pages.length) {
-          return `<p class="bar-unknown">Для постраничной таблицы данных пока недостаточно.</p>`;
+          return `<p class="bar-unknown">${escapeHTML(readerCopy("technical_ui.pages_missing"))}</p>`;
         }
         const rows = pages.map((page, rowIndex) => {
           const accessible = Array.isArray(page?.accessible_families)
@@ -7772,9 +7879,7 @@
             : blocked.length
             ? "Доступ ограничен"
             : "Не определено";
-          const schemaTypes = Array.isArray(page?.structured_data_types)
-            ? page.structured_data_types.filter(Boolean)
-            : [];
+          const schemaPresentation = schemaStatePresentation(page);
           const textLength = firstFinite(page?.text_length, page?.server_text_length);
           const httpStatus = finiteNumber(page?.http_status);
           const passedChecks = finiteNumber(page?.passed_checks);
@@ -7784,11 +7889,6 @@
             : passedChecks !== null && totalChecks !== null
             ? `${safeNumber(passedChecks)} из ${safeNumber(totalChecks)}`
             : "Не измерялись";
-          const schemaText = isUtility
-            ? "Не проверяем"
-            : schemaTypes.length
-            ? schemaTypes.join(", ")
-            : "Не найдена";
           const renderText = renderStrategyLabel(page?.render_strategy);
           const scoreLabel = isUtility ? "Исключена" : "Учитывается";
           const tooltipPrefix = `page-audit-${rowIndex}`;
@@ -7804,7 +7904,7 @@
               <td data-label="HTTP">
                 ${auditTooltipHTML({
                   id: `${tooltipPrefix}-http-help`,
-                  visibleHTML: `<strong>${httpStatus === null ? "—" : safeNumber(httpStatus)}</strong>`,
+                  visibleHTML: `<strong>${httpStatus === null ? "Нет данных" : safeNumber(httpStatus)}</strong>`,
                   title: httpStatus === null ? "Ответ сервера не определён" : `Ответ сервера: ${safeNumber(httpStatus)}`,
                   copy: httpTooltipCopy(httpStatus, textLength),
                   controlLabel: "Пояснение к ответу сервера и объёму текста"
@@ -7843,11 +7943,21 @@
               <td data-label="Schema.org">
                 ${auditTooltipHTML({
                   id: `${tooltipPrefix}-schema-help`,
-                  visibleHTML: `<strong>${escapeHTML(schemaText)}</strong>`,
-                  title: "Машинное описание страницы",
-                  copy: schemaTooltipCopy({ isUtility, schemaTypes }),
-                  controlLabel: `Пояснение к разметке Schema.org: ${schemaText}`
+                  visibleHTML: statusPillHTML(
+                    schemaPresentation.state === "found"
+                      ? "good"
+                      : schemaPresentation.state === "absent"
+                      ? "bad"
+                      : "limited",
+                    schemaPresentation.label
+                  ),
+                  title: schemaPresentation.title,
+                  copy: schemaPresentation.copy,
+                  controlLabel: `Пояснение к разметке Schema.org: ${schemaPresentation.label}`
                 })}
+                ${schemaPresentation.schemaTypes.length
+                  ? `<small>${escapeHTML(schemaPresentation.schemaTypes.join(", "))}</small>`
+                  : ""}
               </td>
               <td data-label="В оценке">
                 ${auditTooltipHTML({
@@ -7930,11 +8040,15 @@
       };
 
       const technicalFindingsHTML = (technical) => {
-        const candidates = [
-          ...(Array.isArray(technical?.review?.findings) ? technical.review.findings : []),
-          ...(Array.isArray(technical?.findings) ? technical.findings : []),
-          ...(Array.isArray(technical?.barriers) ? technical.barriers : [])
-        ];
+        const reviewedFindings = Array.isArray(technical?.review?.findings)
+          ? technical.review.findings
+          : [];
+        const candidates = reviewedFindings.length
+          ? reviewedFindings
+          : [
+              ...(Array.isArray(technical?.findings) ? technical.findings : []),
+              ...(Array.isArray(technical?.barriers) ? technical.barriers : [])
+            ];
         const seen = new Set();
         const findings = candidates.filter((finding) => {
           const key = String(finding?.title || "").trim().toLocaleLowerCase("ru-RU");
@@ -7943,7 +8057,7 @@
           return true;
         });
         if (!findings.length) {
-          return `<p class="bar-unknown">Подтверждённых технических проблем в этом срезе нет.</p>`;
+          return `<p class="bar-unknown">${escapeHTML(readerCopy("technical_ui.findings_empty"))}</p>`;
         }
         const severityLabels = {
           critical: "Критично",
@@ -7977,10 +8091,10 @@
                       <td data-label="Приоритет">
                         ${statusPillHTML(pillState, severityLabels[severity])}
                       </td>
-                      <td data-label="Вывод"><strong>${escapeHTML(finding?.title || "Без названия")}</strong></td>
-                      <td data-label="Доказательство">${escapeHTML(finding?.evidence || "Не указано")}</td>
-                      <td data-label="Почему важно">${escapeHTML(finding?.business_effect || "Влияние не описано")}</td>
-                      <td data-label="Действие">${escapeHTML(finding?.action || "Дополнительных действий не требуется")}</td>
+                      <td data-label="Вывод"><strong>${escapeHTML(finding?.title || readerCopy("technical_ui.finding_title_missing"))}</strong></td>
+                      <td data-label="Доказательство">${escapeHTML(finding?.evidence || readerCopy("technical_ui.finding_basis_missing"))}</td>
+                      <td data-label="Почему важно">${escapeHTML(finding?.business_effect || readerCopy("technical_ui.finding_effect_missing"))}</td>
+                      <td data-label="Действие">${escapeHTML(finding?.action || readerCopy("technical_ui.finding_action_missing"))}</td>
                     </tr>
                   `;
                 }).join("")}
@@ -9242,7 +9356,7 @@
           >
             <div class="family-status-overview">
               <p class="family-status-summary">${escapeHTML(summary)}</p>
-              <span class="family-status-legend">Лампа горит — доступ открыт</span>
+              <span class="family-status-legend">Лампа горит: доступ открыт</span>
             </div>
             <div class="family-status-grid" role="list">
               ${rows.map((row) => `
@@ -9622,7 +9736,7 @@
               : "Числитель или база расчёта не указаны";
             const formula = mentionCount !== null && totalAnswers !== null
               ? (
-                  `Числитель — ${safeNumber(mentionCount)}; база — `
+                  `Числитель: ${safeNumber(mentionCount)}; база: `
                   + `${pluralizeValidAnswers(totalAnswers)}. Процент равен `
                   + `${safeNumber(mentionCount)} ÷ ${safeNumber(totalAnswers)} × 100. `
                   + "Повтор сущности внутри одного ответа не увеличивает числитель."
@@ -9944,7 +10058,7 @@
             : null
         );
         const brandName = brand.name || run.domain || "Бренд";
-        document.title = `${brandName}: AI visibility — RW+`;
+        document.title = `${brandName}: AI visibility · RW+`;
 
         const rawCompetitors = Array.isArray(report.competitors)
           ? report.competitors.map((row) => ({ ...row }))
@@ -10121,7 +10235,7 @@
           && knowledgeScores.some((value) => value > 0)
         )
           ? "На прямой вопрос о бренде системы отвечают конкретнее, чем обнаруживают его в безбрендовом выборе. Эти результаты измеряют разные ситуации."
-          : "Безбрендовое обнаружение и ответ на прямой вопрос о бренде — разные показатели; один результат нельзя подменять другим.";
+          : "Безбрендовое обнаружение и ответ на прямой вопрос о бренде измеряют разные показатели; один результат нельзя подменять другим.";
 
         const explicitTechnicalConclusion = (
           technical.review?.overall_conclusion
@@ -10262,9 +10376,9 @@
                   ${providerRows || `
                     <div class="matrix-row">
                       <span class="matrix-name">Недостаточно данных</span>
-                      <span class="matrix-value">—</span>
-                      <span class="matrix-value">—</span>
-                      <span class="matrix-value">—</span>
+                      <span class="matrix-value">Нет данных</span>
+                      <span class="matrix-value">Нет данных</span>
+                      <span class="matrix-value">Нет данных</span>
                     </div>
                   `}
                 </div>
@@ -10274,7 +10388,7 @@
 
             <section class="report-block report-grid" aria-labelledby="memory-title">
               <div class="report-aside">
-                <h2 class="section-title" id="memory-title">Ответ на прямой вопрос — не рекомендация</h2>
+                <h2 class="section-title" id="memory-title">Ответ на прямой вопрос не равен рекомендации</h2>
                 <p>
                   Сопоставляем органическое обнаружение бренда, появление его
                   продуктов и конкретность ответа на прямой вопрос.
@@ -10321,7 +10435,7 @@
                     <ul>
                       ${technicalLimitations.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}
                     </ul>
-                  ` : `<p>Дополнительных технических ограничений не зафиксировано.</p>`}
+                  ` : `<p>${escapeHTML(readerCopy("technical_ui.limitations_empty"))}</p>`}
                 </div>
               </details>
             </section>
@@ -10348,7 +10462,7 @@
           sitePreview,
           methodology
         } = viewModel;
-        document.title = `${brandName}: AI visibility — RW+`;
+        document.title = `${brandName}: AI visibility · RW+`;
 
         const entityScope = Array.isArray(brand.entity_scope) ? brand.entity_scope : [];
         const hasCommercialPortfolio = entityScope.some((entity) => (
@@ -10454,7 +10568,7 @@
                 ? "В историческом срезе системы давали конкретные ответы на прямой вопрос, но не называли бренд в безбрендовом выборе. Это описательное наблюдение, а не подтверждение устойчивой памяти модели."
                 : "На прямой вопрос о бренде системы отвечают конкретнее, чем обнаруживают его в безбрендовом выборе. Эти результаты измеряют разные ситуации."
             )
-          : "Безбрендовое обнаружение и ответ на прямой вопрос о бренде — разные сигналы; один результат нельзя подменять другим.";
+          : "Безбрендовое обнаружение и ответ на прямой вопрос о бренде дают разные сигналы; один результат нельзя подменять другим.";
 
         const explicitTechnicalConclusion = (
           technical.review?.overall_conclusion
@@ -10656,7 +10770,7 @@
 
             <section class="report-block report-grid" aria-labelledby="memory-title">
               <div class="report-aside">
-                <h2 class="section-title" id="memory-title">Ответ на прямой вопрос — не рекомендация</h2>
+                <h2 class="section-title" id="memory-title">Ответ на прямой вопрос не равен рекомендации</h2>
                 <p>
                   Сопоставляем ответы на одинаковые запросы в двух режимах, а
                   конкретность ответа о прямо названном бренде показываем отдельно.
@@ -10733,7 +10847,7 @@
               <details>
                 <summary>Как рассчитан экспресс-снимок</summary>
                 <div class="details-body">
-                  <p>${escapeHTML(methodology.summary || "Метрики рассчитаны по сохранённым ответам ИИ-систем и техническим проверкам сайта.")}</p>
+                  <p>${escapeHTML(methodology.summary || readerCopy("technical_ui.methodology_fallback"))}</p>
                   ${methodology.note ? `<p>${escapeHTML(methodology.note)}</p>` : ""}
                   ${methodology.offline_limit ? `<p>${escapeHTML(methodology.offline_limit)}</p>` : ""}
                 </div>
@@ -10747,7 +10861,7 @@
                     <ul>
                       ${technicalLimitations.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}
                     </ul>
-                  ` : `<p>Дополнительных технических ограничений не зафиксировано.</p>`}
+                  ` : `<p>${escapeHTML(readerCopy("technical_ui.limitations_empty"))}</p>`}
                 </div>
               </details>
             </section>
@@ -10766,19 +10880,26 @@
 
       const renderError = () => {
         const run = state.run || {};
-        document.title = "Проверку нужно продолжить — RW+";
+        const needsReview = runNeedsOperatorReview(run);
+        document.title = needsReview
+          ? `${operatorReviewLabel(run)} · RW+`
+          : "Проверку нужно продолжить · RW+";
         app.innerHTML = `
           <div class="site-shell error-page">
             <section class="error-panel">
               <div class="error-content">
-                <h1 class="error-title">Проверка остановилась, но данные сохранились</h1>
+                <h1 class="error-title">${escapeHTML(needsReview ? operatorReviewLabel(run) : "Проверка остановилась, но данные сохранились")}</h1>
                 <p class="error-copy">
-                  ${escapeHTML(run.error_message || "Сервис не завершил один из этапов. Продолжите проверку: готовые результаты не пропадут.")}
+                  ${escapeHTML(run.error_message || (needsReview
+                    ? "Автоматическое продолжение отключено: сначала нужно проверить сохранённые источники и контрольные данные. Уже полученные ответы не пропали."
+                    : "Сервис не завершил один из этапов. Продолжите проверку: готовые результаты не пропадут."))}
                 </p>
                 <div class="error-actions">
-                  <button class="button button-accent" type="button" data-retry>
-                    ${icon("retry")} Продолжить проверку
-                  </button>
+                  ${needsReview ? "" : `
+                    <button class="button button-accent" type="button" data-retry>
+                      ${icon("retry")} Продолжить проверку
+                    </button>
+                  `}
                   <button class="button button-light" type="button" data-new-run>
                     Проверить другой сайт
                   </button>
@@ -10942,7 +11063,10 @@
         state.pollTimer = setInterval(() => refreshRun(runId), 10000);
       };
 
-      const refreshHistory = async ({ showLoading = false } = {}) => {
+      const refreshHistory = async ({
+        showLoading = false,
+        activeOnly = false
+      } = {}) => {
         if (state.historyRefreshInFlight) return;
         const fetchToken = ++state.historyFetchToken;
         state.historyRefreshInFlight = true;
@@ -10952,7 +11076,25 @@
           if (state.view === "history") render();
         }
         try {
-          const runs = await loadPublicRuns();
+          const now = Date.now();
+          const canUseActiveLookup = (
+            activeOnly
+            && state.historyLastFullRefreshAt > 0
+            && now - state.historyLastFullRefreshAt < 60000
+          );
+          const activeIds = canUseActiveLookup
+            ? state.runs
+              .filter((run) => !["completed", "failed"].includes(runLifecycleState(run)))
+              .slice(0, 8)
+              .map((run) => run.id)
+            : [];
+          const runs = canUseActiveLookup
+            ? (
+              activeIds.length
+                ? await loadPublicRunUpdates(activeIds)
+                : []
+            )
+            : await loadPublicRuns();
           if (
             state.view !== "history"
             || fetchToken !== state.historyFetchToken
@@ -10960,6 +11102,10 @@
             return;
           }
           state.runs = mergeRunListsByRevision(state.runs, runs);
+          if (!canUseActiveLookup) {
+            state.historyHasMore = runs.length === HISTORY_PAGE_SIZE;
+            state.historyLastFullRefreshAt = now;
+          }
           state.historyError = "";
         } catch (error) {
           if (
@@ -10979,10 +11125,39 @@
         }
       };
 
+      const loadMoreHistory = async () => {
+        if (state.historyLoadingMore || !state.historyHasMore) return;
+        const oldest = state.runs[state.runs.length - 1];
+        if (!oldest?.created_at || !oldest?.id) {
+          state.historyHasMore = false;
+          render();
+          return;
+        }
+        state.historyLoadingMore = true;
+        render();
+        try {
+          const page = await loadPublicRuns({
+            beforeCreatedAt: oldest.created_at,
+            beforeId: oldest.id
+          });
+          state.runs = mergeRunListsByRevision(state.runs, page);
+          state.historyHasMore = page.length === HISTORY_PAGE_SIZE;
+          state.historyError = "";
+        } catch (error) {
+          state.historyError = (
+            error.message
+            || "Не удалось получить более ранние проверки."
+          );
+        } finally {
+          state.historyLoadingMore = false;
+          if (state.view === "history") render();
+        }
+      };
+
       const startHistoryWatch = () => {
         if (state.historyPollTimer) clearInterval(state.historyPollTimer);
         state.historyPollTimer = setInterval(
-          () => refreshHistory(),
+          () => refreshHistory({ activeOnly: true }),
           10000
         );
       };
@@ -11107,6 +11282,9 @@
           button.addEventListener("click", () => {
             refreshHistory({ showLoading: state.runs.length === 0 });
           });
+        });
+        document.querySelectorAll("[data-load-more-history]").forEach((button) => {
+          button.addEventListener("click", loadMoreHistory);
         });
         document.querySelectorAll("[data-hard-refresh]").forEach((button) => {
           button.addEventListener("click", () => window.location.reload());

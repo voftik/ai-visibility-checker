@@ -3356,18 +3356,45 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("resume_checkpoint", kwargs)
         self.assertNotIn("max_continuations", kwargs)
 
-    async def test_semantic_reviewer_sends_only_bounded_evidence_context(
+    async def test_atomic_semantic_reviewer_uses_bounded_context_and_full_corpus_audit(
         self,
     ) -> None:
-        response = SimpleNamespace(
-            parsed={
-                "verdict": "pass",
-                "summary": "Смысловых противоречий не найдено.",
-                "violations": [],
-            },
-            text="{}",
-            usage={},
-        )
+        async def fake_chat(**kwargs: object) -> SimpleNamespace:
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            if str(kwargs["schema_name"]).startswith(
+                "aiv_semantic_evidence_"
+            ):
+                claim_batch = user_payload["claim_batch"]
+                parsed = {
+                    "task_id": user_payload["task_id"],
+                    "evidence_shard_id": user_payload["evidence_shard"][
+                        "evidence_shard_id"
+                    ],
+                    "claim_batch_sha256": claim_batch[
+                        "claim_batch_sha256"
+                    ],
+                    "coverage_complete": True,
+                    "dispositions": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "status": "clear",
+                            "evidence_paths": [],
+                            "evidence_quote": "",
+                            "explanation": (
+                                "В этом фрагменте нет противоречия."
+                            ),
+                        }
+                        for claim in claim_batch["claims"]
+                    ],
+                }
+            else:
+                parsed = _pass_review()
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={},
+            )
+
         payload = {
             "evidence_document": {
                 "report_data": {"full_only": "FULL-EVIDENCE-SENTINEL"},
@@ -3376,12 +3403,12 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "evidence_digest": {"bounded": "BOUNDED-CONTEXT-SENTINEL"},
             },
             "metric_availability_contract": [],
-            "candidate_report": {},
+            "candidate_report": _candidate("Проверяемый вывод."),
             "deterministic_precheck_errors": [],
         }
         with patch(
             "app.services.report_semantic_gate.chat",
-            new=AsyncMock(return_value=response),
+            new=AsyncMock(side_effect=fake_chat),
         ) as chat_mock, patch(
             "app.services.report_semantic_gate.model_output_envelope",
             new=AsyncMock(
@@ -3391,14 +3418,15 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 }
             ),
         ):
-            review, _text, _usage = await review_final_report_semantics(
+            review, _text, usage = await review_final_report_semantics(
                 payload,
                 attempt=1,
             )
 
         self.assertEqual(review["verdict"], "pass")
+        self.assertGreater(chat_mock.await_count, 1)
         provider_user_payload = json.loads(
-            chat_mock.await_args.kwargs["messages"][1]["content"]
+            chat_mock.await_args_list[0].kwargs["messages"][1]["content"]
         )
         serialized = json.dumps(provider_user_payload, ensure_ascii=False)
         self.assertNotIn("model_evidence_context", provider_user_payload)
@@ -3408,6 +3436,205 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
             provider_user_payload["evidence_document"],
             payload["model_evidence_context"],
         )
+        full_corpus_calls = [
+            json.loads(call.kwargs["messages"][1]["content"])
+            for call in chat_mock.await_args_list[1:]
+            if str(call.kwargs["schema_name"]).startswith(
+                "aiv_semantic_evidence_"
+            )
+        ]
+        self.assertTrue(full_corpus_calls)
+        self.assertIn(
+            "FULL-EVIDENCE-SENTINEL",
+            json.dumps(full_corpus_calls, ensure_ascii=False),
+        )
+        coverage = usage["_aiv_semantic_evidence_coverage"]["manifest"]
+        self.assertTrue(coverage["coverage_complete"])
+        self.assertEqual(
+            coverage["reviewed_pair_count"],
+            coverage["expected_pair_count"],
+        )
+
+    async def test_material_tail_contradiction_is_seen_by_independent_reviewer(
+        self,
+    ) -> None:
+        tail_fact = "Фактический показатель равен 12%."
+        evidence = {
+            "report_data": {
+                "corpus": ("Промежуточные исходные данные. " * 2_000)
+                + tail_fact,
+            }
+        }
+        payload = {
+            "evidence_document": evidence,
+            "model_evidence_context": {
+                "evidence_digest": {
+                    "summary": "Сжатый корневой контекст без хвоста."
+                }
+            },
+            "metric_availability_contract": [],
+            "candidate_report": _candidate("Показатель равен 100%."),
+            "deterministic_precheck_errors": [],
+        }
+        saw_tail = False
+
+        async def fake_chat(**kwargs: object) -> SimpleNamespace:
+            nonlocal saw_tail
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            if not str(kwargs["schema_name"]).startswith(
+                "aiv_semantic_evidence_"
+            ):
+                parsed = _pass_review()
+            else:
+                shard_text = json.dumps(
+                    user_payload["evidence_shard"],
+                    ensure_ascii=False,
+                )
+                tail_visible = tail_fact in shard_text
+                saw_tail = saw_tail or tail_visible
+                dispositions = []
+                for claim in user_payload["claim_batch"]["claims"]:
+                    is_conflict = (
+                        tail_visible
+                        and claim["report_path"] == "/executive_summary"
+                    )
+                    dispositions.append(
+                        {
+                            "claim_id": claim["claim_id"],
+                            "status": (
+                                "contradiction" if is_conflict else "clear"
+                            ),
+                            "evidence_paths": (
+                                ["/report_data/corpus"]
+                                if is_conflict
+                                else []
+                            ),
+                            "evidence_quote": tail_fact if is_conflict else "",
+                            "explanation": (
+                                "Полный хвост корпуса противоречит числу в отчёте."
+                                if is_conflict
+                                else "В этом фрагменте нет противоречия."
+                            ),
+                        }
+                    )
+                parsed = {
+                    "task_id": user_payload["task_id"],
+                    "evidence_shard_id": user_payload["evidence_shard"][
+                        "evidence_shard_id"
+                    ],
+                    "claim_batch_sha256": user_payload["claim_batch"][
+                        "claim_batch_sha256"
+                    ],
+                    "coverage_complete": True,
+                    "dispositions": dispositions,
+                }
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={},
+            )
+
+        with patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=fake_chat),
+        ), patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 60_000,
+                    "max_completion_tokens": 8_000,
+                }
+            ),
+        ):
+            review, _text, usage = await review_final_report_semantics(
+                payload,
+                attempt=1,
+            )
+
+        self.assertTrue(saw_tail)
+        self.assertEqual(review["verdict"], "revise")
+        self.assertTrue(
+            any(
+                violation["report_path"] == "/executive_summary"
+                and tail_fact in violation["finding"]
+                for violation in review["violations"]
+            )
+        )
+        coverage = usage["_aiv_semantic_evidence_coverage"]["manifest"]
+        self.assertGreater(coverage["evidence_manifest"]["unit_count"], 1)
+        self.assertGreater(coverage["evidence_shard_count"], 1)
+        self.assertEqual(
+            coverage["reviewed_pair_count"],
+            coverage["expected_pair_count"],
+        )
+
+    async def test_incomplete_full_corpus_dispositions_block_after_bounded_loop(
+        self,
+    ) -> None:
+        payload = {
+            "evidence_document": {
+                "report_data": {"fact": "Полный исходный факт."},
+            },
+            "model_evidence_context": {
+                "evidence_digest": {"summary": "Сжатый контекст."},
+            },
+            "metric_availability_contract": [],
+            "candidate_report": _candidate("Проверяемый вывод."),
+            "deterministic_precheck_errors": [],
+        }
+
+        async def fake_chat(**kwargs: object) -> SimpleNamespace:
+            user_payload = json.loads(kwargs["messages"][1]["content"])
+            if str(kwargs["schema_name"]).startswith(
+                "aiv_semantic_evidence_"
+            ):
+                parsed = {
+                    "task_id": user_payload["task_id"],
+                    "evidence_shard_id": user_payload["evidence_shard"][
+                        "evidence_shard_id"
+                    ],
+                    "claim_batch_sha256": user_payload["claim_batch"][
+                        "claim_batch_sha256"
+                    ],
+                    "coverage_complete": True,
+                    "dispositions": [],
+                }
+            else:
+                parsed = _pass_review()
+            return SimpleNamespace(
+                parsed=parsed,
+                text=json.dumps(parsed, ensure_ascii=False),
+                usage={},
+            )
+
+        with patch(
+            "app.services.report_semantic_gate.chat",
+            new=AsyncMock(side_effect=fake_chat),
+        ) as chat_mock, patch(
+            "app.services.report_semantic_gate.model_output_envelope",
+            new=AsyncMock(
+                return_value={
+                    "context_length": 1_000_000,
+                    "max_completion_tokens": 100_000,
+                }
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "exhausted its bounded protocol-repair loop",
+            ):
+                await review_final_report_semantics(payload, attempt=1)
+
+        coverage_calls = [
+            call
+            for call in chat_mock.await_args_list
+            if str(call.kwargs["schema_name"]).startswith(
+                "aiv_semantic_evidence_"
+            )
+        ]
+        self.assertEqual(len(coverage_calls), 2)
+        self.assertTrue(coverage_calls[0].kwargs["schema_name"].endswith("_r1"))
+        self.assertTrue(coverage_calls[1].kwargs["schema_name"].endswith("_r2"))
 
     async def test_semantic_reviewer_rejects_unpreflighted_evidence(
         self,

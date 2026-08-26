@@ -4,6 +4,7 @@ The public product accepts one domain.  Discovery may inspect a broad
 same-domain navigation/sitemap frontier, but the expensive page and crawler-UA
 matrix is always bounded to an evidence-backed representative corpus.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +13,7 @@ import ipaddress
 import json
 import logging
 import re
+import shlex
 import socket
 import tempfile
 import time
@@ -128,19 +130,30 @@ BODY_SAMPLE_BYTES = 4096
 HEADERS_BUDGET_BYTES = 8 * 1024
 MIN_GAP_PER_DOMAIN_SECONDS = 0.65
 SITE_PAGE_MANIFEST_KEY = "site_page_manifest"
-SITE_PAGE_MANIFEST_VERSION = "aiv-2026-08-26-site-page-manifest-v5"
+SITE_PAGE_MANIFEST_VERSION = "aiv-2026-08-26-site-page-manifest-v7"
+SITE_PAGE_EVIDENCE_VERSION = "aiv-site-page-evidence-v1"
 SITEMAP_DISCOVERY_VERSION = "aiv-sitemap-graph-v2"
 TECHNICAL_MATRIX_ARTIFACT_KEY = "technical_matrix_receipt"
 TECHNICAL_MATRIX_VERSION = "aiv-technical-matrix-v1"
-CRAWL_ADMISSION_VERSION = "aiv-crawl-admission-v1"
+CRAWL_ADMISSION_VERSION = "aiv-crawl-admission-v2"
 PAGE_SCOPE = "bounded_representative_v2"
+PAGE_RELEVANCE_ARTIFACT_KEY = "page_candidate_relevance"
+COMMERCIAL_RELEVANCE_POLICY_VERSION = "aiv-commercial-relevance-v1"
+COMMERCIAL_RELEVANCE_RECEIPT_VERSION = "aiv-commercial-relevance-receipt-v1"
 AUDIT_PAGE_MIN = 6
 AUDIT_PAGE_DEFAULT = 8
 AUDIT_PAGE_HARD_MAX = 10
+COMMERCIAL_RELEVANCE_THRESHOLD = 40
+MAX_DISCOVERY_OCCURRENCES_PER_URL = 8
+MAX_DISCOVERY_TEXT_CHARS = 420
+RENDERED_NAVIGATION_WORKER_PROTOCOL = "aiv-site-preview-worker-v2"
+MAX_RENDERED_NAVIGATION_WORKER_OUTPUT_BYTES = 3 * 1024 * 1024
+MAX_RENDERED_NAVIGATION_WORKER_ANCHORS = 1_000
 SITEMAP_MAX_DOCUMENTS = 64
 SITEMAP_DISCOVERY_DEADLINE_SECONDS = 75.0
 SITEMAP_MAX_FETCH_ATTEMPTS = 3
 TECHNICAL_MAX_PROBE_ATTEMPTS = 3
+SITE_PAGE_MAX_PROBE_ATTEMPTS = 3
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _BODY_CONTENT_RX = re.compile(r"<(article|main|section|p|h1|h2)[\s>]", re.I)
 _TERMINAL_PROBE_ERRORS = frozenset(
@@ -315,7 +328,9 @@ def normalize_domains(domains: list[str]) -> list[str]:
 
 async def _validate_public_host(host: str) -> None:
     normalized = host.strip("[]").lower()
-    if normalized in {"localhost", "localhost.localdomain"} or normalized.endswith(".local"):
+    if normalized in {"localhost", "localhost.localdomain"} or normalized.endswith(
+        ".local"
+    ):
         raise ValueError("unsafe_target")
     try:
         direct_ip = ipaddress.ip_address(normalized)
@@ -500,8 +515,7 @@ async def _do_probe(
                     result.full_text = _decode_body(body, content_type)
                     result.body_sample = result.full_text[:BODY_SAMPLE_BYTES]
                 result.body_looks_empty = bool(
-                    len(body) < 1500
-                    and not _BODY_CONTENT_RX.search(result.full_text)
+                    len(body) < 1500 and not _BODY_CONTENT_RX.search(result.full_text)
                 )
                 break
             else:
@@ -637,7 +651,10 @@ def _page_kind(url: str) -> str:
             ),
         ),
         ("about", ("about", "company", "o-nas", "компан", "о-нас")),
-        ("content", ("blog", "article", "news", "case", "media", "стат", "новост", "кейс")),
+        (
+            "content",
+            ("blog", "article", "news", "case", "media", "стат", "новост", "кейс"),
+        ),
         ("faq", ("faq", "help", "question", "support", "вопрос", "помощ")),
         ("contact", ("contact", "kontakty", "контакт")),
     )
@@ -700,16 +717,234 @@ def _canonical_candidate(url: str, domain: str) -> str | None:
     return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, ""))
 
 
-def _links_from_html(html: str, base_url: str, domain: str) -> list[str]:
-    soup = BeautifulSoup(html or "", "html.parser")
-    output: list[str] = []
+def _compact_discovery_text(value: Any) -> str:
+    text = re.sub(r"\s+", " ", unescape(str(value or ""))).strip()
+    return text[:MAX_DISCOVERY_TEXT_CHARS]
+
+
+def _discovery_occurrence(
+    *,
+    source: str,
+    anchor_text: Any = "",
+    title: Any = "",
+    primary_snippet: Any = "",
+) -> dict[str, str]:
+    return {
+        "source": str(source),
+        "anchor_text": _compact_discovery_text(anchor_text),
+        "title": _compact_discovery_text(title),
+        "primary_snippet": _compact_discovery_text(primary_snippet),
+    }
+
+
+def _candidate_evidence_record(
+    url: str,
+    *,
+    source: str,
+    anchor_text: Any = "",
+    title: Any = "",
+    primary_snippet: Any = "",
+) -> dict[str, Any]:
+    return {
+        "url": url,
+        "discoveries": [
+            _discovery_occurrence(
+                source=source,
+                anchor_text=anchor_text,
+                title=title,
+                primary_snippet=primary_snippet,
+            )
+        ],
+    }
+
+
+def _canonical_candidate_evidence(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        url = value
+        raw_discoveries: list[Any] = []
+    elif isinstance(value, dict):
+        url = value.get("url")
+        raw_discoveries = (
+            value.get("discoveries")
+            if isinstance(value.get("discoveries"), list)
+            else []
+        )
+    else:
+        return None
+    if not isinstance(url, str) or not url:
+        return None
+
+    discoveries: list[dict[str, str]] = []
     seen: set[str] = set()
+    for raw in raw_discoveries:
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get("source") or "unknown")
+        occurrence = _discovery_occurrence(
+            source=source,
+            anchor_text=raw.get("anchor_text"),
+            title=raw.get("title"),
+            primary_snippet=raw.get("primary_snippet"),
+        )
+        digest = _json_sha256(occurrence)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        discoveries.append(occurrence)
+        if len(discoveries) >= MAX_DISCOVERY_OCCURRENCES_PER_URL:
+            break
+    if not discoveries:
+        discoveries = [_discovery_occurrence(source="url_frontier")]
+    return {"url": url, "discoveries": discoveries}
+
+
+def _merge_candidate_evidence(values: list[Any]) -> list[dict[str, Any]]:
+    by_url: dict[str, dict[str, Any]] = {}
+    for value in values:
+        record = _canonical_candidate_evidence(value)
+        if record is None:
+            continue
+        url = str(record["url"])
+        target = by_url.setdefault(url, {"url": url, "discoveries": []})
+        existing = {_json_sha256(item) for item in target["discoveries"]}
+        for occurrence in record["discoveries"]:
+            digest = _json_sha256(occurrence)
+            if digest in existing:
+                continue
+            target["discoveries"].append(occurrence)
+            existing.add(digest)
+            if len(target["discoveries"]) >= MAX_DISCOVERY_OCCURRENCES_PER_URL:
+                break
+    return list(by_url.values())
+
+
+def _anchor_primary_snippet(anchor: Any) -> str:
+    container = anchor.find_parent(["li", "article", "section"])
+    if container is None:
+        container = anchor.parent
+    return _compact_discovery_text(
+        container.get_text(" ", strip=True) if container is not None else ""
+    )
+
+
+def _link_candidates_from_html(
+    html: str,
+    base_url: str,
+    domain: str,
+) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    records: list[dict[str, Any]] = []
     for anchor in soup.find_all("a", href=True):
         candidate = _canonical_candidate(urljoin(base_url, anchor["href"]), domain)
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            output.append(candidate)
-    return output
+        if candidate is None:
+            continue
+        records.append(
+            _candidate_evidence_record(
+                candidate,
+                source="server_navigation",
+                anchor_text=anchor.get_text(" ", strip=True),
+                title=anchor.get("title") or anchor.get("aria-label") or "",
+                primary_snippet=_anchor_primary_snippet(anchor),
+            )
+        )
+    return _merge_candidate_evidence(records)
+
+
+def _links_from_html(html: str, base_url: str, domain: str) -> list[str]:
+    """Compatibility URL view over source-grounded navigation evidence."""
+
+    return [
+        str(record["url"])
+        for record in _link_candidates_from_html(html, base_url, domain)
+    ]
+
+
+def _rendered_candidate_evidence(
+    rendered_anchors: Any,
+    *,
+    domain: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for raw in rendered_anchors if isinstance(rendered_anchors, list) else []:
+        if isinstance(raw, str):
+            href = raw
+            anchor_text = title = primary_snippet = ""
+        elif isinstance(raw, dict):
+            href = str(raw.get("href") or "")
+            anchor_text = raw.get("anchor_text")
+            title = raw.get("title")
+            primary_snippet = raw.get("primary_snippet")
+        else:
+            continue
+        candidate = _canonical_candidate(href, domain)
+        if candidate is None:
+            continue
+        records.append(
+            _candidate_evidence_record(
+                candidate,
+                source="rendered_navigation",
+                anchor_text=anchor_text,
+                title=title,
+                primary_snippet=primary_snippet,
+            )
+        )
+    return _merge_candidate_evidence(records)
+
+
+async def _rendered_navigation_worker(
+    url: str,
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    command = str(settings.SITE_PREVIEW_WORKER_COMMAND or "").strip()
+    if not command:
+        raise RuntimeError("rendered_navigation_worker_not_configured")
+    process = await asyncio.create_subprocess_exec(
+        *shlex.split(command),
+        "--mode",
+        "navigation",
+        "--url",
+        url,
+        "--timeout",
+        str(timeout_seconds),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout_seconds + 8,
+        )
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise TimeoutError("rendered_navigation_worker_timeout")
+    if len(stdout) > MAX_RENDERED_NAVIGATION_WORKER_OUTPUT_BYTES:
+        raise ValueError("rendered_navigation_worker_output_too_large")
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        if not detail:
+            detail = stdout.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail[:1000] or "rendered_navigation_worker_failed")
+    result = json.loads(stdout.decode("utf-8"))
+    anchors = result.get("anchors") if isinstance(result, dict) else None
+    if (
+        not isinstance(result, dict)
+        or result.get("ok") is not True
+        or result.get("mode") != "navigation"
+        or result.get("worker_protocol_version") != RENDERED_NAVIGATION_WORKER_PROTOCOL
+        or not isinstance(anchors, list)
+        or len(anchors) > MAX_RENDERED_NAVIGATION_WORKER_ANCHORS
+        or result.get("anchor_count") != len(anchors)
+        or type(result.get("truncated")) is not bool
+    ):
+        raise ValueError("rendered_navigation_worker_invalid_response")
+    return result
 
 
 async def _links_from_rendered_homepage(
@@ -721,14 +956,40 @@ async def _links_from_rendered_homepage(
     """Best-effort rendered navigation discovery for JS-only homepages.
 
     It is deliberately discovery-only: the selected corpus is still fetched
-    and persisted through the normal lossless HTTP path.  Production setups
-    that isolate Playwright in a screenshot-only worker record the unavailable
-    state instead of silently pretending that rendered navigation was read.
+    and persisted through the normal lossless HTTP path. Production uses the
+    same isolated Playwright worker as the first-screen preview, but through a
+    versioned navigation mode that returns bounded link evidence, not an image.
     """
 
-    if str(settings.SITE_PREVIEW_WORKER_COMMAND or "").strip():
-        return [], {"state": "unavailable_isolated_worker", "candidate_count": 0}
     try:
+        if str(settings.SITE_PREVIEW_WORKER_COMMAND or "").strip():
+            result = await _rendered_navigation_worker(
+                url,
+                timeout_seconds=timeout_seconds,
+            )
+            final_url = str(result.get("final_url") or url)
+            await _validate_public_url(final_url)
+            if normalize_domain(urlparse(final_url).hostname or "") != normalize_domain(
+                domain
+            ):
+                raise ValueError("rendered_navigation_cross_domain_redirect")
+            evidence = _rendered_candidate_evidence(
+                result.get("anchors"),
+                domain=domain,
+            )
+            links = [str(record["url"]) for record in evidence]
+            state = "bounded" if result.get("truncated") is True else "completed"
+            return links, {
+                "state": state,
+                "candidate_count": len(links),
+                "candidate_urls_sha256": _json_sha256(links),
+                "candidate_evidence": evidence,
+                "candidate_evidence_sha256": _json_sha256(evidence),
+                "worker_protocol_version": RENDERED_NAVIGATION_WORKER_PROTOCOL,
+                "worker_anchor_count": result.get("anchor_count"),
+                "worker_output_truncated": bool(result.get("truncated")),
+            }
+
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
 
@@ -763,21 +1024,33 @@ async def _links_from_rendered_homepage(
                     await page.wait_for_load_state("networkidle", timeout=3_500)
                 except PlaywrightTimeoutError:
                     pass
-                hrefs = await page.eval_on_selector_all(
+                rendered_anchors = await page.eval_on_selector_all(
                     "a[href]",
-                    "elements => elements.map(element => element.href)",
+                    """elements => elements.map(element => {
+                        const container = element.closest('li, article, section')
+                            || element.parentElement;
+                        return {
+                            href: element.href,
+                            anchor_text: (element.innerText || element.textContent || ''),
+                            title: element.getAttribute('title')
+                                || element.getAttribute('aria-label') || '',
+                            primary_snippet: container
+                                ? (container.innerText || container.textContent || '')
+                                : ''
+                        };
+                    })""",
                 )
-                links: list[str] = []
-                seen: set[str] = set()
-                for raw in hrefs if isinstance(hrefs, list) else []:
-                    candidate = _canonical_candidate(str(raw or ""), domain)
-                    if candidate and candidate not in seen:
-                        seen.add(candidate)
-                        links.append(candidate)
+                evidence = _rendered_candidate_evidence(
+                    rendered_anchors,
+                    domain=domain,
+                )
+                links = [str(record["url"]) for record in evidence]
                 return links, {
                     "state": "completed",
                     "candidate_count": len(links),
                     "candidate_urls_sha256": _json_sha256(links),
+                    "candidate_evidence": evidence,
+                    "candidate_evidence_sha256": _json_sha256(evidence),
                 }
             finally:
                 await browser.close()
@@ -1023,8 +1296,7 @@ async def _discover_sitemap_graph(
                 {
                     "kind": None,
                     "location_count": None,
-                    "parse_error": probe.error_class
-                    or "incomplete sitemap response",
+                    "parse_error": probe.error_class or "incomplete sitemap response",
                     "retryable": retryable_fetch,
                     "terminal_after_attempts": bool(
                         not retryable_fetch and attempts >= SITEMAP_MAX_FETCH_ATTEMPTS
@@ -1063,9 +1335,7 @@ async def _discover_sitemap_graph(
                 child_sitemaps.append(child)
                 if child not in visited:
                     queue.append((child, None))
-            receipt["child_sitemap_urls"] = list(
-                dict.fromkeys(child_sitemaps)
-            )
+            receipt["child_sitemap_urls"] = list(dict.fromkeys(child_sitemaps))
             receipt["page_candidates"] = []
             await save_checkpoint()
             continue
@@ -1144,6 +1414,155 @@ def _commercial_cluster(url: str) -> str:
     return segments[0]
 
 
+_COMMERCIAL_OFFER_RE = re.compile(
+    r"\b(?:"
+    r"services?|products?|solutions?|platforms?|software|packages?|"
+    r"subscriptions?|consult(?:ing|ation)?|agency|studio|treatments?|courses?|"
+    r"услуг\w*|продукт\w*|решени\w*|платформ\w*|сервис\w*|пакет\w*|"
+    r"консультац\w*|агентств\w*|студи\w*|курс\w*"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_COMMERCIAL_ACTION_RE = re.compile(
+    r"\b(?:"
+    r"buy|book|order|subscribe|request\s+(?:a\s+)?(?:demo|quote)|get\s+(?:a\s+)?quote|"
+    r"contact\s+sales|start\s+(?:a\s+)?trial|"
+    r"куп\w*|заказ\w*|запис\w*|заброниров\w*|остав\w*\s+заяв\w*|"
+    r"получ\w*\s+(?:демо|расч[её]т|предложен\w*)"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_GENERIC_LINK_CTA_RE = re.compile(
+    r"^(?:"
+    r"learn\s+more|read\s+more|view|open|explore|details?|"
+    r"подробнее|узнать\s+больше|смотреть|открыть|перейти"
+    r")[\s.!?→›»]*$",
+    re.IGNORECASE | re.UNICODE,
+)
+_PRICING_RE = re.compile(
+    r"\b(?:price|prices|pricing|plans?|tariffs?|cost|from\s+[$€£₽]|"
+    r"цен\w*|тариф\w*|стоим\w*|от\s+\d[\d\s]*(?:₽|руб))\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_CONTENT_RE = re.compile(
+    r"\b(?:blog|article|news|case\s+stud(?:y|ies)|guide|insights?|trends?|"
+    r"блог\w*|стат\w*|новост\w*|кейс\w*|гайд\w*|тренд\w*)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_ABOUT_RE = re.compile(
+    r"\b(?:about\s+us|our\s+company|company|team|о\s+нас|компан\w*|команд\w*)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_FAQ_RE = re.compile(
+    r"\b(?:faq|help|support|questions?|помощ\w*|вопрос\w*)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_CONTACT_RE = re.compile(
+    r"\b(?:contacts?|get\s+in\s+touch|контакт\w*|связат\w*)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _candidate_field_text(record: dict[str, Any], field: str) -> str:
+    return " ".join(
+        str(occurrence.get(field) or "")
+        for occurrence in record.get("discoveries") or []
+        if isinstance(occurrence, dict)
+    )
+
+
+def _evidence_page_kind(record: dict[str, Any]) -> str:
+    url = str(record.get("url") or "")
+    url_kind = _page_kind(url)
+    if url_kind != "other":
+        return url_kind
+    anchor_text = _candidate_field_text(record, "anchor_text")
+    title = _candidate_field_text(record, "title")
+    primary_snippet = _candidate_field_text(record, "primary_snippet")
+    direct_evidence = " ".join((anchor_text, title)).strip()
+    contextual_evidence_allowed = bool(
+        not direct_evidence or _GENERIC_LINK_CTA_RE.fullmatch(direct_evidence)
+    )
+    evidence = " ".join(
+        (
+            direct_evidence,
+            primary_snippet if contextual_evidence_allowed else "",
+        )
+    ).strip()
+    has_action = _COMMERCIAL_ACTION_RE.search(evidence) is not None
+    if _PRICING_RE.search(evidence):
+        return "pricing"
+    if _CONTENT_RE.search(evidence) and not has_action:
+        return "content"
+    if _COMMERCIAL_OFFER_RE.search(evidence) or has_action:
+        return "product"
+    if _FAQ_RE.search(evidence):
+        return "faq"
+    if _CONTACT_RE.search(evidence):
+        return "contact"
+    if _ABOUT_RE.search(evidence):
+        return "about"
+    return "other"
+
+
+def _commercial_relevance(record: dict[str, Any]) -> dict[str, Any]:
+    canonical = _canonical_candidate_evidence(record)
+    if canonical is None:
+        raise ValueError("Candidate evidence is invalid")
+    url = str(canonical["url"])
+    page_kind = _evidence_page_kind(canonical)
+    components: list[dict[str, Any]] = []
+
+    def add(signal: str, points: int, evidence: str = "") -> None:
+        components.append(
+            {
+                "signal": signal,
+                "points": points,
+                "evidence": _compact_discovery_text(evidence),
+            }
+        )
+
+    if page_kind == "product":
+        add("page_kind_product", 45, url)
+    elif page_kind == "pricing":
+        add("page_kind_pricing", 50, url)
+
+    anchor_text = _candidate_field_text(canonical, "anchor_text")
+    title = _candidate_field_text(canonical, "title")
+    snippet = _candidate_field_text(canonical, "primary_snippet")
+    for field_name, value, points in (
+        ("anchor_offer_language", anchor_text, 20),
+        ("title_offer_language", title, 18),
+        ("snippet_offer_language", snippet, 10),
+    ):
+        if _COMMERCIAL_OFFER_RE.search(value):
+            add(field_name, points, value)
+    combined = " ".join((anchor_text, title, snippet))
+    if _COMMERCIAL_ACTION_RE.search(combined):
+        add("commercial_action", 20, combined)
+    if _PRICING_RE.search(combined):
+        add("pricing_language", 20, combined)
+    if page_kind == "content" and not _COMMERCIAL_ACTION_RE.search(combined):
+        add("editorial_context", -20, combined)
+
+    score = max(0, min(100, sum(int(item["points"]) for item in components)))
+    evidence_payload = {
+        "url": url,
+        "discoveries": canonical["discoveries"],
+    }
+    return {
+        **evidence_payload,
+        "page_kind": page_kind,
+        "commercial_relevance_score": score,
+        "commercially_relevant": bool(
+            page_kind in {"product", "pricing"}
+            and score >= COMMERCIAL_RELEVANCE_THRESHOLD
+        ),
+        "score_components": components,
+        "evidence_sha256": _json_sha256(evidence_payload),
+    }
+
+
 def _candidate_sort_key(url: str) -> tuple[Any, ...]:
     kind = _page_kind(url)
     priorities = {
@@ -1177,23 +1596,58 @@ def _candidate_sort_key(url: str) -> tuple[Any, ...]:
     )
 
 
+def _candidate_record_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    url = str(record["url"])
+    kind = str(record["page_kind"])
+    priorities = {
+        "product": 0,
+        "pricing": 1,
+        "about": 2,
+        "content": 3,
+        "faq": 4,
+        "contact": 5,
+        "other": 6,
+    }
+    path = unquote(urlparse(url).path).casefold()
+    return (
+        0 if record.get("commercially_relevant") is True else 1,
+        priorities.get(kind, 99),
+        -int(record.get("commercial_relevance_score") or 0),
+        path.count("/"),
+        len(path),
+        url,
+    )
+
+
+def _ranked_candidate_records(
+    homepage_url: str,
+    candidates: list[Any],
+) -> list[dict[str, Any]]:
+    merged = _merge_candidate_evidence(candidates)
+    ranked = [
+        _commercial_relevance(record)
+        for record in merged
+        if record.get("url") != homepage_url
+        and _page_kind(str(record.get("url") or "")) != "utility"
+    ]
+    return sorted(ranked, key=_candidate_record_sort_key)
+
+
 def _ranked_semantic_candidates(
     homepage_url: str,
-    candidates: list[str],
+    candidates: list[Any],
 ) -> list[tuple[str, str]]:
     """Rank eligible URLs while retaining more candidates than we will audit."""
 
-    deduped = [
-        url
-        for url in dict.fromkeys(candidates)
-        if url != homepage_url and _page_kind(url) != "utility"
+    return [
+        (str(record["url"]), str(record["page_kind"]))
+        for record in _ranked_candidate_records(homepage_url, candidates)
     ]
-    return [(url, _page_kind(url)) for url in sorted(deduped, key=_candidate_sort_key)]
 
 
 def _semantic_frontier_urls(
     homepage_url: str,
-    candidates: list[str],
+    candidates: list[Any],
     limit: int | None = None,
 ) -> list[tuple[str, str]]:
     """Choose an ordered, diverse 6..10-page audit corpus.
@@ -1251,6 +1705,263 @@ def _semantic_frontier_urls(
     return selected
 
 
+def _candidate_attempt(
+    page: tuple[str, str],
+    *,
+    outcome: str,
+    page_receipt_sha256: str | None = None,
+) -> dict[str, Any]:
+    if outcome not in {"usable", "retryable", "unusable"}:
+        raise ValueError("Candidate attempt outcome is invalid")
+    return {
+        "url": page[0],
+        "page_kind": page[1],
+        "outcome": outcome,
+        "page_receipt_sha256": page_receipt_sha256,
+    }
+
+
+def _selection_relevance_receipt(
+    *,
+    homepage_url: str,
+    candidates: list[Any],
+    target: int,
+    proposed: list[tuple[str, str]],
+    attempts: list[dict[str, Any]],
+    selected: list[tuple[str, str]],
+) -> dict[str, Any]:
+    bounded_target = _bounded_page_limit(target)
+    ranked = _ranked_candidate_records(homepage_url, candidates)
+    canonical_attempts = [
+        {
+            "ordinal": ordinal,
+            "url": str(value.get("url") or ""),
+            "page_kind": str(value.get("page_kind") or ""),
+            "outcome": str(value.get("outcome") or ""),
+            "page_receipt_sha256": (
+                str(value.get("page_receipt_sha256"))
+                if value.get("page_receipt_sha256")
+                else None
+            ),
+        }
+        for ordinal, value in enumerate(attempts)
+    ]
+    attempted_urls = {str(item.get("url") or "") for item in canonical_attempts}
+    selection_exhausted = len(attempted_urls) >= 1 + len(ranked)
+    retryable_attempt_count = sum(
+        1 for item in canonical_attempts if item.get("outcome") == "retryable"
+    )
+    body = {
+        "version": COMMERCIAL_RELEVANCE_RECEIPT_VERSION,
+        "policy_version": COMMERCIAL_RELEVANCE_POLICY_VERSION,
+        "homepage_url": homepage_url,
+        "target_page_count": bounded_target,
+        "commercial_relevance_threshold": COMMERCIAL_RELEVANCE_THRESHOLD,
+        "candidate_count": len(ranked),
+        "candidates": ranked,
+        "proposed_pages": _selected_page_records(proposed),
+        "attempts": canonical_attempts,
+        "attempt_count": len(canonical_attempts),
+        "selection_exhausted": selection_exhausted,
+        "retryable_attempt_count": retryable_attempt_count,
+        "terminal_exhaustion": bool(
+            selection_exhausted and retryable_attempt_count == 0
+        ),
+        "selected_pages": _selected_page_records(selected),
+        "selected_pages_sha256": _selected_pages_sha256(selected),
+        "complete": True,
+    }
+    return {**body, "receipt_sha256": _json_sha256(body)}
+
+
+def _selection_relevance_projection(
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    evidence_by_url = {
+        str(item.get("url") or ""): item
+        for item in receipt.get("candidates") or []
+        if isinstance(item, dict)
+    }
+    selected_evidence: list[dict[str, Any]] = []
+    for page in receipt.get("selected_pages") or []:
+        if not isinstance(page, dict):
+            continue
+        url = str(page.get("url") or "")
+        evidence = evidence_by_url.get(url)
+        selected_evidence.append(
+            {
+                "ordinal": page.get("ordinal"),
+                "url": url,
+                "page_kind": page.get("page_kind"),
+                "commercial_relevance_score": (
+                    evidence.get("commercial_relevance_score")
+                    if evidence is not None
+                    else None
+                ),
+                "commercially_relevant": bool(
+                    evidence is not None
+                    and evidence.get("commercially_relevant") is True
+                ),
+                "evidence_sha256": (
+                    evidence.get("evidence_sha256") if evidence is not None else None
+                ),
+            }
+        )
+    body = {
+        "version": COMMERCIAL_RELEVANCE_RECEIPT_VERSION,
+        "policy_version": COMMERCIAL_RELEVANCE_POLICY_VERSION,
+        "artifact_key": PAGE_RELEVANCE_ARTIFACT_KEY,
+        "artifact_sha256": receipt.get("receipt_sha256"),
+        "candidate_count": receipt.get("candidate_count"),
+        "attempt_count": receipt.get("attempt_count"),
+        "selection_exhausted": receipt.get("selection_exhausted"),
+        "terminal_exhaustion": receipt.get("terminal_exhaustion"),
+        "selected_pages_sha256": receipt.get("selected_pages_sha256"),
+        "selected_evidence": selected_evidence,
+        "selected_evidence_count": len(selected_evidence),
+    }
+    return {**body, "projection_sha256": _json_sha256(body)}
+
+
+def _selection_relevance_receipt_is_valid(
+    receipt: Any,
+    *,
+    domain: str,
+) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    body = dict(receipt)
+    receipt_sha256 = body.pop("receipt_sha256", None)
+    if receipt_sha256 != _json_sha256(body):
+        return False
+    if (
+        body.get("version") != COMMERCIAL_RELEVANCE_RECEIPT_VERSION
+        or body.get("policy_version") != COMMERCIAL_RELEVANCE_POLICY_VERSION
+        or body.get("commercial_relevance_threshold") != COMMERCIAL_RELEVANCE_THRESHOLD
+        or body.get("complete") is not True
+    ):
+        return False
+    homepage_url = body.get("homepage_url")
+    if not isinstance(homepage_url, str):
+        return False
+    normalized_domain = normalize_domain(domain)
+    if normalize_domain(urlparse(homepage_url).hostname or "") != normalized_domain:
+        return False
+    raw_candidates = body.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return False
+    candidate_inputs = [
+        {
+            "url": value.get("url"),
+            "discoveries": value.get("discoveries"),
+        }
+        for value in raw_candidates
+        if isinstance(value, dict)
+    ]
+    if len(candidate_inputs) != len(raw_candidates):
+        return False
+    recomputed = _ranked_candidate_records(homepage_url, candidate_inputs)
+    if recomputed != raw_candidates or body.get("candidate_count") != len(recomputed):
+        return False
+    if any(
+        normalize_domain(urlparse(str(item.get("url") or "")).hostname or "")
+        != normalized_domain
+        for item in recomputed
+    ):
+        return False
+    target = body.get("target_page_count")
+    if type(target) is not int or target != _bounded_page_limit(target):
+        return False
+    expected_proposed = _semantic_frontier_urls(
+        homepage_url,
+        candidate_inputs,
+        target,
+    )
+    if body.get("proposed_pages") != _selected_page_records(expected_proposed):
+        return False
+    attempts = body.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return False
+    normalized_attempts: list[tuple[str, str, str]] = []
+    for ordinal, attempt in enumerate(attempts):
+        if (
+            not isinstance(attempt, dict)
+            or attempt.get("ordinal") != ordinal
+            or attempt.get("outcome") not in {"usable", "retryable", "unusable"}
+        ):
+            return False
+        normalized_attempts.append(
+            (
+                str(attempt.get("url") or ""),
+                str(attempt.get("page_kind") or ""),
+                str(attempt.get("outcome")),
+            )
+        )
+    proposed_pairs = [(url, kind) for url, kind in expected_proposed]
+    if [
+        pair[:2] for pair in normalized_attempts[: len(proposed_pairs)]
+    ] != proposed_pairs:
+        return False
+    ranked_pairs = [(str(item["url"]), str(item["page_kind"])) for item in recomputed]
+    remaining_pairs = [pair for pair in ranked_pairs if pair not in proposed_pairs]
+    extra_pairs = [pair[:2] for pair in normalized_attempts[len(proposed_pairs) :]]
+    if extra_pairs != remaining_pairs[: len(extra_pairs)]:
+        return False
+    attempted_urls = {pair[0] for pair in normalized_attempts}
+    selection_exhausted = len(attempted_urls) >= 1 + len(recomputed)
+    retryable_attempt_count = sum(
+        1 for pair in normalized_attempts if pair[2] == "retryable"
+    )
+    if (
+        body.get("attempt_count") != len(normalized_attempts)
+        or body.get("selection_exhausted") is not selection_exhausted
+        or body.get("retryable_attempt_count") != retryable_attempt_count
+        or body.get("terminal_exhaustion")
+        is not bool(selection_exhausted and retryable_attempt_count == 0)
+    ):
+        return False
+    selected = [pair[:2] for pair in normalized_attempts if pair[2] == "usable"][
+        :target
+    ]
+    if body.get("selected_pages") != _selected_page_records(selected):
+        return False
+    return body.get("selected_pages_sha256") == _selected_pages_sha256(selected)
+
+
+def _selection_relevance_projection_is_valid(
+    projection: Any,
+    *,
+    pages: list[tuple[str, str]],
+) -> bool:
+    if not isinstance(projection, dict):
+        return False
+    body = dict(projection)
+    projection_sha256 = body.pop("projection_sha256", None)
+    if projection_sha256 != _json_sha256(body):
+        return False
+    if (
+        body.get("version") != COMMERCIAL_RELEVANCE_RECEIPT_VERSION
+        or body.get("policy_version") != COMMERCIAL_RELEVANCE_POLICY_VERSION
+        or body.get("artifact_key") != PAGE_RELEVANCE_ARTIFACT_KEY
+        or body.get("selected_pages_sha256") != _selected_pages_sha256(pages)
+        or not isinstance(body.get("artifact_sha256"), str)
+        or type(body.get("attempt_count")) is not int
+        or type(body.get("selection_exhausted")) is not bool
+        or type(body.get("terminal_exhaustion")) is not bool
+    ):
+        return False
+    selected_evidence = body.get("selected_evidence")
+    if not isinstance(selected_evidence, list) or len(selected_evidence) != len(pages):
+        return False
+    if [
+        (item.get("ordinal"), item.get("url"), item.get("page_kind"))
+        for item in selected_evidence
+        if isinstance(item, dict)
+    ] != [(ordinal, url, page_kind) for ordinal, (url, page_kind) in enumerate(pages)]:
+        return False
+    return body.get("selected_evidence_count") == len(pages)
+
+
 async def _store_site_page(
     run_id: str,
     *,
@@ -1289,6 +2000,14 @@ async def _store_site_page(
             )
         ).scalar_one_or_none()
         page = existing or SitePage(run_id=run_id, url=url)
+        previous_signals = (
+            dict(existing.content_signals or {}) if existing is not None else {}
+        )
+        previous_attempts = previous_signals.get("_probe_attempts", 0)
+        try:
+            probe_attempts = max(0, int(previous_attempts)) + 1
+        except (TypeError, ValueError):
+            probe_attempts = 1
         page.canonical_url = signals.get("canonical_url")
         page.page_kind = page_kind
         page.http_status = probe.http_status
@@ -1301,6 +2020,8 @@ async def _store_site_page(
             for key, value in signals.items()
             if key not in {"main_text_excerpt", "visible_text_excerpt"}
         }
+        page.content_signals["_probe_attempts"] = probe_attempts
+        page.content_signals["_probe_attempt_limit"] = SITE_PAGE_MAX_PROBE_ATTEMPTS
         if existing is None:
             session.add(page)
         await session.commit()
@@ -1327,6 +2048,14 @@ def _site_page_is_usable(page: SitePage, *, legacy: bool = False) -> bool:
 def _site_page_is_retryable(page: SitePage) -> bool:
     signals = dict(page.content_signals or {})
     error_class = signals.get("_probe_error_class")
+    try:
+        attempts = max(0, int(signals.get("_probe_attempts") or 0))
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts >= SITE_PAGE_MAX_PROBE_ATTEMPTS:
+        return False
+    if error_class in _TERMINAL_PROBE_ERRORS:
+        return False
     if signals.get("_body_truncated") is True:
         return True
     if error_class and error_class not in _TERMINAL_PROBE_ERRORS:
@@ -1337,6 +2066,42 @@ def _site_page_is_retryable(page: SitePage) -> bool:
         or status in _TRANSIENT_HTTP_STATUSES
         or (isinstance(status, int) and 500 <= status < 600)
     )
+
+
+def site_page_evidence_sha256(
+    page: SitePage,
+    *,
+    url: str,
+    page_kind: str,
+) -> str:
+    """Bind every SitePage field consumed by semantic or technical analysis.
+
+    Empty strings and missing optional text have the same downstream meaning,
+    so they intentionally share one canonical representation.  The complete
+    content_signals object is bound because schema, rendering and identity
+    decisions read different keys from it over the lifetime of a report.
+    """
+
+    signals = (
+        dict(page.content_signals) if isinstance(page.content_signals, dict) else {}
+    )
+    payload = {
+        "version": SITE_PAGE_EVIDENCE_VERSION,
+        "url": url,
+        "page_kind": page_kind,
+        "http_status": page.http_status,
+        "title": str(page.title or ""),
+        "meta_description": str(page.meta_description or ""),
+        "main_text": str(page.main_text or ""),
+        "text_length": (
+            int(page.text_length)
+            if isinstance(page.text_length, int)
+            and not isinstance(page.text_length, bool)
+            else 0
+        ),
+        "content_signals": signals,
+    }
+    return _json_sha256(payload)
 
 
 def _site_page_receipt(
@@ -1351,8 +2116,7 @@ def _site_page_receipt(
     for ordinal, (url, page_kind) in enumerate(pages):
         page = stored_pages.get(url)
         usable = bool(
-            page is not None
-            and _site_page_is_usable(page, legacy=legacy_snapshot)
+            page is not None and _site_page_is_usable(page, legacy=legacy_snapshot)
         )
         if page is None:
             retryable_urls.append(url)
@@ -1362,6 +2126,8 @@ def _site_page_receipt(
             )
         signals = dict(page.content_signals or {}) if page is not None else {}
         main_text = str(page.main_text or "") if page is not None else ""
+        title = str(page.title or "") if page is not None else ""
+        meta_description = str(page.meta_description or "") if page is not None else ""
         records.append(
             {
                 "ordinal": ordinal,
@@ -1369,9 +2135,22 @@ def _site_page_receipt(
                 "page_kind": page_kind,
                 "http_status": page.http_status if page is not None else None,
                 "text_length": int(page.text_length or 0) if page is not None else 0,
-                "content_sha256": hashlib.sha256(
-                    main_text.encode("utf-8")
+                "content_sha256": hashlib.sha256(main_text.encode("utf-8")).hexdigest(),
+                "title_sha256": hashlib.sha256(title.encode("utf-8")).hexdigest(),
+                "meta_description_sha256": hashlib.sha256(
+                    meta_description.encode("utf-8")
                 ).hexdigest(),
+                "content_signals_sha256": _json_sha256(signals),
+                "evidence_version": SITE_PAGE_EVIDENCE_VERSION,
+                "evidence_sha256": (
+                    site_page_evidence_sha256(
+                        page,
+                        url=url,
+                        page_kind=page_kind,
+                    )
+                    if page is not None
+                    else None
+                ),
                 "source_body_sha256": signals.get("_source_body_sha256"),
                 "body_policy_version": (
                     (signals.get("_body_read_policy") or {}).get("version")
@@ -1408,6 +2187,11 @@ def _site_page_manifest_input(
             "target_page_count": target,
             "min_page_count": 1 if legacy_snapshot else AUDIT_PAGE_MIN,
             "max_page_count": AUDIT_PAGE_HARD_MAX,
+            "commercial_relevance_policy_version": (
+                "legacy_unproven"
+                if legacy_snapshot
+                else COMMERCIAL_RELEVANCE_POLICY_VERSION
+            ),
         },
         "legacy_snapshot": bool(legacy_snapshot),
     }
@@ -1467,9 +2251,18 @@ def _manifest_pages(
     if output_json.get("selected_pages_sha256") != _selected_pages_sha256(pages):
         return None
     legacy_snapshot = output_json.get("legacy_snapshot") is True
-    verified_exhaustion = output_json.get("verified_exhaustion") is True
-    if len(pages) < AUDIT_PAGE_MIN and not (legacy_snapshot or verified_exhaustion):
+    selection_policy = output_json.get("selection_policy")
+    if not isinstance(selection_policy, dict):
         return None
+    expected_relevance_policy = (
+        "legacy_unproven" if legacy_snapshot else COMMERCIAL_RELEVANCE_POLICY_VERSION
+    )
+    if (
+        selection_policy.get("commercial_relevance_policy_version")
+        != expected_relevance_policy
+    ):
+        return None
+    verified_exhaustion = output_json.get("verified_exhaustion") is True
     discovered_count = output_json.get("discovered_candidate_count")
     compatibility_count = output_json.get("discovered_count")
     if (
@@ -1482,19 +2275,16 @@ def _manifest_pages(
     discovery_state = output_json.get("discovery_state")
     coverage_state = output_json.get("coverage_state")
     if legacy_snapshot:
-        if (
-            discovery_state != "legacy_snapshot"
-            or coverage_state != "limited"
-        ):
+        if discovery_state != "legacy_snapshot" or coverage_state != "limited":
             return None
-    elif (
-        discovery_state not in {"complete", "bounded", "terminal_partial"}
-        or coverage_state
-        != (
-            "complete"
-            if discovered_count == len(pages) and discovery_state == "complete"
-            else "bounded"
-        )
+    elif discovery_state not in {
+        "complete",
+        "bounded",
+        "terminal_partial",
+    } or coverage_state != (
+        "complete"
+        if discovered_count == len(pages) and discovery_state == "complete"
+        else "bounded"
     ):
         return None
     receipt = output_json.get("site_page_receipt")
@@ -1517,10 +2307,25 @@ def _manifest_pages(
         (item.get("url"), item.get("page_kind"), item.get("ordinal"))
         for item in receipt_pages
         if isinstance(item, dict)
-    ] != [
-        (url, page_kind, ordinal)
-        for ordinal, (url, page_kind) in enumerate(pages)
-    ]:
+    ] != [(url, page_kind, ordinal) for ordinal, (url, page_kind) in enumerate(pages)]:
+        return None
+    relevance_projection = output_json.get("commercial_relevance_receipt")
+    if legacy_snapshot:
+        if relevance_projection is not None:
+            return None
+    elif not _selection_relevance_projection_is_valid(
+        relevance_projection,
+        pages=pages,
+    ):
+        return None
+    elif output_json.get("selection_exhausted") is not relevance_projection.get(
+        "selection_exhausted"
+    ) or verified_exhaustion is not bool(
+        len(pages) < AUDIT_PAGE_MIN
+        and relevance_projection.get("terminal_exhaustion") is True
+    ):
+        return None
+    if len(pages) < AUDIT_PAGE_MIN and not (legacy_snapshot or verified_exhaustion):
         return None
     return pages
 
@@ -1531,7 +2336,7 @@ def validated_site_page_manifest_output(
     domain: str,
     allow_legacy_snapshot: bool = True,
 ) -> dict[str, Any] | None:
-    """Validate the complete v5 bounded manifest without reading the network.
+    """Validate the complete v6 bounded manifest without reading the network.
 
     Technical reporting uses this pure helper to select its denominator.  The
     stronger async admission gate additionally re-derives SitePage and probe
@@ -1558,14 +2363,82 @@ def validated_site_page_manifest_output(
     ):
         return None
     legacy_snapshot = output.get("legacy_snapshot") is True
-    if (
-        input_json.get("legacy_snapshot") is not legacy_snapshot
-        or (legacy_snapshot and not allow_legacy_snapshot)
+    if input_json.get("legacy_snapshot") is not legacy_snapshot or (
+        legacy_snapshot and not allow_legacy_snapshot
     ):
         return None
     if _manifest_pages(output, domain=normalized_domain) is None:
         return None
     return dict(output)
+
+
+def _relevance_artifact_matches_projection(
+    artifact: RunArtifact | None,
+    projection: Any,
+    *,
+    domain: str,
+) -> bool:
+    return bool(
+        artifact is not None
+        and artifact.status == "completed"
+        and artifact.prompt_version == COMMERCIAL_RELEVANCE_POLICY_VERSION
+        and isinstance(artifact.input_json, dict)
+        and artifact.input_json.get("domain") == normalize_domain(domain)
+        and artifact.input_json.get("policy_version")
+        == COMMERCIAL_RELEVANCE_POLICY_VERSION
+        and isinstance(artifact.output_json, dict)
+        and _selection_relevance_receipt_is_valid(
+            artifact.output_json,
+            domain=domain,
+        )
+        and isinstance(projection, dict)
+        and projection.get("artifact_key") == PAGE_RELEVANCE_ARTIFACT_KEY
+        and projection.get("artifact_sha256")
+        == artifact.output_json.get("receipt_sha256")
+        and projection == _selection_relevance_projection(artifact.output_json)
+    )
+
+
+async def _save_page_relevance_artifact(
+    run_id: str,
+    *,
+    domain: str,
+    receipt: dict[str, Any],
+) -> None:
+    if not _selection_relevance_receipt_is_valid(receipt, domain=domain):
+        raise ValueError("Commercial relevance receipt is invalid")
+    async with SessionLocal() as session:
+        artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == PAGE_RELEVANCE_ARTIFACT_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+        if artifact is None:
+            artifact = RunArtifact(
+                run_id=run_id,
+                stage_key="site_discovery",
+                artifact_key=PAGE_RELEVANCE_ARTIFACT_KEY,
+            )
+            session.add(artifact)
+        artifact.stage_key = "site_discovery"
+        artifact.status = "completed"
+        artifact.model = None
+        artifact.prompt_version = COMMERCIAL_RELEVANCE_POLICY_VERSION
+        artifact.input_json = {
+            "domain": normalize_domain(domain),
+            "policy_version": COMMERCIAL_RELEVANCE_POLICY_VERSION,
+        }
+        artifact.output_json = receipt
+        artifact.raw_text = None
+        artifact.usage_json = {
+            "candidate_count": receipt.get("candidate_count"),
+            "attempt_count": len(receipt.get("attempts") or []),
+        }
+        artifact.error_message = None
+        await session.commit()
 
 
 async def _matching_site_page_manifest(
@@ -1577,14 +2450,20 @@ async def _matching_site_page_manifest(
 ) -> tuple[dict[str, Any], list[tuple[str, str]]] | None:
     input_json = _site_page_manifest_input(domain, limit)
     async with SessionLocal() as session:
-        artifact = (
-            await session.execute(
-                select(RunArtifact).where(
-                    RunArtifact.run_id == run_id,
-                    RunArtifact.artifact_key == SITE_PAGE_MANIFEST_KEY,
+        artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.in_(
+                            [SITE_PAGE_MANIFEST_KEY, PAGE_RELEVANCE_ARTIFACT_KEY]
+                        ),
+                    )
                 )
-            )
-        ).scalar_one_or_none()
+            ).scalars()
+        )
+        by_key = {artifact.artifact_key: artifact for artifact in artifacts}
+        artifact = by_key.get(SITE_PAGE_MANIFEST_KEY)
         if (
             artifact is None
             or artifact.status != "completed"
@@ -1610,6 +2489,14 @@ async def _matching_site_page_manifest(
             domain=domain,
         )
         if pages is None:
+            return None
+        if artifact.output_json.get("legacy_snapshot") is not True and not (
+            _relevance_artifact_matches_projection(
+                by_key.get(PAGE_RELEVANCE_ARTIFACT_KEY),
+                artifact.output_json.get("commercial_relevance_receipt"),
+                domain=domain,
+            )
+        ):
             return None
         return dict(artifact.output_json), pages
 
@@ -1712,9 +2599,7 @@ def _known_discovered_page_count(
         if element.tag.rsplit("}", 1)[-1].lower() == "loc"
     ]
     discovered = {
-        url
-        for url in [homepage_url, *candidates]
-        if _page_kind(url) != "utility"
+        url for url in [homepage_url, *candidates] if _page_kind(url) != "utility"
     }
     return len(discovered)
 
@@ -1734,9 +2619,7 @@ async def _reconcile_site_pages(
     async with SessionLocal() as session:
         existing_pages = list(
             (
-                await session.execute(
-                    select(SitePage).where(SitePage.run_id == run_id)
-                )
+                await session.execute(select(SitePage).where(SitePage.run_id == run_id))
             ).scalars()
         )
         for page in existing_pages:
@@ -1808,9 +2691,7 @@ async def _prune_site_pages(
     async with SessionLocal() as session:
         existing = list(
             (
-                await session.execute(
-                    select(SitePage).where(SitePage.run_id == run_id)
-                )
+                await session.execute(select(SitePage).where(SitePage.run_id == run_id))
             ).scalars()
         )
         for page in existing:
@@ -1912,11 +2793,12 @@ async def discover_site_pages(
         if homepage_probe.final_url:
             homepage_url = homepage_probe.final_url
 
-        server_candidates = _links_from_html(
+        server_candidate_evidence = _link_candidates_from_html(
             homepage_probe.full_text,
             homepage_url,
             domain,
         )
+        server_candidates = [str(record["url"]) for record in server_candidate_evidence]
         rendered_candidates: list[str] = []
         rendered_navigation: dict[str, Any] = {
             "state": "not_needed",
@@ -1926,19 +2808,43 @@ async def discover_site_pages(
             homepage_probe.full_text,
             homepage_probe.content_type,
         )
-        if (
-            len(server_candidates) < target
-            and homepage_signals.get("render_strategy")
-            == "client_rendered_shell"
-        ):
-            rendered_candidates, rendered_navigation = (
-                await _links_from_rendered_homepage(
-                    homepage_url,
-                    domain=domain,
-                    timeout_seconds=min(timeout_seconds, 20),
-                )
+        homepage_is_client_shell = (
+            homepage_signals.get("render_strategy") == "client_rendered_shell"
+        )
+        if homepage_is_client_shell:
+            (
+                rendered_candidates,
+                rendered_navigation,
+            ) = await _links_from_rendered_homepage(
+                homepage_url,
+                domain=domain,
+                timeout_seconds=min(timeout_seconds, 20),
             )
-        candidates = [*server_candidates, *rendered_candidates]
+        raw_rendered_evidence = rendered_navigation.get("candidate_evidence")
+        if raw_rendered_evidence is not None:
+            if not isinstance(raw_rendered_evidence, list) or rendered_navigation.get(
+                "candidate_evidence_sha256"
+            ) != _json_sha256(raw_rendered_evidence):
+                raise ValueError("Rendered navigation evidence receipt mismatch")
+            rendered_candidate_evidence = _merge_candidate_evidence(
+                raw_rendered_evidence
+            )
+        else:
+            # Compatibility for a test double or an older in-process provider.
+            # URL-only rendered candidates remain eligible, but cannot acquire
+            # a commercial score without source text.
+            rendered_candidate_evidence = _merge_candidate_evidence(
+                [
+                    _candidate_evidence_record(
+                        candidate,
+                        source="rendered_navigation_url_only",
+                    )
+                    for candidate in rendered_candidates
+                ]
+            )
+        candidate_evidence = _merge_candidate_evidence(
+            [*server_candidate_evidence, *rendered_candidate_evidence]
+        )
         robots_url = urljoin(homepage_url, "/robots.txt")
         robots_probe, _, _ = await _probe_with_transport(
             url=robots_url,
@@ -1955,9 +2861,7 @@ async def discover_site_pages(
             if robots_probe.http_status == 200 and not robots_probe.body_truncated
             else []
         )
-        sitemap_roots = advertised_sitemaps or [
-            urljoin(homepage_url, "/sitemap.xml")
-        ]
+        sitemap_roots = advertised_sitemaps or [urljoin(homepage_url, "/sitemap.xml")]
 
         async def checkpoint_sitemap_graph(
             partial_manifest: dict[str, Any],
@@ -1977,22 +2881,40 @@ async def discover_site_pages(
             prior_manifest=prior_sitemap_manifest,
             checkpoint=checkpoint_sitemap_graph,
         )
-        candidates.extend(sitemap_discovery["candidates"])
+        sitemap_candidate_evidence = [
+            _candidate_evidence_record(candidate, source="sitemap")
+            for candidate in sitemap_discovery["candidates"]
+        ]
+        candidate_evidence = _merge_candidate_evidence(
+            [*candidate_evidence, *sitemap_candidate_evidence]
+        )
+        candidate_urls = [str(record["url"]) for record in candidate_evidence]
         sitemap_manifest = sitemap_discovery["manifest"]
+        rendered_navigation_manifest = {
+            key: value
+            for key, value in rendered_navigation.items()
+            if key != "candidate_evidence"
+        }
         discovery_receipts = {
             "sitemap_discovery": sitemap_manifest,
-            "rendered_navigation_discovery": rendered_navigation,
+            "rendered_navigation_discovery": rendered_navigation_manifest,
+            "candidate_frontier": {
+                "candidate_count": len(candidate_urls),
+                "candidate_urls_sha256": _json_sha256(candidate_urls),
+                "candidate_evidence_artifact_key": PAGE_RELEVANCE_ARTIFACT_KEY,
+            },
             "server_navigation_discovery": {
                 "candidate_count": len(server_candidates),
                 "candidate_urls_sha256": _json_sha256(server_candidates),
+                "candidate_evidence_sha256": _json_sha256(server_candidate_evidence),
             },
             "robots_sitemap_discovery": {
-            "robots_url": robots_url,
-            "robots_http_status": robots_probe.http_status,
-            "robots_body_truncated": bool(robots_probe.body_truncated),
-            "advertised_sitemap_count": len(advertised_sitemaps),
-            "advertised_sitemap_urls": advertised_sitemaps,
-            "used_default_sitemap": not bool(advertised_sitemaps),
+                "robots_url": robots_url,
+                "robots_http_status": robots_probe.http_status,
+                "robots_body_truncated": bool(robots_probe.body_truncated),
+                "advertised_sitemap_count": len(advertised_sitemaps),
+                "advertised_sitemap_urls": advertised_sitemaps,
+                "used_default_sitemap": not bool(advertised_sitemaps),
             },
         }
         if sitemap_manifest.get("resume_required") is True:
@@ -2020,8 +2942,8 @@ async def discover_site_pages(
         )
         raise
 
-    ranked = _ranked_semantic_candidates(homepage_url, candidates)
-    proposed = _semantic_frontier_urls(homepage_url, candidates, target)
+    ranked = _ranked_semantic_candidates(homepage_url, candidate_evidence)
+    proposed = _semantic_frontier_urls(homepage_url, candidate_evidence, target)
     attempted_urls = {url for url, _kind in proposed}
     receipt = await _reconcile_site_pages(
         run_id,
@@ -2036,6 +2958,29 @@ async def discover_site_pages(
         for item in receipt.get("pages") or []
         if item.get("usable") is True
     ]
+    attempts: list[dict[str, Any]] = []
+    initial_receipts = {
+        str(item.get("url") or ""): item
+        for item in receipt.get("pages") or []
+        if isinstance(item, dict)
+    }
+    retryable_initial = set(receipt.get("retryable_urls") or [])
+    for page in proposed:
+        item = initial_receipts.get(page[0])
+        outcome = (
+            "usable"
+            if item is not None and item.get("usable") is True
+            else "retryable"
+            if page[0] in retryable_initial
+            else "unusable"
+        )
+        attempts.append(
+            _candidate_attempt(
+                page,
+                outcome=outcome,
+                page_receipt_sha256=(_json_sha256(item) if item is not None else None),
+            )
+        )
     if not usable or usable[0] != (homepage_url, "home"):
         if homepage_url in (receipt.get("retryable_urls") or []):
             raise SitePageCorpusIncomplete(
@@ -2062,8 +3007,21 @@ async def discover_site_pages(
         item = (candidate_receipt.get("pages") or [{}])[0]
         if item.get("usable") is True:
             usable.append(candidate)
+            outcome = "usable"
         elif candidate_receipt.get("retryable_urls"):
             retryable_candidate_urls.add(candidate[0])
+            outcome = "retryable"
+        else:
+            outcome = "unusable"
+        attempts.append(
+            _candidate_attempt(
+                candidate,
+                outcome=outcome,
+                page_receipt_sha256=(
+                    _json_sha256(item) if isinstance(item, dict) else None
+                ),
+            )
+        )
 
     selected = usable[:target]
     final_receipt = await _reconcile_site_pages(
@@ -2077,16 +3035,7 @@ async def discover_site_pages(
         raise SitePageCorpusIncomplete(
             "Selected SitePage corpus is not completely materialised"
         )
-    eligible_count = len(
-        {
-            homepage_url,
-            *(
-                url
-                for url in candidates
-                if _page_kind(url) != "utility"
-            ),
-        }
-    )
+    eligible_count = 1 + len(ranked)
     verified_exhaustion = bool(
         len(selected) < AUDIT_PAGE_MIN
         and len(attempted_urls) >= eligible_count
@@ -2097,9 +3046,28 @@ async def discover_site_pages(
             f"Only {len(selected)} usable pages; minimum is {AUDIT_PAGE_MIN}",
             retryable=bool(retryable_candidate_urls),
         )
+    relevance_receipt = _selection_relevance_receipt(
+        homepage_url=homepage_url,
+        candidates=candidate_evidence,
+        target=target,
+        proposed=proposed,
+        attempts=attempts,
+        selected=selected,
+    )
+    await _save_page_relevance_artifact(
+        run_id,
+        domain=domain,
+        receipt=relevance_receipt,
+    )
+    relevance_projection = _selection_relevance_projection(relevance_receipt)
     selected_digest = _selected_pages_sha256(selected)
+    rendered_navigation_complete = bool(
+        not homepage_is_client_shell or rendered_navigation.get("state") == "completed"
+    )
     discovery_state = (
-        "complete"
+        "terminal_partial"
+        if not rendered_navigation_complete
+        else "complete"
         if sitemap_manifest.get("complete") is True
         else "bounded"
         if sitemap_manifest.get("bounded") is True
@@ -2127,6 +3095,7 @@ async def discover_site_pages(
         "discovery_state": discovery_state,
         "coverage_state": coverage_state,
         "site_page_receipt": final_receipt,
+        "commercial_relevance_receipt": relevance_projection,
         **discovery_receipts,
     }
     # Completion is intentionally the final write, after DB reconciliation and
@@ -2198,7 +3167,8 @@ async def _completed_probe_keys(run_id: str) -> set[tuple[str, str, str]]:
                 DomainProbe.id,
                 DomainProbe.content_signals,
                 DomainProbe.response_size_bytes,
-            ).where(DomainProbe.run_id == run_id)
+            )
+            .where(DomainProbe.run_id == run_id)
             .order_by(DomainProbe.id)
         )
         latest: dict[
@@ -2216,9 +3186,7 @@ async def _completed_probe_keys(run_id: str) -> set[tuple[str, str, str]]:
             content_signals,
             response_size_bytes,
         ) in result.all():
-            body_read_policy = (content_signals or {}).get(
-                "_body_read_policy"
-            )
+            body_read_policy = (content_signals or {}).get("_body_read_policy")
             key = (url, label, probe_type.value)
             attempts[key] = attempts.get(key, 0) + 1
             latest[key] = (
@@ -2264,10 +3232,7 @@ def _probe_result_is_reusable(
         return False
     if not _current_complete_eof_policy(body_read_policy):
         return False
-    return (
-        http_status not in _TRANSIENT_HTTP_STATUSES
-        and not 500 <= http_status < 600
-    )
+    return http_status not in _TRANSIENT_HTTP_STATUSES and not 500 <= http_status < 600
 
 
 def _technical_matrix_input(
@@ -2383,27 +3348,21 @@ def _technical_matrix_receipt(
                 }
             )
     terminal = [
-        item
-        for item in cells
-        if item["state"] in {"success", "terminal_blocked"}
+        item for item in cells if item["state"] in {"success", "terminal_blocked"}
     ]
     payload = {
         "selected_pages_sha256": _selected_pages_sha256(pages),
         "user_agents_sha256": _json_sha256(user_agents),
         "expected_cell_count": len(cells),
         "terminal_cell_count": len(terminal),
-        "success_cell_count": sum(
-            1 for item in cells if item["state"] == "success"
-        ),
+        "success_cell_count": sum(1 for item in cells if item["state"] == "success"),
         "terminal_blocked_cell_count": sum(
             1 for item in cells if item["state"] == "terminal_blocked"
         ),
         "retryable_cell_count": sum(
             1 for item in cells if item["state"] == "retryable"
         ),
-        "missing_cell_count": sum(
-            1 for item in cells if item["state"] == "missing"
-        ),
+        "missing_cell_count": sum(1 for item in cells if item["state"] == "missing"),
         "cells": cells,
         "legacy_snapshot": bool(legacy_snapshot),
         "complete": len(terminal) == len(cells) and bool(cells),
@@ -2571,6 +3530,7 @@ async def require_crawl_admission(
                         RunArtifact.artifact_key.in_(
                             [
                                 SITE_PAGE_MANIFEST_KEY,
+                                PAGE_RELEVANCE_ARTIFACT_KEY,
                                 TECHNICAL_MATRIX_ARTIFACT_KEY,
                             ]
                         ),
@@ -2579,6 +3539,7 @@ async def require_crawl_admission(
             ).scalars()
         }
     manifest = artifacts.get(SITE_PAGE_MANIFEST_KEY)
+    relevance = artifacts.get(PAGE_RELEVANCE_ARTIFACT_KEY)
     matrix = artifacts.get(TECHNICAL_MATRIX_ARTIFACT_KEY)
     if (
         manifest is None
@@ -2596,6 +3557,14 @@ async def require_crawl_admission(
     pages = _manifest_pages(manifest.output_json, domain=normalized_domain)
     if pages is None:
         raise CrawlAdmissionIncomplete("site_page_manifest contract mismatch")
+    if not legacy_snapshot and not _relevance_artifact_matches_projection(
+        relevance,
+        manifest.output_json.get("commercial_relevance_receipt"),
+        domain=normalized_domain,
+    ):
+        raise CrawlAdmissionIncomplete(
+            "commercial relevance receipt is not bound to manifest"
+        )
     async with SessionLocal() as session:
         stored_pages = {
             page.url: page
@@ -2667,10 +3636,11 @@ async def require_crawl_admission(
         "legacy_snapshot": legacy_snapshot,
         "coverage_state": manifest.output_json.get("coverage_state"),
         "page_count": len(pages),
-        "selected_pages_sha256": manifest.output_json.get(
-            "selected_pages_sha256"
-        ),
+        "selected_pages_sha256": manifest.output_json.get("selected_pages_sha256"),
         "site_page_receipt_sha256": current_page_receipt["receipt_sha256"],
+        "commercial_relevance_receipt_sha256": (
+            None if legacy_snapshot else relevance.output_json.get("receipt_sha256")
+        ),
         "user_agents": labels,
         "user_agents_sha256": current_matrix["user_agents_sha256"],
         "expected_cell_count": current_matrix["expected_cell_count"],
@@ -3123,7 +4093,7 @@ async def _run_crawl_impl(
         logger.exception("AIV crawl failed for run %s", run_id)
         await fail_run(
             run_id,
-            "Проверка прервалась на этапе чтения сайта. Повторите попытку — "
+            "Проверка прервалась на этапе чтения сайта. Повторите попытку: "
             "сохранённые результаты останутся на месте.",
         )
 

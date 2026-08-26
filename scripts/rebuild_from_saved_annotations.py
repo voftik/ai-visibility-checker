@@ -34,6 +34,13 @@ from app.models import (
     SitePage,
 )
 from app.services import analyzer, crawler
+from app.services.publication_contract import (
+    PublicationContractError,
+    ensure_publication_contract,
+    publication_snapshot,
+    publication_snapshot_digest,
+    replace_completed_publication,
+)
 from app.services.site_preview import get_saved_site_preview
 
 
@@ -85,7 +92,7 @@ async def _optional_artifact_dict(
     return dict(artifact.output_json)
 
 
-async def _validate_saved_inputs(run_id: str) -> None:
+async def _validate_saved_inputs(run_id: str) -> str:
     async with SessionLocal() as session:
         run = (
             await session.execute(select(Run).where(Run.id == run_id))
@@ -96,6 +103,28 @@ async def _validate_saved_inputs(run_id: str) -> None:
             raise RebuildGuardError(
                 "Пересборка разрешена только для завершённой проверки."
             )
+        try:
+            receipt = await ensure_publication_contract(
+                session,
+                run,
+                allow_legacy_baseline=False,
+            )
+        except PublicationContractError as exc:
+            raise RebuildGuardError(
+                "Текущий отчёт не прошёл проверку контракта публикации; "
+                "используйте полный reprocess_saved_run.py."
+            ) from exc
+        if not isinstance(receipt, dict) or receipt.get("legacy_baseline") is True:
+            raise RebuildGuardError(
+                "Legacy-отчёт нельзя точечно пересобирать без подтверждённого "
+                "reader-copy provenance; используйте полный reprocess_saved_run.py."
+            )
+        expected_snapshot_digest = publication_snapshot_digest(
+            publication_snapshot(
+                report_json=run.report_json,
+                analysis_markdown=run.analysis_markdown,
+            )
+        )
         answer_count = int(
             (
                 await session.execute(
@@ -128,6 +157,7 @@ async def _validate_saved_inputs(run_id: str) -> None:
             "Нужен полный комплект сохранённых ответов и аннотаций: "
             f"{answer_count} ответов, {annotation_count} аннотаций."
         )
+    return expected_snapshot_digest
 
 
 async def _refresh_control_pages(run_id: str) -> list[dict[str, Any]]:
@@ -210,7 +240,7 @@ async def rebuild_from_saved_annotations(
     refresh_control_pages: bool = False,
 ) -> dict[str, Any]:
     run_id = canonical_run_id(value)
-    await _validate_saved_inputs(run_id)
+    expected_snapshot_digest = await _validate_saved_inputs(run_id)
 
     refreshed = (
         await _refresh_control_pages(run_id)
@@ -345,17 +375,27 @@ async def rebuild_from_saved_annotations(
         "illustrations": illustrations,
         **({"site_preview": site_preview} if site_preview else {}),
     }
-    async with SessionLocal() as session:
-        run = (
-            await session.execute(select(Run).where(Run.id == run_id))
-        ).scalar_one()
-        if run.status != RunStatus.completed:
-            raise RebuildGuardError(
-                "Статус проверки изменился во время теневой пересборки."
-            )
-        run.analysis_markdown = markdown
-        run.report_json = report_json
-        await session.commit()
+    reader_copy_manifest = await analyzer._save_reader_copy_manifest(
+        run_id,
+        final_report=final,
+        public_report=public_report,
+        illustrations=illustrations,
+        analysis_markdown=markdown,
+        report_json=report_json,
+    )
+    try:
+        await replace_completed_publication(
+            run_id=run_id,
+            expected_snapshot_digest=expected_snapshot_digest,
+            report_json=report_json,
+            analysis_markdown=markdown,
+            reader_copy_manifest=reader_copy_manifest,
+        )
+    except PublicationContractError as exc:
+        raise RebuildGuardError(
+            "Публичный отчёт изменился или перестал проходить контракт "
+            "публикации во время пересборки; результат не опубликован."
+        ) from exc
 
     return {
         "run_id": run_id,

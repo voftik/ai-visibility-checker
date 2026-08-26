@@ -11,6 +11,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import html
 import json
 import logging
 import math
@@ -23,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 from sqlalchemy import delete, func, or_, select, update
@@ -73,6 +74,7 @@ from app.services.structured_audit_store import (
     load_structured_checkpoint,
     structured_audit_checkpoint,
 )
+from app.services.event_bus import bus
 from app.services.claim_ledger import (
     SourceClaim,
     build_claim_ledger,
@@ -106,7 +108,10 @@ from app.services.sharded_document import (
 )
 from app.services.analysis_critic import (
     CRITIC_CALL_AUDIT_VERSION,
+    CRITIC_MAP_REDUCE_VERSION,
     CRITIC_MODEL,
+    CRITIC_REASONING_EFFORT,
+    CRITIC_REPAIR_REASONING_EFFORT,
     CRITIC_TRANSPORT_CONTRACT_VERSION,
     CRITIC_VERSION,
     MAX_CRITIC_RECOVERY_FINAL_REVIEWS,
@@ -140,21 +145,37 @@ from app.services.report_editor import (
     build_editorial_units,
     edit_report,
     editorial_policy_sha256,
+    illustration_copy_narrative_paths,
     seal_editorial_audit,
     technical_review_narrative_paths,
     validate_editorial_cache,
 )
+from app.services.live_russian_policy import (
+    LIVE_RUSSIAN_POLICY_MANIFEST,
+    assert_live_russian_policy_integrity,
+    lint_reader_copy_tree,
+)
+from app.services.reader_copy_registry import (
+    READER_COPY_REGISTRY_MANIFEST,
+    assert_reader_copy_registry_integrity,
+    reader_copy_registry_document,
+    reader_copy_value,
+)
 from app.services.offer_catalog import (
     AnswerSetReceipt,
+    CLIENT_IDENTITY_ADMISSION_VERSION,
     ClusterExclusion,
     IntentPrompt,
     OfferCatalog,
+    OfferCatalogAdmissionError,
     OfferCatalogError,
     OfferCluster,
     PromptFoundation,
     ResumeCompatibilityError,
     SourceUnit,
     artifact_digest as offer_artifact_digest,
+    admit_client_identity_aliases,
+    assess_offer_catalog_admission,
     build_answer_set_receipt,
     build_domain_research_payload,
     build_offer_catalog,
@@ -177,7 +198,19 @@ from app.services.recovery_orchestrator import (
     CHECK_PROMPT_CONTRACT_VALID,
     CHECK_RAW_CORPUS_UNCHANGED,
     CHECK_SEMANTIC_REVIEW_PASSED,
+    ORCHESTRATOR_MODEL as RECOVERY_ORCHESTRATOR_MODEL,
+    ORCHESTRATOR_VERSION as RECOVERY_ORCHESTRATOR_VERSION,
     OrchestratorContractError,
+    PROCESSING_MODEL as RECOVERY_PROCESSING_MODEL,
+    RECOVERY_DECISION_ARBITER_VERSION,
+    RECOVERY_DECISION_DOSSIER_VERSION,
+    RECOVERY_DECISION_LEDGER_VERSION,
+    RECOVERY_DECISION_SHARD_VERSION,
+    RECOVERY_INPUT_HARNESS_VERSION,
+    RECOVERY_MAP_VERSION,
+    RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION,
+    RECOVERY_RATIONALE_REPAIR_VERSION,
+    RECOVERY_REDUCE_VERSION,
     RecoveryDecisionRejected,
     RecoveryPlannerUnavailable,
 )
@@ -189,17 +222,39 @@ from app.services.recovery_state import (
     plan_code_owned_recovery,
     plan_durable_recovery,
     recovery_execution_state,
+    recovery_scope_digest,
     stable_digest,
 )
-from app.services.progress import complete_run, fail_run, update_progress
+from app.services.progress import fail_run, update_progress
+from app.services.publication_contract import (
+    EDITORIAL_CACHE_PROOF_VERSION,
+    PublicationContractError,
+    READER_COPY_MANIFEST_VERSION,
+    persist_immutable_illustration_qa_receipt,
+    stage_publication_receipt,
+)
+from app.services.panel_coverage import (
+    PANEL_METRIC_COVERAGE_ADMISSION_VERSION,
+    PanelMetricCoverageError,
+    build_panel_metric_coverage_admission,
+    require_panel_metric_coverage,
+)
 from app.services.robots_parser import robots_path_allowed
 from app.services.run_lease import (
     RunLeaseLostError,
     assert_run_lease,
     lease_owner_for,
 )
-from app.services.run_coordinator import SAVED_ANSWERS_ONLY_MARKER_KEY
-from app.services.site_preview import get_saved_site_preview
+from app.services.raw_answer_integrity import model_answer_fingerprint_rows
+from app.services.run_coordinator import (
+    SAVED_ANSWERS_ONLY_MARKER_KEY,
+    SAVED_ANSWERS_ONLY_MARKER_VERSION,
+    SAVED_ANSWERS_ONLY_MODE,
+)
+from app.services.site_preview import (
+    get_saved_site_preview,
+    site_preview_asset_receipt,
+)
 from app.services.crawler import (
     CrawlAdmissionIncomplete,
     PAGE_SCOPE,
@@ -207,6 +262,7 @@ from app.services.crawler import (
     SITE_PAGE_MANIFEST_VERSION,
     bootstrap_legacy_crawl_admission,
     require_crawl_admission,
+    site_page_evidence_sha256,
     validated_site_page_manifest_output,
 )
 
@@ -216,9 +272,17 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 PROMPT_VERSION = "aiv-2026-07-30-system-v2"
 SITE_PROFILE_VERSION = f"{PROMPT_VERSION}-site-profile-v5"
-OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v2"
+OFFER_CATALOG_PIPELINE_VERSION = f"{PROMPT_VERSION}-offer-catalog-v4"
 PROMPT_FOUNDATION_PIPELINE_VERSION = f"{PROMPT_VERSION}-prompt-foundation-v1"
 ANSWER_SET_RECEIPT_PIPELINE_VERSION = f"{PROMPT_VERSION}-answer-receipt-v1"
+PANEL_CORPUS_RECEIPT_VERSION = f"{PROMPT_VERSION}-panel-corpus-receipt-v1"
+PANEL_CORPUS_RECEIPT_KEY = "panel_corpus_receipt"
+LEGACY_PANEL_CORPUS_BASELINE_AUDIT_VERSION = (
+    f"{PROMPT_VERSION}-legacy-panel-corpus-baseline-v1"
+)
+LEGACY_PANEL_CORPUS_BASELINE_AUDIT_KEY = "legacy_panel_corpus_baseline_audit"
+PANEL_CORPUS_PROMPT_COUNT = 9
+PANEL_CORPUS_EXPECTED_CELL_COUNT = 81
 LEGACY_FOUNDATION_AUDIT_VERSION = f"{PROMPT_VERSION}-legacy-foundation-v1"
 MARKET_RESEARCH_VERSION = f"{PROMPT_VERSION}-market-research-v7"
 PROMPT_SET_VERSION = f"{PROMPT_VERSION}-intent-v5"
@@ -261,12 +325,12 @@ ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY = {
 ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256 = stable_digest(
     ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY
 )
-ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v18"
-METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v20"
+ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v19"
+METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v21"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
 FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v28"
-FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v3"
+FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v4"
 TECHNICAL_EDITORIAL_VERSION = f"{TECHNICAL_REVIEW_VERSION}-ru-editor-v3"
 FINAL_REPORT_SHARD_PLAN_VERSION = "aiv-final-report-shards-v5"
 FINAL_REPORT_SHARD_MERGE_VERSION = "aiv-final-report-merge-v5"
@@ -349,12 +413,24 @@ LEGACY_PROMPT_SET_VERSIONS = {
 }
 CANONICAL_INTENT_PROMPT_SET_VERSIONS = {
     f"{PROMPT_VERSION}-intent-v3",
+    f"{PROMPT_VERSION}-intent-v4",
     PROMPT_SET_VERSION,
 }
 ILLUSTRATION_CONCEPTS_VERSION = f"{PROMPT_VERSION}-visual-v15"
+ILLUSTRATION_EDITORIAL_VERSION = f"{ILLUSTRATION_CONCEPTS_VERSION}-ru-editor-v1"
 ILLUSTRATION_COPY_FALLBACK_VERSION = f"{PROMPT_VERSION}-visual-fallback-v1"
 ILLUSTRATION_GENERATION_VERSION = f"{PROMPT_VERSION}-image-gen-v2"
 ILLUSTRATION_QA_VERSION = f"{PROMPT_VERSION}-image-qa-v8"
+ILLUSTRATION_PUBLICATION_POLICY = {
+    "version": f"{PROMPT_VERSION}-illustration-publication-v1",
+    "publish_only_verified_assets": True,
+    "verified_subset_allowed": True,
+    "zero_assets_allowed": True,
+    "zero_assets_reason": (
+        "The analytical report remains publishable when no generated or saved "
+        "asset passes the visual and file-integrity gates."
+    ),
+}
 ILLUSTRATION_QUALITY_ATTEMPTS = 2
 ILLUSTRATION_MAX_ATTEMPTS = 3
 ILLUSTRATION_ROLE_CONCURRENCY = 2
@@ -389,12 +465,12 @@ AI_LABELS = {
 CONTROL_LABEL = "Chrome-control"
 LEGACY_RESPONSE_BODY_LIMIT_BYTES = 768 * 1024
 INTENT_DEFINITIONS: dict[str, str] = {
-    "I": "Information Seeking — общие сведения и понимание темы.",
-    "E": "Evaluative — сравнение вариантов и критериев выбора.",
-    "T": "Transactional — готовность купить, заказать или принять решение.",
-    "NB": "Need Based — задача, боль, ограничение или контекст использования.",
-    "NAV": "Navigation — источник, площадка, обзор, агрегатор или точка входа.",
-    "TR": "Trend-Driven — тренды, новизна, популярность или меняющееся поведение.",
+    "I": "Information Seeking: общие сведения и понимание темы.",
+    "E": "Evaluative: сравнение вариантов и критериев выбора.",
+    "T": "Transactional: готовность купить, заказать или принять решение.",
+    "NB": "Need Based: задача, боль, ограничение или контекст использования.",
+    "NAV": "Navigation: источник, площадка, обзор, агрегатор или точка входа.",
+    "TR": "Trend-Driven: тренды, новизна, популярность или меняющееся поведение.",
 }
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429})
 _ENTITY_SCHEMA_TYPES = frozenset(
@@ -2266,6 +2342,11 @@ async def _site_context(run_id: str) -> dict[str, Any]:
         page = pages_by_url[expected_url]
         main_text = page.main_text or ""
         source_sha256 = text_sha256(main_text)
+        evidence_sha256 = site_page_evidence_sha256(
+            page,
+            url=expected_url,
+            page_kind=expected_kind,
+        )
         if (
             page.page_kind != expected_kind
             or not isinstance(receipt_page, dict)
@@ -2273,6 +2354,7 @@ async def _site_context(run_id: str) -> dict[str, Any]:
             or receipt_page.get("url") != expected_url
             or receipt_page.get("page_kind") != expected_kind
             or receipt_page.get("content_sha256") != source_sha256
+            or receipt_page.get("evidence_sha256") != evidence_sha256
         ):
             raise CrawlAdmissionIncomplete(
                 f"SitePage lineage no longer matches manifest: {expected_url}"
@@ -5054,6 +5136,50 @@ def _offer_source_units(site_context: dict[str, Any]) -> list[SourceUnit]:
     return units
 
 
+def _offer_identity_records(site_context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose only crawler-owned page identity fields to alias admission."""
+
+    records: list[dict[str, Any]] = []
+    for page in site_context.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        url = str(page.get("url") or "").strip()
+        source_unit_id = str(page.get("source_unit_id") or url).strip()
+        title = str(page.get("title") or "").strip()
+        if not url or not source_unit_id or not title:
+            continue
+        source_sha256 = str(page.get("source_sha256") or "").strip()
+        if not source_sha256:
+            source_sha256 = text_sha256(str(page.get("main_text") or ""))
+        records.append(
+            {
+                "source_unit_id": source_unit_id,
+                "source_url": url,
+                "source_sha256": source_sha256,
+                "page_kind": str(page.get("page_kind") or ""),
+                "title": title,
+            }
+        )
+    return records
+
+
+def _offer_absence_contract(site_context: dict[str, Any]) -> tuple[bool, str]:
+    """Bind zero-offer claims to complete saved text and crawl coverage."""
+
+    pages = [page for page in site_context.get("pages") or [] if isinstance(page, dict)]
+    absence_claims_allowed = bool(
+        pages and all(page.get("absence_claims_allowed") is True for page in pages)
+    )
+    crawl_admission = site_context.get("crawl_admission")
+    selected_manifest = site_context.get("selected_pages_manifest")
+    coverage_state = "unknown"
+    if isinstance(crawl_admission, dict):
+        coverage_state = str(crawl_admission.get("coverage_state") or "unknown")
+    elif isinstance(selected_manifest, dict):
+        coverage_state = str(selected_manifest.get("coverage_state") or "unknown")
+    return absence_claims_allowed, coverage_state
+
+
 async def _bind_offer_catalog(
     run_id: str,
     profile: dict[str, Any],
@@ -5062,13 +5188,46 @@ async def _bind_offer_catalog(
     """Admit only source-bound offers and make them the downstream truth."""
 
     source_units = _offer_source_units(site_context)
+    source_absence_claims_allowed, crawl_coverage_state = _offer_absence_contract(
+        site_context
+    )
     requested_site = site_context.get("requested_site") or {}
     domain = str(requested_site.get("domain") or "").strip()
-    aliases = [
+    requested_aliases = [
         str(profile.get("brand_name") or "").strip(),
         *(str(value or "").strip() for value in profile.get("brand_aliases") or []),
-        domain,
     ]
+    aliases, identity_admission = admit_client_identity_aliases(
+        client_domain=domain,
+        requested_aliases=[value for value in requested_aliases if value],
+        source_units=source_units,
+        structured_identity_records=_offer_identity_records(site_context),
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="client_identity_admission",
+        status="completed",
+        model=None,
+        input_json={
+            "client_domain": domain,
+            "requested_aliases_sha256": offer_artifact_digest(
+                [value for value in requested_aliases if value]
+            ),
+            "structured_identity_record_digest": identity_admission[
+                "structured_identity_record_digest"
+            ],
+            "source_manifest_digest": identity_admission["source_manifest_digest"],
+        },
+        output_json=identity_admission,
+        usage_json={
+            "trusted_alias_count": len(aliases),
+            "rejected_alias_count": len(
+                identity_admission.get("rejected_aliases") or []
+            ),
+        },
+        prompt_version=CLIENT_IDENTITY_ADMISSION_VERSION,
+    )
     normalized_candidates, normalization_audit = (
         normalize_offer_candidates_against_sources(
             source_units=source_units,
@@ -5079,10 +5238,39 @@ async def _bind_offer_catalog(
     )
     catalog = build_offer_catalog(
         client_domain=domain,
-        client_aliases=[value for value in aliases if value],
+        client_aliases=aliases,
         source_units=source_units,
         candidates=normalized_candidates,
         max_offers=10,
+    )
+    admission = assess_offer_catalog_admission(
+        catalog=catalog,
+        profile=profile,
+        source_units=source_units,
+        source_absence_claims_allowed=source_absence_claims_allowed,
+        crawl_coverage_state=crawl_coverage_state,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="scenario_design",
+        artifact_key="offer_catalog_admission",
+        status="completed",
+        model=None,
+        input_json={
+            "profile_sha256": admission.profile_digest,
+            "catalog_digest": admission.catalog_digest,
+        },
+        output_json=admission.as_dict(),
+        usage_json={
+            "accepted_offer_count": admission.accepted_offer_count,
+            "source_evidence_receipt_count": len(admission.source_evidence_receipts),
+            "zero_offer_admitted": (
+                admission.accepted_offer_count == 0 and admission.allowed
+            ),
+            "source_absence_claims_allowed": (admission.source_absence_claims_allowed),
+            "crawl_coverage_state": admission.crawl_coverage_state,
+        },
+        prompt_version=admission.version,
     )
     clusters = build_offer_clusters(catalog, max_clusters=6)
     research_payload = build_domain_research_payload(catalog)
@@ -5164,6 +5352,9 @@ async def _bind_offer_catalog(
         output_json=research_payload.as_dict(),
         prompt_version=OFFER_CATALOG_PIPELINE_VERSION,
     )
+    # Preserve the deterministic catalog and normalization evidence even when
+    # the gate blocks semantic market research and generic INTENT generation.
+    admission.require_allowed()
     return enriched, catalog, clusters
 
 
@@ -10001,9 +10192,143 @@ def _new_panel_claim_status(generation: int) -> str:
     return f"running:{bounded_generation:08x}:{uuid.uuid4().hex[:12]}"
 
 
+def _panel_default_model_contract() -> tuple[
+    dict[tuple[str, str], str],
+    list[str],
+]:
+    """Return the configured provider/mode topology without hiding ambiguity."""
+
+    defaults: dict[tuple[str, str], str] = {}
+    reasons: list[str] = []
+    for panel in panel_models():
+        provider_key = str(panel.key or "").strip()
+        if not provider_key:
+            reasons.append("panel_provider_key_missing")
+            continue
+        for mode, configured_model in (
+            ("web", panel.model),
+            ("memory", panel.memory_model),
+        ):
+            if configured_model is None:
+                continue
+            model = str(configured_model or "").strip()
+            if not model:
+                reasons.append("panel_configured_model_missing")
+                continue
+            key = (provider_key, mode)
+            previous = defaults.get(key)
+            if previous is not None and previous != model:
+                reasons.append("panel_provider_mode_config_ambiguous")
+                continue
+            if previous is not None:
+                reasons.append("panel_provider_mode_config_duplicate")
+                continue
+            defaults[key] = model
+    return defaults, reasons
+
+
+def _panel_model_contract_from_cells(
+    answer_cells: Iterable[dict[str, Any]],
+) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """Infer one immutable model per persisted provider/mode lane.
+
+    This helper deliberately has no dependency on ``panel_models()``.  It is
+    used only after a historical grid has been sealed (or while creating the
+    explicit legacy baseline seal), where the persisted topology is the fact
+    being validated.  New and incomplete runs continue to use
+    ``_panel_default_model_contract`` as their authority.
+    """
+
+    observed: dict[tuple[str, str], set[str]] = defaultdict(set)
+    reasons: list[str] = []
+    for cell in answer_cells:
+        provider_key = str(cell.get("provider_key") or "").strip()
+        mode = str(cell.get("mode") or "").strip()
+        model = str(cell.get("model") or "").strip()
+        if not provider_key or not model:
+            reasons.append("answer_provider_or_model_missing")
+            continue
+        if mode not in {"web", "memory"}:
+            reasons.append("answer_mode_invalid")
+            continue
+        observed[(provider_key, mode)].add(model)
+
+    contract: dict[tuple[str, str], str] = {}
+    for lane, models in observed.items():
+        if len(models) != 1:
+            reasons.append("answer_grid_model_lane_mismatch")
+            continue
+        contract[lane] = next(iter(models))
+    return contract, reasons
+
+
+def _panel_grid_from_contract(
+    prompt_ids: Iterable[int],
+    contract: dict[tuple[str, str], str],
+) -> set[tuple[int, str, str, str]]:
+    return {
+        (int(prompt_id), provider_key, mode, model)
+        for prompt_id in prompt_ids
+        for (provider_key, mode), model in contract.items()
+    }
+
+
+def _panel_grid_from_cells(
+    cells: Iterable[dict[str, Any]],
+) -> tuple[set[tuple[int, str, str, str]], list[str]]:
+    grid: set[tuple[int, str, str, str]] = set()
+    reasons: list[str] = []
+    physical_count = 0
+    for cell in cells:
+        physical_count += 1
+        prompt_id = cell.get("prompt_id")
+        if isinstance(prompt_id, bool) or not isinstance(prompt_id, int):
+            reasons.append("answer_prompt_id_invalid")
+            continue
+        provider_key = str(cell.get("provider_key") or "").strip()
+        mode = str(cell.get("mode") or "").strip()
+        model = str(cell.get("model") or "").strip()
+        if not provider_key or not model:
+            reasons.append("answer_provider_or_model_missing")
+            continue
+        if mode not in {"web", "memory"}:
+            reasons.append("answer_mode_invalid")
+            continue
+        grid.add((prompt_id, provider_key, mode, model))
+    if len(grid) != physical_count:
+        reasons.append("answer_grid_duplicate_physical_cell")
+    return grid, reasons
+
+
+def _bound_panel_model_contract(
+    answer_cells: Iterable[dict[str, Any]],
+) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """Bind every provider/mode lane to one immutable model identifier.
+
+    A partially completed historical panel may legitimately use an older model
+    than the current configuration.  Its first persisted cell therefore binds
+    the whole provider/mode lane.  We still fail closed on unknown lanes or on
+    two model identifiers inside one lane, so configuration drift cannot make
+    the final grid heterogeneous or silently add an extra provider.
+    """
+
+    defaults, reasons = _panel_default_model_contract()
+    observed, observed_reasons = _panel_model_contract_from_cells(answer_cells)
+    reasons.extend(observed_reasons)
+    for lane, model in observed.items():
+        if lane not in defaults:
+            reasons.append("answer_grid_unknown_provider_mode")
+            continue
+        defaults[lane] = model
+    bound = defaults
+    return bound, reasons
+
+
 async def _panel_resume_checkpoint_from_session(
     session: Any,
     run_id: str,
+    *,
+    authoritative_expected_cells: Iterable[dict[str, Any]] | None = None,
 ) -> list[VisibilityPrompt] | None:
     answer_rows = list(
         (
@@ -10093,7 +10418,41 @@ async def _panel_resume_checkpoint_from_session(
         reasons.append("persisted_prompt_set_mismatch")
 
     prompt_ids = {prompt.id for prompt in prompts}
+    answer_contract_cells = [
+        {
+            "prompt_id": int(answer_row.prompt_id),
+            "provider_key": str(answer_row.provider_key or ""),
+            "model": str(answer_row.model or ""),
+            "mode": str(answer_row.mode or ""),
+        }
+        for answer_row in answer_rows
+    ]
+    authority_cells = (
+        [dict(cell) for cell in authoritative_expected_cells]
+        if authoritative_expected_cells is not None
+        else None
+    )
+    if authority_cells is None:
+        bound_models, grid_reasons = _bound_panel_model_contract(
+            answer_contract_cells
+        )
+    else:
+        bound_models, grid_reasons = _panel_model_contract_from_cells(
+            authority_cells
+        )
+        authority_grid, authority_grid_reasons = _panel_grid_from_cells(
+            authority_cells
+        )
+        grid_reasons.extend(authority_grid_reasons)
+        complete_authority_grid = _panel_grid_from_contract(
+            prompt_ids,
+            bound_models,
+        )
+        if authority_grid != complete_authority_grid:
+            grid_reasons.append("sealed_answer_grid_not_rectangular")
+    reasons.extend(grid_reasons)
     answer_cells: set[tuple[int, str, str]] = set()
+    actual_contract_grid: set[tuple[int, str, str, str]] = set()
     for answer_row in answer_rows:
         (
             _answer_id,
@@ -10114,6 +10473,11 @@ async def _panel_resume_checkpoint_from_session(
             reasons.append("answer_provider_or_model_missing")
         if mode_value not in {"web", "memory"}:
             reasons.append("answer_mode_invalid")
+        expected_model = bound_models.get((provider_value, mode_value))
+        if expected_model is None:
+            reasons.append("answer_grid_unknown_cell")
+        elif model_value != expected_model:
+            reasons.append("answer_grid_model_mismatch")
         if status_value not in {"pending", "failed", "completed"} and (
             _panel_running_generation(status_value) is None
         ):
@@ -10124,6 +10488,15 @@ async def _panel_resume_checkpoint_from_session(
         if cell in answer_cells:
             reasons.append("answer_grid_duplicate_cell")
         answer_cells.add(cell)
+        actual_contract_grid.add(
+            (int(prompt_id), provider_value, mode_value, model_value)
+        )
+
+    if authority_cells is not None:
+        if actual_contract_grid != authority_grid:
+            reasons.append("sealed_answer_grid_changed")
+        if len(actual_contract_grid) != len(answer_rows):
+            reasons.append("sealed_answer_grid_duplicate_cell")
 
     if reasons:
         raise PanelCheckpointMismatchError(
@@ -10138,7 +10511,29 @@ async def _load_panel_resume_checkpoint(
     """Return the immutable prompt checkpoint once panel evidence exists."""
 
     async with SessionLocal() as session:
-        checkpoint = await _panel_resume_checkpoint_from_session(session, run_id)
+        receipt_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == PANEL_CORPUS_RECEIPT_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+        authoritative_expected_cells: list[dict[str, Any]] | None = None
+        if receipt_artifact is not None:
+            if not isinstance(receipt_artifact.output_json, dict):
+                raise PanelCheckpointMismatchError(
+                    "Panel corpus receipt mismatch: invalid_artifact_envelope"
+                )
+            _validate_panel_corpus_receipt_shape(receipt_artifact.output_json)
+            authoritative_expected_cells = _panel_expected_corpus_cells_from_receipt(
+                receipt_artifact.output_json
+            )
+        checkpoint = await _panel_resume_checkpoint_from_session(
+            session,
+            run_id,
+            authoritative_expected_cells=authoritative_expected_cells,
+        )
     await assert_run_lease(run_id)
     return checkpoint
 
@@ -10275,12 +10670,19 @@ async def _save_prompt_foundation(
         for item in prompt_set.get("cluster_exclusions") or []
         if isinstance(item, dict)
     )
+    source_absence_claims_allowed, crawl_coverage_state = _offer_absence_contract(
+        site_context
+    )
     foundation = build_prompt_foundation(
         upstream=upstream,
         catalog=catalog,
         clusters=clusters,
         prompts=intent_prompts,
         exclusions=exclusions,
+        profile=profile,
+        source_units=_offer_source_units(site_context),
+        source_absence_claims_allowed=source_absence_claims_allowed,
+        crawl_coverage_state=crawl_coverage_state,
     )
     await _save_artifact(
         run_id,
@@ -10358,6 +10760,8 @@ async def _discovery_answers_by_prompt(
                 "response_sha256": text_sha256(response_text),
                 "response_utf8_bytes": len(response_text.encode("utf-8")),
                 "citations_sha256": offer_artifact_digest(answer.citations_json or []),
+                "usage_sha256": offer_artifact_digest(answer.usage_json or {}),
+                "error_sha256": text_sha256(str(answer.error_message or "")),
             }
         )
     return answers
@@ -10387,11 +10791,7 @@ async def _save_answer_set_receipt(run_id: str) -> AnswerSetReceipt | None:
         key
         for key, cells in answers.items()
         if not cells
-        or any(
-            cell.get("status") != "completed"
-            or int(cell.get("response_utf8_bytes") or 0) <= 0
-            for cell in cells
-        )
+        or any(cell.get("status") not in {"completed", "failed"} for cell in cells)
     ]
     if incomplete:
         raise ResumeCompatibilityError(
@@ -10419,6 +10819,515 @@ async def _save_answer_set_receipt(run_id: str) -> AnswerSetReceipt | None:
         prompt_version=ANSWER_SET_RECEIPT_PIPELINE_VERSION,
     )
     return receipt
+
+
+def _panel_corpus_receipt_digest(value: dict[str, Any]) -> str:
+    body = copy.deepcopy(value)
+    body.pop("receipt_sha256", None)
+    return _stable_json_sha256(body)
+
+
+def _panel_expected_corpus_cells_from_receipt(
+    value: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return the exact provider/mode/model grid sealed for one run."""
+
+    cells = value.get("cells")
+    if not isinstance(cells, list):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: cells_missing"
+        )
+    expected: list[dict[str, Any]] = []
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: cell_invalid"
+            )
+        prompt_id = cell.get("prompt_id")
+        if isinstance(prompt_id, bool) or not isinstance(prompt_id, int):
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: cell_prompt_id_invalid"
+            )
+        expected.append(
+            {
+                "prompt_id": prompt_id,
+                "provider_key": str(cell.get("provider_key") or "").strip(),
+                "model": str(cell.get("model") or "").strip(),
+                "mode": str(cell.get("mode") or "").strip(),
+            }
+        )
+    return sorted(
+        expected,
+        key=lambda cell: (
+            int(cell["prompt_id"]),
+            str(cell["provider_key"]),
+            str(cell["model"]),
+            str(cell["mode"]),
+        ),
+    )
+
+
+def _validate_panel_corpus_receipt_shape(value: dict[str, Any]) -> None:
+    proof_scope = str(value.get("proof_scope") or "")
+    historical_integrity_proven = value.get("historical_integrity_proven")
+    if value.get("version") != PANEL_CORPUS_RECEIPT_VERSION:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: unsupported_version"
+        )
+    if proof_scope == "normal_panel_completion":
+        if historical_integrity_proven is not True:
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: invalid_normal_proof_state"
+            )
+    elif proof_scope == "legacy_reprocess_baseline":
+        if historical_integrity_proven is not False:
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: invalid_legacy_proof_state"
+            )
+    else:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: invalid_proof_scope"
+        )
+    if value.get("prompt_count") != PANEL_CORPUS_PROMPT_COUNT:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: prompt_count"
+        )
+    if value.get("expected_cell_count") != PANEL_CORPUS_EXPECTED_CELL_COUNT:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: expected_cell_count"
+        )
+    if value.get("actual_cell_count") != PANEL_CORPUS_EXPECTED_CELL_COUNT:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: actual_cell_count"
+        )
+    prompt_receipts = value.get("prompts")
+    cells = value.get("cells")
+    if (
+        not isinstance(prompt_receipts, list)
+        or len(prompt_receipts) != PANEL_CORPUS_PROMPT_COUNT
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: prompt_manifest"
+        )
+    if (
+        not isinstance(cells, list)
+        or len(cells) != PANEL_CORPUS_EXPECTED_CELL_COUNT
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: cell_manifest"
+        )
+    prompt_ids: set[int] = set()
+    prompt_keys: dict[int, str] = {}
+    for prompt in prompt_receipts:
+        if not isinstance(prompt, dict):
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: prompt_manifest"
+            )
+        prompt_id = prompt.get("prompt_id")
+        prompt_key = str(prompt.get("prompt_key") or "").strip()
+        if (
+            isinstance(prompt_id, bool)
+            or not isinstance(prompt_id, int)
+            or prompt_id in prompt_ids
+            or not prompt_key
+        ):
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: prompt_manifest"
+            )
+        prompt_ids.add(prompt_id)
+        prompt_keys[prompt_id] = prompt_key
+
+    expected_cells = _panel_expected_corpus_cells_from_receipt(value)
+    model_contract, contract_reasons = _panel_model_contract_from_cells(
+        expected_cells
+    )
+    receipt_grid, grid_reasons = _panel_grid_from_cells(expected_cells)
+    complete_grid = _panel_grid_from_contract(prompt_ids, model_contract)
+    if contract_reasons or grid_reasons or receipt_grid != complete_grid:
+        reasons = list(dict.fromkeys([*contract_reasons, *grid_reasons]))
+        detail = ", ".join(reasons) if reasons else "non_rectangular_grid"
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: topology " + detail
+        )
+    for cell in cells:
+        assert isinstance(cell, dict)
+        prompt_id = int(cell["prompt_id"])
+        if (
+            prompt_id not in prompt_ids
+            or str(cell.get("prompt_key") or "") != prompt_keys[prompt_id]
+            or str(cell.get("status") or "") not in {"completed", "failed"}
+        ):
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: cell_manifest"
+            )
+    if value.get("prompt_identity_sha256") != _stable_json_sha256(
+        prompt_receipts
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: prompt_identity_digest"
+        )
+    if value.get("cell_manifest_sha256") != _stable_json_sha256(cells):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: cell_manifest_digest"
+        )
+    receipt_sha256 = str(value.get("receipt_sha256") or "")
+    if receipt_sha256 != _panel_corpus_receipt_digest(value):
+        raise PanelCheckpointMismatchError("Panel corpus receipt mismatch: self_digest")
+
+
+async def _panel_corpus_receipt_snapshot(
+    run_id: str,
+    *,
+    proof_scope: str,
+    historical_integrity_proven: bool,
+    authoritative_expected_cells: Iterable[dict[str, Any]] | None = None,
+    infer_persisted_topology: bool = False,
+) -> dict[str, Any]:
+    """Hash the complete persisted 9-prompt/81-cell raw panel corpus."""
+
+    async with SessionLocal() as session:
+        answers = list(
+            (
+                await session.execute(
+                    select(ModelAnswer)
+                    .where(ModelAnswer.run_id == run_id)
+                    .order_by(
+                        ModelAnswer.prompt_id,
+                        ModelAnswer.mode,
+                        ModelAnswer.provider_key,
+                        ModelAnswer.model,
+                        ModelAnswer.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        answer_contract_cells = [
+            {
+                "prompt_id": answer.prompt_id,
+                "provider_key": answer.provider_key,
+                "model": answer.model,
+                "mode": answer.mode,
+            }
+            for answer in answers
+        ]
+        authority_cells = (
+            [dict(cell) for cell in authoritative_expected_cells]
+            if authoritative_expected_cells is not None
+            else answer_contract_cells
+            if infer_persisted_topology
+            else None
+        )
+        prompts = await _panel_resume_checkpoint_from_session(
+            session,
+            run_id,
+            authoritative_expected_cells=authority_cells,
+        )
+        if prompts is None:
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: panel_answers_missing"
+            )
+
+    if authority_cells is None:
+        bound_models, grid_reasons = _bound_panel_model_contract(
+            answer_contract_cells
+        )
+    else:
+        bound_models, grid_reasons = _panel_model_contract_from_cells(
+            authority_cells
+        )
+    if grid_reasons:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: " + ", ".join(dict.fromkeys(grid_reasons))
+        )
+
+    expected_grid = _panel_grid_from_contract(
+        (prompt.id for prompt in prompts),
+        bound_models,
+    )
+    if authoritative_expected_cells is not None:
+        sealed_grid, sealed_grid_reasons = _panel_grid_from_cells(authority_cells)
+        if sealed_grid_reasons or sealed_grid != expected_grid:
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: sealed_topology_invalid"
+            )
+    actual_grid = {
+        (
+            int(answer.prompt_id),
+            str(answer.provider_key or "").strip(),
+            str(answer.mode or "").strip(),
+            str(answer.model or "").strip(),
+        )
+        for answer in answers
+    }
+    if len(prompts) != PANEL_CORPUS_PROMPT_COUNT:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: prompt_count"
+        )
+    if len(expected_grid) != PANEL_CORPUS_EXPECTED_CELL_COUNT:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: configured_grid_not_81_cells"
+        )
+    if len(answers) != len(actual_grid):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: duplicate_physical_cells"
+        )
+    if actual_grid != expected_grid:
+        missing_count = len(expected_grid - actual_grid)
+        extra_count = len(actual_grid - expected_grid)
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: exact_grid_changed "
+            f"(missing={missing_count}, extra={extra_count})"
+        )
+
+    prompt_by_id = {prompt.id: prompt for prompt in prompts}
+    prompt_receipts = [
+        {
+            "prompt_id": prompt.id,
+            "sequence": prompt.sequence,
+            **_panel_prompt_identity(prompt),
+        }
+        for prompt in prompts
+    ]
+    cells: list[dict[str, Any]] = []
+    for answer in sorted(
+        answers,
+        key=lambda row: (
+            prompt_by_id[row.prompt_id].sequence,
+            str(row.mode or ""),
+            str(row.provider_key or ""),
+            str(row.model or ""),
+        ),
+    ):
+        status = str(answer.status or "").strip()
+        if status not in {"completed", "failed"}:
+            raise PanelCheckpointMismatchError(
+                "Panel corpus receipt mismatch: nonterminal_cell"
+            )
+        response_text = str(answer.response_text or "")
+        error_message = str(answer.error_message or "")
+        cells.append(
+            {
+                "prompt_id": answer.prompt_id,
+                "prompt_key": prompt_by_id[answer.prompt_id].prompt_key,
+                "provider_key": str(answer.provider_key or ""),
+                "model": str(answer.model or ""),
+                "mode": str(answer.mode or ""),
+                "status": status,
+                "response_utf8_bytes": len(response_text.encode("utf-8")),
+                "response_sha256": text_sha256(response_text),
+                "citations_sha256": _stable_json_sha256(answer.citations_json or []),
+                "usage_sha256": _stable_json_sha256(answer.usage_json or {}),
+                "error_utf8_bytes": len(error_message.encode("utf-8")),
+                "error_sha256": text_sha256(error_message),
+            }
+        )
+
+    receipt: dict[str, Any] = {
+        "version": PANEL_CORPUS_RECEIPT_VERSION,
+        "run_id": run_id,
+        "proof_scope": proof_scope,
+        "historical_integrity_proven": historical_integrity_proven,
+        "prompt_count": len(prompt_receipts),
+        "expected_cell_count": len(expected_grid),
+        "actual_cell_count": len(cells),
+        "prompts": prompt_receipts,
+        "prompt_identity_sha256": _stable_json_sha256(prompt_receipts),
+        "cells": cells,
+        "cell_manifest_sha256": _stable_json_sha256(cells),
+    }
+    receipt["receipt_sha256"] = _panel_corpus_receipt_digest(receipt)
+    _validate_panel_corpus_receipt_shape(receipt)
+    return receipt
+
+
+async def _panel_corpus_receipt_artifact(run_id: str) -> RunArtifact | None:
+    async with SessionLocal() as session:
+        return (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == PANEL_CORPUS_RECEIPT_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+
+
+def _legacy_panel_corpus_baseline_audit(
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "version": LEGACY_PANEL_CORPUS_BASELINE_AUDIT_VERSION,
+        "state": "baseline_created_before_saved_answer_reprocess",
+        "historical_integrity_proven": False,
+        "reason": (
+            "The saved panel predates the full-corpus receipt. This "
+            "seal proves immutability only from this reprocess boundary."
+        ),
+        "panel_corpus_receipt_sha256": receipt["receipt_sha256"],
+    }
+
+
+async def _validate_legacy_panel_corpus_baseline_audit(
+    run_id: str,
+    receipt: dict[str, Any],
+) -> None:
+    async with SessionLocal() as session:
+        audit_artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == LEGACY_PANEL_CORPUS_BASELINE_AUDIT_KEY,
+                )
+            )
+        ).scalar_one_or_none()
+    if (
+        audit_artifact is None
+        or audit_artifact.status != "completed"
+        or audit_artifact.prompt_version != LEGACY_PANEL_CORPUS_BASELINE_AUDIT_VERSION
+        or audit_artifact.model is not None
+        or audit_artifact.input_json != {"run_id": run_id}
+        or audit_artifact.output_json != _legacy_panel_corpus_baseline_audit(receipt)
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: legacy_baseline_audit"
+        )
+
+
+async def _validate_panel_corpus_receipt_artifact(
+    run_id: str,
+    artifact: RunArtifact,
+) -> dict[str, Any]:
+    if (
+        artifact.status != "completed"
+        or artifact.prompt_version != PANEL_CORPUS_RECEIPT_VERSION
+        or artifact.model is not None
+        or not isinstance(artifact.output_json, dict)
+    ):
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: invalid_artifact_envelope"
+        )
+    persisted = copy.deepcopy(artifact.output_json)
+    _validate_panel_corpus_receipt_shape(persisted)
+    if artifact.input_json != {
+        "run_id": run_id,
+        "proof_scope": persisted["proof_scope"],
+        "historical_integrity_proven": persisted["historical_integrity_proven"],
+    } or artifact.usage_json != {
+        "prompt_count": PANEL_CORPUS_PROMPT_COUNT,
+        "cell_count": PANEL_CORPUS_EXPECTED_CELL_COUNT,
+        "scope": "all_panel_prompts_and_modes",
+    }:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: artifact_envelope_changed"
+        )
+    expected = await _panel_corpus_receipt_snapshot(
+        run_id,
+        proof_scope=str(persisted["proof_scope"]),
+        historical_integrity_proven=bool(persisted["historical_integrity_proven"]),
+        authoritative_expected_cells=_panel_expected_corpus_cells_from_receipt(
+            persisted
+        ),
+    )
+    if persisted != expected:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: persisted_corpus_changed"
+        )
+    if persisted["proof_scope"] == "legacy_reprocess_baseline":
+        await _validate_legacy_panel_corpus_baseline_audit(run_id, persisted)
+    return persisted
+
+
+async def _validate_panel_corpus_receipt_if_present(run_id: str) -> bool:
+    """Validate an existing seal before any downstream reanalysis work."""
+
+    artifact = await _panel_corpus_receipt_artifact(run_id)
+    if artifact is None:
+        return False
+    await _validate_panel_corpus_receipt_artifact(run_id, artifact)
+    await assert_run_lease(run_id)
+    return True
+
+
+async def _seal_or_validate_panel_corpus_receipt(
+    run_id: str,
+    *,
+    allow_legacy_baseline: bool,
+) -> dict[str, Any]:
+    """Create the full corpus seal once, or validate it without resealing."""
+
+    artifact = await _panel_corpus_receipt_artifact(run_id)
+    if artifact is not None:
+        return await _validate_panel_corpus_receipt_artifact(run_id, artifact)
+
+    proof_scope = (
+        "legacy_reprocess_baseline"
+        if allow_legacy_baseline
+        else "normal_panel_completion"
+    )
+    receipt = await _panel_corpus_receipt_snapshot(
+        run_id,
+        proof_scope=proof_scope,
+        historical_integrity_proven=not allow_legacy_baseline,
+        infer_persisted_topology=allow_legacy_baseline,
+    )
+    await assert_run_lease(run_id)
+    async with SessionLocal() as session:
+        await session.execute(
+            sqlite_insert(RunArtifact)
+            .values(
+                run_id=run_id,
+                stage_key="knowledge_gap",
+                artifact_key=PANEL_CORPUS_RECEIPT_KEY,
+                status="completed",
+                model=None,
+                prompt_version=PANEL_CORPUS_RECEIPT_VERSION,
+                input_json={
+                    "run_id": run_id,
+                    "proof_scope": proof_scope,
+                    "historical_integrity_proven": not allow_legacy_baseline,
+                },
+                output_json=receipt,
+                usage_json={
+                    "prompt_count": PANEL_CORPUS_PROMPT_COUNT,
+                    "cell_count": PANEL_CORPUS_EXPECTED_CELL_COUNT,
+                    "scope": "all_panel_prompts_and_modes",
+                },
+            )
+            .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
+        )
+        if allow_legacy_baseline:
+            await session.execute(
+                sqlite_insert(RunArtifact)
+                .values(
+                    run_id=run_id,
+                    stage_key="knowledge_gap",
+                    artifact_key=LEGACY_PANEL_CORPUS_BASELINE_AUDIT_KEY,
+                    status="completed",
+                    model=None,
+                    prompt_version=LEGACY_PANEL_CORPUS_BASELINE_AUDIT_VERSION,
+                    input_json={"run_id": run_id},
+                    output_json=_legacy_panel_corpus_baseline_audit(receipt),
+                )
+                .on_conflict_do_nothing(index_elements=("run_id", "artifact_key"))
+            )
+        await session.commit()
+
+    persisted_artifact = await _panel_corpus_receipt_artifact(run_id)
+    if persisted_artifact is None:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: immutable_insert_missing"
+        )
+    persisted = await _validate_panel_corpus_receipt_artifact(
+        run_id,
+        persisted_artifact,
+    )
+    if persisted != receipt:
+        raise PanelCheckpointMismatchError(
+            "Panel corpus receipt mismatch: immutable_insert_conflict"
+        )
+    return persisted
 
 
 async def _validate_panel_foundation_resume(
@@ -10483,12 +11392,19 @@ async def _validate_panel_foundation_resume(
         for item in prompt_set_value.get("cluster_exclusions") or []
         if isinstance(item, dict)
     )
+    source_absence_claims_allowed, crawl_coverage_state = _offer_absence_contract(
+        site_context
+    )
     reconstructed_foundation = build_prompt_foundation(
         upstream=current_upstream,
         catalog=catalog,
         clusters=_clusters,
         prompts=current_intent_prompts,
         exclusions=current_exclusions,
+        profile=profile,
+        source_units=_offer_source_units(site_context),
+        source_absence_claims_allowed=source_absence_claims_allowed,
+        crawl_coverage_state=crawl_coverage_state,
     )
     if reconstructed_foundation.foundation_digest != foundation.foundation_digest:
         raise PanelCheckpointMismatchError(
@@ -11729,6 +12645,25 @@ async def _ensure_answer_rows(
             .scalars()
             .all()
         )
+        existing_contract_cells = [
+            {
+                "prompt_id": row.prompt_id,
+                "provider_key": row.provider_key,
+                "model": row.model,
+                "mode": row.mode,
+            }
+            for row in existing_rows
+        ]
+        bound_models, grid_reasons = _bound_panel_model_contract(
+            existing_contract_cells
+        )
+        prompt_ids = {prompt.id for prompt in prompts}
+        if any(row.prompt_id not in prompt_ids for row in existing_rows):
+            grid_reasons.append("answer_prompt_outside_requested_panel")
+        if grid_reasons:
+            raise PanelCheckpointMismatchError(
+                "Panel answer grid mismatch: " + ", ".join(dict.fromkeys(grid_reasons))
+            )
         existing = {(row.prompt_id, row.provider_key): row for row in existing_rows}
         annotation_by_answer_id: dict[int, dict[str, Any]] = {}
         if existing_rows:
@@ -11750,9 +12685,14 @@ async def _ensure_answer_rows(
             }
         for prompt in prompts:
             for panel in panel_models():
-                selected_model = panel.model if mode == "web" else panel.memory_model
-                if selected_model is None:
+                configured_model = panel.model if mode == "web" else panel.memory_model
+                if configured_model is None:
                     continue
+                selected_model = bound_models.get((panel.key, mode))
+                if selected_model is None:
+                    raise PanelCheckpointMismatchError(
+                        "Panel answer grid mismatch: configured lane is absent"
+                    )
                 request_sha256 = _panel_request_sha256(
                     prompt_text=prompt.text,
                     mode=mode,
@@ -14741,6 +15681,8 @@ async def _unannotated_answers(
         output.append(
             {
                 "answer_id": answer.id,
+                "status": "completed",
+                "metric_eligible": True,
                 "mode": answer.mode,
                 "system": labels.get(answer.provider_key, answer.provider_key),
                 "answer_model": answer.model,
@@ -14752,6 +15694,10 @@ async def _unannotated_answers(
                 "scenario": prompt.text,
                 "scenario_role": prompt.role,
                 "intent_class": prompt.intent_class,
+                "citations": copy.deepcopy(answer.citations_json or []),
+                "response_annotations": copy.deepcopy(
+                    (answer.usage_json or {}).get("_aiv_response_annotations") or []
+                ),
                 "answer": answer_text,
             }
         )
@@ -17779,6 +18725,7 @@ def _reconcile_annotation(
     *,
     annotation_input_sha256: str = "",
     annotation_repair_provenance: dict[str, Any] | None = None,
+    target_mention_receipts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Enforce literal entity evidence before deterministic metrics are computed."""
 
@@ -17798,7 +18745,36 @@ def _reconcile_annotation(
         if value.get("canonical_name")
     }
     reconciliation_notes: list[str] = []
-    direct_aliases = _target_aliases(profile, catalog)
+    profile_direct_aliases = _target_aliases(profile, catalog)
+    direct_aliases = list(profile_direct_aliases)
+    validated_target_receipts: list[dict[str, Any]] = []
+    catalog_entities_by_name = {
+        str(entity.get("canonical_name") or "").casefold(): entity
+        for entity in catalog.get("entities") or []
+        if isinstance(entity, dict) and entity.get("canonical_name")
+    }
+    for receipt in target_mention_receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        entity = catalog_entities_by_name.get(
+            str(receipt.get("entity_name") or "").casefold()
+        )
+        alias = str(receipt.get("alias") or "")
+        expected_receipt = (
+            _target_mention_receipt(
+                profile=profile,
+                catalog=catalog,
+                entity=entity,
+                alias=alias,
+                row=pending_answer,
+            )
+            if entity is not None and alias
+            else None
+        )
+        if expected_receipt == receipt:
+            validated_target_receipts.append(copy.deepcopy(receipt))
+            direct_aliases.append(alias)
+    direct_aliases = list(dict.fromkeys(direct_aliases))
     confirmed_owner_aliases = _attribution_owner_aliases(profile, catalog)
     entity_attribution_aliases = _entity_attribution_alias_map(
         profile,
@@ -18086,6 +19062,9 @@ def _reconcile_annotation(
         )
     )
 
+    profile_direct_alias_present = any(
+        _alias_is_present(answer_text, alias) for alias in profile_direct_aliases
+    )
     direct_alias_present = any(
         _alias_is_present(answer_text, alias) for alias in direct_aliases
     )
@@ -18095,9 +19074,27 @@ def _reconcile_annotation(
                 "Детерминированно найден прямой алиас целевого бренда."
             )
         reconciled["target_mentioned"] = True
-        if reconciled.get("target_role") in {None, "absent", "unknown"}:
+        receipt_only_target_grounding = bool(
+            validated_target_receipts and not profile_direct_alias_present
+        )
+        if receipt_only_target_grounding:
+            # A target-mention receipt proves identity and a literal mention,
+            # but it does not prove recommendation semantics or a global list
+            # position.  A separate answer-bound semantic receipt would be
+            # required before either may affect recommendation/top-3 metrics.
             reconciled["target_role"] = "mentioned"
-        if reconciled.get("sentiment") == "unknown":
+            reconciled["target_position"] = None
+            reconciled["sentiment"] = "neutral"
+            reconciliation_notes.append(
+                "Scoped-квитанция подтвердила только упоминание цели; "
+                "роль рекомендации и позиция не переносились."
+            )
+        elif reconciled.get("target_role") in {None, "absent", "unknown"}:
+            reconciled["target_role"] = "mentioned"
+        if (
+            not receipt_only_target_grounding
+            and reconciled.get("sentiment") == "unknown"
+        ):
             reconciled["sentiment"] = "neutral"
     else:
         if reconciled.get("target_mentioned") is True:
@@ -18192,6 +19189,9 @@ def _reconcile_annotation(
     reconciled["_answer_sha256"] = str(pending_answer.get("answer_sha256") or "")
     reconciled["_answer_model"] = str(pending_answer.get("answer_model") or "")
     reconciled["_annotation_input_sha256"] = annotation_input_sha256
+    reconciled.pop("_critic_target_mention_receipts", None)
+    if validated_target_receipts:
+        reconciled["_critic_target_mention_receipts"] = validated_target_receipts
     reconciled.pop("_annotation_repair_provenance", None)
     if annotation_repair_provenance is not None:
         reconciled["_annotation_repair_provenance"] = copy.deepcopy(
@@ -18207,6 +19207,7 @@ def _annotation_context_sha256(
     research_guidance: str = "",
     *,
     repair_mode: str = "",
+    target_mention_receipts: list[dict[str, Any]] | None = None,
 ) -> str:
     context = {
         "brand_name": profile.get("brand_name"),
@@ -18219,6 +19220,7 @@ def _annotation_context_sha256(
         ),
         "research_guidance": research_guidance.strip(),
         "repair_mode": repair_mode.strip(),
+        "target_mention_receipts": target_mention_receipts or [],
     }
     return hashlib.sha256(
         json.dumps(
@@ -18436,11 +19438,17 @@ def _restrict_partition_annotation_to_core(
         for alias in target_aliases
         if alias
     )
-    if output.get("target_mentioned") is True and not owns_target:
+    if not owns_target:
+        # Sentiment is a property of the target mention. A model can see the
+        # target in the overlap and emit a non-unknown sentiment for both
+        # neighbouring units; once this unit does not own the literal mention,
+        # none of its target fields belong to this core. Keeping any of them
+        # would let an inconsistent leaf manufacture a global recommendation,
+        # top-three position, exclusion, or mixed sentiment at merge time.
         output["target_mentioned"] = False
         output["target_position"] = None
-        if output.get("target_role") not in {"excluded", "unknown"}:
-            output["target_role"] = "absent"
+        output["target_role"] = "absent"
+        output["sentiment"] = "unknown"
 
     # List ordinals emitted for a later window are local to that window.  They
     # cannot be promoted to a position in the complete answer because earlier
@@ -18875,6 +19883,7 @@ async def _annotate_answers(
     target_answer_ids: set[int] | None = None,
     repair_mode: str = "",
     annotation_repair_provenance: dict[str, Any] | None = None,
+    target_mention_receipts: list[dict[str, Any]] | None = None,
     _completion_attempt: int = 1,
 ) -> None:
     normalized_target_ids: set[int] | None = None
@@ -18893,6 +19902,7 @@ async def _annotate_answers(
         catalog,
         research_guidance,
         repair_mode=repair_mode,
+        target_mention_receipts=target_mention_receipts,
     )
     pending = await _unannotated_answers(
         run_id,
@@ -18901,6 +19911,18 @@ async def _annotate_answers(
     )
     if not pending:
         return
+    target_receipts_by_answer_id: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for receipt in target_mention_receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        receipt_answer_id = receipt.get("answer_id")
+        if isinstance(receipt_answer_id, int) and not isinstance(
+            receipt_answer_id,
+            bool,
+        ):
+            target_receipts_by_answer_id[receipt_answer_id].append(
+                copy.deepcopy(receipt)
+            )
     system = f"""
 Разметь каждый ответ атомарно и только по его тексту.
 Целевая сущность: {profile.get("brand_name")}.
@@ -19413,7 +20435,28 @@ context_provenance описывает code-owned subset/shard полного а�
         normalized = _restrict_partition_annotation_to_core(
             normalized,
             unit,
-            target_aliases=partition_target_aliases,
+            target_aliases=list(
+                dict.fromkeys(
+                    [
+                        *partition_target_aliases,
+                        *[
+                            str(receipt.get("alias") or "")
+                            for receipt in target_receipts_by_answer_id.get(
+                                source_id,
+                                [],
+                            )
+                            if isinstance(
+                                (receipt_start := receipt.get("alias_start_char")),
+                                int,
+                            )
+                            and not isinstance(receipt_start, bool)
+                            and int(unit.get("_lr_start_char") or 0)
+                            <= receipt_start
+                            < int(unit.get("_lr_end_char") or 0)
+                        ],
+                    ]
+                )
+            ),
         )
         parts_by_source_id[source_id].append(
             (int(unit.get("_lr_unit_index") or 0), normalized)
@@ -19465,6 +20508,10 @@ context_provenance описывает code-owned subset/shard полного а�
             catalog,
             annotation_input_sha256=annotation_input_sha256,
             annotation_repair_provenance=annotation_repair_provenance,
+            target_mention_receipts=target_receipts_by_answer_id.get(
+                source_id,
+                [],
+            ),
         )
         reconciled["_long_response_partition"] = {
             "version": LONG_RESPONSE_HARNESS_VERSION,
@@ -19553,6 +20600,7 @@ context_provenance описывает code-owned subset/shard полного а�
             target_answer_ids=normalized_target_ids,
             repair_mode=repair_mode,
             annotation_repair_provenance=annotation_repair_provenance,
+            target_mention_receipts=target_mention_receipts,
             _completion_attempt=_completion_attempt + 1,
         )
         return
@@ -19720,7 +20768,12 @@ def _visibility_slice(
 
     def outcome(row: dict[str, Any]) -> tuple[bool, int | None, str]:
         annotation = row["annotation"]
-        mentioned = bool(annotation.get("target_mentioned"))
+        mentioned = bool(
+            row.get(
+                "_grounded_target_mentioned",
+                annotation.get("target_mentioned"),
+            )
+        )
         position = (
             int(annotation["target_position"])
             if isinstance(annotation.get("target_position"), int)
@@ -19728,6 +20781,8 @@ def _visibility_slice(
         )
         role = str(annotation.get("target_role") or "absent")
         if scope != "portfolio":
+            if not mentioned:
+                return False, None, "absent"
             return mentioned, position, role
 
         mentioned = False
@@ -19891,6 +20946,7 @@ async def _metric_rows(
     output: list[dict[str, Any]] = []
     for answer, prompt, annotation in rows:
         answer_text = answer.response_text or ""
+        error_text = str(answer.error_message or "")
         stored = annotation.annotation_json if annotation is not None else {}
         expected_annotation_sha256 = (
             annotation_input_sha256_by_answer_id.get(
@@ -19938,6 +20994,13 @@ async def _metric_rows(
             and observation_attested
             and metric_access["context_eligible"]
         )
+        unavailable_limitation = (
+            "terminal_panel_failure"
+            if answer.status == "failed"
+            else "empty_completed_response"
+            if answer.status == "completed" and not answer_text.strip()
+            else None
+        )
         output.append(
             {
                 "answer_id": answer.id,
@@ -19951,7 +21014,13 @@ async def _metric_rows(
                 "status": answer.status,
                 "model": answer.model,
                 "citations_count": len(answer.citations_json or []),
+                "citations": copy.deepcopy(answer.citations_json or []),
+                "response_annotations": copy.deepcopy(
+                    (answer.usage_json or {}).get("_aiv_response_annotations") or []
+                ),
                 "answer_text": answer_text,
+                "error_utf8_bytes": len(error_text.encode("utf-8")),
+                "error_sha256": text_sha256(error_text),
                 "web_attested": web_attested,
                 "web_attestation_reason": web_attestation_reason,
                 "observation_state": observation_state,
@@ -19967,8 +21036,14 @@ async def _metric_rows(
                 ),
                 "metric_eligible": metric_eligible,
                 "context_eligible": context_eligible,
-                "metric_evidence_state": metric_access["metric_evidence_state"],
-                "metric_limitation": metric_access["metric_limitation"],
+                "metric_evidence_state": (
+                    "unavailable"
+                    if unavailable_limitation is not None
+                    else metric_access["metric_evidence_state"]
+                ),
+                "metric_limitation": (
+                    unavailable_limitation or metric_access["metric_limitation"]
+                ),
                 "annotation": stored if annotation_is_current else {},
                 "annotation_state": (
                     "current"
@@ -19982,16 +21057,25 @@ async def _metric_rows(
     return output
 
 
-async def _expected_corpus_cells(
+async def _expected_corpus_contract(
     run_id: str,
     rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str | None, str]:
     """Build the full prompt × provider × mode contract for this run.
 
-    Existing answer models are authoritative for saved historical runs. A
-    missing answer row still gets an expected cell from the current panel
-    contract, so absence cannot disappear from the manifest.
+    A validated corpus receipt is the authority for a sealed historical run.
+    Only an unsealed current run falls back to today's panel configuration; a
+    missing answer row then remains visible as an expected cell.
     """
+
+    receipt_artifact = await _panel_corpus_receipt_artifact(run_id)
+    if receipt_artifact is not None:
+        receipt = await _validate_panel_corpus_receipt_artifact(
+            run_id,
+            receipt_artifact,
+        )
+        cells = _panel_expected_corpus_cells_from_receipt(receipt)
+        return cells, str(receipt["receipt_sha256"]), "sealed_panel_corpus_receipt"
 
     async with SessionLocal() as session:
         prompts = list(
@@ -20032,7 +21116,18 @@ async def _expected_corpus_cells(
                         "mode": mode,
                     }
                 )
-    return sorted(cells, key=_corpus_cell_key)
+    return sorted(cells, key=_corpus_cell_key), None, "current_panel_configuration"
+
+
+async def _expected_corpus_cells(
+    run_id: str,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    cells, _receipt_sha256, _authority = await _expected_corpus_contract(
+        run_id,
+        rows,
+    )
+    return cells
 
 
 def _consistency_index(
@@ -20069,7 +21164,12 @@ def _consistency_index(
                         mentioned = True
                         break
             else:
-                mentioned = bool(annotation.get("target_mentioned"))
+                mentioned = bool(
+                    row.get(
+                        "_grounded_target_mentioned",
+                        annotation.get("target_mentioned"),
+                    )
+                )
             by_prompt[row["prompt_id"]].append(int(mentioned))
     values: list[float] = []
     for outcomes in by_prompt.values():
@@ -20210,6 +21310,17 @@ def _compute_metrics(
     )
     scoped_catalog = _scope_entity_catalog_to_profile(catalog, profile)
     target_aliases = _target_aliases(profile, scoped_catalog)
+    rows = [
+        {
+            **row,
+            "_grounded_target_mentioned": _row_target_mention_is_grounded(
+                row,
+                profile=profile,
+                catalog=scoped_catalog,
+            ),
+        }
+        for row in rows
+    ]
     confirmed_owner_aliases = _attribution_owner_aliases(
         profile,
         scoped_catalog,
@@ -20358,7 +21469,7 @@ def _compute_metrics(
         ):
             continue
         answer_denominator += 1
-        if annotation.get("target_mentioned"):
+        if row.get("_grounded_target_mentioned"):
             events[target_name] += 1
         seen_entity_keys: set[str] = set()
         for mention in annotation.get("entity_mentions") or []:
@@ -20435,7 +21546,7 @@ def _compute_metrics(
             and row["role"] == "unbranded_discovery"
             and _row_has_completed_raw(row)
             and annotation.get("valid") is True
-            and annotation.get("target_mentioned")
+            and row.get("_grounded_target_mentioned")
             and annotation.get("sentiment") != "unknown"
         ):
             sentiments[str(annotation.get("sentiment"))] += 1
@@ -20831,14 +21942,25 @@ def _critic_row_provenance(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "web_attestation_reason": row.get("web_attestation_reason"),
             "panel_evidence_version": row.get("panel_evidence_version"),
             "panel_evidence_sha256": row.get("panel_evidence_sha256"),
+            "citation_sources_sha256": _stable_json_sha256(
+                _critic_row_citation_sources(row)
+            ),
+            "response_annotations_sha256": _stable_json_sha256(
+                _critic_row_response_annotations(row)
+            ),
             "metric_eligible": row.get("metric_eligible"),
             "context_eligible": row.get("context_eligible"),
             "metric_evidence_state": row.get("metric_evidence_state"),
             "metric_limitation": row.get("metric_limitation"),
             "annotation_state": row.get("annotation_state"),
+            "response_utf8_bytes": len(
+                str(row.get("answer_text") or "").encode("utf-8")
+            ),
             "raw_answer_sha256": hashlib.sha256(
                 str(row.get("answer_text") or "").encode("utf-8")
             ).hexdigest(),
+            "error_utf8_bytes": int(row.get("error_utf8_bytes") or 0),
+            "error_sha256": str(row.get("error_sha256") or text_sha256("")),
             "annotation": row.get("annotation") or {},
         }
         for row in rows
@@ -20919,7 +22041,9 @@ def _final_corpus_manifest(
         tuple[int, str, str, str],
         list[dict[str, Any]],
     ] = defaultdict(list)
-    invalid_cells: list[dict[str, Any]] = []
+    structural_invalid_cells: list[dict[str, Any]] = []
+    evidentiary_invalid_cells: list[dict[str, Any]] = []
+    unavailable_cells: list[dict[str, Any]] = []
 
     for row in rows:
         annotation = (
@@ -20927,6 +22051,8 @@ def _final_corpus_manifest(
         )
         raw_answer = str(row.get("answer_text") or "")
         raw_sha256 = hashlib.sha256(raw_answer.encode("utf-8")).hexdigest()
+        error_utf8_bytes = int(row.get("error_utf8_bytes") or 0)
+        error_sha256 = str(row.get("error_sha256") or text_sha256(""))
         annotation_input_sha256 = str(annotation.get("_annotation_input_sha256") or "")
         annotation_provenance = {
             "annotation_version": annotation.get("_annotation_version"),
@@ -20941,7 +22067,14 @@ def _final_corpus_manifest(
             "mode": str(row.get("mode") or ""),
             "answer_id": row.get("answer_id"),
             "status": str(row.get("status") or ""),
+            "response_utf8_bytes": len(raw_answer.encode("utf-8")),
             "raw_answer_sha256": raw_sha256,
+            "error_utf8_bytes": error_utf8_bytes,
+            "error_sha256": error_sha256,
+            "metric_eligible": row.get("metric_eligible") is True,
+            "context_eligible": row.get("context_eligible") is True,
+            "metric_evidence_state": row.get("metric_evidence_state"),
+            "metric_limitation": row.get("metric_limitation"),
             "annotation_sha256": _stable_json_sha256(annotation),
             "annotation_input_sha256": annotation_input_sha256,
             "annotation_provenance_sha256": _stable_json_sha256(annotation_provenance),
@@ -20949,27 +22082,13 @@ def _final_corpus_manifest(
         observed.append(item)
         observed_by_key[_corpus_cell_key(item)].append(item)
 
-        reasons: list[str] = []
+        structural_reasons: list[str] = []
         if not isinstance(item["answer_id"], int):
-            reasons.append("answer_id_missing")
-        if item["status"] != "completed":
-            reasons.append("answer_not_completed")
-        if not raw_answer.strip():
-            reasons.append("raw_answer_missing")
-        if row.get("annotation_state") != "current":
-            reasons.append("annotation_missing_or_stale")
-        if not annotation:
-            reasons.append("annotation_missing")
-        if annotation.get("_answer_sha256") != raw_sha256:
-            reasons.append("annotation_raw_hash_mismatch")
-        if annotation.get("_answer_model") != item["model"]:
-            reasons.append("annotation_model_mismatch")
-        if not annotation_input_sha256:
-            reasons.append("annotation_input_provenance_missing")
-        if not isinstance(annotation.get("valid"), bool):
-            reasons.append("annotation_validity_missing")
-        if reasons:
-            invalid_cells.append(
+            structural_reasons.append("answer_id_missing")
+        if item["status"] not in {"completed", "failed"}:
+            structural_reasons.append("answer_not_terminal")
+        if structural_reasons:
+            structural_invalid_cells.append(
                 {
                     **{
                         field: item[field]
@@ -20981,7 +22100,84 @@ def _final_corpus_manifest(
                             "answer_id",
                         )
                     },
-                    "reasons": reasons,
+                    "reasons": structural_reasons,
+                }
+            )
+            continue
+
+        evidence_bearing = bool(item["status"] == "completed" and raw_answer.strip())
+        if not evidence_bearing:
+            unavailable_reasons = (
+                ["terminal_panel_failure"]
+                if item["status"] == "failed"
+                else ["empty_completed_response"]
+            )
+            if item["metric_eligible"] or item["context_eligible"]:
+                structural_invalid_cells.append(
+                    {
+                        **{
+                            field: item[field]
+                            for field in (
+                                "prompt_id",
+                                "provider_key",
+                                "model",
+                                "mode",
+                                "answer_id",
+                            )
+                        },
+                        "reasons": ["unavailable_cell_marked_eligible"],
+                    }
+                )
+            unavailable_cells.append(
+                {
+                    **{
+                        field: item[field]
+                        for field in (
+                            "prompt_id",
+                            "provider_key",
+                            "model",
+                            "mode",
+                            "answer_id",
+                            "status",
+                            "response_utf8_bytes",
+                            "raw_answer_sha256",
+                            "error_utf8_bytes",
+                            "error_sha256",
+                            "metric_limitation",
+                        )
+                    },
+                    "reasons": unavailable_reasons,
+                }
+            )
+            continue
+
+        evidence_reasons: list[str] = []
+        if row.get("annotation_state") != "current":
+            evidence_reasons.append("annotation_missing_or_stale")
+        if not annotation:
+            evidence_reasons.append("annotation_missing")
+        if annotation.get("_answer_sha256") != raw_sha256:
+            evidence_reasons.append("annotation_raw_hash_mismatch")
+        if annotation.get("_answer_model") != item["model"]:
+            evidence_reasons.append("annotation_model_mismatch")
+        if not annotation_input_sha256:
+            evidence_reasons.append("annotation_input_provenance_missing")
+        if not isinstance(annotation.get("valid"), bool):
+            evidence_reasons.append("annotation_validity_missing")
+        if evidence_reasons:
+            evidentiary_invalid_cells.append(
+                {
+                    **{
+                        field: item[field]
+                        for field in (
+                            "prompt_id",
+                            "provider_key",
+                            "model",
+                            "mode",
+                            "answer_id",
+                        )
+                    },
+                    "reasons": evidence_reasons,
                 }
             )
 
@@ -21021,7 +22217,7 @@ def _final_corpus_manifest(
         for key, items in sorted(observed_by_key.items())
         if len(items) > 1
     ]
-    complete = (
+    structural_complete = (
         bool(normalized_expected)
         and not any(
             (
@@ -21029,11 +22225,17 @@ def _final_corpus_manifest(
                 unexpected_cells,
                 duplicate_expected_cells,
                 duplicate_cells,
-                invalid_cells,
+                structural_invalid_cells,
             )
         )
         and len(observed) == len(normalized_expected)
     )
+    evidentiary_complete = not evidentiary_invalid_cells
+    complete = structural_complete and evidentiary_complete
+    invalid_cells = [
+        *structural_invalid_cells,
+        *evidentiary_invalid_cells,
+    ]
     digest_input = {
         "version": FINAL_CORPUS_MANIFEST_VERSION,
         "expected_cells": normalized_expected,
@@ -21042,7 +22244,12 @@ def _final_corpus_manifest(
         "unexpected_cells": unexpected_cells,
         "duplicate_expected_cells": duplicate_expected_cells,
         "duplicate_cells": duplicate_cells,
+        "structural_invalid_cells": structural_invalid_cells,
+        "evidentiary_invalid_cells": evidentiary_invalid_cells,
+        "unavailable_cells": unavailable_cells,
         "invalid_cells": invalid_cells,
+        "structural_complete": structural_complete,
+        "evidentiary_complete": evidentiary_complete,
         "complete": complete,
     }
     return {
@@ -21173,6 +22380,12 @@ def _deterministic_annotation_warnings(
     confirmed_owner_aliases = _attribution_owner_aliases(profile, catalog)
     rejected: list[dict[str, Any]] = []
     invalid_brand_answers: list[int] = []
+    target_false_negatives: list[dict[str, Any]] = []
+    exact_target_entities = [
+        entity
+        for entity in entities.values()
+        if _exact_target_entity_matches_profile(entity, profile, catalog)
+    ]
     for row in rows:
         annotation = row.get("annotation") or {}
         if (
@@ -21194,6 +22407,30 @@ def _deterministic_annotation_warnings(
             or annotation.get("valid") is not True
         ):
             continue
+        if annotation.get("target_mentioned") is not True:
+            target_receipt: dict[str, Any] | None = None
+            for exact_target in exact_target_entities:
+                for target_alias in _entity_alias_values(exact_target):
+                    target_receipt = _target_mention_receipt(
+                        profile=profile,
+                        catalog=catalog,
+                        entity=exact_target,
+                        alias=target_alias,
+                        row=row,
+                    )
+                    if target_receipt is not None:
+                        break
+                if target_receipt is not None:
+                    break
+            if target_receipt is not None:
+                target_false_negatives.append(
+                    {
+                        "answer_id": target_receipt["answer_id"],
+                        "entity": target_receipt["entity_name"],
+                        "alias": target_receipt["alias"],
+                        "receipt_sha256": _stable_json_sha256(target_receipt),
+                    }
+                )
         for mention in annotation.get("entity_mentions") or []:
             if (
                 not isinstance(mention, dict)
@@ -21235,6 +22472,25 @@ def _deterministic_annotation_warnings(
         }
     )
     warnings: list[dict[str, Any]] = []
+    if target_false_negatives:
+        warnings.append(
+            {
+                "code": "target_mention_false_negative",
+                "severity": "important",
+                "finding": (
+                    "В безбрендовом raw-ответе найден дословный алиас exact "
+                    "target, локально связанный с официальным источником, "
+                    "но разметка не засчитала упоминание цели."
+                ),
+                "answer_ids": sorted(
+                    {int(item["answer_id"]) for item in target_false_negatives}
+                ),
+                "entities": sorted(
+                    {str(item["entity"]) for item in target_false_negatives}
+                ),
+                "receipt_candidates": target_false_negatives,
+            }
+        )
     if len(answer_ids) >= 3:
         warnings.append(
             {
@@ -21448,6 +22704,7 @@ def _critic_payload(
         )
         raw_manifests[answer_id] = manifest.as_dict()
     return {
+        "client_domain": _profile_client_domain(profile),
         "site_profile": profile,
         "entity_catalog": scoped_catalog,
         "metric_contract": {
@@ -21530,6 +22787,18 @@ def _critic_payload(
                 "panel_evidence_reason": row.get("web_attestation_reason"),
                 "panel_evidence_sha256": row.get("panel_evidence_sha256"),
                 "citations_count": row.get("citations_count"),
+                "citation_sources": [
+                    {
+                        "url": source["url"],
+                        "host": _research_url_host(source["url"]),
+                        "title": source.get("title") or "",
+                        "sha256": hashlib.sha256(
+                            source["url"].encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    for source in _critic_row_citation_sources(row)
+                ],
+                "response_annotations": _critic_row_response_annotations(row),
                 "raw_answer_sha256": hashlib.sha256(
                     str(row.get("answer_text") or "").encode("utf-8")
                 ).hexdigest(),
@@ -21669,8 +22938,10 @@ def _scope_leakage_warning_machine_resolved(
             raw_answer = str(item.get("raw_answer") or "")
             annotation = item["annotation"]
             if annotation.get("target_mentioned") is True:
-                if not any(
-                    _alias_is_present(raw_answer, alias) for alias in target_aliases
+                if not _row_target_mention_is_grounded(
+                    item,
+                    profile=profile,
+                    catalog=scoped_catalog,
                 ):
                     return False
                 parent_ids.add(answer_id)
@@ -21790,6 +23061,7 @@ def _critic_review_errors(
         "unsupported_membership",
         "fabricated_evidence",
         "annotation_evidence_mismatch",
+        "target_mention_false_negative",
         "brand_knowledge_false_negative",
         "provider_uniformity",
         "denominator_error",
@@ -21986,6 +23258,8 @@ def _critic_review_validation_errors(
         payload.get("entity_catalog") or {},
         review,
         valid_answer_ids=valid_answer_ids,
+        profile=payload.get("site_profile") or {},
+        answer_rows=payload.get("answers") or [],
     )
     if not applied:
         errors.append("revise contains no safely applicable policy adjustments")
@@ -22086,19 +23360,26 @@ def _deterministic_critic_fallback_review(
             },
         }
     else:
+        preserved_anomalies = [
+            copy.deepcopy(item) for item in anomalies or [] if isinstance(item, dict)
+        ]
+        preserved_adjustments = [
+            copy.deepcopy(item) for item in adjustments or [] if isinstance(item, dict)
+        ]
         fallback = {
             "verdict": "block",
             "summary": (
-                "Формат ответа независимого критика не восстановлен, а "
-                "кодовая проверка не смогла безопасно подтвердить все "
-                "материальные условия публикации."
+                "Решение независимого критика содержит материальную находку, "
+                "но код не смог безопасно скомпилировать предложенное "
+                "исправление; публикация остановлена без потери диагностики."
             ),
-            "anomalies": [],
-            "policy_adjustments": [],
-            "annotation_guidance": "",
+            "anomalies": preserved_anomalies,
+            "policy_adjustments": preserved_adjustments,
+            "annotation_guidance": guidance if isinstance(guidance, str) else "",
             "acceptance_checks": [],
             "fallback": {
-                "kind": "deterministic_block",
+                "kind": "deterministic_actionability_block",
+                "original_verdict": incomplete_review.get("verdict"),
                 "critic_validation_errors": list(validation_errors),
             },
         }
@@ -22837,13 +24118,614 @@ def _require_alias_attribution(
     return found
 
 
+CRITIC_TARGET_MENTION_RECEIPT_VERSION = "aiv-critic-target-mention-receipt-v1"
+
+
+def _critic_row_answer_text(row: dict[str, Any]) -> str:
+    return str(
+        row.get("raw_answer") or row.get("answer_text") or row.get("answer") or ""
+    )
+
+
+def _critic_row_role(row: dict[str, Any]) -> str:
+    return str(row.get("scenario_role") or row.get("role") or "")
+
+
+def _critic_row_citation_sources(
+    row: dict[str, Any],
+) -> list[dict[str, str]]:
+    raw_sources = row.get("citation_sources")
+    if not isinstance(raw_sources, list):
+        raw_sources = row.get("citations")
+    if not isinstance(raw_sources, list):
+        return []
+    sources: list[dict[str, str]] = []
+    for raw_source in raw_sources:
+        if isinstance(raw_source, dict):
+            url = str(raw_source.get("url") or "").strip()
+            title = str(raw_source.get("title") or "").strip()
+        else:
+            url = str(raw_source or "").strip()
+            title = ""
+        if url:
+            sources.append({"url": url, "title": title})
+    return sources
+
+
+def _critic_row_response_annotations(
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_annotations = row.get("response_annotations")
+    if not isinstance(raw_annotations, list):
+        return []
+    annotations: list[dict[str, Any]] = []
+    for raw_annotation in raw_annotations:
+        if not isinstance(raw_annotation, dict):
+            continue
+        raw_source = raw_annotation.get("url_citation") or raw_annotation
+        if not isinstance(raw_source, dict):
+            continue
+        source: dict[str, Any] = {
+            "url": str(raw_source.get("url") or "").strip(),
+            "title": str(raw_source.get("title") or "").strip(),
+        }
+        for key in ("start_index", "end_index"):
+            value = raw_source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                source[key] = value
+        if source["url"]:
+            annotations.append(source)
+    return annotations
+
+
+def _numbered_citation_mapping_is_attested(row: dict[str, Any]) -> bool:
+    """Prove that ``[n]`` indexes the persisted, deduplicated source list."""
+
+    source_urls = [
+        str(source.get("url") or "") for source in _critic_row_citation_sources(row)
+    ]
+    annotation_urls = [
+        str(source.get("url") or "") for source in _critic_row_response_annotations(row)
+    ]
+    return bool(
+        source_urls
+        and source_urls == annotation_urls
+        and len(source_urls) == len(set(source_urls))
+    )
+
+
+def _profile_client_domain(profile: dict[str, Any]) -> str:
+    offer_catalog = profile.get("offer_catalog")
+    candidates = [
+        (offer_catalog or {}).get("client_domain")
+        if isinstance(offer_catalog, dict)
+        else None,
+        profile.get("client_domain"),
+        profile.get("domain"),
+    ]
+    for raw_value in candidates:
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        normalized = _normalized_research_url(
+            value if "://" in value else f"https://{value}"
+        )
+        host = (urlparse(normalized).hostname or "").casefold().removeprefix("www.")
+        if host:
+            return host
+    return ""
+
+
+def _official_domain_citations(
+    row: dict[str, Any],
+    *,
+    client_domain: str,
+) -> list[tuple[int, dict[str, str]]]:
+    domain = client_domain.casefold().removeprefix("www.").strip(".")
+    if not domain:
+        return []
+    matches: list[tuple[int, dict[str, str]]] = []
+    for citation_index, source in enumerate(_critic_row_citation_sources(row), start=1):
+        host = _research_url_host(source.get("url"))
+        if host == domain or host.endswith(f".{domain}"):
+            matches.append((citation_index, source))
+    return matches
+
+
+def _decoded_identity_text(value: str) -> str:
+    decoded = value
+    for _decode_pass in range(2):
+        decoded = html.unescape(unquote(decoded))
+    return decoded
+
+
+def _literal_identity_sequence_is_present(text: str, identity: str) -> bool:
+    """Find an identity token sequence even inside URLs or Markdown."""
+
+    def token_values(value: str) -> list[str]:
+        # Prompts may carry the disclosed brand inside a once- or twice-
+        # encoded URL slug (`%26` / `%2526`). Decode both common layers before
+        # token comparison so transport encoding cannot turn a branded prompt
+        # into an unbranded measurement.
+        decoded = _decoded_identity_text(value)
+        normalized = (
+            unicodedata.normalize("NFKC", decoded)
+            .casefold()
+            .replace("ё", "е")
+            .replace("&", " and ")
+        )
+        return re.findall(r"\w+", normalized, flags=re.UNICODE)
+
+    identity_tokens = token_values(identity)
+    text_tokens = token_values(text)
+    if not identity_tokens or not text_tokens:
+        return False
+
+    def contains_sequence(haystack: list[str], needle: list[str]) -> bool:
+        return bool(
+            needle
+            and any(
+                haystack[index : index + len(needle)] == needle
+                for index in range(len(haystack) - len(needle) + 1)
+            )
+        )
+
+    if contains_sequence(text_tokens, identity_tokens):
+        return True
+    # URL slugs often omit conjunctions: `tattoo-piercing-makarska` must still
+    # count as prompt disclosure of `Tattoo & Piercing Makarska`. A
+    # conservative false rejection is safer here than promoting a branded
+    # prompt into unbranded discovery metrics.
+    connector_tokens = {"and", "и"}
+    identity_without_connectors = [
+        token for token in identity_tokens if token not in connector_tokens
+    ]
+    text_without_connectors = [
+        token for token in text_tokens if token not in connector_tokens
+    ]
+    return contains_sequence(
+        text_without_connectors,
+        identity_without_connectors,
+    )
+
+
+def _local_citation_reference(
+    claim_line: str,
+    *,
+    alias_end_in_line: int,
+    citation_index: int,
+    citation_url: str,
+    client_domain: str,
+    numbered_marker_attested: bool,
+) -> tuple[int, int, str] | None:
+    """Locate an official source immediately after the alias in one claim line."""
+
+    marker_patterns = (
+        (
+            (
+                "numbered_marker",
+                rf"\[\s*{citation_index}\s*\]",
+            ),
+            (
+                "numbered_marker",
+                rf"【\s*{citation_index}(?:†[^】]*)?】",
+            ),
+        )
+        if numbered_marker_attested
+        else ()
+    )
+    candidates: list[tuple[int, int, str]] = []
+    for kind, pattern in marker_patterns:
+        candidates.extend(
+            (match.start(), match.end(), kind)
+            for match in re.finditer(pattern, claim_line)
+        )
+    normalized_line = claim_line.casefold()
+    normalized_url = citation_url.casefold().strip()
+    if normalized_url:
+        start = normalized_line.find(normalized_url, alias_end_in_line)
+        if start >= 0:
+            candidates.append((start, start + len(normalized_url), "literal_url"))
+
+    normalized_domain = client_domain.casefold().removeprefix("www.").strip(".")
+    if normalized_domain:
+        for url_match in re.finditer(
+            r"https?://[^\s<>\[\]\"'()]+",
+            claim_line,
+            re.IGNORECASE,
+        ):
+            host = _research_url_host(url_match.group(0))
+            if host == normalized_domain or host.endswith(f".{normalized_domain}"):
+                candidates.append(
+                    (url_match.start(), url_match.end(), "official_host_url")
+                )
+        for domain_match in re.finditer(
+            rf"(?<![\w.-]){re.escape(normalized_domain)}(?![\w.-])",
+            normalized_line,
+            re.UNICODE,
+        ):
+            candidates.append(
+                (
+                    domain_match.start(),
+                    domain_match.end(),
+                    "literal_domain",
+                )
+            )
+
+    for start, end, kind in sorted(candidates):
+        if start < alias_end_in_line:
+            continue
+        between = claim_line[alias_end_in_line:start]
+        if len(between) > 320:
+            continue
+        if re.search(
+            r"[.!?](?:[\"'»”)]*)\s+(?=[\w#*«“])",
+            between,
+            re.UNICODE,
+        ):
+            continue
+        return start, end, kind
+    return None
+
+
+def _exact_target_entity_matches_profile(
+    entity: dict[str, Any],
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> bool:
+    relationship = str(
+        entity.get("target_relationship") or entity.get("relationship") or ""
+    ).casefold()
+    if entity.get("category") != "target" or relationship not in {
+        "exact_target",
+        "self",
+    }:
+        return False
+    canonical = (
+        str(entity.get("canonical_name") or "").casefold().replace("ё", "е").strip()
+    )
+    profile_identities = {
+        value.casefold().replace("ё", "е").strip()
+        for value in _target_aliases(profile, catalog)
+    }
+    return bool(canonical and canonical in profile_identities)
+
+
+def _target_mention_receipt(
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    entity: dict[str, Any],
+    alias: str,
+    row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Issue one answer-bound identity receipt from independent evidence."""
+
+    answer_id = row.get("answer_id")
+    if not isinstance(answer_id, int) or isinstance(answer_id, bool):
+        return None
+    if row.get("status") != "completed" or row.get("metric_eligible", True) is False:
+        return None
+    if _critic_row_role(row) != "unbranded_discovery":
+        return None
+    if not _exact_target_entity_matches_profile(entity, profile, catalog):
+        return None
+
+    declared_alias = next(
+        (
+            value
+            for value in _entity_alias_values(entity)
+            if value.casefold().replace("ё", "е") == alias.casefold().replace("ё", "е")
+        ),
+        "",
+    )
+    if not declared_alias:
+        return None
+    raw_answer = _critic_row_answer_text(row)
+    if not raw_answer:
+        return None
+    alias_spans = _alias_spans(raw_answer, [declared_alias])
+    if not alias_spans:
+        return None
+    scenario = str(row.get("scenario") or "")
+    client_domain = _profile_client_domain(profile)
+    prompt_identities = list(
+        dict.fromkeys(
+            [
+                *_entity_alias_values(entity),
+                *_target_aliases(profile, catalog),
+            ]
+        )
+    )
+    decoded_scenario = _decoded_identity_text(scenario)
+    if any(
+        _literal_identity_sequence_is_present(scenario, identity)
+        for identity in prompt_identities
+        if identity
+    ) or (client_domain and client_domain.casefold() in decoded_scenario.casefold()):
+        return None
+
+    alias_tokens = re.findall(
+        r"[a-zа-я0-9]+",
+        declared_alias.casefold(),
+        re.UNICODE,
+    )
+    canonical_tokens = set(
+        re.findall(
+            r"[a-zа-я0-9]+",
+            str(entity.get("canonical_name") or "").casefold(),
+            re.UNICODE,
+        )
+    )
+    generic_identity_tokens = {
+        "and",
+        "company",
+        "group",
+        "studio",
+        "the",
+        "бренд",
+        "группа",
+        "компания",
+        "сервис",
+        "студия",
+        "piercing",
+        "tattoo",
+    }
+    distinctive_tokens = [
+        token
+        for token in alias_tokens
+        if len(token) >= 4 and token not in generic_identity_tokens
+    ]
+    domain_label = client_domain.split(".", 1)[0].casefold()
+    if not distinctive_tokens or not any(
+        token in canonical_tokens and token in domain_label
+        for token in distinctive_tokens
+    ):
+        return None
+
+    official_citations = _official_domain_citations(
+        row,
+        client_domain=client_domain,
+    )
+    if not official_citations:
+        return None
+    numbered_marker_attested = _numbered_citation_mapping_is_attested(row)
+    linked_occurrence: (
+        tuple[
+            int,
+            int,
+            int,
+            str,
+            int,
+            dict[str, str],
+            tuple[int, int, str],
+        ]
+        | None
+    ) = None
+    for alias_start, alias_end in alias_spans:
+        claim_line_start = raw_answer.rfind("\n", 0, alias_start) + 1
+        claim_line_end = raw_answer.find("\n", alias_end)
+        if claim_line_end < 0:
+            claim_line_end = len(raw_answer)
+        claim_line = raw_answer[claim_line_start:claim_line_end]
+        alias_end_in_line = alias_end - claim_line_start
+        linked_citations = [
+            (citation_index, citation, reference)
+            for citation_index, citation in official_citations
+            if (
+                reference := _local_citation_reference(
+                    claim_line,
+                    alias_end_in_line=alias_end_in_line,
+                    citation_index=citation_index,
+                    citation_url=str(citation.get("url") or ""),
+                    client_domain=client_domain,
+                    numbered_marker_attested=numbered_marker_attested,
+                )
+            )
+            is not None
+        ]
+        if linked_citations:
+            citation_index, citation, reference = linked_citations[0]
+            linked_occurrence = (
+                alias_start,
+                alias_end,
+                claim_line_start,
+                claim_line,
+                citation_index,
+                citation,
+                reference,
+            )
+            break
+    if linked_occurrence is None:
+        return None
+    (
+        alias_start,
+        alias_end,
+        claim_line_start,
+        claim_line,
+        citation_index,
+        citation,
+        reference,
+    ) = linked_occurrence
+    reference_start, reference_end, reference_kind = reference
+    citation_url = str(citation.get("url") or "")
+    citation_sources = _critic_row_citation_sources(row)
+    return {
+        "version": CRITIC_TARGET_MENTION_RECEIPT_VERSION,
+        "answer_id": answer_id,
+        "entity_name": str(entity.get("canonical_name") or "").strip(),
+        "alias": declared_alias,
+        "alias_start_char": alias_start,
+        "alias_end_char": alias_end,
+        "raw_answer_sha256": hashlib.sha256(raw_answer.encode("utf-8")).hexdigest(),
+        "scenario_sha256": hashlib.sha256(scenario.encode("utf-8")).hexdigest(),
+        "profile_sha256": _stable_json_sha256(profile),
+        "catalog_sha256": _stable_json_sha256(catalog),
+        "official_domain": client_domain,
+        "official_citation_index": citation_index,
+        "official_reference_kind": reference_kind,
+        "official_reference_start_char": claim_line_start + reference_start,
+        "official_reference_end_char": claim_line_start + reference_end,
+        "claim_line_sha256": hashlib.sha256(claim_line.encode("utf-8")).hexdigest(),
+        "official_citation_url_sha256": hashlib.sha256(
+            citation_url.encode("utf-8")
+        ).hexdigest(),
+        "citation_sources_sha256": _stable_json_sha256(citation_sources),
+        "response_annotations_sha256": _stable_json_sha256(
+            _critic_row_response_annotations(row)
+        ),
+        "ownership_rule": (
+            "exact_alias_first_character_in_owned_raw_core_and_official_domain_citation"
+        ),
+    }
+
+
+def _critic_target_mention_receipts(
+    adjustments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    for adjustment in adjustments:
+        if not isinstance(adjustment, dict):
+            continue
+        for receipt in adjustment.get("target_mention_receipts") or []:
+            if isinstance(receipt, dict):
+                receipts.append(copy.deepcopy(receipt))
+    return receipts
+
+
+def _canonical_target_mention_receipts(
+    receipts: list[dict[str, Any]],
+    *,
+    allowed_answer_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a deterministic, deduplicated receipt manifest."""
+
+    by_digest: dict[str, dict[str, Any]] = {}
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        answer_id = receipt.get("answer_id")
+        if allowed_answer_ids is not None and answer_id not in allowed_answer_ids:
+            continue
+        value = copy.deepcopy(receipt)
+        by_digest.setdefault(stable_digest(value), value)
+    return sorted(
+        by_digest.values(),
+        key=lambda value: (
+            int(value.get("answer_id") or 0),
+            str(value.get("entity_name") or "").casefold(),
+            str(value.get("alias") or "").casefold(),
+            stable_digest(value),
+        ),
+    )
+
+
+def _validated_persisted_target_mention_receipts(
+    rows: list[dict[str, Any]],
+    *,
+    target_answer_ids: set[int],
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Re-derive every persisted receipt before crash-resumed publication."""
+
+    entities = {
+        str(entity.get("canonical_name") or "").casefold(): entity
+        for entity in catalog.get("entities") or []
+        if isinstance(entity, dict) and entity.get("canonical_name")
+    }
+    receipts: list[dict[str, Any]] = []
+    for row in sorted(
+        (value for value in rows if value.get("answer_id") in target_answer_ids),
+        key=lambda value: int(value.get("answer_id") or 0),
+    ):
+        annotation = row.get("annotation")
+        if not isinstance(annotation, dict):
+            raise OrchestratorContractError(
+                "Targeted recovery row has no persisted annotation"
+            )
+        for receipt in annotation.get("_critic_target_mention_receipts") or []:
+            if not isinstance(receipt, dict):
+                raise OrchestratorContractError(
+                    "Persisted target receipt is not an object"
+                )
+            entity = entities.get(str(receipt.get("entity_name") or "").casefold())
+            alias = str(receipt.get("alias") or "")
+            expected = (
+                _target_mention_receipt(
+                    profile=profile,
+                    catalog=catalog,
+                    entity=entity,
+                    alias=alias,
+                    row=row,
+                )
+                if entity is not None and alias
+                else None
+            )
+            if expected != receipt:
+                raise OrchestratorContractError(
+                    "Persisted target receipt failed deterministic revalidation"
+                )
+            receipts.append(copy.deepcopy(receipt))
+    return _canonical_target_mention_receipts(
+        receipts,
+        allowed_answer_ids=target_answer_ids,
+    )
+
+
+def _row_target_mention_is_grounded(
+    row: dict[str, Any],
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> bool:
+    annotation = row.get("annotation")
+    if (
+        not isinstance(annotation, dict)
+        or annotation.get("target_mentioned") is not True
+    ):
+        return False
+    raw_answer = _critic_row_answer_text(row)
+    if any(
+        _alias_is_present(raw_answer, alias)
+        for alias in _target_aliases(profile, catalog)
+    ):
+        return True
+    entities = {
+        str(entity.get("canonical_name") or "").casefold(): entity
+        for entity in catalog.get("entities") or []
+        if isinstance(entity, dict) and entity.get("canonical_name")
+    }
+    for receipt in annotation.get("_critic_target_mention_receipts") or []:
+        if not isinstance(receipt, dict):
+            continue
+        entity = entities.get(str(receipt.get("entity_name") or "").casefold())
+        alias = str(receipt.get("alias") or "")
+        expected_receipt = (
+            _target_mention_receipt(
+                profile=profile,
+                catalog=catalog,
+                entity=entity,
+                alias=alias,
+                row=row,
+            )
+            if entity is not None and alias
+            else None
+        )
+        if expected_receipt == receipt:
+            return True
+    return False
+
+
 def _apply_critic_policy(
     catalog: dict[str, Any],
     review: dict[str, Any],
     *,
     valid_answer_ids: set[int],
+    profile: dict[str, Any] | None = None,
+    answer_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    """Apply only narrowing, enumerated per-run changes proposed by the critic."""
+    """Apply only bounded, enumerated per-run changes proposed by the critic."""
 
     tightened = copy.deepcopy(catalog)
     tightened["entities"] = _deduplicate_scoped_catalog_entities(
@@ -22854,7 +24736,15 @@ def _apply_critic_policy(
         for entity in tightened.get("entities") or []
         if isinstance(entity, dict) and entity.get("canonical_name")
     }
+    rows_by_id = {
+        int(row["answer_id"]): row
+        for row in answer_rows or []
+        if isinstance(row, dict)
+        and isinstance(row.get("answer_id"), int)
+        and not isinstance(row.get("answer_id"), bool)
+    }
     applied: list[dict[str, Any]] = []
+    deferred_target_receipts: list[tuple[dict[str, Any], set[int], str]] = []
     for raw_adjustment in review.get("policy_adjustments") or []:
         if not isinstance(raw_adjustment, dict):
             continue
@@ -22870,7 +24760,11 @@ def _apply_critic_policy(
         if entity is None:
             continue
         action = str(raw_adjustment.get("action") or "")
+        if action == "require_literal_target_mention_evidence":
+            deferred_target_receipts.append((raw_adjustment, answer_ids, name))
+            continue
         changed = False
+        target_mention_receipts: list[dict[str, Any]] = []
         if action == "exclude_portfolio_entity":
             entity["commercially_relevant"] = False
             entity["_critic_excluded"] = True
@@ -22894,15 +24788,47 @@ def _apply_critic_policy(
                 "self",
             }
         if changed:
-            applied.append(
-                {
-                    "action": action,
-                    "entity_name": name,
-                    "alias": raw_adjustment.get("alias"),
-                    "reason": str(raw_adjustment.get("reason") or ""),
-                    "answer_ids": sorted(answer_ids),
-                }
+            applied_item = {
+                "action": action,
+                "entity_name": name,
+                "alias": raw_adjustment.get("alias"),
+                "reason": str(raw_adjustment.get("reason") or ""),
+                "answer_ids": sorted(answer_ids),
+            }
+            if target_mention_receipts:
+                applied_item["target_mention_receipts"] = target_mention_receipts
+            applied.append(applied_item)
+
+    for raw_adjustment, answer_ids, name in deferred_target_receipts:
+        entity = entities.get(name.casefold())
+        alias = str(raw_adjustment.get("alias") or "").strip()
+        if entity is None or profile is None or not alias:
+            continue
+        receipts = [
+            _target_mention_receipt(
+                profile=profile,
+                catalog=tightened,
+                entity=entity,
+                alias=alias,
+                row=rows_by_id.get(answer_id) or {},
             )
+            for answer_id in sorted(answer_ids)
+        ]
+        if not receipts or not all(receipt is not None for receipt in receipts):
+            continue
+        target_mention_receipts = [
+            receipt for receipt in receipts if receipt is not None
+        ]
+        applied.append(
+            {
+                "action": "require_literal_target_mention_evidence",
+                "entity_name": name,
+                "alias": raw_adjustment.get("alias"),
+                "reason": str(raw_adjustment.get("reason") or ""),
+                "answer_ids": sorted(answer_ids),
+                "target_mention_receipts": target_mention_receipts,
+            }
+        )
 
     guidance_lines = [
         "Дополнительные обязательные ограничения независимого критика:",
@@ -22916,25 +24842,38 @@ def _apply_critic_policy(
                         (
                             "для ответов "
                             + ", ".join(str(value) for value in item["answer_ids"])
-                            + " заново проверить brand_answer по буквальным "
-                            "фактам о целевом бренде; specific допустим "
-                            "только для конкретных фактов, согласующихся "
-                            "с site_profile или entity_catalog"
+                            + " заново проверить упоминание exact target "
+                            + f"по буквальному алиасу «{item['alias']}»; "
+                            + "алиас допустим только в этих raw-ответах, "
+                            + "не переносится в другие строки и не задаёт "
+                            + "роль, позицию или тональность вручную"
                         )
-                        if item["action"] == "require_literal_brand_knowledge_evidence"
+                        if item["action"] == "require_literal_target_mention_evidence"
                         else (
-                            "при явной связи в raw-ответе скопировать один "
-                            "точный непрерывный фрагмент с разрешённым "
-                            "владельцем, услугой и словами связи, сохранив "
-                            "Markdown и регистр; иначе не атрибутировать"
-                        )
-                        if item["action"] == "require_literal_attribution_evidence"
-                        else (
-                            "требовать явную буквальную атрибуцию для алиаса "
-                            f"«{item['alias']}»"
-                            if item["action"] == "require_alias_attribution"
+                            (
+                                "для ответов "
+                                + ", ".join(str(value) for value in item["answer_ids"])
+                                + " заново проверить brand_answer по буквальным "
+                                "фактам о целевом бренде; specific допустим "
+                                "только для конкретных фактов, согласующихся "
+                                "с site_profile или entity_catalog"
+                            )
+                            if item["action"]
+                            == "require_literal_brand_knowledge_evidence"
                             else (
-                                "требовать явную буквальную атрибуцию целевому бренду"
+                                "при явной связи в raw-ответе скопировать один "
+                                "точный непрерывный фрагмент с разрешённым "
+                                "владельцем, услугой и словами связи, сохранив "
+                                "Markdown и регистр; иначе не атрибутировать"
+                            )
+                            if item["action"] == "require_literal_attribution_evidence"
+                            else (
+                                "требовать явную буквальную атрибуцию для алиаса "
+                                f"«{item['alias']}»"
+                                if item["action"] == "require_alias_attribution"
+                                else (
+                                    "требовать явную буквальную атрибуцию целевому бренду"
+                                )
                             )
                         )
                     )
@@ -22968,14 +24907,29 @@ async def _save_critic_gate(
         metrics=metrics,
         policy_history=policy_history,
     )
+    normalized_expected_cells = (
+        expected_corpus_cells
+        if expected_corpus_cells is not None
+        else _expected_corpus_cells_from_rows(rows)
+    )
     corpus_manifest = _final_corpus_manifest(
         rows,
-        expected_cells=(
-            expected_corpus_cells
-            if expected_corpus_cells is not None
-            else _expected_corpus_cells_from_rows(rows)
-        ),
+        expected_cells=normalized_expected_cells,
     )
+    coverage_admission = build_panel_metric_coverage_admission(
+        expected_cells=normalized_expected_cells,
+        observed_rows=rows,
+    )
+    if passed:
+        if corpus_manifest.get("structural_complete") is not True:
+            raise OpenRouterError(
+                "Analysis critic cannot pass an incomplete panel structure"
+            )
+        if corpus_manifest.get("evidentiary_complete") is not True:
+            raise OpenRouterError(
+                "Analysis critic cannot pass stale or incomplete evidence"
+            )
+        require_panel_metric_coverage(coverage_admission)
     output = {
         "passed": passed,
         "iteration": iteration,
@@ -22983,6 +24937,10 @@ async def _save_critic_gate(
         "metrics_sha256": provenance["metrics_sha256"],
         "provenance": provenance,
         "corpus_manifest": corpus_manifest,
+        "panel_metric_coverage_admission": coverage_admission,
+        "panel_metric_coverage_admission_sha256": coverage_admission[
+            "admission_sha256"
+        ],
         "policy_history": policy_history,
         "reason": reason,
     }
@@ -22995,6 +24953,9 @@ async def _save_critic_gate(
         input_json={
             "provenance": provenance,
             "corpus_manifest_digest": corpus_manifest["digest"],
+            "panel_metric_coverage_admission_sha256": coverage_admission[
+                "admission_sha256"
+            ],
             "iteration": iteration,
         },
         output_json=output,
@@ -23006,6 +24967,12 @@ async def _save_critic_gate(
 
 ANALYSIS_CRITIC_RECOVERY_STAGE = "analysis_critic"
 ANALYSIS_CRITIC_TARGETED_REPAIR_MODE = "analysis_critic_targeted_v1"
+ANALYSIS_CRITIC_TERMINAL_SCOPE_VERSION = (
+    "aiv-analysis-critic-terminal-scope-v2"
+)
+ANALYSIS_CRITIC_RECOVERY_POLICY_VERSION = (
+    "aiv-analysis-critic-recovery-policy-v2"
+)
 
 
 class _AnalysisCriticRecoveryBlocked(OpenRouterError):
@@ -23065,9 +25032,70 @@ def _raw_corpus_digest(rows: list[dict[str, Any]]) -> str:
 def _critic_analysis_state_digest(
     rows: list[dict[str, Any]],
     metrics: dict[str, Any],
+    *,
+    expected_corpus_cells: list[dict[str, Any]] | None = None,
 ) -> str:
+    normalized_expected_cells = sorted(
+        (
+            {
+                "prompt_id": int(cell.get("prompt_id") or 0),
+                "provider_key": str(cell.get("provider_key") or ""),
+                "model": str(cell.get("model") or ""),
+                "mode": str(cell.get("mode") or ""),
+            }
+            for cell in (
+                expected_corpus_cells
+                if expected_corpus_cells is not None
+                else _expected_corpus_cells_from_rows(rows)
+            )
+        ),
+        key=_corpus_cell_key,
+    )
+    expected_panel_contract_sha256 = stable_digest(
+        {
+            "version": FINAL_CORPUS_MANIFEST_VERSION,
+            "expected_cells": normalized_expected_cells,
+        }
+    )
+    execution_scope = {
+        "version": ANALYSIS_CRITIC_TERMINAL_SCOPE_VERSION,
+        "analysis_critic_version": ANALYSIS_CRITIC_VERSION,
+        "critic_model": CRITIC_MODEL,
+        "critic_reasoning_effort": CRITIC_REASONING_EFFORT,
+        "critic_repair_reasoning_effort": CRITIC_REPAIR_REASONING_EFFORT,
+        "critic_transport_contract_version": (
+            CRITIC_TRANSPORT_CONTRACT_VERSION
+        ),
+        "critic_map_reduce_version": CRITIC_MAP_REDUCE_VERSION,
+        "recovery_policy": {
+            "version": ANALYSIS_CRITIC_RECOVERY_POLICY_VERSION,
+            "targeted_repair_mode": ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+            "max_critic_iterations": MAX_CRITIC_ITERATIONS,
+            "max_recovery_final_reviews": (
+                MAX_CRITIC_RECOVERY_FINAL_REVIEWS
+            ),
+            "orchestrator_model": RECOVERY_ORCHESTRATOR_MODEL,
+            "processing_model": RECOVERY_PROCESSING_MODEL,
+            "orchestrator_version": RECOVERY_ORCHESTRATOR_VERSION,
+            "input_harness_version": RECOVERY_INPUT_HARNESS_VERSION,
+            "map_version": RECOVERY_MAP_VERSION,
+            "reduce_version": RECOVERY_REDUCE_VERSION,
+            "decision_ledger_version": RECOVERY_DECISION_LEDGER_VERSION,
+            "decision_shard_version": RECOVERY_DECISION_SHARD_VERSION,
+            "decision_arbiter_version": RECOVERY_DECISION_ARBITER_VERSION,
+            "decision_dossier_version": RECOVERY_DECISION_DOSSIER_VERSION,
+            "rationale_repair_version": RECOVERY_RATIONALE_REPAIR_VERSION,
+            "model_envelope_snapshot_version": (
+                RECOVERY_MODEL_ENVELOPE_SNAPSHOT_VERSION
+            ),
+        },
+        "expected_panel_contract_sha256": (
+            expected_panel_contract_sha256
+        ),
+    }
     return stable_digest(
         {
+            "execution_scope": execution_scope,
             "annotations": [
                 {
                     "answer_id": row.get("answer_id"),
@@ -23471,13 +25499,85 @@ async def _resume_executing_analysis_critic_recovery(
         raise _AnalysisCriticRecoveryBlocked(
             "Executing analysis recovery has no exact single-attempt reservation"
         )
+    recovery_input = epoch.input_json if isinstance(epoch.input_json, dict) else None
     incident = (
-        epoch.input_json.get("incident") if isinstance(epoch.input_json, dict) else None
+        recovery_input.get("incident") if isinstance(recovery_input, dict) else None
     )
     facts = incident.get("facts") if isinstance(incident, dict) else None
     if not isinstance(facts, dict):
         raise _AnalysisCriticRecoveryBlocked(
             "Executing analysis recovery is missing immutable facts"
+        )
+    stored_allowed_actions = (
+        recovery_input.get("allowed_actions")
+        if isinstance(recovery_input, dict)
+        else None
+    )
+    stored_answer_ids = (
+        recovery_input.get("permitted_answer_ids")
+        if isinstance(recovery_input, dict)
+        else None
+    )
+    stored_artifact_keys = (
+        recovery_input.get("permitted_artifact_keys")
+        if isinstance(recovery_input, dict)
+        else None
+    )
+    action_scope = (
+        set(stored_allowed_actions)
+        if isinstance(stored_allowed_actions, list)
+        and all(isinstance(value, str) and value for value in stored_allowed_actions)
+        and len(stored_allowed_actions) == len(set(stored_allowed_actions))
+        else None
+    )
+    answer_scope = (
+        set(stored_answer_ids)
+        if isinstance(stored_answer_ids, list)
+        and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in stored_answer_ids
+        )
+        and len(stored_answer_ids) == len(set(stored_answer_ids))
+        else None
+    )
+    artifact_scope = (
+        set(stored_artifact_keys)
+        if isinstance(stored_artifact_keys, list)
+        and all(isinstance(value, str) and value for value in stored_artifact_keys)
+        and len(stored_artifact_keys) == len(set(stored_artifact_keys))
+        else None
+    )
+    expected_actions = {
+        ACTION_TARGETED_ANNOTATION_REPAIR,
+        ACTION_STOP,
+    }
+    if (
+        action_scope != expected_actions
+        or answer_scope != target_answer_ids
+        or artifact_scope != set()
+        or stored_allowed_actions != sorted(action_scope)
+        or stored_answer_ids != sorted(answer_scope)
+        or stored_artifact_keys != sorted(artifact_scope)
+        or incident.get("run_id") != run_id
+        or incident.get("stage") != ANALYSIS_CRITIC_RECOVERY_STAGE
+        or incident.get("failure_class") != "repairable_semantic"
+        or incident.get("code") != "analysis_critic_non_convergent"
+        or incident.get("fingerprint") != epoch.failure_fingerprint
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery has a corrupted durable scope"
+        )
+    recomputed_facts_digest = recovery_scope_digest(
+        facts=facts,
+        allowed_actions=action_scope,
+        permitted_answer_ids=answer_scope,
+        permitted_artifact_keys=artifact_scope,
+    )
+    if recomputed_facts_digest != str(
+        incident.get("facts_digest") or ""
+    ) or recomputed_facts_digest != str(epoch.facts_digest or ""):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing analysis recovery facts scope digest does not match"
         )
     before_digest = str(facts.get("analysis_state_sha256") or "")
     raw_digest = _raw_corpus_digest(rows)
@@ -23500,6 +25600,7 @@ async def _resume_executing_analysis_critic_recovery(
             "Executing analysis recovery target rows are incomplete"
         )
     policy_steps: list[dict[str, Any]] = []
+    repair_provenances: list[dict[str, Any]] = []
     for row in repaired_rows.values():
         annotation = row.get("annotation")
         provenance = (
@@ -23520,6 +25621,7 @@ async def _resume_executing_analysis_critic_recovery(
             raise _AnalysisCriticRecoveryBlocked(
                 "Executing recovery annotation provenance is not exact"
             )
+        repair_provenances.append(copy.deepcopy(provenance))
         policy_steps.append(copy.deepcopy(provenance["recovery_policy_step"]))
     recovery_policy_step = policy_steps[0]
     if (
@@ -23531,6 +25633,56 @@ async def _resume_executing_analysis_critic_recovery(
     ):
         raise _AnalysisCriticRecoveryBlocked(
             "Executing recovery checkpoint has inconsistent policy context"
+        )
+    expected_receipts_sha256 = str(facts.get("target_mention_receipts_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_receipts_sha256):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery checkpoint has no receipt manifest digest"
+        )
+    try:
+        persisted_receipts = _validated_persisted_target_mention_receipts(
+            rows,
+            target_answer_ids=target_answer_ids,
+            profile=profile,
+            catalog=catalog,
+        )
+    except OrchestratorContractError as exc:
+        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+    persisted_receipts_sha256 = _stable_json_sha256(persisted_receipts)
+    targeted_guidance = str(recovery_policy_step.get("annotation_guidance") or "")
+    resume_annotation_input_sha256 = _annotation_context_sha256(
+        profile,
+        catalog,
+    )
+    repair_annotation_input_sha256 = _annotation_context_sha256(
+        profile,
+        catalog,
+        targeted_guidance,
+        repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+        target_mention_receipts=persisted_receipts,
+    )
+    guidance_sha256 = hashlib.sha256(targeted_guidance.encode("utf-8")).hexdigest()
+    if (
+        persisted_receipts_sha256 != expected_receipts_sha256
+        or recovery_policy_step.get("target_mention_receipts_sha256")
+        != expected_receipts_sha256
+        or any(
+            provenance.get("target_mention_receipts_sha256") != expected_receipts_sha256
+            or provenance.get("repair_annotation_input_sha256")
+            != repair_annotation_input_sha256
+            or provenance.get("resume_annotation_input_sha256")
+            != resume_annotation_input_sha256
+            or provenance.get("guidance_sha256") != guidance_sha256
+            for provenance in repair_provenances
+        )
+        or any(
+            row["annotation"].get("_annotation_input_sha256")
+            != repair_annotation_input_sha256
+            for row in repaired_rows.values()
+        )
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery receipt or annotation provenance is not derivable"
         )
     prior_policy_history = facts.get("prior_policy_history")
     if not isinstance(prior_policy_history, list):
@@ -23759,6 +25911,7 @@ async def _recover_analysis_critic_exhaustion(
     review: dict[str, Any],
     policy_history: list[dict[str, Any]],
     accumulated_guidance: list[str],
+    accumulated_target_mention_receipts: list[dict[str, Any]],
     valid_answer_ids: set[int],
     resume_annotation_input_sha256: str,
     expected_corpus_cells: list[dict[str, Any]] | None,
@@ -23786,11 +25939,21 @@ async def _recover_analysis_critic_exhaustion(
         catalog,
         review,
         valid_answer_ids=valid_answer_ids,
+        profile=profile,
+        answer_rows=rows,
     )
     if stable_digest(proposed_catalog) != stable_digest(catalog):
         raise OrchestratorContractError(
             "Targeted critic recovery cannot apply a catalog-wide adjustment"
         )
+    target_mention_receipts = _canonical_target_mention_receipts(
+        [
+            *accumulated_target_mention_receipts,
+            *_critic_target_mention_receipts(applied_adjustments),
+        ],
+        allowed_answer_ids=issue_answer_ids,
+    )
+    target_mention_receipts_sha256 = _stable_json_sha256(target_mention_receipts)
 
     issue_rows = [
         {
@@ -23812,13 +25975,18 @@ async def _recover_analysis_critic_exhaustion(
             "Analysis critic recovery issue rows are incomplete"
         )
     raw_digest_before = _raw_corpus_digest(rows)
-    before_digest = _critic_analysis_state_digest(rows, metrics)
+    before_digest = _critic_analysis_state_digest(
+        rows,
+        metrics,
+        expected_corpus_cells=expected_corpus_cells,
+    )
     facts = {
         "site_profile": profile,
         "entity_catalog": catalog,
         "candidate_metrics": metrics,
         "critic_review": review,
         "prior_policy_history": policy_history,
+        "target_mention_receipts_sha256": (target_mention_receipts_sha256),
         "issue_rows": issue_rows,
         "raw_corpus_sha256": raw_digest_before,
         "analysis_state_sha256": before_digest,
@@ -23988,14 +26156,14 @@ async def _recover_analysis_critic_exhaustion(
         )
 
     target_answer_ids = set(plan.decision.get("target_answer_ids") or [])
-    if not target_answer_ids or not target_answer_ids.issubset(issue_answer_ids):
+    if not target_answer_ids or target_answer_ids != issue_answer_ids:
         await finish_recovery(
             plan,
             succeeded=False,
             before_digest=before_digest,
             after_digest=before_digest,
             details={
-                "error": "target_answer_ids_out_of_scope",
+                "error": "target_answer_ids_do_not_cover_all_critic_issues",
                 "terminal_analysis_critic_block": True,
                 "terminal_analysis_state_digest": before_digest,
             },
@@ -24042,6 +26210,7 @@ async def _recover_analysis_critic_exhaustion(
         "critic_adjustments": applied_adjustments,
         "annotation_guidance": targeted_guidance,
         "raw_corpus_sha256": raw_digest_before,
+        "target_mention_receipts_sha256": (target_mention_receipts_sha256),
     }
 
     expected_annotation_digests = _current_annotation_input_digests(rows)
@@ -24050,6 +26219,7 @@ async def _recover_analysis_critic_exhaustion(
         catalog,
         targeted_guidance,
         repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+        target_mention_receipts=target_mention_receipts,
     )
     for answer_id in target_answer_ids:
         expected_annotation_digests[answer_id] = repair_annotation_digest
@@ -24064,6 +26234,7 @@ async def _recover_analysis_critic_exhaustion(
             targeted_guidance.encode("utf-8")
         ).hexdigest(),
         "critic_review_sha256": stable_digest(review),
+        "target_mention_receipts_sha256": (target_mention_receipts_sha256),
         # This deterministic step is persisted atomically with every targeted
         # annotation.  It is the restart checkpoint needed to reconstruct the
         # one allowed r3 payload after a crash between annotation CAS and the
@@ -24087,6 +26258,7 @@ async def _recover_analysis_critic_exhaustion(
             target_answer_ids=target_answer_ids,
             repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
             annotation_repair_provenance=(annotation_repair_provenance),
+            target_mention_receipts=target_mention_receipts,
             # One recovery execution gets one annotation pass.  A partial
             # result fails closed instead of starting the normal completion
             # retry recursively.
@@ -24106,6 +26278,7 @@ async def _recover_analysis_critic_exhaustion(
         after_digest = _critic_analysis_state_digest(
             recovered_rows,
             recovered_metrics,
+            expected_corpus_cells=expected_corpus_cells,
         )
         gate_rows = recovered_rows
         gate_metrics = recovered_metrics
@@ -24197,6 +26370,7 @@ async def _recover_analysis_critic_exhaustion(
                 after_digest = _critic_analysis_state_digest(
                     persisted_rows,
                     persisted_metrics,
+                    expected_corpus_cells=expected_corpus_cells,
                 )
             except RunLeaseLostError:
                 raise
@@ -24292,6 +26466,7 @@ async def _run_analysis_critic_loop(
     current_metrics = metrics
     policy_history: list[dict[str, Any]] = []
     accumulated_guidance: list[str] = []
+    accumulated_target_mention_receipts: list[dict[str, Any]] = []
     valid_answer_ids = {
         int(row["answer_id"])
         for row in rows
@@ -24304,6 +26479,7 @@ async def _run_analysis_critic_loop(
     current_state_digest = _critic_analysis_state_digest(
         current_rows,
         current_metrics,
+        expected_corpus_cells=expected_corpus_cells,
     )
     successful_gate = await _successful_analysis_critic_recovery_gate(
         run_id,
@@ -24407,6 +26583,9 @@ async def _run_analysis_critic_loop(
                         review=review,
                         policy_history=policy_history,
                         accumulated_guidance=accumulated_guidance,
+                        accumulated_target_mention_receipts=(
+                            accumulated_target_mention_receipts
+                        ),
                         valid_answer_ids=valid_answer_ids,
                         resume_annotation_input_sha256=(resume_annotation_input_sha256),
                         expected_corpus_cells=expected_corpus_cells,
@@ -24446,9 +26625,14 @@ async def _run_analysis_critic_loop(
             current_catalog,
             review,
             valid_answer_ids=valid_answer_ids,
+            profile=profile,
+            answer_rows=current_rows,
         )
         if guidance:
             accumulated_guidance.append(guidance)
+        accumulated_target_mention_receipts.extend(
+            _critic_target_mention_receipts(applied)
+        )
         if not applied and not accumulated_guidance:
             reason = (
                 "Критик запросил переработку, но не предложил безопасного "
@@ -24495,6 +26679,7 @@ async def _run_analysis_critic_loop(
             profile,
             current_catalog,
             research_guidance="\n\n".join(accumulated_guidance),
+            target_mention_receipts=accumulated_target_mention_receipts,
         )
         current_rows = await _metric_rows(
             run_id,
@@ -24502,6 +26687,7 @@ async def _run_analysis_critic_loop(
                 profile,
                 current_catalog,
                 "\n\n".join(accumulated_guidance),
+                target_mention_receipts=(accumulated_target_mention_receipts),
             ),
         )
         current_metrics = _compute_metrics(
@@ -24569,6 +26755,7 @@ def _full_answer_corpus_item(
         else {}
     )
     answer_text = str(answer.response_text or "")
+    error_text = str(answer.error_message or "")
     panel_contract = (answer.usage_json or {}).get("_aiv_panel_contract")
     legacy_context = legacy_contract or {"eligible": False, "digest": ""}
     web_attested, web_attestation_reason = _panel_answer_attestation(
@@ -24588,6 +26775,13 @@ def _full_answer_corpus_item(
         observation_state=observation_state,
     )
     answer_complete = bool(answer.status == "completed" and answer_text.strip())
+    unavailable_limitation = (
+        "terminal_panel_failure"
+        if answer.status == "failed"
+        else "empty_completed_response"
+        if answer.status == "completed" and not answer_text.strip()
+        else None
+    )
     return {
         "answer_id": answer.id,
         "prompt_id": prompt.id,
@@ -24603,6 +26797,9 @@ def _full_answer_corpus_item(
         "mode": answer.mode,
         "status": answer.status,
         "citations": answer.citations_json or [],
+        "response_annotations": copy.deepcopy(
+            (answer.usage_json or {}).get("_aiv_response_annotations") or []
+        ),
         "metric_eligible": bool(
             answer_complete
             and observation_attested
@@ -24613,8 +26810,14 @@ def _full_answer_corpus_item(
             and observation_attested
             and metric_access["context_eligible"]
         ),
-        "metric_evidence_state": metric_access["metric_evidence_state"],
-        "metric_limitation": metric_access["metric_limitation"],
+        "metric_evidence_state": (
+            "unavailable"
+            if unavailable_limitation is not None
+            else metric_access["metric_evidence_state"]
+        ),
+        "metric_limitation": (
+            unavailable_limitation or metric_access["metric_limitation"]
+        ),
         "observation_state": observation_state,
         "panel_evidence": {
             "version": (
@@ -24631,6 +26834,10 @@ def _full_answer_corpus_item(
         },
         "annotation": annotation_json,
         "answer_text": answer_text,
+        "failure": {
+            "error_utf8_bytes": len(error_text.encode("utf-8")),
+            "error_sha256": text_sha256(error_text),
+        },
         "provenance": {
             "raw_answer_sha256": hashlib.sha256(
                 answer_text.encode("utf-8")
@@ -24660,6 +26867,7 @@ def _rows_from_full_answer_models(
             else {}
         )
         answer_text = str(answer.response_text or "")
+        error_text = str(answer.error_message or "")
         annotation_input_sha256 = str(
             annotation_json.get("_annotation_input_sha256") or ""
         )
@@ -24695,6 +26903,13 @@ def _rows_from_full_answer_models(
             observation_state=observation_state,
         )
         answer_complete = bool(answer.status == "completed" and answer_text.strip())
+        unavailable_limitation = (
+            "terminal_panel_failure"
+            if answer.status == "failed"
+            else "empty_completed_response"
+            if answer.status == "completed" and not answer_text.strip()
+            else None
+        )
         output.append(
             {
                 "answer_id": answer.id,
@@ -24708,7 +26923,13 @@ def _rows_from_full_answer_models(
                 "status": answer.status,
                 "model": answer.model,
                 "citations_count": len(answer.citations_json or []),
+                "citations": copy.deepcopy(answer.citations_json or []),
+                "response_annotations": copy.deepcopy(
+                    (answer.usage_json or {}).get("_aiv_response_annotations") or []
+                ),
                 "answer_text": answer_text,
+                "error_utf8_bytes": len(error_text.encode("utf-8")),
+                "error_sha256": text_sha256(error_text),
                 "web_attested": web_attested,
                 "web_attestation_reason": web_attestation_reason,
                 "panel_evidence_version": (
@@ -24731,8 +26952,14 @@ def _rows_from_full_answer_models(
                     and observation_attested
                     and metric_access["context_eligible"]
                 ),
-                "metric_evidence_state": metric_access["metric_evidence_state"],
-                "metric_limitation": metric_access["metric_limitation"],
+                "metric_evidence_state": (
+                    "unavailable"
+                    if unavailable_limitation is not None
+                    else metric_access["metric_evidence_state"]
+                ),
+                "metric_limitation": (
+                    unavailable_limitation or metric_access["metric_limitation"]
+                ),
                 "observation_state": observation_state,
                 "annotation": (annotation_json if annotation_is_current else {}),
                 "annotation_state": (
@@ -25301,7 +27528,12 @@ async def _full_answer_context(
         current_rows,
         expected_cells=expected_corpus_cells,
     )
+    current_coverage_admission = build_panel_metric_coverage_admission(
+        expected_cells=expected_corpus_cells,
+        observed_rows=current_rows,
+    )
     gate_manifest = critic_gate.get("corpus_manifest")
+    gate_coverage_admission = critic_gate.get("panel_metric_coverage_admission")
     gate_rows_sha256 = (
         (critic_gate.get("provenance") or {}).get("rows_sha256")
         if isinstance(critic_gate.get("provenance"), dict)
@@ -25321,8 +27553,20 @@ async def _full_answer_context(
         != current_manifest["critic_rows_sha256"]
     ):
         mismatch_reasons.append("in_memory_critic_rows_mismatch")
-    if not current_manifest["complete"]:
-        mismatch_reasons.append("corpus_incomplete")
+    if current_manifest.get("structural_complete") is not True:
+        mismatch_reasons.append("corpus_structure_incomplete")
+    if current_manifest.get("evidentiary_complete") is not True:
+        mismatch_reasons.append("corpus_evidence_incomplete")
+    if not isinstance(gate_coverage_admission, dict):
+        mismatch_reasons.append("critic_coverage_admission_missing")
+    elif gate_coverage_admission != current_coverage_admission:
+        mismatch_reasons.append("critic_coverage_admission_mismatch")
+    if critic_gate.get(
+        "panel_metric_coverage_admission_sha256"
+    ) != current_coverage_admission.get("admission_sha256"):
+        mismatch_reasons.append("critic_coverage_digest_mismatch")
+    if current_coverage_admission.get("allowed") is not True:
+        mismatch_reasons.append("panel_metric_coverage_not_admitted")
     if mismatch_reasons:
         raise OpenRouterError(
             "Final answer corpus failed closed: " + ", ".join(mismatch_reasons)
@@ -25640,7 +27884,8 @@ def _render_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# {str(report.get('headline') or '').strip()}",
         "",
-        f"**Вердикт.** {str(report.get('verdict') or '').strip()}",
+        f"**{reader_copy_value('markdown.verdict_label')}.** "
+        f"{str(report.get('verdict') or '').strip()}",
         "",
         str(report.get("executive_summary") or "").strip(),
     ]
@@ -25653,30 +27898,696 @@ def _render_markdown(report: dict[str, Any]) -> str:
                 str(section.get("body") or "").strip(),
             ]
         )
-    lines.extend(["", "## Что изменить в первую очередь", ""])
+    lines.extend(
+        [
+            "",
+            "## " + reader_copy_value("markdown.priority_section_heading"),
+            "",
+        ]
+    )
     priority_labels = {
-        "now": "Сейчас",
-        "next": "Следом",
-        "later": "После основных исправлений",
+        "now": reader_copy_value("markdown.priority_now"),
+        "next": reader_copy_value("markdown.priority_next"),
+        "later": reader_copy_value("markdown.priority_later"),
     }
     for action in report.get("actions") or []:
+        priority_label = priority_labels.get(
+            action.get("priority"),
+            reader_copy_value("markdown.action_default"),
+        )
         lines.extend(
             [
-                f"### {priority_labels.get(action.get('priority'), 'Действие')}: "
-                f"{str(action.get('title') or '').strip()}",
+                f"### {priority_label}: {str(action.get('title') or '').strip()}",
                 "",
                 str(action.get("why") or "").strip(),
                 "",
-                f"**Шаг.** {str(action.get('step') or '').strip()}",
+                f"**{reader_copy_value('markdown.step_label')}.** "
+                f"{str(action.get('step') or '').strip()}",
                 "",
-                f"**Основание.** {str(action.get('evidence') or '').strip()}",
+                f"**{reader_copy_value('markdown.basis_label')}.** "
+                f"{str(action.get('evidence') or '').strip()}",
                 "",
             ]
         )
-    lines.extend(["## Где заканчивается точность экспресс-снимка", ""])
+    lines.extend(
+        [
+            "## " + reader_copy_value("markdown.limitations_heading"),
+            "",
+        ]
+    )
     for limitation in report.get("limitations") or []:
         lines.append(f"- {str(limitation).strip()}")
     return "\n".join(lines).strip()
+
+
+def _reader_copy_document(
+    *,
+    final_report: dict[str, Any],
+    public_report: dict[str, Any],
+    illustrations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Register authored copy that can reach the report reader.
+
+    Names, source excerpts, URLs and raw evidence remain immutable data rather
+    than editorial prose.  The registry deliberately includes code-owned
+    methodology and labels so the final model pass is not the only copy gate.
+    """
+
+    assert_reader_copy_registry_integrity()
+    code_owned_registry = reader_copy_registry_document()
+    brand = public_report.get("brand")
+    brand_copy = brand if isinstance(brand, dict) else {}
+    technical = public_report.get("technical")
+    technical_copy = technical if isinstance(technical, dict) else {}
+    raw_technical_review = technical_copy.get("review")
+    technical_review_copy = (
+        raw_technical_review if isinstance(raw_technical_review, dict) else {}
+    )
+    methodology = public_report.get("methodology")
+    methodology_copy = methodology if isinstance(methodology, dict) else {}
+    key_metrics = public_report.get("key_metrics")
+    metric_copy = key_metrics if isinstance(key_metrics, dict) else {}
+    return {
+        "final_report": copy.deepcopy(final_report),
+        "code_owned_copy_registry": copy.deepcopy(code_owned_registry["copy"]),
+        # ``evidence`` is normally excluded from the generic tree walk because
+        # site quotes and model citations must remain literal.  Action evidence
+        # is authored report copy, so expose it under a distinct key and audit
+        # it without weakening that global evidence exclusion.
+        "action_basis_copy": [
+            str(action.get("evidence") or "")
+            for action in final_report.get("actions") or []
+            if isinstance(action, dict)
+        ],
+        # Technical finding evidence is model-authored explanatory copy shown
+        # to readers, not a verbatim source quote.  Keep it immutable during
+        # semantic editing, but register it under a non-excluded key so the
+        # final deterministic language gate cannot skip it.
+        "technical_finding_basis_copy": [
+            str(finding.get("evidence") or "")
+            for finding in (technical_review_copy.get("findings") or [])
+            if isinstance(finding, dict)
+        ],
+        # The frontend may fall back from the edited technical review to
+        # deterministic summary facts/barriers and also renders methodology,
+        # metric labels and other code-owned strings.  Bind the complete
+        # published snapshot here so those paths cannot silently bypass the
+        # final language audit.  Raw evidence/citations/URLs remain excluded by
+        # ``lint_reader_copy_tree`` and are never rewritten.
+        "published_report": copy.deepcopy(public_report),
+        "technical_review": copy.deepcopy(technical_review_copy),
+        "methodology": {
+            key: copy.deepcopy(methodology_copy.get(key))
+            for key in (
+                "summary",
+                "modes",
+                "note",
+                "offline_limit",
+                "portfolio_scope_limit",
+                "intent_definitions",
+            )
+            if methodology_copy.get(key) not in (None, "", [], {})
+        },
+        "metric_labels": {
+            key: {
+                field: copy.deepcopy(row.get(field))
+                for field in (
+                    "label",
+                    "unit",
+                    "coverage_label",
+                    "scope_label",
+                )
+                if row.get(field) not in (None, "")
+            }
+            for key, row in metric_copy.items()
+            if isinstance(row, dict)
+        },
+        "brand_context": {
+            key: copy.deepcopy(brand_copy.get(key))
+            for key in ("site_type", "category", "positioning")
+            if brand_copy.get(key) not in (None, "")
+        },
+        "illustrations": [
+            {
+                "title": str(item.get("title") or ""),
+                "caption": str(item.get("caption") or ""),
+                "alt_text": str(item.get("alt_text") or ""),
+            }
+            for item in illustrations
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _immutable_editorial_cache_proof(
+    *,
+    source: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+    audit: dict[str, Any] | None,
+    prose_paths: Iterable[str] | None,
+    protected_terms: Iterable[str],
+    source_artifact_key: str | None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Freeze all inputs needed to re-run ``validate_editorial_cache``."""
+
+    if (
+        not isinstance(source, dict)
+        or not isinstance(result, dict)
+        or not isinstance(audit, dict)
+    ):
+        return None, False
+    normalized_paths = None if prose_paths is None else list(prose_paths)
+    normalized_terms = [str(value) for value in protected_terms]
+    revalidated = validate_editorial_cache(
+        source,
+        result,
+        audit,
+        prose_paths=normalized_paths,
+        protected_terms=normalized_terms,
+    )
+    proof_core = {
+        "version": EDITORIAL_CACHE_PROOF_VERSION,
+        "source_artifact_key": source_artifact_key,
+        "source": copy.deepcopy(source),
+        "result": copy.deepcopy(result),
+        "audit": copy.deepcopy(audit),
+        "prose_paths": copy.deepcopy(normalized_paths),
+        "protected_terms": copy.deepcopy(normalized_terms),
+        "source_sha256": _stable_json_sha256(source),
+        "result_sha256": _stable_json_sha256(result),
+        "audit_sha256": audit.get("audit_sha256"),
+    }
+    return {
+        **proof_core,
+        "proof_sha256": _stable_json_sha256(proof_core),
+    }, revalidated
+
+
+def _editorial_receipt_state(
+    artifact: RunArtifact | None,
+    *,
+    output_key: str,
+    published_value: dict[str, Any],
+    source_value: dict[str, Any] | None,
+    prose_paths: Iterable[str] | None,
+    protected_terms: Iterable[str],
+    source_artifact_key: str | None,
+) -> dict[str, Any]:
+    """Verify one persisted editorial receipt against the published value."""
+
+    reasons: list[str] = []
+    output = artifact.output_json if artifact is not None else None
+    if artifact is None:
+        reasons.append("artifact_missing")
+    elif artifact.status != "completed":
+        reasons.append("artifact_not_completed")
+    if not isinstance(output, dict):
+        reasons.append("artifact_output_missing")
+        output = {}
+    audited_value = output.get(output_key)
+    audit = output.get("audit")
+    if not isinstance(audited_value, dict):
+        reasons.append("audited_value_missing")
+    elif audited_value != published_value:
+        reasons.append("published_value_mismatch")
+    if not isinstance(audit, dict):
+        reasons.append("audit_missing")
+        audit = {}
+    else:
+        if audit.get("quality_complete") is not True:
+            reasons.append("quality_incomplete")
+        if audit.get("fallback_units") != []:
+            reasons.append("fallback_units_present")
+        if audit.get("canonical_policy") != LIVE_RUSSIAN_POLICY_MANIFEST.as_dict():
+            reasons.append("canonical_policy_mismatch")
+        if audit.get("result_report_sha256") != _stable_json_sha256(published_value):
+            reasons.append("published_digest_mismatch")
+        if seal_editorial_audit(audit).get("audit_sha256") != audit.get("audit_sha256"):
+            reasons.append("audit_digest_mismatch")
+    cache_proof, cache_revalidated = _immutable_editorial_cache_proof(
+        source=source_value,
+        result=(audited_value if isinstance(audited_value, dict) else None),
+        audit=(audit if isinstance(audit, dict) else None),
+        prose_paths=prose_paths,
+        protected_terms=protected_terms,
+        source_artifact_key=source_artifact_key,
+    )
+    if not cache_revalidated:
+        reasons.append("editorial_cache_revalidation_failed")
+    return {
+        "accepted": not reasons,
+        "artifact_key": artifact.artifact_key if artifact is not None else None,
+        "prompt_version": artifact.prompt_version if artifact is not None else None,
+        "audit_sha256": audit.get("audit_sha256") if isinstance(audit, dict) else None,
+        "result_report_sha256": (
+            _stable_json_sha256(audited_value)
+            if isinstance(audited_value, dict)
+            else None
+        ),
+        "cache_revalidated": cache_revalidated,
+        "cache_proof": cache_proof,
+        "cache_proof_sha256": (
+            cache_proof.get("proof_sha256") if isinstance(cache_proof, dict) else None
+        ),
+        "reasons": reasons,
+    }
+
+
+def _illustration_receipt_state(
+    artifact: RunArtifact | None,
+    illustrations: list[dict[str, Any]],
+    *,
+    source_document: dict[str, Any] | None = None,
+    prose_paths: Iterable[str] | None = None,
+    protected_terms: Iterable[str] = (),
+    source_artifact_key: str | None = None,
+) -> dict[str, Any]:
+    """Bind each published subset row to the audited concept with its sequence."""
+
+    if not illustrations:
+        return {
+            "accepted": True,
+            "artifact_key": None,
+            "prompt_version": None,
+            "audit_sha256": None,
+            "result_report_sha256": None,
+            "cache_revalidated": None,
+            "cache_proof": None,
+            "cache_proof_sha256": None,
+            "reasons": [],
+            "state": "not_published",
+            "publication_policy": copy.deepcopy(ILLUSTRATION_PUBLICATION_POLICY),
+            "published_count": 0,
+            "audited_count": 0,
+        }
+    output = artifact.output_json if artifact is not None else None
+    audited_document = output.get("copy") if isinstance(output, dict) else None
+    audit = output.get("audit") if isinstance(output, dict) else None
+    reasons: list[str] = []
+    if artifact is None:
+        reasons.append("artifact_missing")
+    elif artifact.status != "completed":
+        reasons.append("artifact_not_completed")
+    if not isinstance(audited_document, dict):
+        reasons.append("audited_value_missing")
+        audited_document = {}
+    rows = audited_document.get("illustrations")
+    if not isinstance(rows, list):
+        reasons.append("audited_rows_missing")
+        rows = []
+    audited_by_sequence = {
+        sequence: row
+        for sequence, row in enumerate(rows, start=1)
+        if isinstance(row, dict)
+    }
+    seen_sequences: set[int] = set()
+    for position, published in enumerate(illustrations, start=1):
+        if not isinstance(published, dict):
+            reasons.append("published_row_invalid")
+            continue
+        sequence = _non_negative_int(published.get("sequence"))
+        if sequence is None or sequence < 1:
+            reasons.append("published_sequence_invalid")
+            continue
+        if sequence in seen_sequences:
+            reasons.append("published_sequence_duplicate")
+            continue
+        seen_sequences.add(sequence)
+        audited = audited_by_sequence.get(sequence)
+        if audited is None:
+            reasons.append("published_sequence_not_audited")
+            continue
+        if any(
+            str(published.get(field) or "") != str(audited.get(field) or "")
+            for field in ("title", "caption", "alt_text")
+        ):
+            reasons.append("published_copy_mismatch")
+    if not isinstance(audit, dict):
+        reasons.append("audit_missing")
+        audit = {}
+    else:
+        if audit.get("quality_complete") is not True:
+            reasons.append("quality_incomplete")
+        if audit.get("fallback_units") != []:
+            reasons.append("fallback_units_present")
+        if audit.get("canonical_policy") != LIVE_RUSSIAN_POLICY_MANIFEST.as_dict():
+            reasons.append("canonical_policy_mismatch")
+        if audit.get("result_report_sha256") != _stable_json_sha256(audited_document):
+            reasons.append("published_digest_mismatch")
+        if seal_editorial_audit(audit).get("audit_sha256") != audit.get("audit_sha256"):
+            reasons.append("audit_digest_mismatch")
+    cache_proof, cache_revalidated = _immutable_editorial_cache_proof(
+        source=source_document,
+        result=audited_document,
+        audit=(audit if isinstance(audit, dict) else None),
+        prose_paths=prose_paths,
+        protected_terms=protected_terms,
+        source_artifact_key=source_artifact_key,
+    )
+    if not cache_revalidated:
+        reasons.append("editorial_cache_revalidation_failed")
+    return {
+        "accepted": not reasons,
+        "artifact_key": artifact.artifact_key if artifact is not None else None,
+        "prompt_version": artifact.prompt_version if artifact is not None else None,
+        "audit_sha256": audit.get("audit_sha256") if isinstance(audit, dict) else None,
+        "result_report_sha256": _stable_json_sha256(audited_document),
+        "cache_revalidated": cache_revalidated,
+        "cache_proof": cache_proof,
+        "cache_proof_sha256": (
+            cache_proof.get("proof_sha256") if isinstance(cache_proof, dict) else None
+        ),
+        "reasons": list(dict.fromkeys(reasons)),
+        "state": "published",
+        "publication_policy": copy.deepcopy(ILLUSTRATION_PUBLICATION_POLICY),
+        "published_count": len(illustrations),
+        "audited_count": len(rows),
+        "published_sequences": sorted(seen_sequences),
+    }
+
+
+def _reader_copy_publication_contract(
+    *,
+    final_report: dict[str, Any],
+    public_report: dict[str, Any],
+    illustrations: list[dict[str, Any]],
+    analysis_markdown: str,
+    report_json: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind edited copy to both database fields that the API can publish."""
+
+    expected_markdown = _render_markdown(final_report)
+    expected_narrative = {
+        "headline": final_report.get("headline"),
+        "headline_emphasis": final_report.get("headline_emphasis") or [],
+        "verdict": final_report.get("verdict"),
+        "executive_summary": final_report.get("executive_summary"),
+        "actions": final_report.get("actions") or [],
+    }
+    checks = {
+        "analysis_markdown_matches_final_report": (
+            analysis_markdown == expected_markdown
+        ),
+        "report_json_narrative_matches_final_report": (
+            report_json.get("narrative") == expected_narrative
+        ),
+        "report_json_illustrations_match_published_copy": (
+            report_json.get("illustrations") == illustrations
+        ),
+        "report_json_contains_public_report_snapshot": all(
+            report_json.get(key) == value for key, value in public_report.items()
+        ),
+    }
+    blocking_reasons = [name for name, accepted in checks.items() if not accepted]
+    return {
+        "checks": checks,
+        "blocking_reasons": blocking_reasons,
+        "final_report_sha256": _stable_json_sha256(final_report),
+        "expected_analysis_markdown_sha256": hashlib.sha256(
+            expected_markdown.encode("utf-8")
+        ).hexdigest(),
+        "analysis_markdown_sha256": hashlib.sha256(
+            analysis_markdown.encode("utf-8")
+        ).hexdigest(),
+        "report_json_sha256": _stable_json_sha256(report_json),
+        "public_report_sha256": _stable_json_sha256(public_report),
+        "illustrations_sha256": _stable_json_sha256(illustrations),
+    }
+
+
+def _reader_copy_gate_decision(
+    *,
+    publication: dict[str, Any],
+    lint: dict[str, Any],
+    receipts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Fail closed when published reader copy escaped a complete audit."""
+
+    receipt_quality_complete = all(
+        receipt.get("accepted") is True for receipt in receipts.values()
+    )
+    deterministic_complete = bool(
+        lint.get("blocking") is False and lint.get("omitted_issue_count") == 0
+    )
+    quality_complete = bool(
+        deterministic_complete and lint.get("issues") == [] and receipt_quality_complete
+    )
+    degraded_reasons: list[str] = []
+    if lint.get("blocking") is True:
+        degraded_reasons.append("blocking_copy_lint")
+    if lint.get("omitted_issue_count"):
+        degraded_reasons.append("copy_lint_not_exhaustive")
+    if lint.get("issues") and not lint.get("blocking"):
+        degraded_reasons.append("copy_lint_warnings")
+    for name, receipt in receipts.items():
+        if receipt.get("accepted") is not True:
+            degraded_reasons.append(f"{name}_receipt_incomplete")
+
+    receipt_tamper_codes = {
+        "published_value_mismatch",
+        "published_copy_mismatch",
+        "canonical_policy_mismatch",
+        "published_digest_mismatch",
+        "audit_digest_mismatch",
+    }
+    blocking_reasons = list(publication.get("blocking_reasons") or [])
+    if lint.get("blocking") is True:
+        blocking_reasons.append("blocking_copy_lint")
+    if lint.get("omitted_issue_count"):
+        blocking_reasons.append("copy_lint_not_exhaustive")
+    if lint.get("issues"):
+        blocking_reasons.append("reader_copy_policy_issues_present")
+    for name, receipt in receipts.items():
+        if receipt.get("accepted") is not True:
+            blocking_reasons.append(f"{name}_receipt_incomplete")
+        for reason in receipt.get("reasons") or []:
+            if reason in receipt_tamper_codes:
+                blocking_reasons.append(f"{name}:{reason}")
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    degraded_reasons = list(dict.fromkeys(degraded_reasons))
+    return {
+        "decision": (
+            "block"
+            if blocking_reasons
+            else "degraded_safe"
+            if degraded_reasons
+            else "pass"
+        ),
+        "blocking_reasons": blocking_reasons,
+        "degraded_reasons": degraded_reasons,
+        "deterministic_complete": deterministic_complete,
+        "quality_complete": quality_complete,
+    }
+
+
+async def _save_reader_copy_manifest(
+    run_id: str,
+    *,
+    final_report: dict[str, Any],
+    public_report: dict[str, Any],
+    illustrations: list[dict[str, Any]],
+    analysis_markdown: str,
+    report_json: dict[str, Any],
+) -> dict[str, Any]:
+    """Audit all reader copy and block an unaudited presentation from publish."""
+
+    assert_live_russian_policy_integrity()
+    document = _reader_copy_document(
+        final_report=final_report,
+        public_report=public_report,
+        illustrations=illustrations,
+    )
+    publication = _reader_copy_publication_contract(
+        final_report=final_report,
+        public_report=public_report,
+        illustrations=illustrations,
+        analysis_markdown=analysis_markdown,
+        report_json=report_json,
+    )
+    lint = lint_reader_copy_tree(document).as_dict()
+    artifact_keys = (
+        "final_report_editorial",
+        "technical_review_editorial",
+        "illustration_copy_editorial",
+        "final_report",
+        "technical_review",
+        "illustration_concepts",
+    )
+    async with SessionLocal() as session:
+        artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.in_(artifact_keys),
+                    )
+                )
+            ).scalars()
+        )
+    by_key = {artifact.artifact_key: artifact for artifact in artifacts}
+
+    def completed_output(artifact_key: str) -> dict[str, Any] | None:
+        artifact = by_key.get(artifact_key)
+        if (
+            artifact is None
+            or artifact.status != "completed"
+            or not isinstance(artifact.output_json, dict)
+        ):
+            return None
+        return copy.deepcopy(artifact.output_json)
+
+    def editorial_inputs(artifact_key: str) -> dict[str, Any]:
+        artifact = by_key.get(artifact_key)
+        if artifact is None or not isinstance(artifact.input_json, dict):
+            return {}
+        return copy.deepcopy(artifact.input_json)
+
+    final_source = completed_output("final_report")
+    if isinstance(final_source, dict):
+        # The editorial stage deliberately normalizes this presentation-only
+        # field before invoking the lossless editor.  Recreate that exact
+        # source rather than trusting only the editorial result's self-seal.
+        final_source["headline_emphasis"] = []
+    final_editorial_input = editorial_inputs("final_report_editorial")
+    technical_source = completed_output("technical_review")
+    technical_editorial_input = editorial_inputs("technical_review_editorial")
+    illustration_source_payload = completed_output("illustration_concepts")
+    illustration_source_rows = (
+        illustration_source_payload.get("illustrations")
+        if isinstance(illustration_source_payload, dict)
+        else None
+    )
+    illustration_source = (
+        _illustration_copy_document(illustration_source_rows)
+        if isinstance(illustration_source_rows, list)
+        else None
+    )
+    illustration_editorial_input = editorial_inputs("illustration_copy_editorial")
+    technical = public_report.get("technical")
+    technical_review = (
+        copy.deepcopy(technical.get("review") or {})
+        if isinstance(technical, dict)
+        else {}
+    )
+    receipts = {
+        "final_report": _editorial_receipt_state(
+            by_key.get("final_report_editorial"),
+            output_key="report",
+            published_value=final_report,
+            source_value=final_source,
+            prose_paths=None,
+            protected_terms=final_editorial_input.get("protected_terms") or [],
+            source_artifact_key="final_report",
+        ),
+        "technical_review": _editorial_receipt_state(
+            by_key.get("technical_review_editorial"),
+            output_key="review",
+            published_value=technical_review,
+            source_value=technical_source,
+            prose_paths=technical_editorial_input.get("prose_paths"),
+            protected_terms=(technical_editorial_input.get("protected_terms") or []),
+            source_artifact_key="technical_review",
+        ),
+        "illustrations": _illustration_receipt_state(
+            by_key.get("illustration_copy_editorial"),
+            illustrations,
+            source_document=illustration_source,
+            prose_paths=illustration_editorial_input.get("prose_paths"),
+            protected_terms=(illustration_editorial_input.get("protected_terms") or []),
+            source_artifact_key="illustration_concepts",
+        ),
+    }
+    illustration_asset_receipts = await _verified_illustration_asset_receipts(
+        run_id,
+        illustrations,
+    )
+    preview_asset_receipt: dict[str, Any] | None = None
+    if report_json.get("site_preview") is not None:
+        try:
+            preview_asset_receipt = site_preview_asset_receipt(
+                run_id,
+                report_json.get("site_preview"),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise OpenRouterError(
+                "Site preview failed byte-level publication integrity"
+            ) from exc
+    receipts["illustration_assets"] = {
+        "accepted": True,
+        "reasons": [],
+        "published_count": len(illustrations),
+        "verified_count": len(illustration_asset_receipts),
+        "publication_policy": copy.deepcopy(ILLUSTRATION_PUBLICATION_POLICY),
+    }
+    gate = _reader_copy_gate_decision(
+        publication=publication,
+        lint=lint,
+        receipts=receipts,
+    )
+    blocking_reasons = gate["blocking_reasons"]
+    decision = gate["decision"]
+    manifest_core = {
+        "version": READER_COPY_MANIFEST_VERSION,
+        "canonical_policy": LIVE_RUSSIAN_POLICY_MANIFEST.as_dict(),
+        "code_owned_copy_registry": READER_COPY_REGISTRY_MANIFEST.as_dict(),
+        "reader_copy_sha256": _stable_json_sha256(document),
+        "reader_copy_utf8_bytes": len(
+            json.dumps(document, ensure_ascii=False).encode("utf-8")
+        ),
+        "lint": lint,
+        "editorial_receipts": receipts,
+        "illustration_asset_receipts": illustration_asset_receipts,
+        "illustration_asset_receipts_sha256": _stable_json_sha256(
+            illustration_asset_receipts
+        ),
+        "site_preview_asset_receipt": preview_asset_receipt,
+        "site_preview_asset_receipt_sha256": (
+            preview_asset_receipt.get("receipt_sha256")
+            if isinstance(preview_asset_receipt, dict)
+            else None
+        ),
+        "publication_contract": publication,
+        "decision": decision,
+        "blocking_reasons": blocking_reasons,
+        "deterministic_complete": gate["deterministic_complete"],
+        "quality_complete": gate["quality_complete"],
+        "degraded_reasons": gate["degraded_reasons"],
+    }
+    manifest = {
+        **manifest_core,
+        "manifest_sha256": _stable_json_sha256(manifest_core),
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key="reader_copy_manifest",
+        status="failed" if decision == "block" else "completed",
+        model=None,
+        input_json={
+            "reader_copy_sha256": manifest["reader_copy_sha256"],
+            "report_json_sha256": publication["report_json_sha256"],
+            "analysis_markdown_sha256": publication["analysis_markdown_sha256"],
+            "canonical_policy": LIVE_RUSSIAN_POLICY_MANIFEST.as_dict(),
+            "code_owned_copy_registry": READER_COPY_REGISTRY_MANIFEST.as_dict(),
+            "site_preview_asset_receipt_sha256": manifest[
+                "site_preview_asset_receipt_sha256"
+            ],
+        },
+        output_json=manifest,
+        error_message=(
+            "Reader copy publication quality gate failed: "
+            + ", ".join(blocking_reasons)
+            if decision == "block"
+            else None
+        ),
+        prompt_version=READER_COPY_MANIFEST_VERSION,
+    )
+    if decision == "block":
+        raise OpenRouterError(
+            "Reader copy publication quality gate failed: "
+            + ", ".join(blocking_reasons)
+        )
+    return manifest
 
 
 def _validate_final_report(report: dict[str, Any]) -> list[str]:
@@ -26484,6 +29395,12 @@ def _validate_illustration_concepts(
                     "headline": item["title"],
                     "verdict": item["core_claim"],
                     "executive_summary": item["caption"],
+                    "sections": [
+                        {
+                            "heading": "Описание изображения",
+                            "body": item["alt_text"],
+                        }
+                    ],
                 },
                 public_report,
                 enforce_report_contract=False,
@@ -33233,6 +36150,12 @@ def _final_editor_protected_terms(
     brand = public_report.get("brand")
     if isinstance(brand, dict):
         protected.append(str(brand.get("name") or "").strip())
+        protected.extend(str(value).strip() for value in brand.get("products") or [])
+        for offer in brand.get("offers") or []:
+            if not isinstance(offer, dict):
+                continue
+            protected.append(str(offer.get("name") or "").strip())
+            protected.extend(str(value).strip() for value in offer.get("aliases") or [])
         for entity in brand.get("entity_scope") or []:
             if not isinstance(entity, dict):
                 continue
@@ -33252,7 +36175,49 @@ def _final_editor_protected_terms(
             value = str(row.get(key) or "").strip()
             if value:
                 protected.append(value)
+    for competitor in public_report.get("competitors") or []:
+        if isinstance(competitor, dict):
+            for key in ("name", "canonical_name", "label"):
+                value = str(competitor.get(key) or "").strip()
+                if value:
+                    protected.append(value)
     return list(dict.fromkeys(value for value in protected if value))
+
+
+def _final_editor_semantic_binding_is_valid(
+    *,
+    source: dict[str, Any],
+    result: dict[str, Any],
+    audit: dict[str, Any],
+    cache_input: dict[str, Any],
+) -> bool:
+    binding = audit.get("final_semantic_gate")
+    if not isinstance(binding, dict):
+        return False
+    for key in (
+        "semantic_gate_version",
+        "selected_answer_context_sha256",
+        "answer_selection_manifest_sha256",
+        "semantic_evidence_document_sha256",
+    ):
+        if binding.get(key) != cache_input.get(key):
+            return False
+    changed = result != source
+    if binding.get("required") is not changed:
+        return False
+    if binding.get("result_report_sha256") != _stable_json_sha256(result):
+        return False
+    if not changed:
+        return binding.get("accepted") is True
+    return bool(
+        binding.get("accepted") is True
+        and binding.get("verdict") == "pass"
+        and binding.get("candidate_report_sha256") == _stable_json_sha256(result)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(binding.get("review_sha256") or ""),
+        )
+    )
 
 
 async def _edit_final_report_language(
@@ -33320,6 +36285,14 @@ async def _edit_final_report_language(
         "policy_sha256": editorial_policy_sha256(),
         "source_manifest_sha256": source_manifest["manifest_sha256"],
         "protected_terms": protected_terms,
+        "semantic_gate_version": REPORT_SEMANTIC_GATE_VERSION,
+        "selected_answer_context_sha256": _stable_json_sha256(selected_answer_context),
+        "answer_selection_manifest_sha256": _stable_json_sha256(
+            answer_selection_manifest
+        ),
+        "semantic_evidence_document_sha256": _stable_json_sha256(
+            semantic_evidence_document
+        ),
     }
     cached = await _artifact_output(
         run_id,
@@ -33339,6 +36312,12 @@ async def _edit_final_report_language(
                 cached_report,
                 cached_audit,
                 protected_terms=protected_terms,
+            )
+            and _final_editor_semantic_binding_is_valid(
+                source=source,
+                result=cached_report,
+                audit=cached_audit,
+                cache_input=cache_input,
             )
             and not _validate_final_report(cached_report)
         ):
@@ -33426,6 +36405,21 @@ async def _edit_final_report_language(
         )
         errors = _validate_final_report(edited)
         semantic_review: dict[str, Any] | None = None
+        semantic_binding = {
+            "semantic_gate_version": REPORT_SEMANTIC_GATE_VERSION,
+            "selected_answer_context_sha256": cache_input[
+                "selected_answer_context_sha256"
+            ],
+            "answer_selection_manifest_sha256": cache_input[
+                "answer_selection_manifest_sha256"
+            ],
+            "semantic_evidence_document_sha256": cache_input[
+                "semantic_evidence_document_sha256"
+            ],
+            "required": edited != source,
+            "accepted": edited == source and not errors,
+            "result_report_sha256": _stable_json_sha256(edited),
+        }
         if not errors and edited != source:
             semantic_review = await _final_report_semantic_review_artifact(
                 run_id,
@@ -33442,6 +36436,14 @@ async def _edit_final_report_language(
                 semantic_review,
                 evidence_document=semantic_evidence_document,
             )
+            semantic_binding.update(
+                {
+                    "accepted": not errors,
+                    "verdict": semantic_review.get("verdict"),
+                    "candidate_report_sha256": _stable_json_sha256(edited),
+                    "review_sha256": _stable_json_sha256(semantic_review),
+                }
+            )
         if errors:
             audit["semantic_fallback"] = {
                 "used": True,
@@ -33451,8 +36453,10 @@ async def _edit_final_report_language(
             edited = source
             audit["result_report_sha256"] = _stable_json_sha256(edited)
             audit["changed_paths"] = []
+            semantic_binding["result_report_sha256"] = _stable_json_sha256(edited)
         else:
             audit["semantic_fallback"] = {"used": False, "errors": []}
+        audit["final_semantic_gate"] = semantic_binding
         audit = seal_editorial_audit(audit)
         output = {"report": edited, "audit": audit}
         await _save_artifact(
@@ -33890,6 +36894,319 @@ def _eligible_illustration_answer_context(
     }
 
 
+def _illustration_copy_document(
+    concepts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Extract exactly the illustration strings rendered by the reader."""
+
+    return {
+        "illustrations": [
+            {
+                "role": str(concept.get("role") or ""),
+                "core_claim": str(concept.get("core_claim") or ""),
+                "title": str(concept.get("title") or ""),
+                "caption": str(concept.get("caption") or ""),
+                "alt_text": str(concept.get("alt_text") or ""),
+                "evidence_paths": [
+                    str(value)
+                    for value in concept.get("evidence_paths") or []
+                    if isinstance(value, str)
+                ],
+            }
+            for concept in concepts
+            if isinstance(concept, dict)
+        ]
+    }
+
+
+def _merge_illustration_copy(
+    concepts: list[dict[str, Any]],
+    copy_document: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows = copy_document.get("illustrations")
+    if not isinstance(rows, list) or len(rows) != len(concepts):
+        raise OpenRouterError("Illustration editorial copy has invalid row coverage")
+    merged = copy.deepcopy(concepts)
+    for index, (concept, row) in enumerate(zip(merged, rows)):
+        if not isinstance(concept, dict) or not isinstance(row, dict):
+            raise OpenRouterError(f"Illustration editorial row {index + 1} is invalid")
+        if (
+            set(row)
+            != {
+                "role",
+                "core_claim",
+                "title",
+                "caption",
+                "alt_text",
+                "evidence_paths",
+            }
+            or not all(
+                isinstance(row.get(field), str)
+                for field in ("role", "core_claim", "title", "caption", "alt_text")
+            )
+            or not isinstance(row.get("evidence_paths"), list)
+        ):
+            raise OpenRouterError(
+                f"Illustration editorial row {index + 1} has invalid fields"
+            )
+        if (
+            row["role"] != concept.get("role")
+            or row["core_claim"] != concept.get("core_claim")
+            or row["evidence_paths"] != concept.get("evidence_paths")
+        ):
+            raise OpenRouterError(
+                f"Illustration editorial row {index + 1} changed evidence scope"
+            )
+        for field in ("title", "caption", "alt_text"):
+            concept[field] = row[field]
+    return merged
+
+
+async def _edit_illustration_copy_language(
+    run_id: str,
+    *,
+    concepts: list[dict[str, Any]],
+    public_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Apply the audited Russian layer to title, caption and alt text."""
+
+    source_concepts = copy.deepcopy(concepts)
+    source = _illustration_copy_document(source_concepts)
+    protected_terms = _final_editor_protected_terms(public_report)
+    try:
+        prose_paths = illustration_copy_narrative_paths(source)
+        _source_units, source_manifest = build_editorial_units(
+            source,
+            prose_paths=prose_paths,
+            protected_terms=protected_terms,
+        )
+    except Exception as exc:
+        fallback_audit = seal_editorial_audit(
+            {
+                "version": REPORT_EDITOR_HARNESS_VERSION,
+                "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                "policy_sha256": editorial_policy_sha256(),
+                "source_report_sha256": _stable_json_sha256(source),
+                "result_report_sha256": _stable_json_sha256(source),
+                "coverage_complete": False,
+                "fallback_reason": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key="illustration_copy_editorial",
+            status="failed",
+            model=PROCESSING_MODEL,
+            input_json={
+                "source_concepts_sha256": _stable_json_sha256(source_concepts),
+                "public_report_sha256": _stable_json_sha256(public_report),
+                "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                "policy_sha256": fallback_audit["policy_sha256"],
+                "source_manifest_sha256": None,
+                "prose_paths": [],
+                "protected_terms": protected_terms,
+            },
+            output_json={"copy": source, "audit": fallback_audit},
+            error_message=str(exc),
+            prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+        )
+        raise OpenRouterError(
+            "Illustration copy could not be prepared for audited editing"
+        ) from exc
+
+    cache_input = {
+        "source_concepts_sha256": _stable_json_sha256(source_concepts),
+        "public_report_sha256": _stable_json_sha256(public_report),
+        "policy_version": REPORT_EDITOR_POLICY_VERSION,
+        "policy_sha256": editorial_policy_sha256(),
+        "source_manifest_sha256": source_manifest["manifest_sha256"],
+        "prose_paths": prose_paths,
+        "protected_terms": protected_terms,
+    }
+    cached = await _artifact_output(
+        run_id,
+        "illustration_copy_editorial",
+        input_json=cache_input,
+        model=PROCESSING_MODEL,
+        prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+    )
+    if isinstance(cached, dict):
+        cached_copy = cached.get("copy")
+        cached_audit = cached.get("audit")
+        if (
+            isinstance(cached_copy, dict)
+            and isinstance(cached_audit, dict)
+            and validate_editorial_cache(
+                source,
+                cached_copy,
+                cached_audit,
+                prose_paths=prose_paths,
+                protected_terms=protected_terms,
+            )
+        ):
+            cached_concepts = _merge_illustration_copy(
+                source_concepts,
+                cached_copy,
+            )
+            if not _validate_illustration_concepts(
+                {"illustrations": cached_concepts},
+                public_report,
+            ):
+                return cached_concepts
+
+    async def editor_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        attempt = int(value.get("attempt") or 0)
+        identity = _stable_json_sha256(
+            {
+                "source_unit_id": value.get("source_unit_id"),
+                "source_sha256": value.get("source_sha256"),
+            }
+        )[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=f"illustration_ru_editor_unit_a{attempt}_{identity}",
+            schema=EDITOR_UNIT_SCHEMA,
+            schema_name="aiv_illustration_ru_editor_unit",
+            system=EDITORIAL_POLICY,
+            user_payload=value,
+            model=PROCESSING_MODEL,
+            reasoning_effort="high",
+            prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+        )
+
+    async def critic_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        digest = _stable_json_sha256(value)[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=f"illustration_ru_editor_critic_{digest}",
+            schema=EDITOR_CRITIC_SCHEMA,
+            schema_name="aiv_illustration_ru_editor_critic",
+            system=EDITOR_CRITIC_POLICY,
+            user_payload=value,
+            model=REPORT_SEMANTIC_MODEL,
+            reasoning_effort="high",
+            prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+        )
+
+    async def arbiter_call(payload: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(payload)
+        value.pop("response_schema", None)
+        digest = _stable_json_sha256(value)[:24]
+        return await _structured_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key=f"illustration_ru_editor_arbiter_{digest}",
+            schema=EDITOR_UNIT_SCHEMA,
+            schema_name="aiv_illustration_ru_editor_arbiter",
+            system=(
+                EDITORIAL_POLICY + "\n\nТы старший арбитр. Исправь только доказанный "
+                "редакционный или смысловой дефект; факты неизменны."
+            ),
+            user_payload=value,
+            model=ANALYSIS_MODEL,
+            reasoning_effort="high",
+            prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+        )
+
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key="illustration_copy_editorial",
+        status="running",
+        model=PROCESSING_MODEL,
+        input_json=cache_input,
+        prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+    )
+    try:
+        edited_copy, audit = await edit_report(
+            source,
+            editor_call=editor_call,
+            critic_call=critic_call,
+            arbiter_call=arbiter_call,
+            prose_paths=prose_paths,
+            protected_terms=protected_terms,
+            concurrency=max(1, min(4, PROCESSING_BATCH_CONCURRENCY)),
+        )
+        edited_concepts = _merge_illustration_copy(
+            source_concepts,
+            edited_copy,
+        )
+        semantic_errors = _validate_illustration_concepts(
+            {"illustrations": edited_concepts},
+            public_report,
+        )
+        if semantic_errors:
+            audit["semantic_fallback"] = {
+                "used": True,
+                "errors": semantic_errors,
+            }
+            edited_copy = source
+            edited_concepts = source_concepts
+            audit["result_report_sha256"] = _stable_json_sha256(source)
+            audit["changed_paths"] = []
+        else:
+            audit["semantic_fallback"] = {"used": False, "errors": []}
+        audit = seal_editorial_audit(audit)
+        if not validate_editorial_cache(
+            source,
+            edited_copy,
+            audit,
+            prose_paths=prose_paths,
+            protected_terms=protected_terms,
+        ):
+            raise OpenRouterError(
+                "Illustration copy did not pass the complete editorial contract"
+            )
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key="illustration_copy_editorial",
+            status="completed",
+            model=PROCESSING_MODEL,
+            input_json=cache_input,
+            output_json={"copy": edited_copy, "audit": audit},
+            raw_text=json.dumps(edited_copy, ensure_ascii=False),
+            prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+        )
+        return edited_concepts
+    except Exception as exc:
+        fallback_audit = seal_editorial_audit(
+            {
+                "version": REPORT_EDITOR_HARNESS_VERSION,
+                "policy_version": REPORT_EDITOR_POLICY_VERSION,
+                "policy_sha256": editorial_policy_sha256(),
+                "source_report_sha256": _stable_json_sha256(source),
+                "result_report_sha256": _stable_json_sha256(source),
+                "coverage_complete": False,
+                "source_manifest": source_manifest,
+                "fallback_reason": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="report",
+            artifact_key="illustration_copy_editorial",
+            status="failed",
+            model=PROCESSING_MODEL,
+            input_json=cache_input,
+            output_json={"copy": source, "audit": fallback_audit},
+            error_message=str(exc),
+            prompt_version=ILLUSTRATION_EDITORIAL_VERSION,
+        )
+        if isinstance(exc, OpenRouterError):
+            raise
+        raise OpenRouterError(
+            "Illustration copy failed audited editorial processing"
+        ) from exc
+
+
 async def _illustration_concepts(
     run_id: str,
     public_report: dict[str, Any],
@@ -33984,7 +37301,11 @@ rw.plus исследуемый бренд может совпадать с из�
     if isinstance(cached, dict):
         cached = _normalize_unpaired_memory_illustration(cached, public_report)
         if not _validate_illustration_concepts(cached, public_report):
-            return list(cached["illustrations"])
+            return await _edit_illustration_copy_language(
+                run_id,
+                concepts=list(cached["illustrations"]),
+                public_report=public_report,
+            )
 
     last_errors: list[str] = []
     await _save_artifact(
@@ -34117,7 +37438,11 @@ rw.plus исследуемый бренд может совпадать с из�
                 usage_json=result.usage,
                 prompt_version=ILLUSTRATION_CONCEPTS_VERSION,
             )
-            return list(result.parsed["illustrations"])
+            return await _edit_illustration_copy_language(
+                run_id,
+                concepts=list(result.parsed["illustrations"]),
+                public_report=public_report,
+            )
         raise OpenRouterError(
             "; ".join(last_errors) or "Illustration concept validation failed"
         )
@@ -34843,7 +38168,8 @@ async def _generate_illustrations(
                     base_prompt=prompt,
                     initial_review=initial_review,
                 )
-                filename = f"{sequence:02d}.{image.extension}"
+                image_sha256 = hashlib.sha256(image.content).hexdigest()
+                filename = f"{sequence:02d}-{image_sha256}.{image.extension}"
                 target = target_dir / filename
                 temporary = target.with_suffix(target.suffix + ".tmp")
                 temporary.write_bytes(image.content)
@@ -34869,7 +38195,7 @@ async def _generate_illustrations(
                             "quality_version": ILLUSTRATION_QA_VERSION,
                             "quality_attempts": quality_attempts,
                             "accepted_generation_prompt": accepted_prompt,
-                            "image_sha256": hashlib.sha256(image.content).hexdigest(),
+                            "image_sha256": image_sha256,
                         }
                         illustration.error_message = None
                         await session.commit()
@@ -34910,7 +38236,7 @@ async def _generate_illustrations(
             await mark_role_completed()
             return result
 
-    return list(
+    generated = list(
         await asyncio.gather(
             *(
                 generate_role(sequence, concept)
@@ -34918,6 +38244,14 @@ async def _generate_illustrations(
             )
         )
     )
+    # ``report_json.illustrations`` is the public asset set, not a list of
+    # attempted concepts.  Failed roles remain in the durable generation rows
+    # and audit artifacts but cannot become public placeholders.
+    return [
+        item
+        for item in generated
+        if isinstance(item.get("file_url"), str) and item["file_url"]
+    ]
 
 
 def _reuse_saved_illustration_assets(
@@ -34945,16 +38279,389 @@ def _reuse_saved_illustration_assets(
                 "sequence": sequence,
                 "title": str(concept.get("title") or f"Схема {sequence}")[:300],
                 "caption": str(concept.get("caption") or ""),
-                "alt_text": (
-                    str(saved.get("alt_text"))
-                    if isinstance(saved.get("alt_text"), str)
-                    and str(saved.get("alt_text")).strip()
-                    else str(concept.get("alt_text") or "")
-                ),
+                # Only the binary asset is reused.  Every reader-facing string
+                # belongs to the current analysis and its editorial receipt.
+                "alt_text": str(concept.get("alt_text") or ""),
                 "file_url": copy.deepcopy(saved.get("file_url")),
             }
         )
     return reused
+
+
+def _reused_illustration_validation_jobs(
+    public_rows: list[dict[str, Any]],
+    refreshed_concepts: list[dict[str, Any]],
+) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """Match a reused bitmap to the concept with the same sequence."""
+
+    concepts_by_sequence = {
+        sequence: concept
+        for sequence, concept in enumerate(refreshed_concepts, start=1)
+        if isinstance(concept, dict)
+    }
+    jobs: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for position, public_item in enumerate(public_rows, start=1):
+        if not isinstance(public_item, dict):
+            continue
+        sequence = _non_negative_int(public_item.get("sequence")) or position
+        concept = concepts_by_sequence.get(sequence)
+        if concept is not None:
+            jobs.append((position, public_item, concept))
+    return jobs
+
+
+def _saved_illustration_file_path(run_id: str, file_url: Any) -> Path | None:
+    """Resolve only an image owned by this run under static/generated."""
+
+    if not isinstance(file_url, str) or not file_url.strip():
+        return None
+    parsed = urlparse(file_url.strip())
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        return None
+    safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)
+    expected_prefix = f"/static/generated/{safe_run_id}/"
+    if not safe_run_id or not parsed.path.startswith(expected_prefix):
+        return None
+    relative = parsed.path.removeprefix("/static/")
+    candidate = (STATIC_DIR / relative).resolve()
+    run_root = (GENERATED_DIR / safe_run_id).resolve()
+    if not candidate.is_relative_to(run_root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+async def _verified_illustration_asset_receipts(
+    run_id: str,
+    illustrations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Prove that every public illustration is this run's QA-approved file."""
+
+    if not illustrations:
+        return []
+    sequences: list[int] = []
+    for item in illustrations:
+        if not isinstance(item, dict):
+            raise PublicationContractError("Published illustration row is invalid")
+        sequence = _non_negative_int(item.get("sequence"))
+        if sequence is None or sequence < 1 or sequence in sequences:
+            raise PublicationContractError(
+                "Published illustration sequences are missing or duplicated"
+            )
+        sequences.append(sequence)
+
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ReportIllustration).where(
+                        ReportIllustration.run_id == run_id,
+                        ReportIllustration.sequence.in_(sequences),
+                    )
+                )
+            ).scalars()
+        )
+        qa_artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.like("illustration_qa_%"),
+                    )
+                )
+            ).scalars()
+        )
+    stored_by_sequence = {row.sequence: row for row in rows}
+    qa_by_key = {artifact.artifact_key: artifact for artifact in qa_artifacts}
+    receipts: list[dict[str, Any]] = []
+    for item, sequence in zip(illustrations, sequences):
+        file_url = item.get("file_url")
+        image_path = _saved_illustration_file_path(run_id, file_url)
+        if image_path is None:
+            raise PublicationContractError(
+                f"Illustration {sequence} is missing or outside run scope"
+            )
+        image_content = image_path.read_bytes()
+        image_sha256 = hashlib.sha256(image_content).hexdigest()
+        stored = stored_by_sequence.get(sequence)
+        if stored is None or stored.file_url != file_url:
+            raise PublicationContractError(
+                f"Illustration {sequence} does not match its run record"
+            )
+        usage = stored.usage_json if isinstance(stored.usage_json, dict) else {}
+        if usage.get("image_sha256") != image_sha256:
+            raise PublicationContractError(
+                f"Illustration {sequence} content hash does not match metadata"
+            )
+        if (
+            usage.get("quality_version") != ILLUSTRATION_QA_VERSION
+            or usage.get("quality_model") != PROCESSING_MODEL
+        ):
+            raise PublicationContractError(
+                f"Illustration {sequence} has no current QA contract"
+            )
+        quality_review = usage.get("quality_review")
+        if not isinstance(quality_review, dict) or _illustration_review_errors(
+            quality_review
+        ):
+            raise PublicationContractError(
+                f"Illustration {sequence} did not pass visual QA"
+            )
+        artifact_key = f"illustration_qa_{sequence}_{image_sha256[:16]}"
+        qa_artifact = qa_by_key.get(artifact_key)
+        if (
+            qa_artifact is None
+            or qa_artifact.status != "completed"
+            or qa_artifact.prompt_version != ILLUSTRATION_QA_VERSION
+            or not isinstance(qa_artifact.input_json, dict)
+            or qa_artifact.input_json.get("image_sha256") != image_sha256
+            or not isinstance(qa_artifact.output_json, dict)
+        ):
+            raise PublicationContractError(
+                f"Illustration {sequence} QA receipt is missing or invalid"
+            )
+        review_core = {
+            key: value
+            for key, value in quality_review.items()
+            if not str(key).startswith("_")
+        }
+        if qa_artifact.output_json != review_core:
+            raise PublicationContractError(
+                f"Illustration {sequence} QA result does not match metadata"
+            )
+        immutable_qa = await persist_immutable_illustration_qa_receipt(
+            run_id=run_id,
+            sequence=sequence,
+            file_url=str(file_url),
+            image_sha256=image_sha256,
+            source_artifact_key=artifact_key,
+            source_input=copy.deepcopy(qa_artifact.input_json),
+            source_output=copy.deepcopy(qa_artifact.output_json),
+            source_prompt_version=str(qa_artifact.prompt_version or ""),
+        )
+        receipts.append(
+            {
+                "sequence": sequence,
+                "file_url": file_url,
+                "image_sha256": image_sha256,
+                "image_bytes": len(image_content),
+                "qa_verified": True,
+                **immutable_qa,
+                "content_addressed_filename": image_path.name
+                == f"{sequence:02d}-{image_sha256}{image_path.suffix.casefold()}",
+            }
+        )
+    return receipts
+
+
+async def _revalidate_reused_illustration_assets(
+    run_id: str,
+    *,
+    saved_illustrations: list[dict[str, Any]],
+    refreshed_concepts: list[dict[str, Any]],
+    public_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Publish a saved bitmap only after QA against the refreshed facts."""
+
+    public_rows = _reuse_saved_illustration_assets(
+        saved_illustrations,
+        refreshed_concepts,
+    )
+    async with SessionLocal() as session:
+        stored_rows = list(
+            (
+                await session.execute(
+                    select(ReportIllustration).where(
+                        ReportIllustration.run_id == run_id
+                    )
+                )
+            ).scalars()
+        )
+    stored_by_sequence = {row.sequence: row for row in stored_rows}
+    semaphore = asyncio.Semaphore(ILLUSTRATION_ROLE_CONCURRENCY)
+
+    async def validate_one(
+        position: int,
+        public_item: dict[str, Any],
+        concept: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        sequence = _non_negative_int(public_item.get("sequence")) or position
+        image_path = _saved_illustration_file_path(
+            run_id,
+            public_item.get("file_url"),
+        )
+        receipt: dict[str, Any] = {
+            "sequence": sequence,
+            "file_url": public_item.get("file_url"),
+            "published": False,
+            "reason": None,
+        }
+        if image_path is None:
+            receipt["reason"] = "saved_image_missing_or_outside_run_scope"
+            return None, receipt
+        media_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(image_path.suffix.casefold(), "image/png")
+        stored = stored_by_sequence.get(sequence)
+        stored_usage = stored.usage_json if stored is not None else None
+        generation_prompt = (
+            str(stored_usage.get("accepted_generation_prompt") or "")
+            if isinstance(stored_usage, dict)
+            else ""
+        )
+        if not generation_prompt and stored is not None:
+            generation_prompt = str(stored.generation_prompt or "")
+        if not generation_prompt:
+            generation_prompt = (
+                "Saved AIV illustration; original generation prompt unavailable."
+            )
+        evidence_paths = [
+            str(path)
+            for path in concept.get("evidence_paths") or []
+            if isinstance(path, str)
+        ]
+        fact_context = _illustration_fact_context(
+            public_report,
+            sequence,
+            evidence_paths,
+        )
+        generation_concept = _illustration_generation_concept(
+            concept,
+            sequence=sequence,
+            fact_context=fact_context,
+        )
+        try:
+            async with semaphore:
+                content = image_path.read_bytes()
+                review = await _review_illustration(
+                    run_id,
+                    sequence=sequence,
+                    concept=generation_concept,
+                    fact_context=fact_context,
+                    generation_prompt=generation_prompt,
+                    image_content=content,
+                    media_type=media_type,
+                )
+            errors = _illustration_review_errors(review)
+            if errors:
+                receipt["reason"] = "visual_qa_rejected"
+                receipt["errors"] = errors
+                return None, receipt
+            image_sha256 = hashlib.sha256(content).hexdigest()
+            content_addressed_path = image_path.with_name(
+                f"{sequence:02d}-{image_sha256}{image_path.suffix.casefold()}"
+            )
+            if content_addressed_path != image_path:
+                if content_addressed_path.exists():
+                    if (
+                        hashlib.sha256(content_addressed_path.read_bytes()).hexdigest()
+                        != image_sha256
+                    ):
+                        raise PublicationContractError(
+                            "Content-addressed illustration path has different bytes"
+                        )
+                else:
+                    temporary = content_addressed_path.with_suffix(
+                        content_addressed_path.suffix + ".tmp"
+                    )
+                    temporary.write_bytes(content)
+                    temporary.replace(content_addressed_path)
+            safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)
+            content_addressed_url = (
+                f"/static/generated/{safe_run_id}/{content_addressed_path.name}"
+            )
+            refreshed_usage = dict(stored_usage or {})
+            refreshed_usage.update(
+                {
+                    "quality_review": review,
+                    "quality_model": PROCESSING_MODEL,
+                    "quality_version": ILLUSTRATION_QA_VERSION,
+                    "accepted_generation_prompt": generation_prompt,
+                    "image_sha256": image_sha256,
+                    "reused_asset_revalidated": True,
+                }
+            )
+            async with SessionLocal() as session:
+                updated = await session.execute(
+                    update(ReportIllustration)
+                    .where(
+                        ReportIllustration.run_id == run_id,
+                        ReportIllustration.sequence == sequence,
+                        ReportIllustration.file_url == public_item.get("file_url"),
+                    )
+                    .values(
+                        file_url=content_addressed_url,
+                        usage_json=refreshed_usage,
+                        error_message=None,
+                    )
+                )
+                if updated.rowcount != 1:
+                    await session.rollback()
+                    receipt["reason"] = "saved_image_record_changed_during_qa"
+                    return None, receipt
+                await session.commit()
+            receipt.update(
+                {
+                    "file_url": content_addressed_url,
+                    "published": True,
+                    "reason": "visual_qa_passed",
+                    "image_sha256": image_sha256,
+                    "review_sha256": _stable_json_sha256(review),
+                }
+            )
+            published_item = copy.deepcopy(public_item)
+            published_item["file_url"] = content_addressed_url
+            return published_item, receipt
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            receipt.update(
+                {
+                    "reason": "visual_qa_failed",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            return None, receipt
+
+    outcomes = await asyncio.gather(
+        *(
+            validate_one(position, public_item, concept)
+            for position, public_item, concept in (
+                _reused_illustration_validation_jobs(
+                    public_rows,
+                    refreshed_concepts,
+                )
+            )
+        )
+    )
+    published = [item for item, _receipt in outcomes if item is not None]
+    receipts = [receipt for _item, receipt in outcomes]
+    manifest_core = {
+        "version": f"{ILLUSTRATION_QA_VERSION}-saved-assets-v1",
+        "saved_asset_count": len(saved_illustrations),
+        "candidate_count": len(public_rows),
+        "published_count": len(published),
+        "receipts": receipts,
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key="reused_illustration_qa_manifest",
+        status="completed",
+        model=None,
+        input_json={
+            "public_report_sha256": _stable_json_sha256(public_report),
+            "concepts_sha256": _stable_json_sha256(refreshed_concepts),
+            "saved_assets_sha256": _stable_json_sha256(saved_illustrations),
+        },
+        output_json={
+            **manifest_core,
+            "manifest_sha256": _stable_json_sha256(manifest_core),
+        },
+        prompt_version=f"{ILLUSTRATION_QA_VERSION}-saved-assets-v1",
+    )
+    return published
 
 
 async def _synchronize_reused_illustration_metadata(
@@ -35050,28 +38757,32 @@ async def _run_reused_report_branches(
             )
         except asyncio.CancelledError:
             raise
-        except OpenRouterError as exc:
+        except Exception as exc:
             logger.warning(
                 "Illustration copy validation failed for saved run %s; "
-                "using deterministic fallback (%s)",
+                "publishing the analysis without saved illustrations (%s)",
                 run_id,
                 type(exc).__name__,
             )
-            fallback = _fallback_reused_illustration_concepts()
             await _save_artifact(
                 run_id,
                 stage_key="report",
-                artifact_key="illustration_concepts_fallback",
+                artifact_key="illustration_layer_degraded",
                 status="completed",
                 model=None,
                 input_json={
-                    "reason": "saved_asset_copy_validation_failed",
+                    "reason": "saved_asset_copy_not_publishable",
                     "source_version": ILLUSTRATION_CONCEPTS_VERSION,
                 },
-                output_json={"illustrations": fallback},
+                output_json={
+                    "illustrations_published": False,
+                    "saved_asset_count": len(saved_illustrations),
+                    "error_type": type(exc).__name__,
+                },
+                error_message=str(exc),
                 prompt_version=ILLUSTRATION_COPY_FALLBACK_VERSION,
             )
-            return fallback
+            return []
 
     async with asyncio.TaskGroup() as task_group:
         final_task = task_group.create_task(
@@ -35085,9 +38796,11 @@ async def _run_reused_report_branches(
 
     return (
         final_task.result(),
-        _reuse_saved_illustration_assets(
-            saved_illustrations,
-            concepts_task.result(),
+        await _revalidate_reused_illustration_assets(
+            run_id,
+            saved_illustrations=saved_illustrations,
+            refreshed_concepts=concepts_task.result(),
+            public_report=public_report,
         ),
     )
 
@@ -35564,6 +39277,7 @@ async def _final_analysis_foundation_context(run_id: str) -> dict[str, Any]:
         "offer_catalog",
         "prompt_foundation",
         "answer_set_receipt",
+        "panel_metric_coverage_admission",
         "legacy_prompt_foundation_audit",
         "legacy_answer_foundation_audit",
     )
@@ -35586,6 +39300,129 @@ async def _final_analysis_foundation_context(run_id: str) -> dict[str, Any]:
     }
 
 
+async def _admit_panel_metric_coverage(
+    run_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Separate immutable raw evidence from its analytic denominator gate."""
+
+    rows = await _metric_rows(
+        run_id,
+        # Annotation freshness is irrelevant at this boundary.  Only raw
+        # completion, transport attestation and physical completeness decide
+        # whether a cell may enter a denominator.
+        annotation_input_sha256="panel-coverage-pre-annotation",
+    )
+    (
+        expected_cells,
+        panel_corpus_receipt_sha256,
+        topology_authority,
+    ) = await _expected_corpus_contract(run_id, rows)
+    admission = build_panel_metric_coverage_admission(
+        expected_cells=expected_cells,
+        observed_rows=rows,
+    )
+    await _save_artifact(
+        run_id,
+        stage_key="knowledge_gap",
+        artifact_key="panel_metric_coverage_admission",
+        status="completed",
+        model=None,
+        input_json={
+            "panel_corpus_receipt_key": PANEL_CORPUS_RECEIPT_KEY,
+            "panel_corpus_receipt_sha256": panel_corpus_receipt_sha256,
+            "topology_authority": topology_authority,
+            "expected_cells_sha256": admission[
+                "expected_cell_manifest_sha256"
+            ],
+            "expected_cell_count": len(expected_cells),
+            "observed_cell_count": len(rows),
+        },
+        output_json=admission,
+        usage_json={
+            "eligible_cell_count": admission["eligible_cell_count"],
+            "expected_cell_count": admission["expected_cell_count"],
+            "coverage_rate": admission["coverage_rate"],
+        },
+        prompt_version=PANEL_METRIC_COVERAGE_ADMISSION_VERSION,
+    )
+    require_panel_metric_coverage(admission)
+    return rows, expected_cells, admission
+
+
+async def _assert_saved_answer_marker_raw_corpus(
+    session: Any,
+    *,
+    run_id: str,
+) -> None:
+    """Recheck the operator raw digest inside the publication transaction.
+
+    The no-op row update acquires SQLite's writer lock in the same transaction
+    that stages the publication receipt and promotes the report.  A matching
+    digest therefore remains true until commit, closing the crash window
+    between analyzer completion and the CLI's independent post-run check.
+    """
+
+    locked = await session.execute(
+        update(Run)
+        .where(Run.id == run_id)
+        .values(state_revision=Run.state_revision)
+    )
+    if locked.rowcount != 1:
+        raise PanelCheckpointMismatchError(
+            "Saved-answer raw marker mismatch: run_missing"
+        )
+    run_row = (
+        await session.execute(
+            select(Run.config_json, Run.lease_owner, Run.attempt_count).where(
+                Run.id == run_id
+            )
+        )
+    ).one_or_none()
+    if run_row is None:
+        raise PanelCheckpointMismatchError(
+            "Saved-answer raw marker mismatch: run_missing"
+        )
+    config_json, lease_owner, attempt_count = run_row
+    if not isinstance(config_json, dict):
+        return
+    marker = config_json.get(SAVED_ANSWERS_ONLY_MARKER_KEY)
+    if marker is None:
+        return
+    expected_sha256 = (
+        str(marker.get("raw_answers_sha256") or "")
+        if isinstance(marker, dict)
+        else ""
+    )
+    if (
+        not isinstance(marker, dict)
+        or marker.get("version") != SAVED_ANSWERS_ONLY_MARKER_VERSION
+        or marker.get("mode") != SAVED_ANSWERS_ONLY_MODE
+        or marker.get("run_id") != run_id
+        or marker.get("owner") != lease_owner
+        or marker.get("attempt_count") != int(attempt_count or 0)
+        or len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise PanelCheckpointMismatchError(
+            "Saved-answer raw marker mismatch: invalid_marker"
+        )
+    answer_rows = list(
+        (
+            await session.execute(
+                select(ModelAnswer)
+                .where(ModelAnswer.run_id == run_id)
+                .order_by(ModelAnswer.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if model_answer_fingerprint_rows(answer_rows) != expected_sha256:
+        raise PanelCheckpointMismatchError(
+            "Saved-answer raw marker mismatch: persisted_corpus_changed"
+        )
+
+
 async def _finish_saved_answer_analysis(
     run_id: str,
     *,
@@ -35594,6 +39431,11 @@ async def _finish_saved_answer_analysis(
     technical_review: dict[str, Any],
     regenerate_illustrations: bool = True,
 ) -> None:
+    (
+        _coverage_rows,
+        expected_corpus_cells,
+        _coverage_admission,
+    ) = await _admit_panel_metric_coverage(run_id)
     catalog_answers = await _answers_for_catalog(run_id)
     if not catalog_answers:
         raise OpenRouterError("No saved model answers are available for reanalysis")
@@ -35604,7 +39446,8 @@ async def _finish_saved_answer_analysis(
         annotation_input_sha256=_annotation_context_sha256(profile, catalog),
     )
     metrics = _compute_metrics(rows, profile, catalog)
-    expected_corpus_cells = await _expected_corpus_cells(run_id, rows)
+    # The corpus topology was admitted before any semantic model work.  The
+    # annotations below cannot add, remove or rename raw panel cells.
     catalog, rows, metrics, critic_gate = await _run_analysis_critic_loop(
         run_id,
         profile=profile,
@@ -35702,6 +39545,14 @@ async def _finish_saved_answer_analysis(
         "illustrations": illustrations,
         **({"site_preview": site_preview} if site_preview else {}),
     }
+    reader_copy_manifest = await _save_reader_copy_manifest(
+        run_id,
+        final_report=final,
+        public_report=public_report,
+        illustrations=illustrations,
+        analysis_markdown=markdown,
+        report_json=report_json,
+    )
     owner = lease_owner_for(run_id)
     report_conditions = [Run.id == run_id]
     if owner is not None:
@@ -35718,18 +39569,44 @@ async def _finish_saved_answer_analysis(
                 ),
             )
         )
+    finished_at = datetime.now(timezone.utc)
     async with SessionLocal() as session:
+        await stage_publication_receipt(
+            session,
+            run_id=run_id,
+            report_json=report_json,
+            analysis_markdown=markdown,
+            reader_copy_manifest=reader_copy_manifest,
+        )
+        await _assert_saved_answer_marker_raw_corpus(session, run_id=run_id)
         saved = await session.execute(
             update(Run)
             .where(*report_conditions)
             .values(
                 analysis_markdown=markdown,
                 report_json=report_json,
+                status=RunStatus.completed,
+                stage_key="report",
+                stage_label="Собираем отчёт и иллюстрации",
+                stage_detail="Отчёт готов.",
+                progress_current=100,
+                progress_total=100,
+                progress_percent=100,
+                eta_seconds=0,
+                error_message=None,
+                execution_slot=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                finished_at=finished_at,
+                state_changed_at=finished_at,
+                checkpointed_at=finished_at,
+                state_revision=Run.state_revision + 1,
             )
-            .returning(Run.id)
+            .returning(Run.id, Run.state_revision)
         )
-        saved_run_id = saved.scalar_one_or_none()
-        if saved_run_id is None:
+        saved_row = saved.one_or_none()
+        if saved_row is None:
             await session.rollback()
         else:
             if not regenerate_illustrations:
@@ -35739,23 +39616,34 @@ async def _finish_saved_answer_analysis(
                     illustrations=illustrations,
                 )
             await session.commit()
-    if saved_run_id is None:
+    if saved_row is None:
         if owner is not None:
             raise RunLeaseLostError(f"Run lease lost for {run_id}")
         raise LookupError(f"Run not found: {run_id}")
-    completed = await complete_run(run_id)
-    if not completed:
-        if owner is not None:
-            raise RunLeaseLostError(
-                f"Run lease lost before terminal completion for {run_id}"
-            )
-        raise LookupError(f"Run could not be completed: {run_id}")
+    saved_run_id, revision = saved_row
+    bus.publish(
+        str(saved_run_id),
+        {
+            "type": "final",
+            "status": "completed",
+            "run_state": "completed",
+            "state_revision": int(revision or 0),
+        },
+    )
 
 
 async def reprocess_saved_answers(run_id: str) -> None:
     """Rebuild annotations, metrics and report without calling the model panel."""
 
     try:
+        # This is the first integrity boundary of saved-answer reprocessing.
+        # Existing receipts are validated before catalog/profile/annotation
+        # artifacts can change. Historical runs without a receipt receive an
+        # explicitly non-historical baseline seal at this exact boundary.
+        await _seal_or_validate_panel_corpus_receipt(
+            run_id,
+            allow_legacy_baseline=True,
+        )
         await update_progress(
             run_id,
             stage="knowledge_gap",
@@ -35773,6 +39661,11 @@ async def reprocess_saved_answers(run_id: str) -> None:
             run_id,
             allow_legacy_snapshot=True,
         )
+        await _validate_panel_foundation_resume(
+            run_id,
+            profile=profile,
+            site_context=_site_context_value,
+        )
         await _save_answer_set_receipt(run_id)
         await _finish_saved_answer_analysis(
             run_id,
@@ -35783,6 +39676,73 @@ async def reprocess_saved_answers(run_id: str) -> None:
         )
     except asyncio.CancelledError:
         raise
+    except PanelCheckpointMismatchError as exc:
+        logger.error(
+            "Saved-answer reanalysis rejected panel checkpoint for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Переанализ остановлен: сохранённые сценарии, ответы или их "
+            "контрольный receipt не прошли проверку целостности. Исходные "
+            "ответы не изменены; нужна операторская проверка.",
+            failure_stage="integrity_review_required",
+        )
+    except PanelMetricCoverageError as exc:
+        logger.error(
+            "Saved-answer reanalysis has insufficient panel coverage for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Сохранённые ответы целы, но содержательно полных наблюдений "
+            "недостаточно для корректных процентов по моделям и сценариям. "
+            "Отчёт не опубликован; нужна точечная операторская проверка "
+            "недоступных ответов, а не повторная обработка тех же данных.",
+            failure_stage="panel_review_required",
+        )
+    except OfferCatalogAdmissionError as exc:
+        logger.error(
+            "Saved-answer reanalysis stopped by offer-catalog admission for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Не удалось подтвердить продукты или услуги по сохранённым "
+            "страницам сайта. Технические данные и ответы моделей сохранены, "
+            "но строить отчёт на неподтверждённом каталоге нельзя. Нужна "
+            "проверка источников, а не повторный опрос моделей.",
+            failure_stage="source_review_required",
+        )
+    except CrawlAdmissionIncomplete as exc:
+        logger.error(
+            "Saved-answer reanalysis stopped by crawl admission for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Сохранённый технический срез не прошёл проверку полноты. Ответы "
+            "моделей не изменены, но для корректного отчёта нужно заново "
+            "проверить страницы сайта; повторный анализ тех же страниц не поможет.",
+            failure_stage="source_review_required",
+        )
+    except OfferCatalogError as exc:
+        logger.error(
+            "Saved-answer reanalysis stopped by catalog contract for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Сохранённые данные не прошли проверку целостности каталога или "
+            "сценариев. Ответы моделей не изменены; нужна операторская "
+            "проверка артефактов, а не повторный запуск того же шага.",
+            failure_stage="integrity_review_required",
+        )
     except Exception:
         logger.exception("Saved-answer reanalysis failed for run %s", run_id)
         await fail_run(
@@ -35794,6 +39754,12 @@ async def reprocess_saved_answers(run_id: str) -> None:
 
 async def analyze_run(run_id: str) -> None:
     try:
+        # Validate the persisted nine-prompt panel checkpoint before any
+        # upstream model work or artifact writes. Provenance validation still
+        # follows below, but a DB/artifact mismatch must fail at the cheapest,
+        # read-only boundary.
+        panel_checkpoint = await _load_panel_resume_checkpoint(run_id)
+        panel_corpus_is_sealed = await _validate_panel_corpus_receipt_if_present(run_id)
         await update_progress(
             run_id,
             stage="scenario_design",
@@ -35803,11 +39769,6 @@ async def analyze_run(run_id: str) -> None:
             status=RunStatus.analyzing,
         )
         await apply_ua_conditional_block(run_id)
-        # Validate the persisted nine-prompt panel checkpoint before any
-        # upstream model work or artifact writes. Provenance validation still
-        # follows below, but a DB/artifact mismatch must fail at the cheapest,
-        # read-only boundary.
-        panel_checkpoint = await _load_panel_resume_checkpoint(run_id)
         (
             technical,
             technical_review,
@@ -35862,35 +39823,40 @@ async def analyze_run(run_id: str) -> None:
                 detail="Продолжаем с сохранёнными сценариями и ответами.",
                 eta_seconds=840,
             )
-        await update_progress(
-            run_id,
-            stage="web_visibility",
-            percent=38,
-            detail="Запрашиваем независимые ответы с актуальным веб-поиском.",
-            eta_seconds=900,
-        )
-        await _run_panel(
-            run_id,
-            prompts,
-            mode="web",
-            start_percent=38,
-            end_percent=64,
-        )
-        await update_progress(
-            run_id,
-            stage="knowledge_gap",
-            percent=65,
-            detail="Проверяем знания моделей без веб-поиска.",
-            eta_seconds=600,
-        )
-        await _run_panel(
-            run_id,
-            prompts,
-            mode="memory",
-            start_percent=65,
-            end_percent=72,
-        )
+        if not panel_corpus_is_sealed:
+            await update_progress(
+                run_id,
+                stage="web_visibility",
+                percent=38,
+                detail="Запрашиваем независимые ответы с актуальным веб-поиском.",
+                eta_seconds=900,
+            )
+            await _run_panel(
+                run_id,
+                prompts,
+                mode="web",
+                start_percent=38,
+                end_percent=64,
+            )
+            await update_progress(
+                run_id,
+                stage="knowledge_gap",
+                percent=65,
+                detail="Проверяем знания моделей без веб-поиска.",
+                eta_seconds=600,
+            )
+            await _run_panel(
+                run_id,
+                prompts,
+                mode="memory",
+                start_percent=65,
+                end_percent=72,
+            )
         await _save_answer_set_receipt(run_id)
+        await _seal_or_validate_panel_corpus_receipt(
+            run_id,
+            allow_legacy_baseline=False,
+        )
         await _finish_saved_answer_analysis(
             run_id,
             profile=profile,
@@ -35906,11 +39872,58 @@ async def analyze_run(run_id: str) -> None:
             "Продолжение остановлено: сохранённые сценарии и ответы не прошли "
             "проверку целостности. Исходные ответы не изменены; нужна "
             "операторская проверка.",
+            failure_stage="integrity_review_required",
+        )
+    except PanelMetricCoverageError as exc:
+        logger.error(
+            "Panel metric coverage stopped analysis for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Ответы сохранены, но содержательно полных наблюдений недостаточно "
+            "для корректного отчёта. Сервис не превращает оборванные ответы "
+            "или единичные наблюдения в точные проценты; нужна точечная "
+            "диагностика недоступных ячеек.",
+            failure_stage="panel_review_required",
+        )
+    except OfferCatalogAdmissionError as exc:
+        logger.error(
+            "Offer-catalog admission stopped analysis for run %s: %s",
+            run_id,
+            exc,
+        )
+        await fail_run(
+            run_id,
+            "Не удалось подтвердить продукты или услуги по сохранённым "
+            "страницам сайта. Технические данные сохранены, но строить "
+            "сценарии на неподтверждённом каталоге нельзя. Нужна проверка "
+            "источников; повторное продолжение с теми же данными не поможет.",
+            failure_stage="source_review_required",
+        )
+    except CrawlAdmissionIncomplete as exc:
+        logger.error("Crawl admission stopped analysis for run %s: %s", run_id, exc)
+        await fail_run(
+            run_id,
+            "Технический срез сайта неполон или не прошёл проверку целостности. "
+            "Опрос моделей не запускаем: сначала нужно повторно проверить "
+            "страницы сайта.",
+        )
+    except OfferCatalogError as exc:
+        logger.error("Catalog contract stopped analysis for run %s: %s", run_id, exc)
+        await fail_run(
+            run_id,
+            "Каталог предложений, сценарии или их контрольные суммы не прошли "
+            "проверку. Уже полученные данные сохранены; нужна операторская "
+            "диагностика, а не обычное продолжение.",
+            failure_stage="integrity_review_required",
         )
     except Exception:
         logger.exception("AIV analysis failed for run %s", run_id)
         await fail_run(
             run_id,
-            "Проверка прервалась во время анализа. Нажмите «Продолжить»: "
-            "сервис использует уже сохранённые ответы и завершит недостающие этапы.",
+            "Проверка остановилась из-за внутренней ошибки. Все уже полученные "
+            "данные сохранены, но сервис не будет автоматически повторять "
+            "опрос моделей до безопасной диагностики.",
         )

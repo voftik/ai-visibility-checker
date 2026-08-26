@@ -3,12 +3,14 @@
 AIV — публичный сервис RW+ для экспресс-исследования доступности сайта и бренда в ИИ-поиске. Пользователь указывает один домен, после чего сервис:
 
 1. проверяет, какой HTML и какие правила сайт отдаёт поисковым и ИИ-краулерам;
-2. определяет бренд, продукты, аудиторию, рынок и реальные задачи выбора;
-3. моделирует девять пользовательских сценариев;
-4. получает ответы пяти семейств ИИ-систем с веб-поиском и четырёх семейств без него;
-5. детерминированно считает метрики по сохранённым ответам;
-6. пропускает расчёты и текст через ограниченные циклы критики;
-7. публикует интерактивный отчёт, реальные данные и иллюстрации.
+2. определяет бренд и подтверждает продукты или услуги точными фрагментами
+   сохранённых страниц;
+3. исследует аудиторию, рынок и реальные задачи выбора;
+4. моделирует девять пользовательских сценариев;
+5. получает ответы пяти семейств ИИ-систем с веб-поиском и четырёх семейств без него;
+6. детерминированно считает метрики по сохранённым ответам;
+7. пропускает расчёты и текст через ограниченные циклы критики;
+8. публикует интерактивный отчёт, реальные данные и иллюстрации.
 
 Этот документ рассчитан на разработчиков, которые будут ревьювить код, искать узкие места, менять методологию, ускорять пайплайн и поддерживать production. Он описывает текущую реализацию, а не желаемую архитектуру.
 
@@ -18,7 +20,11 @@ AIV — публичный сервис RW+ для экспресс-исслед
 > - Метрики считает код, а не финальная LLM.
 > - `unknown` и `unavailable` не превращаются в ноль и не попадают в знаменатель.
 > - Режим «с вебом» или «без веба» учитывается только после проверки фактической транспортной телеметрии.
+> - Продукт или услуга клиента входит в сценарии только с буквальным source receipt; общая рыночная тема не считается предложением бренда.
+> - Корпус технического аудита ограничен 6–8 страницами, максимум 10. Длина содержательных страниц и raw-ответов локально не ограничена.
 > - Повторный анализ существующей проверки не должен повторно собирать исходные ответы панели.
+> - Историческая проверка использует сетку provider/mode/model из собственного
+>   неизменяемого receipt, а не из сегодняшней конфигурации панели.
 > - Публичный отчёт не должен публиковаться, если критик, provenance-проверка или semantic gate нашли неустранённое противоречие.
 
 ## Содержание
@@ -85,7 +91,9 @@ flowchart TD
     API --> Q["Durable FIFO queue в SQLite"]
     Q --> C["Crawler и технический аудит"]
     C --> P["Chromium preview"]
-    C --> F["Профиль сайта и исследование рынка"]
+    C --> B["Профиль сайта"]
+    B --> O["Source-bound каталог предложений"]
+    O --> F["Исследование рынка"]
     F --> S["9 INTENT-сценариев"]
     S --> CP["Неизменяемый panel checkpoint"]
     F -. resume .-> CP
@@ -94,13 +102,14 @@ flowchart TD
     W --> A["Каталог сущностей и аннотации"]
     M --> A
     A --> D["Детерминированные метрики"]
-    D --> K["Ограниченный critic loop"]
+    D --> K["Ограниченный critic и recovery loop"]
     K --> R["Финальный аналитический отчёт"]
     K --> I["Концепции и генерация иллюстраций"]
     R --> G["Semantic gate"]
     I --> V["Мультимодальная проверка качества"]
-    G --> PUB["report_json + Markdown"]
-    V --> PUB
+    G --> E["Русская редактура и publication manifest"]
+    V --> E
+    E --> PUB["report_json + Markdown"]
     P --> PUB
     PUB --> SPA["Vanilla SPA, ECharts, SSE"]
 ```
@@ -139,6 +148,7 @@ app/
     ├── proxy_pool.py          необязательный Webshare proxy pool
     ├── site_preview*.py       Chromium preview и worker
     ├── analyzer.py            основной аналитический пайплайн
+    ├── offer_catalog.py       source-bound каталог и admission
     ├── long_response.py       lossless units, manifests и режимы длинных данных
     ├── claim_ledger.py        точный учёт JSON-claims и их coverage
     ├── fact_binding.py        неизменяемая привязка фактов к источникам
@@ -147,6 +157,9 @@ app/
     ├── structured_audit_store.py durable audit и resume для continuable JSON
     ├── openrouter.py          OpenRouter transport и web attestation
     ├── analysis_critic.py     критик сущностей и расчётов
+    ├── recovery_orchestrator.py bounded Fable recovery planner
+    ├── report_editor.py       lossless редактура и защита фактов
+    ├── live_russian_policy.py versioned policy snapshot и linter
     ├── report_semantic_gate.py semantic gate финального текста
     ├── run_coordinator.py     durable FIFO queue и lease
     ├── run_lease.py           защита от записи устаревшим worker
@@ -191,16 +204,24 @@ Crawler:
 1. читает главную страницу с контрольным браузерным user-agent до фактического
    конца ответа; после 4 МБ поток переносится из памяти во временный файл, но
    не обрезается;
-2. извлекает ссылки из полного HTML, читает все глобальные `Sitemap:` из
-   `robots.txt` и рекурсивно обходит `sitemapindex` без потолка числа `loc`;
-3. сохраняет content-addressed receipt каждого sitemap-документа; при
+2. извлекает из полного HTML не только URL, но и source evidence ссылки:
+   `anchor_text`, `title` и ближайший содержательный `primary_snippet`; читает
+   все глобальные `Sitemap:` из `robots.txt` и рекурсивно обходит
+   `sitemapindex` без потолка числа `loc`;
+3. если главная страница распознана как `client_rendered_shell`, всегда запускает
+   isolated worker `aiv-site-preview-worker-v2` в режиме `navigation`, даже
+   когда server HTML уже содержит восемь и больше ссылок;
+4. сохраняет content-addressed receipt каждого sitemap-документа; при
    продолжении повторно использует успешные receipts и перечитывает только
    временно недоступные или незавершённые документы;
-4. после полного discovery выбирает 8 репрезентативных страниц; допустимый
+5. детерминированно ранжирует кандидатов по URL и доказательствам коммерческой
+   релевантности, затем выбирает 8 репрезентативных страниц; допустимый
    runtime scope ограничен диапазоном 6–10, а 10 остаётся жёстким максимумом;
-5. сохраняет выбор и состояние покрытия в versioned artifact
-   `site_page_manifest`;
-6. проверяет выбранные страницы с десятью идентичностями:
+6. сохраняет полный набор candidate evidence в отдельном artifact
+   `page_candidate_relevance`, а в `site_page_manifest` версии
+   `aiv-2026-08-26-site-page-manifest-v6` кладёт только компактную проекцию,
+   точно связанную с полным receipt;
+7. проверяет выбранные страницы с десятью идентичностями:
    - `GPTBot`;
    - `OAI-SearchBot`;
    - `ChatGPT-User`;
@@ -211,9 +232,20 @@ Crawler:
    - `Google-Agent-desktop`;
    - `DeepSeekBot`;
    - `Chrome-control`;
-7. отдельно читает и разбирает `robots.txt`;
-8. сохраняет HTTP status, TLS, redirects, latency, безопасную часть заголовков,
+8. отдельно читает и разбирает `robots.txt`;
+9. сохраняет HTTP status, TLS, redirects, latency, безопасную часть заголовков,
    признаки защит, доступный текст и признаки рендеринга.
+
+Коммерческий выбор использует policy `aiv-commercial-relevance-v1` и receipt
+`aiv-commercial-relevance-receipt-v1`. Полные тексты навигационных
+доказательств не попадают в компактный page manifest. Admission заново сверяет
+их content-addressed artifact с выбранными страницами и технической матрицей.
+
+Только полный, неусечённый navigation receipt протокола v2 подтверждает полное
+rendered discovery. Старый worker, ошибка, тайм-аут или ограниченный результат
+не выдаются за полный обход: manifest получает `discovery_state=terminal_partial`
+и `coverage_state=bounded`. Если пригодных страниц меньше шести, анализ не
+начинается на искусственно дополненном корпусе.
 
 `DeepSeekBot` здесь — диагностический observed token. Он не доказывает поведение официального production crawler DeepSeek.
 
@@ -264,6 +296,38 @@ DataDome, captcha, geo-wall и auth-wall классифицируются отд
 - критерии выбора;
 - рынок, географию и позиционирование;
 - связи между сущностями и уровень уверенности.
+
+#### Доказуемый каталог продуктов и услуг
+
+До исследования рынка и генерации INTENT-сценариев `_bind_offer_catalog()`
+строит отдельный source-bound каталог предложений клиента. Его источники —
+точные `SourceUnit` сохранённых страниц: для каждого блока фиксируются URL,
+идентификатор, полный текст и SHA-256. Кандидат попадает в каталог только тогда,
+когда код может связать его с буквальным фрагментом конкретного source unit и с
+явной ролью клиента как владельца или поставщика. Общая тематика страницы,
+например SEO, programmatic или DOOH, сама по себе продуктом клиента не считается.
+
+Этап сохраняет три независимых доказательства:
+
+- `offer_candidate_normalization_audit` — разбор кандидатов и исходных цитат;
+- `offer_catalog` — не более десяти подтверждённых продуктов, услуг или
+  направлений вместе с dispositions и source manifest digest;
+- `offer_catalog_admission` — code-owned решение о том, можно ли переходить к
+  market research и сценариям.
+
+Ограничение в десять предложений задаёт глубину продукта, но не ограничивает
+длину страниц, цитат или ответов моделей. Пустой каталог не превращается в
+универсальные общие сценарии. Он допускается только для явно некоммерческого
+сайта или сайта без публичного предложения, если профиль имеет confidence
+`medium` или `high`, в сохранённом source unit найдена точная цитата после
+нормализации пробелов, source manifest совпадает и нет коммерческих сигналов.
+Во всех остальных случаях `OfferCatalogAdmissionError` останавливает слой
+fail-closed. Сохранённые технические данные остаются целыми, но неподтверждённый
+каталог не маскируется убедительным отчётом.
+
+Дальше `prompt_foundation` связывает digest профиля, каталога и market research
+с шестью безбрендовыми INTENT-сценариями. Каждый принятый offer cluster должен
+попасть хотя бы в один сценарий либо получить явное проверяемое исключение.
 
 ### 5. Исследование рынка до генерации сценариев
 
@@ -373,7 +437,7 @@ durable receipt. При рестарте дерево продолжается �
 
 Несовпавшая или устаревшая аннотация не используется.
 
-Текущая версия разметки — `annotations-v18`. Перед разметкой каждый полный
+Текущая версия разметки — `annotations-v19`. Перед разметкой каждый полный
 raw-ответ делится кодом на lossless units. Каждый unit обрабатывается отдельно,
 а ответ сохраняется только после того, как вернулись все ожидаемые unit id и
 детерминированный reducer собрал единую аннотацию. Окна одного batch ограничивают
@@ -389,6 +453,10 @@ heading и поля вроде «Профиль», «Локация» и «Ос�
 засчитывает буквальный факт только тому core, с которым пересекается evidence.
 Overlap поэтому не создаёт двойных упоминаний и не разрывает связь
 «владелец → услуга» на механической границе окна.
+Версия v19 дополнительно связывает конкретную сущность только с её собственной
+canonical-группой `entity_attribution_aliases` из того же raw-ответа. Общие
+алиасы владельца остаются контекстом, но не могут разрешить атрибуцию соседней
+услуги или продукта.
 При пересборке сохранённого run старые derived-аннотации переразмечаются, тогда
 как panel/raw-ответы моделей не запрашиваются и не изменяются.
 
@@ -402,7 +470,7 @@ Overlap поэтому не создаёт двойных упоминаний �
 - сузить alias/entity policy;
 - запросить повторную аннотацию и пересчёт.
 
-Критик не может переписать raw answers или вручную назначить проценты. Максимум — два раунда. Первый `revise` запускает ограниченную корректировку; повторное возражение или `block` останавливает публикацию.
+Критик не может переписать raw answers или вручную назначить проценты. Максимум — два раунда. Первый `revise` запускает ограниченную корректировку; повторное возражение или `block` останавливает публикацию. Terminal block связан не только с текущими фактами, но и с точной версией critic/model/map-reduce/recovery policy и digest ожидаемой сетки панели. Поэтому тот же execution scope не зацикливается, а осознанное обновление критика или контракта получает одну новую ограниченную попытку.
 
 Первичный контекст критика содержит полный индекс корпуса с SHA, provenance,
 разметкой и lossless manifest каждого raw-ответа. Прежняя выборка максимум из
@@ -461,7 +529,16 @@ schema-invalid verdict не становится готовым решением
   input budget по умолчанию отключён, а фактический provider context window
   маршрутизируется через иерархический evidence-tree.
 
-Структурный кандидат отчёта может получить одну repair-попытку. После этого отдельный semantic gate проверяет causal claims, режимы, недоступные срезы, числа и ограничения; для semantic repair предусмотрено не более двух итераций.
+Структурный кандидат отчёта может получить одну repair-попытку. После этого
+отдельный semantic gate проверяет causal claims, режимы, недоступные срезы,
+числа и ограничения; для semantic repair предусмотрено не более двух итераций.
+Когда исходный evidence-корпус не помещается в один физический запрос,
+code-owned planner строит полную матрицу «утверждение отчёта × lossless
+evidence shard». Каждая disposition обязана вернуть точные claim/shard IDs,
+source path и подтверждаемую цитату. Ordered coverage manifest не допускает
+пропуска, подмены или повторного учёта хвоста корпуса. Два schema-invalid или
+неполных protocol rounds завершаются fail-closed; найденное в последнем shard
+материальное противоречие поднимает итоговый verdict как минимум до `revise`.
 
 Визуальная ветка:
 
@@ -550,6 +627,17 @@ Long-response harness разделяет три разные задачи:
 производного JSON-документа. Смешивать эти режимы нельзя: вторая
 генерация может продолжить отчёт, но не может стать частью первичного
 ответа модели или авторитетного вердикта.
+
+Важно не смешивать два независимых scope-контракта:
+
+- технический аудит ограничен 6–8 страницами, по умолчанию берёт 8 и никогда
+  не превышает 10;
+- длина содержательной страницы или raw-ответа модели локально не ограничена.
+
+Числа 10, 16 000, 24 000 или 48 000 в коде описывают продуктовую глубину либо
+размер одного рабочего shard. Они не разрешают отрезать хвост источника. Когда
+данные не помещаются в физическое окно модели, harness создаёт больше units и
+provider-вызовов, а manifests доказывают exact-once покрытие всего источника.
 
 В production нет локальных output-потолков на 3 200 или 6 400 токенов,
 а также production-ограничений по числу частей или минимальной длине
@@ -719,22 +807,58 @@ output концепций собирается structured-continuation harness �
 
 После смысловой приёмки аналитики отдельный редакционный слой обрабатывает все
 читательские строки итогового отчёта и технического аудита. Политика
-`aiv-ru-editorial-policy-v3` переносит в исполняемые требования правила
-`ru-text` и внутренней инструкции RW+ «Живой русский язык»: называет деятеля и
-носителя каждого числа, отделяет наблюдение от интерпретации, убирает пассив,
-канцелярит, лозунги, механические тройки, длинное тире, мета-повествование и
-фразы «капитана очевидность».
+`aiv-ru-editorial-policy-v4` и lossless harness
+`aiv-report-editor-lossless-v6` переносят в исполняемые требования правила
+`ru-text` и внутренней инструкции RW+ «Живой русский язык». Production не
+читает файл из пользовательского Yandex Disk. Проверенная копия хранится в
+`app/policies/live_russian_ru.v2026-07-29.md`, manifest version —
+`live-russian-2026-07-29.1`. Модуль принимает snapshot только при SHA-256
+`0cd7bbc6cdb006331b3df3c414cc0cdb9bc9860dfa2706b098fe610778392d84`.
+Смена хотя бы одного байта без обновления версии и checksum закрывает
+редакционный контракт.
+
+Слой называет деятеля и носителя каждого числа, отделяет наблюдение от
+интерпретации, убирает пассив, канцелярит, лозунги, механические тройки, длинное
+тире, мета-повествование и фразы «капитана очевидность». Те же editor, critic и
+bounded arbiter обрабатывают не только финальный narrative, но и техническое
+ревью, заголовки, подписи и alt-тексты иллюстраций.
 
 Редактор не имеет права менять числа, знаменатели, бренды, продукты, URL,
 причинность, модальность, границы выборки или набор утверждений. Текст любой
 длины делится на lossless units без общего потолка; каждый claim получает
 receipt, независимый critic сравнивает исходную и новую формулировки, а спорный
-unit проходит не более одной арбитражной правки. Для финального отчёта вся
+unit проходит не более одной арбитражной правки. Пробелы и переносы на границе
+units остаются под контролем кода: модель редактирует только внутренний текст,
+а сборщик восстанавливает точные разделители и проверяет их по отдельным
+receipts. Для финального отчёта вся
 отредактированная версия повторно проходит полный semantic gate на исходных
 данных. Если покрытие неполно, факт изменился или редакционный вызов недоступен,
 публикуется уже проверенная исходная формулировка и сохраняется явный fallback
 audit. Редактура никогда не блокирует готовый доказанный отчёт и не может
 исправлять метрики словом.
+
+Перед записью `analysis_markdown` и `report_json` запускается
+`reader_copy_manifest` версии `aiv-reader-copy-manifest-v5`. Он связывает:
+
+- SHA-256 отредактированного финального отчёта и точный Markdown, который из
+  него отрендерен;
+- публичный narrative в `report_json`;
+- публичный snapshot расчётного отчёта;
+- опубликованный набор иллюстраций и их подписи;
+- редакционные receipts финального, технического и иллюстративного слоёв;
+- manifest и SHA-256 канонической русской политики;
+- версионированный code-owned registry всех интерфейсных и fallback-текстов;
+- точные байты опубликованных bitmap-иллюстраций и site preview.
+
+Browser загружает тот же `static/reader-copy-registry.ru.v2026-08-26.js` по
+закреплённому SRI, который backend проверяет байт-в-байт и прогоняет через
+русский lint. Поэтому текст, созданный кодом, не обходит финальную редакционную
+политику. Manifest возвращает `pass`, `degraded_safe` или `block`. Недоступный редактор,
+предупреждение линтера или безопасный fallback дают `degraded_safe`: готовая
+аналитика не теряется. Несовпадение опубликованного Markdown/JSON, подмена
+значения, policy digest или audit digest дают `block` до записи публичного
+отчёта. Так слой качества улучшает формулировки, но не получает права менять
+факты или скрывать повреждение publication contract.
 
 ### Structured responses
 
@@ -785,9 +909,12 @@ transport-примитив для структурированных анали�
   корпуса под реальные окна провайдера, а не обрезание источника.
 
 Переанализ сохранённой проверки не требует повторно опрашивать модельную
-панель. `scripts/reprocess_saved_run.py` перестраивает только downstream-слои и
-перед записью сверяет SHA-256 всего raw-корпуса. Исходные panel answers
-не запрашиваются заново и не переписываются.
+панель. `scripts/reprocess_saved_run.py` перестраивает только downstream-слои.
+Он снимает точный SHA-256 всех физических полей `model_answers`, а analyzer
+повторно сверяет этот digest уже под SQLite writer lock внутри той же
+транзакции, которая записывает publication receipt, новый report и terminal
+status. После возврата CLI выполняет независимую третью сверку. Исходные panel
+answers не запрашиваются заново и не переписываются.
 
 ## Как считаются метрики
 
@@ -910,16 +1037,20 @@ Artifact — mutable checkpoint по уникальному ключу `(run_id,
 
 Основные группы artifacts:
 
-- page manifest и site preview;
-- site profile и technical review;
+- page manifest, commercial-relevance receipt и site preview;
+- site profile, source-bound offer catalog, admission и technical review;
 - market research;
 - prompt set и prompt semantic review;
+- полный panel-corpus receipt с исторической provider/mode/model topology и
+  отдельный coverage admission, связанный с digest этой сетки;
 - entity catalog и annotation batches;
 - metrics;
 - critic rounds, policy и gate;
 - full-corpus manifest, context selection и token preflight;
-- final author candidate, semantic review и repair;
-- illustration concepts, candidates и QA.
+- final author candidate, semantic review, claim×evidence coverage и repair;
+- illustration concepts, candidates, fresh/saved-asset QA;
+- editorial receipts, code-owned copy registry, immutable reader manifest и
+  content-addressed publication receipts.
 
 Версии слоёв находятся в верхней части `app/services/analyzer.py`, а версии критиков — в соответствующих модулях. Если изменился смысл prompt, schema, deterministic policy или входной контракт, нужно увеличить именно версию затронутого слоя. Иначе старый artifact может быть ошибочно принят за актуальный.
 
@@ -984,7 +1115,7 @@ FastAPI OpenAPI и интерактивная документация откл�
 | `GET` | `/api/ui-version` | Текущий UI build id |
 | `GET` | `/api/healthz` | Минимальный liveness check |
 | `POST` | `/api/runs` | Создать проверку по одному домену |
-| `GET` | `/api/runs` | Все проверки, новые сверху |
+| `GET` | `/api/runs` | Лёгкая cursor-страница публичной истории, 100 строк по умолчанию, максимум 200 |
 | `POST` | `/api/runs/lookup` | Получить до 8 переданных run IDs |
 | `GET` | `/api/runs/{id}` | Progress или готовый публичный отчёт |
 | `POST` | `/api/runs/{id}/retry` | Продолжить обычный pipeline |
@@ -1024,7 +1155,12 @@ FastAPI OpenAPI и интерактивная документация откл�
 4. отклонение stale update по `state_revision`;
 5. восстановление после смены `resume_count`.
 
-История обновляется примерно раз в 10 секунд. UI build id проверяется раз в минуту и при возврате фокуса, чтобы открытая вкладка могла предложить обновление интерфейса.
+История загружает первые 100 строк без тяжёлых `report_json` и
+`analysis_markdown`; более ранние страницы открываются по стабильному cursor
+`before_created_at + before_id`. Каждые 10 секунд UI запрашивает через
+`/api/runs/lookup` только до восьми активных run IDs, а верхнюю страницу
+перечитывает раз в минуту. UI build id также проверяется раз в минуту и при
+возврате фокуса, чтобы открытая вкладка могла предложить обновление интерфейса.
 
 Зависимости в браузере:
 
@@ -1177,9 +1313,11 @@ uv run python -m unittest discover -s tests -v
 | `test_long_response.py` | Lossless partition/reconstruction, manifests и границы atomic/partitioned режимов |
 | `test_claim_ledger.py` | Точная реконструкция JSON-источника, identity claims и полнота coverage |
 | `test_structured_audit_store.py` | Delta receipts, SHA-цепочка, crash gap и безопасный resume continuable JSON |
-| `test_crawler_manifest.py`, `test_crawler_truncation.py` | Полный sitemap graph, resume, чтение body до EOF и unknown при обрыве транспорта |
+| `test_crawler_manifest.py`, `test_crawl_admission.py`, `test_crawler_truncation.py` | Bounded page corpus, commercial relevance receipt, полный sitemap graph, resume, чтение body до EOF и unknown при обрыве транспорта |
+| `test_offer_catalog_admission.py` | Source-bound предложения и fail-closed допуск пустого каталога |
 | `test_analysis_critic.py`, `test_critic_gate_adversarial.py` | Bounded critic loop и fail-closed policy |
 | `test_report_semantic_gate.py`, `test_semantic_gate_stop_adversarial.py` | Семантическая проверка и остановка публикации |
+| `test_report_editor.py`, `test_live_russian_policy.py` | Lossless редактура, точная policy snapshot, lint и editorial receipts |
 | `test_entity_scope_adversarial.py`, `test_jois_attribution_adversarial.py`, `test_realweb_attribution_regressions.py` | Ложная атрибуция продуктов и владельцев |
 | `test_reprocess_saved_run.py`, `test_rebuild_from_saved_annotations.py` | Raw integrity и rebuild-контракты |
 | `test_site_preview.py` | Worker, SSRF-защита, кеш и runtime-файлы |
@@ -1191,6 +1329,8 @@ uv run python -m unittest discover -s tests -v
 ```bash
 uv run python -m unittest tests.test_openrouter_policy -v
 uv run python -m unittest tests.test_run_coordinator -v
+uv run python -m unittest tests.test_offer_catalog_admission -v
+uv run python -m unittest tests.test_live_russian_policy -v
 uv run python -m unittest tests.test_report_semantic_gate -v
 uv run python -m unittest tests.test_reprocess_saved_run -v
 uv run python -m unittest tests.test_frontend_static -v
@@ -1220,12 +1360,24 @@ uv run python scripts/reprocess_saved_run.py <run-id>
 - не запускает crawl, market research, генерацию сценариев или model panel;
 - повторно строит профиль, technical review, entity catalog, annotations, metrics, critic и narrative;
 - не вызывает `_run_panel()` и не получает исходные ответы заново;
-- после завершения проверяет неизменность raw-корпуса;
+- перед atomic publication сверяет raw SHA под writer lock, а после завершения
+  повторяет независимую проверку;
 - при ошибке восстанавливает прежний terminal report и защищённый raw snapshot.
+
+Если у исторического run уже есть panel-corpus receipt, reprocess принимает
+ровно его provider/mode/model grid. Если receipt ещё нет, legacy baseline
+строится из фактически сохранённой прямоугольной сетки. Текущий список моделей
+не переопределяет прошлую проверку и не создаёт новые panel-вызовы.
 
 Downstream LLM-слои по-прежнему могут обращаться к OpenRouter и расходовать токены. «Без повторного panel» не означает полностью offline-пересчёт.
 
-При таком переанализе bitmap-иллюстрации не генерируются заново. Могут обновиться текстовые visual concepts и подписи, а существующие файлы переиспользуются.
+При таком переанализе bitmap-иллюстрации не генерируются заново. Сервис заново
+строит текстовые visual concepts и подписи, затем рассматривает только файл из
+`/static/generated/<тот-же-run-id>/`. Перед публикацией каждый сохранённый
+bitmap проходит свежую мультимодальную QA-проверку против новых фактов и
+концепции. Отсутствующий, чужой, повреждённый или отклонённый файл не попадает в
+`report_json`; аналитический отчёт всё равно завершается без него. Решение и
+SHA-256 принятых файлов сохраняются в `reused_illustration_qa_manifest`.
 
 В production запускайте этот скрипт только через установленный systemd-template,
 который задаёт рабочую директорию и безопасное завершение. Общего wall-clock
@@ -1297,7 +1449,13 @@ sudo scripts/install_site_preview_worker.sh
 SITE_PREVIEW_WORKER_COMMAND=/usr/local/bin/aiv-site-preview
 ```
 
-Wrapper запускает short-lived systemd unit от пользователя `aiv-preview` с private tmp/devices, read-only system, resource limits и блокировкой loopback, link-local и private сетей.
+Wrapper запускает short-lived systemd unit от пользователя `aiv-preview` с
+private tmp/devices, read-only system, resource limits и блокировкой loopback,
+link-local и private сетей. Протокол `aiv-site-preview-worker-v2` поддерживает
+два явных режима: `preview` возвращает JPEG первого экрана, `navigation` —
+ограниченный список rendered anchors с текстовыми доказательствами. Installer
+после копирования запрашивает `--protocol-version` и останавливается, если worker
+не объявляет v2; несовместимый старый бинарник нельзя молча принять новым кодом.
 
 ### Runtime state, который нельзя удалять
 
@@ -1413,7 +1571,13 @@ curl -fsS https://aiv.rw.plus/api/healthz
 - [ ] Все проценты выводятся из deterministic data, а не из narrative LLM.
 - [ ] Web и memory подтверждены фактической телеметрией.
 - [ ] Entity attribution требует явной связи с клиентом.
+- [ ] Offer catalog подтверждён точными source receipts, а пустой каталог не
+      обходит `offer_catalog_admission`.
 - [ ] Critic loop ограничен и fail-closed.
+- [ ] Длина raw/page corpus не ограничена продуктовым page/offer scope или
+      размером одного shard.
+- [ ] `reader_copy_manifest` связывает опубликованные Markdown, JSON и
+      редакционные receipts с канонической русской политикой.
 - [ ] Старый worker не может записать данные после потери lease.
 - [ ] Public schema не раскрывает raw responses, headers, proxies или secrets.
 - [ ] Report schema совместима со старыми сохранёнными отчётами.

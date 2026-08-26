@@ -6,11 +6,11 @@ import secrets
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only
 
 from app.config import settings
 from app.db import get_session
@@ -23,9 +23,16 @@ from app.schemas import (
     RunLookupRequest,
     RunSummary,
     ShareTokenResponse,
+    build_public_run_detail,
 )
 from app.services.crawler import AUDIT_USER_AGENTS, normalize_domain
 from app.services.event_bus import bus
+from app.services.publication_contract import (
+    PublicationContractError,
+    ensure_publication_contract,
+    has_visible_publication_snapshot,
+)
+from app.services.progress import NON_RETRYABLE_FAILURE_STAGES
 from app.services.run_coordinator import (
     ACTIVE_STATUSES,
     coordinator,
@@ -34,6 +41,21 @@ from app.services.run_coordinator import (
 )
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
+
+_RUN_SUMMARY_LOAD_COLUMNS = (
+    Run.id,
+    Run.created_at,
+    Run.status,
+    Run.domain,
+    Run.progress_percent,
+    Run.stage_key,
+    Run.stage_label,
+    Run.state_revision,
+    Run.execution_slot,
+    Run.started_at,
+    Run.finished_at,
+)
+
 
 def _share_url(token: str) -> str:
     return f"/r/{token}"
@@ -50,11 +72,7 @@ def _summary_with_queue(
     return RunSummary.model_validate(run).model_copy(
         update={
             "queue_position": positions.get(run.id),
-            "queue_total": (
-                len(positions)
-                if run.id in positions
-                else None
-            ),
+            "queue_total": (len(positions) if run.id in positions else None),
         }
     )
 
@@ -63,15 +81,10 @@ def _detail_with_queue(
     run: Run,
     positions: dict[str, int],
 ) -> RunDetail:
-    return RunDetail.model_validate(run).model_copy(
-        update={
-            "queue_position": positions.get(run.id),
-            "queue_total": (
-                len(positions)
-                if run.id in positions
-                else None
-            ),
-        }
+    return build_public_run_detail(
+        run,
+        queue_position=positions.get(run.id),
+        queue_total=len(positions) if run.id in positions else None,
     )
 
 
@@ -251,9 +264,7 @@ async def create_run(
         progress_percent=0,
         stage_key="queued",
         stage_label="В очереди",
-        stage_detail=(
-            "Проверка сохранена и запустится автоматически."
-        ),
+        stage_detail=("Проверка сохранена и запустится автоматически."),
         eta_seconds=None,
         state_changed_at=changed_at,
     )
@@ -266,16 +277,30 @@ async def create_run(
 
 @router.get("", response_model=list[RunSummary])
 async def list_runs(
+    limit: int = Query(default=100, ge=1, le=200),
+    before_created_at: datetime | None = Query(default=None),
+    before_id: str | None = Query(default=None, max_length=64),
     session: AsyncSession = Depends(get_session),
 ) -> list[RunSummary]:
-    """Return the public history of every check, newest first."""
+    """Return a lightweight cursor page of public history, newest first."""
 
-    result = await session.execute(select(Run).order_by(Run.created_at.desc()))
+    query = select(Run).options(load_only(*_RUN_SUMMARY_LOAD_COLUMNS))
+    if before_created_at is not None:
+        cursor_clause = Run.created_at < before_created_at
+        if before_id:
+            cursor_clause = or_(
+                cursor_clause,
+                and_(
+                    Run.created_at == before_created_at,
+                    Run.id < before_id,
+                ),
+            )
+        query = query.where(cursor_clause)
+    result = await session.execute(
+        query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit)
+    )
     positions = await queue_positions(session)
-    return [
-        _summary_with_queue(run, positions)
-        for run in result.scalars().all()
-    ]
+    return [_summary_with_queue(run, positions) for run in result.scalars().all()]
 
 
 @router.post("/lookup", response_model=list[RunSummary])
@@ -287,7 +312,11 @@ async def lookup_runs(
 
     if not payload.ids:
         return []
-    result = await session.execute(select(Run).where(Run.id.in_(payload.ids)))
+    result = await session.execute(
+        select(Run)
+        .options(load_only(*_RUN_SUMMARY_LOAD_COLUMNS))
+        .where(Run.id.in_(payload.ids))
+    )
     by_id = {run.id: run for run in result.scalars().all()}
     positions = await queue_positions(session)
     return [
@@ -298,15 +327,23 @@ async def lookup_runs(
 
 
 @router.get("/{run_id}", response_model=RunDetail)
-async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> RunDetail:
-    result = await session.execute(
-        select(Run)
-        .where(Run.id == run_id)
-        .options(selectinload(Run.illustrations))
-    )
+async def get_run(
+    run_id: str, session: AsyncSession = Depends(get_session)
+) -> RunDetail:
+    result = await session.execute(select(Run).where(Run.id == run_id))
     run = result.scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=404, detail="Проверка не найдена.")
+    try:
+        await ensure_publication_contract(session, run)
+    except PublicationContractError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Готовый отчёт не прошёл проверку целостности. "
+                "Мы временно скрыли его до восстановления сохранённого снимка."
+            ),
+        ) from exc
     positions = await queue_positions(session)
     return _detail_with_queue(run, positions)
 
@@ -327,6 +364,16 @@ async def retry_run(
         raise HTTPException(
             status_code=409,
             detail="Готовую проверку нельзя перезапустить.",
+        )
+    if run.status == RunStatus.failed and run.stage_key in NON_RETRYABLE_FAILURE_STAGES:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Эту проверку нельзя безопасно продолжить автоматически: "
+                "сначала нужна операторская проверка сохранённых источников "
+                "или контрольных данных."
+            ),
         )
     if run.status in ACTIVE_STATUSES:
         await session.commit()
@@ -357,8 +404,7 @@ async def retry_run(
             stage_key="recovering",
             stage_label="Восстанавливаем проверку",
             stage_detail=(
-                "Используем уже сохранённые результаты и завершаем "
-                "недостающие этапы."
+                "Используем уже сохранённые результаты и завершаем недостающие этапы."
             ),
             progress_current=resume_percent,
             progress_percent=resume_percent,
@@ -391,11 +437,28 @@ async def share_run(
     run = result.scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=404, detail="Проверка не найдена.")
+    if not has_visible_publication_snapshot(run):
+        raise HTTPException(
+            status_code=409,
+            detail="Ссылка появится после завершения проверки отчёта.",
+        )
+    try:
+        await ensure_publication_contract(session, run)
+    except PublicationContractError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Готовый отчёт не прошёл проверку целостности. "
+                "Ссылка станет доступна после восстановления снимка."
+            ),
+        ) from exc
     if not run.share_token:
         run.share_token = _new_share_token()
         await session.commit()
         await session.refresh(run)
-    return ShareTokenResponse(share_token=run.share_token, share_url=_share_url(run.share_token))
+    return ShareTokenResponse(
+        share_token=run.share_token, share_url=_share_url(run.share_token)
+    )
 
 
 @router.get("/{run_id}/events")
@@ -419,13 +482,7 @@ async def stream_events(
         stream_epoch=stream_epoch,
     )
     history = bus.channel_history(run_id)
-    if (
-        last_sequence is not None
-        and (
-            not history
-            or last_sequence > history[-1][0]
-        )
-    ):
+    if last_sequence is not None and (not history or last_sequence > history[-1][0]):
         last_sequence = None
     # Streaming responses can stay open for many minutes. End the snapshot
     # read transaction now so it cannot pin SQLite's WAL while the generator

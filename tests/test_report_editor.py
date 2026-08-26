@@ -11,10 +11,14 @@ from app.services.analyzer import (
 )
 
 from app.services.report_editor import (
+    REPORT_EDITOR_BOUNDARY_VERSION,
     REPORT_EDITOR_HARNESS_VERSION,
     REPORT_EDITOR_POLICY_VERSION,
     build_editorial_units,
     edit_report,
+    illustration_copy_immutable_passthrough_paths,
+    illustration_copy_narrative_paths,
+    illustration_copy_rendered_string_paths,
     reader_immutable_passthrough_paths,
     reader_narrative_paths,
     reader_rendered_string_paths,
@@ -154,6 +158,45 @@ class ReportEditorUnitTests(unittest.TestCase):
             set(paths) | set(immutable),
         )
 
+    def test_illustration_copy_registers_every_rendered_string(self) -> None:
+        document = {
+            "illustrations": [
+                {
+                    "role": "technical_access",
+                    "core_claim": "Сервер отдаёт основной текст краулеру.",
+                    "title": "Как сайт читают ИИ-системы",
+                    "caption": "Краулер получает основной текст в HTML.",
+                    "alt_text": "Схема пути текста сайта к ИИ-системе.",
+                    "evidence_paths": ["/technical/score"],
+                },
+                {
+                    "role": "competitive_visibility",
+                    "core_claim": "Бренд появляется рядом с альтернативами.",
+                    "title": "Где появляется бренд",
+                    "caption": "Модели сравнивают бренд с альтернативами.",
+                    "alt_text": "Схема поля бренда и альтернатив.",
+                    "evidence_paths": ["/discovery/parent/web/score"],
+                },
+            ]
+        }
+
+        paths = illustration_copy_narrative_paths(document)
+        units, manifest = build_editorial_units(document, prose_paths=paths)
+
+        self.assertEqual(manifest["document_kind"], "illustration_copy")
+        self.assertTrue(manifest["coverage_complete"])
+        self.assertEqual(
+            set(illustration_copy_rendered_string_paths(document)),
+            set(paths)
+            | set(illustration_copy_immutable_passthrough_paths(document)),
+        )
+        self.assertEqual({unit.path for unit in units}, set(paths))
+
+        unsupported = copy.deepcopy(document)
+        unsupported["illustrations"][0]["hidden_copy"] = "Скрытый текст"
+        with self.assertRaisesRegex(ValueError, "invalid editorial document shape"):
+            build_editorial_units(unsupported)
+
     def test_explicit_json_pointer_paths_drive_the_lossless_manifest(self) -> None:
         review = _technical_review()
         paths = technical_review_narrative_paths(review)
@@ -218,8 +261,58 @@ class ReportEditorUnitTests(unittest.TestCase):
         self.assertGreater(len(body_units), 100)
         self.assertEqual("".join(item.source_text for item in body_units), report["sections"][0]["body"])
         self.assertTrue(body_units[-1].source_text.endswith(tail))
+        self.assertTrue(
+            all(
+                item.source_text
+                == item.code_owned_prefix
+                + item.editable_text
+                + item.code_owned_suffix
+                for item in body_units
+            )
+        )
+        self.assertTrue(
+            any(item.code_owned_suffix for item in body_units[:-1])
+        )
+        self.assertEqual(
+            manifest["boundary_contract"]["version"],
+            REPORT_EDITOR_BOUNDARY_VERSION,
+        )
+        self.assertEqual(
+            REPORT_EDITOR_HARNESS_VERSION,
+            "aiv-report-editor-lossless-v6",
+        )
         self.assertTrue(manifest["coverage_complete"])
         self.assertEqual(manifest["unit_count"], len(units))
+
+    def test_validator_rejects_model_owned_edge_whitespace(self) -> None:
+        report = _report("Подтверждённый факт. " * 80)
+        units, _manifest = build_editorial_units(report, target_chars=256)
+        unit = next(
+            item
+            for item in units
+            if item.path == "/sections/0/body" and item.code_owned_suffix
+        )
+        edited = unit.editable_text + " "
+        candidate = {
+            "source_unit_id": unit.unit_id,
+            "source_sha256": unit.source_sha256,
+            "edited_text": edited,
+            "claim_receipts": [
+                {
+                    "claim_sha256": claim["claim_sha256"],
+                    "preserved": True,
+                    "target_excerpt": claim["source_excerpt"],
+                    "note": "Смысл сохранён.",
+                }
+                for claim in unit.claims
+            ],
+            "new_claims": [],
+        }
+
+        self.assertIn(
+            "code_owned_boundary_changed",
+            validate_editor_result(unit, candidate),
+        )
 
     def test_validator_rejects_changed_metric_and_url(self) -> None:
         report = _report("Acme: 50% на https://acme.example/a.")
@@ -281,7 +374,45 @@ class ReportEditorUnitTests(unittest.TestCase):
         self.assertIn("mechanical_triad", errors)
         self.assertIn("number_carrier_missing", errors)
         self.assertIn("long_dash_forbidden", errors)
-        self.assertEqual(REPORT_EDITOR_POLICY_VERSION, "aiv-ru-editorial-policy-v3")
+        self.assertEqual(REPORT_EDITOR_POLICY_VERSION, "aiv-ru-editorial-policy-v4")
+
+    def test_validator_rejects_actor_value_and_url_swaps(self) -> None:
+        report = _report(
+            "OpenAI: 4 из 6, https://openai.example/fact. "
+            "Gemini: 2 из 6, https://gemini.example/fact."
+        )
+        units, _manifest = build_editorial_units(
+            report,
+            protected_terms=["OpenAI", "Gemini"],
+        )
+        unit = next(item for item in units if item.path == "/sections/0/body")
+        edited = (
+            "OpenAI: 2 из 6, https://gemini.example/fact. "
+            "Gemini: 4 из 6, https://openai.example/fact."
+        )
+        result = {
+            "source_unit_id": unit.unit_id,
+            "source_sha256": unit.source_sha256,
+            "edited_text": edited,
+            "claim_receipts": [
+                {
+                    "claim_sha256": item["claim_sha256"],
+                    "preserved": True,
+                    "target_excerpt": edited,
+                    "note": "",
+                }
+                for item in unit.claims
+            ],
+            "new_claims": [],
+        }
+
+        errors = validate_editor_result(unit, result)
+
+        self.assertNotIn("number_or_unit_set_changed", errors)
+        self.assertNotIn("url_set_changed", errors)
+        self.assertNotIn("protected_name_set_changed", errors)
+        self.assertIn("actor_value_binding_changed", errors)
+        self.assertIn("actor_url_binding_changed", errors)
 
     def test_critic_must_confirm_actor_number_carrier_and_natural_style(
         self,
@@ -318,6 +449,43 @@ class ReportEditorUnitTests(unittest.TestCase):
 
 
 class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_final_editor_cache_key_binds_current_semantic_evidence(
+        self,
+    ) -> None:
+        artifact_output = AsyncMock(return_value=None)
+        save_artifact = AsyncMock()
+
+        async def unchanged(source: dict, **_kwargs) -> tuple[dict, dict]:
+            return copy.deepcopy(source), {}
+
+        with (
+            patch("app.services.analyzer._artifact_output", artifact_output),
+            patch("app.services.analyzer.edit_report", side_effect=unchanged),
+            patch("app.services.analyzer._save_artifact", save_artifact),
+        ):
+            for suffix in ("old", "new"):
+                await _edit_final_report_language(
+                    "run-semantic-editor-cache",
+                    report=_report(),
+                    public_report={"brand": {"name": "Acme"}},
+                    selected_answer_context=[
+                        {"answer_id": "answer-1", "answer_text": suffix}
+                    ],
+                    answer_selection_manifest={"digest": suffix},
+                    semantic_evidence_document={"evidence": suffix},
+                )
+
+        first_input = artifact_output.await_args_list[0].kwargs["input_json"]
+        second_input = artifact_output.await_args_list[1].kwargs["input_json"]
+        for key in (
+            "selected_answer_context_sha256",
+            "answer_selection_manifest_sha256",
+            "semantic_evidence_document_sha256",
+        ):
+            self.assertRegex(first_input[key], r"^[0-9a-f]{64}$")
+            self.assertNotEqual(first_input[key], second_input[key])
+        self.assertIn("semantic_gate_version", first_input)
+
     async def test_partial_final_preflight_returns_source_without_model_call(
         self,
     ) -> None:
@@ -628,6 +796,8 @@ class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(edited["actions"][0]["evidence"], source["actions"][0]["evidence"])
         self.assertEqual(edited["limitations"], source["limitations"])
         self.assertTrue(audit["coverage_complete"])
+        self.assertTrue(audit["path_coverage_complete"])
+        self.assertTrue(audit["quality_complete"])
         self.assertFalse(audit["fallback_units"])
         self.assertTrue(
             validate_editorial_cache(
@@ -691,6 +861,262 @@ class ReportEditorWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 source,
                 edited,
                 poisoned_audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+    async def test_long_edit_keeps_code_owned_separators_when_model_strips(
+        self,
+    ) -> None:
+        source = _report("Первый подтверждённый факт. " * 1_100)
+        source["headline"] = "Acme виден в ответах"
+        seen_payloads: list[dict] = []
+
+        async def stripping_editor(payload: dict) -> dict:
+            seen_payloads.append(payload)
+            edited = str(payload["core_text"]).strip()
+            return {
+                "source_unit_id": payload["source_unit_id"],
+                "source_sha256": payload["source_sha256"],
+                "edited_text": edited,
+                "claim_receipts": [
+                    {
+                        "claim_sha256": item["claim_sha256"],
+                        "preserved": True,
+                        "target_excerpt": item["source_excerpt"],
+                        "note": "Смысл сохранён.",
+                    }
+                    for item in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        async def critic(payload: dict) -> dict:
+            return {
+                "verdict": "pass",
+                "issues": [],
+                "claim_checks": [
+                    {
+                        "claim_sha256": item["claim_sha256"],
+                        "meaning_preserved": True,
+                        "actor_preserved": True,
+                        "scope_preserved": True,
+                        "numbers_preserved": True,
+                        "actor_or_mechanism_explicit": True,
+                        "number_carrier_explicit": True,
+                        "active_voice": True,
+                        "no_slogan_or_meta": True,
+                        "no_mechanical_triad": True,
+                        "reason": "Смысл совпадает.",
+                    }
+                    for item in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        edited, audit = await edit_report(
+            source,
+            editor_call=stripping_editor,
+            critic_call=critic,
+            protected_terms=["Acme"],
+        )
+
+        body_payloads = [
+            payload
+            for payload in seen_payloads
+            if payload["path"] == "/sections/0/body"
+        ]
+        self.assertGreater(len(body_payloads), 1)
+        self.assertTrue(
+            all(
+                payload["core_text"] == payload["core_text"].strip()
+                for payload in body_payloads
+            )
+        )
+        self.assertEqual(
+            edited["sections"][0]["body"],
+            source["sections"][0]["body"],
+        )
+        self.assertNotIn("факт.Первый", edited["sections"][0]["body"])
+        self.assertTrue(audit["boundary_integrity_complete"])
+        self.assertTrue(audit["quality_complete"])
+        self.assertEqual(len(audit["boundary_receipts"]), audit["unit_count"])
+        self.assertTrue(
+            validate_editorial_cache(
+                source,
+                edited,
+                audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+        tampered_audit = copy.deepcopy(audit)
+        tampered_audit["boundary_receipts"][0][
+            "code_owned_suffix_sha256"
+        ] = "0" * 64
+        tampered_audit = seal_editorial_audit(tampered_audit)
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                tampered_audit,
+                protected_terms=["Acme"],
+            )
+        )
+
+    async def test_source_fallback_is_path_complete_but_not_cacheable(self) -> None:
+        source = _report()
+        editor = AsyncMock(side_effect=RuntimeError("editor unavailable"))
+        critic = AsyncMock()
+
+        edited, audit = await edit_report(
+            source,
+            editor_call=editor,
+            critic_call=critic,
+            protected_terms=["Acme"],
+        )
+
+        self.assertEqual(edited, source)
+        self.assertTrue(audit["coverage_complete"])
+        self.assertTrue(audit["path_coverage_complete"])
+        self.assertFalse(audit["quality_complete"])
+        self.assertTrue(audit["fallback_units"])
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                audit,
+                protected_terms=["Acme"],
+            )
+        )
+        critic.assert_not_awaited()
+
+    async def test_critic_and_arbiter_failure_keeps_retryable_source(self) -> None:
+        source = _report()
+        source["headline"] = "Acme виден в ответах"
+
+        async def editor(payload: dict) -> dict:
+            edited = str(payload["core_text"])
+            return {
+                "source_unit_id": payload["source_unit_id"],
+                "source_sha256": payload["source_sha256"],
+                "edited_text": edited,
+                "claim_receipts": [
+                    {
+                        "claim_sha256": item["claim_sha256"],
+                        "preserved": True,
+                        "target_excerpt": edited,
+                        "note": "Смысл сохранён.",
+                    }
+                    for item in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        critic = AsyncMock(side_effect=RuntimeError("critic unavailable"))
+        arbiter = AsyncMock(side_effect=RuntimeError("arbiter unavailable"))
+
+        edited, audit = await edit_report(
+            source,
+            editor_call=editor,
+            critic_call=critic,
+            arbiter_call=arbiter,
+            protected_terms=["Acme"],
+        )
+
+        self.assertEqual(edited, source)
+        self.assertTrue(audit["path_coverage_complete"])
+        self.assertFalse(audit["quality_complete"])
+        self.assertTrue(audit["fallback_units"])
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                audit,
+                protected_terms=["Acme"],
+            )
+        )
+        self.assertGreater(critic.await_count, 0)
+        self.assertGreater(arbiter.await_count, 0)
+
+    async def test_semantic_fallback_invalidates_editorial_quality_cache(self) -> None:
+        source = _report()
+        source["headline"] = "Acme виден в ответах"
+
+        async def editor(payload: dict) -> dict:
+            edited = str(payload["core_text"])
+            return {
+                "source_unit_id": payload["source_unit_id"],
+                "source_sha256": payload["source_sha256"],
+                "edited_text": edited,
+                "claim_receipts": [
+                    {
+                        "claim_sha256": item["claim_sha256"],
+                        "preserved": True,
+                        "target_excerpt": edited,
+                        "note": "Смысл сохранён.",
+                    }
+                    for item in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        async def critic(payload: dict) -> dict:
+            return {
+                "verdict": "pass",
+                "issues": [],
+                "claim_checks": [
+                    {
+                        "claim_sha256": item["claim_sha256"],
+                        "meaning_preserved": True,
+                        "actor_preserved": True,
+                        "scope_preserved": True,
+                        "numbers_preserved": True,
+                        "actor_or_mechanism_explicit": True,
+                        "number_carrier_explicit": True,
+                        "active_voice": True,
+                        "no_slogan_or_meta": True,
+                        "no_mechanical_triad": True,
+                        "reason": "Смысл совпадает.",
+                    }
+                    for item in payload["source_claims"]
+                ],
+                "new_claims": [],
+            }
+
+        edited, audit = await edit_report(
+            source,
+            editor_call=editor,
+            critic_call=critic,
+            protected_terms=["Acme"],
+        )
+        self.assertTrue(audit["quality_complete"])
+
+        semantic_pass = copy.deepcopy(audit)
+        semantic_pass["semantic_fallback"] = {"used": False, "errors": []}
+        semantic_pass = seal_editorial_audit(semantic_pass)
+        self.assertTrue(semantic_pass["quality_complete"])
+        self.assertTrue(
+            validate_editorial_cache(
+                source,
+                edited,
+                semantic_pass,
+                protected_terms=["Acme"],
+            )
+        )
+
+        audit["semantic_fallback"] = {
+            "used": True,
+            "errors": ["semantic drift"],
+        }
+        audit = seal_editorial_audit(audit)
+
+        self.assertFalse(audit["quality_complete"])
+        self.assertFalse(
+            validate_editorial_cache(
+                source,
+                edited,
+                audit,
                 protected_terms=["Acme"],
             )
         )

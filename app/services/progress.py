@@ -16,7 +16,18 @@ STAGES: dict[str, str] = {
     "web_visibility": "Сравниваем ответы ИИ-систем",
     "knowledge_gap": "Считаем видимость и разрывы знаний",
     "report": "Собираем отчёт и иллюстрации",
+    "source_review_required": "Нужна проверка источников",
+    "integrity_review_required": "Нужна проверка целостности",
+    "panel_review_required": "Нужна проверка ответов",
 }
+
+NON_RETRYABLE_FAILURE_STAGES = frozenset(
+    {
+        "source_review_required",
+        "integrity_review_required",
+        "panel_review_required",
+    }
+)
 
 
 async def update_progress(
@@ -93,7 +104,17 @@ async def update_progress(
     return True
 
 
-async def fail_run(run_id: str, public_message: str) -> bool:
+async def fail_run(
+    run_id: str,
+    public_message: str,
+    *,
+    failure_stage: str | None = None,
+) -> bool:
+    if (
+        failure_stage is not None
+        and failure_stage not in NON_RETRYABLE_FAILURE_STAGES
+    ):
+        raise ValueError(f"Unsupported terminal failure stage: {failure_stage}")
     finished_at = datetime.now(timezone.utc)
     owner = lease_owner_for(run_id)
     conditions = [Run.id == run_id]
@@ -111,6 +132,15 @@ async def fail_run(run_id: str, public_message: str) -> bool:
                 ),
             )
         )
+    failure_values = (
+        {
+            "stage_key": failure_stage,
+            "stage_label": STAGES[failure_stage],
+            "stage_detail": public_message[:500],
+        }
+        if failure_stage is not None
+        else {}
+    )
     async with SessionLocal() as session:
         changed = await session.execute(
             update(Run)
@@ -127,6 +157,7 @@ async def fail_run(run_id: str, public_message: str) -> bool:
                 state_changed_at=finished_at,
                 checkpointed_at=finished_at,
                 state_revision=Run.state_revision + 1,
+                **failure_values,
             )
             .returning(Run.state_revision)
         )
@@ -140,6 +171,8 @@ async def fail_run(run_id: str, public_message: str) -> bool:
             "type": "final",
             "status": "failed",
             "message": public_message,
+            "stage": failure_stage,
+            "label": STAGES.get(failure_stage) if failure_stage else None,
             "run_state": "failed",
             "state_revision": revision,
         },

@@ -22,6 +22,7 @@ from app.services.offer_catalog import (
     SourceUnit,
     UpstreamArtifactDigests,
     artifact_digest,
+    admit_client_identity_aliases,
     audit_resume_compatibility,
     build_answer_set_receipt,
     build_domain_research_payload,
@@ -176,6 +177,46 @@ class OfferCatalogEvidenceTests(unittest.TestCase):
         self.assertIn("generic_category_term_without_client_offer_binding", reasons)
         self.assertIn("generic_category_term_is_not_a_proprietary_product", reasons)
 
+    def test_unquoted_user_job_cannot_flow_into_clusters_or_research(self) -> None:
+        excerpt = "Realweb предлагает продукт Nebula для аналитики кампаний."
+        source = SourceUnit.from_text(
+            source_unit_id="page:nebula",
+            source_url="https://realweb.ru/products/nebula",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Nebula",
+                    excerpt=excerpt,
+                    jobs=(
+                        "аналитики кампаний",
+                        "Купить космический корабль",
+                    ),
+                ),
+            ),
+        )
+
+        offer = catalog.accepted_offers[0]
+        self.assertEqual(offer.user_jobs, ("аналитики кампаний",))
+        self.assertEqual(
+            [receipt.user_job for receipt in offer.user_job_evidence],
+            ["аналитики кампаний"],
+        )
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "source_bound_commercial_offer_ungrounded_user_jobs_removed",
+        )
+        clusters = build_offer_clusters(catalog)
+        self.assertEqual(clusters[0].user_jobs, ("аналитики кампаний",))
+        payload = build_domain_research_payload(catalog).document
+        self.assertEqual(payload["offers"][0]["user_jobs"], ["аналитики кампаний"])
+        self.assertNotIn("Купить космический корабль", str(payload))
+
     def test_first_party_competitor_seo_is_not_bound_to_client(self) -> None:
         excerpts = (
             (
@@ -325,6 +366,321 @@ class OfferCatalogEvidenceTests(unittest.TestCase):
 
         self.assertEqual(len(catalog.accepted_offers), 2)
 
+    def test_generic_alias_cannot_license_a_fabricated_canonical_product(self) -> None:
+        excerpt = "Realweb предлагает SEO для интернет-магазинов."
+        source = SourceUnit.from_text(
+            source_unit_id="page:seo",
+            source_url="https://realweb.ru/services/seo",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="QuantumRank Suite",
+                    aliases=("SEO",),
+                    excerpt=excerpt,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "canonical_offer_name_not_literal_in_excerpt",
+        )
+
+    def test_only_aliases_with_literal_source_evidence_are_published(self) -> None:
+        excerpt = "Realweb развивает платформу AdTech Compass."
+        source = SourceUnit.from_text(
+            source_unit_id="page:compass-aliases",
+            source_url="https://realweb.ru/products/compass",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="AdTech Compass",
+                    aliases=("Compass", "QuantumRank"),
+                    excerpt=excerpt,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers[0].aliases, ("Compass",))
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "source_bound_commercial_offer_ungrounded_aliases_removed",
+        )
+
+    def test_client_bound_alias_cannot_cross_bind_competitor_product(self) -> None:
+        excerpt = (
+            "Rival предлагает Nebula Audience Engine. "
+            "Realweb предлагает programmatic."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:market",
+            source_url="https://realweb.ru/market",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Nebula Audience Engine",
+                    aliases=("programmatic",),
+                    excerpt=excerpt,
+                ),
+            ),
+        )
+
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "offer_without_explicit_client_ownership_binding",
+        )
+
+    def test_model_cannot_replace_client_identity_with_competitor_alias(self) -> None:
+        excerpt = "Rival предлагает сервис Nebula для рекламных кампаний."
+        source = SourceUnit.from_text(
+            source_unit_id="page:competitor",
+            source_url="https://client.example/market",
+            text=excerpt,
+        )
+        aliases, admission = admit_client_identity_aliases(
+            client_domain="client.example",
+            requested_aliases=("Rival", "Client"),
+            source_units=(source,),
+        )
+        catalog = build_offer_catalog(
+            client_domain="client.example",
+            client_aliases=aliases,
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Nebula",
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertNotIn("Rival", aliases)
+        self.assertIn("Rival", admission["rejected_aliases"])
+        self.assertEqual(catalog.accepted_offers, ())
+        self.assertEqual(
+            catalog.dispositions[0].reason,
+            "offer_without_explicit_client_ownership_binding",
+        )
+
+    def test_first_party_identity_statement_admits_brand_unrelated_to_domain(
+        self,
+    ) -> None:
+        excerpt = (
+            "Мы — Acme. Acme предлагает сервис Atlas для управления продажами."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:home",
+            source_url="https://holding-company.com/",
+            text=excerpt,
+        )
+
+        aliases, admission = admit_client_identity_aliases(
+            client_domain="holding-company.com",
+            requested_aliases=("Acme",),
+            source_units=(source,),
+            structured_identity_records=(
+                {
+                    "source_unit_id": source.source_unit_id,
+                    "source_url": source.source_url,
+                    "source_sha256": source.source_sha256,
+                    "page_kind": "home",
+                    "title": "Acme | Sales platform",
+                },
+            ),
+        )
+        catalog = build_offer_catalog(
+            client_domain="holding-company.com",
+            client_aliases=aliases,
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Atlas",
+                    excerpt="Acme предлагает сервис Atlas для управления продажами.",
+                ),
+            ),
+        )
+
+        self.assertIn("Acme", aliases)
+        self.assertEqual(
+            admission["alias_receipts"][0]["derivation"],
+            "exact_first_party_identity_statement",
+        )
+        self.assertEqual(
+            admission["alias_receipts"][0]["source_identity_receipts"][0]
+            ["body_identity_receipt"]["rule"],
+            "explicit_first_person_identity",
+        )
+        self.assertEqual(
+            [offer.canonical_name for offer in catalog.accepted_offers],
+            ["Atlas"],
+        )
+
+    def test_first_party_competitor_description_is_not_identity_proof(self) -> None:
+        excerpt = (
+            "Rival — конкурирующее агентство. "
+            "Rival предлагает сервис Nebula для рекламных кампаний."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:market",
+            source_url="https://client.example/market",
+            text=excerpt,
+        )
+
+        aliases, admission = admit_client_identity_aliases(
+            client_domain="client.example",
+            requested_aliases=("Rival",),
+            source_units=(source,),
+        )
+
+        self.assertNotIn("Rival", aliases)
+        self.assertIn("Rival", admission["rejected_aliases"])
+
+    def test_plain_homepage_copular_claim_is_not_identity_proof(self) -> None:
+        excerpt = "Rival is agency. Rival offers Nebula."
+        source = SourceUnit.from_text(
+            source_unit_id="page:home",
+            source_url="https://client.example/",
+            text=excerpt,
+        )
+
+        aliases, admission = admit_client_identity_aliases(
+            client_domain="client.example",
+            requested_aliases=("Rival",),
+            source_units=(source,),
+        )
+        catalog = build_offer_catalog(
+            client_domain="client.example",
+            client_aliases=aliases,
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Nebula",
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+
+        self.assertNotIn("Rival", aliases)
+        self.assertIn("Rival", admission["rejected_aliases"])
+        self.assertEqual(catalog.accepted_offers, ())
+
+    def test_partner_official_site_copy_is_not_client_identity(self) -> None:
+        excerpt = (
+            "Партнёры. Официальный сайт Rival. "
+            "Rival предлагает продукт Nebula."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:home",
+            source_url="https://client.example/",
+            text=excerpt,
+        )
+
+        aliases, admission = admit_client_identity_aliases(
+            client_domain="client.example",
+            requested_aliases=("Rival",),
+            source_units=(source,),
+            structured_identity_records=(
+                {
+                    "source_unit_id": source.source_unit_id,
+                    "source_url": source.source_url,
+                    "source_sha256": source.source_sha256,
+                    "page_kind": "home",
+                    "title": "Client | Главная",
+                },
+            ),
+        )
+
+        self.assertNotIn("Rival", aliases)
+        self.assertIn("Rival", admission["rejected_aliases"])
+
+    def test_public_suffix_and_subdomain_are_not_client_aliases(self) -> None:
+        cases = (
+            ("client.ai", "AI", "AI предлагает продукт Nebula."),
+            ("client.co.uk", "UK", "UK предлагает продукт Nebula."),
+            (
+                "brand.client.com",
+                "Brand",
+                "Brand предлагает продукт Nebula.",
+            ),
+        )
+        for domain, requested_alias, excerpt in cases:
+            with self.subTest(domain=domain):
+                source = SourceUnit.from_text(
+                    source_unit_id=f"page:{domain}",
+                    source_url=f"https://{domain}/",
+                    text=excerpt,
+                )
+                aliases, admission = admit_client_identity_aliases(
+                    client_domain=domain,
+                    requested_aliases=(requested_alias,),
+                    source_units=(source,),
+                )
+
+                self.assertNotIn(requested_alias, aliases)
+                self.assertIn(requested_alias, admission["rejected_aliases"])
+
+    def test_two_client_offers_do_not_become_aliases_by_cooccurrence(self) -> None:
+        excerpt = (
+            "Realweb предлагает Brand Alpha. "
+            "Realweb предлагает Brand Beta."
+        )
+        source = SourceUnit.from_text(
+            source_unit_id="page:two-products",
+            source_url="https://realweb.ru/products",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="Brand Alpha",
+                    aliases=("Brand Beta",),
+                    excerpt=excerpt,
+                ),
+                _candidate(
+                    source,
+                    name="Brand Beta",
+                    aliases=("Brand Alpha",),
+                    excerpt=excerpt,
+                ),
+            ),
+        )
+
+        self.assertEqual(len(catalog.accepted_offers), 2)
+        self.assertEqual(
+            {offer.canonical_name for offer in catalog.accepted_offers},
+            {"Brand Alpha", "Brand Beta"},
+        )
+        self.assertTrue(all(not offer.aliases for offer in catalog.accepted_offers))
+
     def test_exact_excerpt_source_url_and_digest_are_enforced(self) -> None:
         valid = _candidate(
             self.source,
@@ -423,6 +779,73 @@ class OfferCatalogEvidenceTests(unittest.TestCase):
 
         self.assertEqual(first.as_dict(), second.as_dict())
         self.assertEqual(OfferCatalog.from_mapping(first.as_dict()).as_dict(), first.as_dict())
+
+    def test_roundtrip_rejects_resealed_generic_flag_tampering(self) -> None:
+        excerpt = "Realweb предлагает услугу SEO для интернет-магазинов."
+        source = SourceUnit.from_text(
+            source_unit_id="page:seo-roundtrip",
+            source_url="https://realweb.ru/services/seo",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="SEO",
+                    excerpt=excerpt,
+                    kind=OfferKind.SERVICE,
+                ),
+            ),
+        )
+        tampered = catalog.as_dict()
+        tampered["accepted_offers"][0]["generic_category_term"] = False
+        tampered["catalog_digest"] = artifact_digest(
+            {
+                key: value
+                for key, value in tampered.items()
+                if key != "catalog_digest"
+            }
+        )
+
+        with self.assertRaisesRegex(OfferCatalogError, "generic-category flag"):
+            OfferCatalog.from_mapping(tampered)
+
+    def test_roundtrip_rejects_resealed_offer_id_tampering(self) -> None:
+        excerpt = "Realweb развивает платформу AdTech Compass."
+        source = SourceUnit.from_text(
+            source_unit_id="page:id-roundtrip",
+            source_url="https://realweb.ru/products/compass",
+            text=excerpt,
+        )
+        catalog = build_offer_catalog(
+            client_domain="realweb.ru",
+            client_aliases=("Realweb",),
+            source_units=(source,),
+            candidates=(
+                _candidate(
+                    source,
+                    name="AdTech Compass",
+                    excerpt=excerpt,
+                ),
+            ),
+        )
+        tampered = catalog.as_dict()
+        fake_id = f"offer:{'0' * 64}"
+        tampered["accepted_offers"][0]["offer_id"] = fake_id
+        tampered["dispositions"][0]["accepted_offer_id"] = fake_id
+        tampered["catalog_digest"] = artifact_digest(
+            {
+                key: value
+                for key, value in tampered.items()
+                if key != "catalog_digest"
+            }
+        )
+
+        with self.assertRaisesRegex(OfferCatalogError, "offer_id is invalid"):
+            OfferCatalog.from_mapping(tampered)
 
 
 class OfferCandidateSourceNormalizationTests(unittest.TestCase):

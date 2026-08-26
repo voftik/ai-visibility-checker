@@ -32,13 +32,18 @@ import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
+import tldextract
 
-OFFER_CATALOG_VERSION = "aiv-offer-catalog-v2"
+
+OFFER_CATALOG_VERSION = "aiv-offer-catalog-v4"
 OFFER_EVIDENCE_VERSION = "aiv-offer-evidence-v2"
+OFFER_USER_JOB_EVIDENCE_VERSION = "aiv-offer-user-job-evidence-v1"
 OFFER_CANDIDATE_NORMALIZATION_VERSION = "aiv-offer-candidate-normalization-v1"
 DOMAIN_RESEARCH_PAYLOAD_VERSION = "aiv-domain-research-payload-v1"
 DOMAIN_RESEARCH_MANIFEST_VERSION = "aiv-domain-research-manifest-v1"
 OFFER_CLUSTER_VERSION = "aiv-offer-cluster-v1"
+OFFER_CATALOG_ADMISSION_VERSION = "aiv-offer-catalog-admission-v2"
+CLIENT_IDENTITY_ADMISSION_VERSION = "aiv-client-identity-admission-v2"
 PROMPT_FOUNDATION_VERSION = "aiv-prompt-foundation-v1"
 ANSWER_SET_RECEIPT_VERSION = "aiv-answer-set-receipt-v1"
 UPSTREAM_DIGESTS_VERSION = "aiv-upstream-artifact-digests-v1"
@@ -168,6 +173,10 @@ class PromptCoverageError(OfferCatalogError):
     """Raised when six INTENT prompts do not account for every offer cluster."""
 
 
+class OfferCatalogAdmissionError(PromptCoverageError):
+    """Raised before generic INTENT prompts can mask a missing offer catalog."""
+
+
 class ResumeCompatibilityError(OfferCatalogError):
     """Raised when current and persisted analysis foundations differ."""
 
@@ -183,6 +192,19 @@ class DispositionDecision(str, Enum):
     DUPLICATE = "duplicate"
     REJECTED = "rejected"
     OVERFLOW = "overflow"
+
+
+class OfferCatalogAdmissionStatus(str, Enum):
+    OFFERS_PRESENT = "offers_present"
+    ZERO_OFFERS_ADMITTED = "zero_offers_admitted"
+    ZERO_OFFERS_BLOCKED = "zero_offers_blocked"
+
+
+class ZeroOfferSiteKind(str, Enum):
+    NOT_APPLICABLE = "not_applicable"
+    NONCOMMERCIAL = "noncommercial"
+    NO_PUBLIC_OFFER = "no_public_offer"
+    COMMERCIAL_OR_UNKNOWN = "commercial_or_unknown"
 
 
 def _canonical_json(value: Any) -> str:
@@ -238,6 +260,777 @@ def _normalized_unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(by_normalized[key] for key in sorted(by_normalized))
 
 
+# An empty catalog is meaningful only for an explicitly classified site that
+# does not expose public commercial offers.  These phrases are deliberately
+# narrow.  Broad labels such as "portal", "corporate site" or
+# "informational site" are not enough: commercial sites use them too.
+_NONCOMMERCIAL_SITE_KIND_MARKERS = tuple(
+    _normalize_phrase(value)
+    for value in (
+        "некоммерческий сайт",
+        "некоммерческий информационный ресурс",
+        "некоммерческая организация",
+        "некоммерческий проект",
+        "noncommercial website",
+        "non commercial website",
+        "nonprofit website",
+        "nonprofit organization",
+        "not for profit",
+    )
+)
+_NO_PUBLIC_OFFER_SITE_KIND_MARKERS = tuple(
+    _normalize_phrase(value)
+    for value in (
+        "без публичного предложения",
+        "без публичных предложений",
+        "публичного предложения нет",
+        "публичных предложений нет",
+        "публичное предложение отсутствует",
+        "публичные предложения отсутствуют",
+        "не предлагает продукты или услуги",
+        "не предлагает продукты и услуги",
+        "нет публичных продуктов или услуг",
+        "no public offer",
+        "no public offering",
+        "no public products or services",
+        "does not offer products or services",
+    )
+)
+
+# An unrelated exact quote must not license an empty commercial catalog.  The
+# full saved source corpus is therefore scanned for conservative, high-signal
+# commercial contradictions.  Clauses that explicitly say that no public
+# offer exists are excluded before this scan, otherwise the words "offer" or
+# "products" inside a negation would become their own contradiction.
+_COMMERCIAL_SOURCE_SIGNAL_MARKERS = tuple(
+    _normalize_phrase(value)
+    for value in (
+        "купить",
+        "заказать",
+        "оставить заявку",
+        "записаться",
+        "получить консультацию",
+        "наши услуги",
+        "наши продукты",
+        "оказываем услуги",
+        "предлагаем услуги",
+        "предлагаем продукты",
+        "цена",
+        "цены",
+        "стоимость",
+        "тариф",
+        "тарифы",
+        "оплата",
+        "подписка",
+        "магазин",
+        "корзина",
+        "buy",
+        "order",
+        "book now",
+        "get a quote",
+        "contact sales",
+        "our services",
+        "our products",
+        "we offer",
+        "pricing",
+        "price",
+        "plans",
+        "subscription",
+        "shop",
+        "cart",
+        "checkout",
+    )
+)
+_SOURCE_CLAUSE_SPLIT_RE = re.compile(r"[\r\n.!?;]+")
+
+
+def _contains_site_kind_marker(value: str, markers: Sequence[str]) -> bool:
+    normalized = _normalize_phrase(str(value or ""))
+    return bool(normalized) and any(marker in normalized for marker in markers)
+
+
+def _matching_site_kind_marker(
+    value: str,
+    markers: Sequence[str],
+) -> str | None:
+    normalized = _normalize_phrase(str(value or ""))
+    if not normalized:
+        return None
+    return next((marker for marker in markers if marker in normalized), None)
+
+
+def _profile_model_evidence(profile: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = profile.get("evidence")
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        return ()
+    return _normalized_unique(
+        value for value in raw if isinstance(value, str) and value.strip()
+    )
+
+
+def _normalize_evidence_whitespace(value: str) -> str:
+    return _SPACE_RE.sub(" ", str(value or "")).strip()
+
+
+def _source_bound_profile_evidence_receipts(
+    *,
+    evidence: Sequence[str],
+    source_units: Iterable[SourceUnit | Mapping[str, Any]],
+) -> tuple[tuple[dict[str, Any], ...], str]:
+    source_map: dict[str, SourceUnit] = {}
+    for raw_source in source_units:
+        source = (
+            raw_source
+            if isinstance(raw_source, SourceUnit)
+            else SourceUnit.from_mapping(raw_source)
+        )
+        existing = source_map.get(source.source_unit_id)
+        if existing is not None and existing != source:
+            raise OfferCatalogAdmissionError(
+                f"Conflicting admission source units use ID {source.source_unit_id!r}"
+            )
+        source_map[source.source_unit_id] = source
+
+    source_manifest_digest = artifact_digest(
+        [source_map[key].descriptor() for key in sorted(source_map)]
+    )
+    receipts: list[dict[str, Any]] = []
+    for quote in evidence:
+        normalized_quote = _normalize_evidence_whitespace(quote)
+        if not normalized_quote:
+            continue
+        for source_unit_id in sorted(source_map):
+            source = source_map[source_unit_id]
+            normalized_source = _normalize_evidence_whitespace(source.text)
+            if normalized_quote not in normalized_source:
+                continue
+            receipts.append(
+                {
+                    "source_unit_id": source.source_unit_id,
+                    "source_url": source.source_url,
+                    "source_sha256": source.source_sha256,
+                    "evidence_excerpt": normalized_quote,
+                    "evidence_sha256": _sha256_text(normalized_quote),
+                    "evidence_utf8_length": len(normalized_quote.encode("utf-8")),
+                    "match_policy": "exact_after_whitespace_normalization",
+                }
+            )
+    receipts.sort(
+        key=lambda item: (
+            str(item["source_unit_id"]),
+            str(item["evidence_sha256"]),
+        )
+    )
+    return tuple(receipts), source_manifest_digest
+
+
+def _site_kind_evidence_receipts(
+    receipts: Sequence[Mapping[str, Any]],
+    *,
+    site_kind: ZeroOfferSiteKind,
+) -> tuple[dict[str, Any], ...]:
+    if site_kind is ZeroOfferSiteKind.NONCOMMERCIAL:
+        markers = _NONCOMMERCIAL_SITE_KIND_MARKERS
+    elif site_kind is ZeroOfferSiteKind.NO_PUBLIC_OFFER:
+        markers = _NO_PUBLIC_OFFER_SITE_KIND_MARKERS
+    else:
+        return ()
+
+    proven: list[dict[str, Any]] = []
+    for raw_receipt in receipts:
+        receipt = json.loads(_canonical_json(raw_receipt))
+        marker = _matching_site_kind_marker(
+            str(receipt.get("evidence_excerpt") or ""),
+            markers,
+        )
+        if marker is None:
+            continue
+        receipt["site_kind_proof"] = site_kind.value
+        receipt["site_kind_marker"] = marker
+        proven.append(receipt)
+    return tuple(proven)
+
+
+def _source_commercial_signal_receipts(
+    source_units: Iterable[SourceUnit | Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    receipts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_source in source_units:
+        source = (
+            raw_source
+            if isinstance(raw_source, SourceUnit)
+            else SourceUnit.from_mapping(raw_source)
+        )
+        for raw_clause in _SOURCE_CLAUSE_SPLIT_RE.split(source.text):
+            clause = _normalize_evidence_whitespace(raw_clause)
+            normalized_clause = _normalize_phrase(clause)
+            if not normalized_clause:
+                continue
+            if _contains_site_kind_marker(
+                normalized_clause,
+                _NO_PUBLIC_OFFER_SITE_KIND_MARKERS,
+            ):
+                continue
+            for marker in _COMMERCIAL_SOURCE_SIGNAL_MARKERS:
+                if not _contains_normalized_phrase(normalized_clause, marker):
+                    continue
+                key = (source.source_unit_id, marker, _sha256_text(clause))
+                if key in seen:
+                    continue
+                seen.add(key)
+                receipts.append(
+                    {
+                        "source_unit_id": source.source_unit_id,
+                        "source_url": source.source_url,
+                        "source_sha256": source.source_sha256,
+                        "signal_marker": marker,
+                        "signal_excerpt": clause,
+                        "signal_sha256": _sha256_text(clause),
+                        "match_policy": "exact_clause_after_whitespace_normalization",
+                    }
+                )
+    receipts.sort(
+        key=lambda item: (
+            str(item["source_unit_id"]),
+            str(item["signal_marker"]),
+            str(item["signal_sha256"]),
+        )
+    )
+    return tuple(receipts)
+
+
+def _profile_has_commercial_offer_signals(profile: Mapping[str, Any]) -> bool:
+    products = profile.get("products")
+    if (
+        isinstance(products, Sequence)
+        and not isinstance(products, (str, bytes))
+        and any(str(value or "").strip() for value in products)
+    ):
+        return True
+
+    candidates = profile.get("offer_candidates")
+    if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)):
+        if any(
+            isinstance(value, Mapping)
+            and value.get("commercially_relevant") is True
+            for value in candidates
+        ):
+            return True
+
+    entities = profile.get("entity_scope")
+    commercial_entity_types = {"business_unit", "product", "service", "platform"}
+    if isinstance(entities, Sequence) and not isinstance(entities, (str, bytes)):
+        if any(
+            isinstance(value, Mapping)
+            and value.get("commercially_relevant") is True
+            and str(value.get("entity_type") or "") in commercial_entity_types
+            for value in entities
+        ):
+            return True
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class OfferCatalogAdmission:
+    """Code-owned decision for allowing analysis to continue past the catalog.
+
+    The site-kind phrase and confidence come from the model-built profile.  A
+    conservative code allowlist, source-profile evidence receipt and explicit
+    contradiction checks decide whether an empty catalog is admissible.
+    """
+
+    status: OfferCatalogAdmissionStatus
+    site_kind: ZeroOfferSiteKind
+    catalog_digest: str
+    profile_digest: str
+    accepted_offer_count: int
+    site_type: str
+    business_model: str
+    model_confidence: str
+    model_evidence_count: int
+    model_evidence_digest: str
+    source_manifest_digest: str
+    source_evidence_receipts: tuple[dict[str, Any], ...]
+    source_evidence_receipt_digest: str
+    source_commercial_signal_receipts: tuple[dict[str, Any], ...]
+    source_commercial_signal_receipt_digest: str
+    source_absence_claims_allowed: bool
+    crawl_coverage_state: str
+    reason_codes: tuple[str, ...]
+    admission_digest: str
+    version: str = OFFER_CATALOG_ADMISSION_VERSION
+
+    @property
+    def allowed(self) -> bool:
+        return self.status is not OfferCatalogAdmissionStatus.ZERO_OFFERS_BLOCKED
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "status": self.status.value,
+            "site_kind": self.site_kind.value,
+            "catalog_digest": self.catalog_digest,
+            "profile_digest": self.profile_digest,
+            "accepted_offer_count": self.accepted_offer_count,
+            "site_type": self.site_type,
+            "business_model": self.business_model,
+            "model_confidence": self.model_confidence,
+            "model_evidence_count": self.model_evidence_count,
+            "model_evidence_digest": self.model_evidence_digest,
+            "source_manifest_digest": self.source_manifest_digest,
+            "source_evidence_receipts": [
+                json.loads(_canonical_json(item))
+                for item in self.source_evidence_receipts
+            ],
+            "source_evidence_receipt_digest": (
+                self.source_evidence_receipt_digest
+            ),
+            "source_commercial_signal_receipts": [
+                json.loads(_canonical_json(item))
+                for item in self.source_commercial_signal_receipts
+            ],
+            "source_commercial_signal_receipt_digest": (
+                self.source_commercial_signal_receipt_digest
+            ),
+            "source_absence_claims_allowed": self.source_absence_claims_allowed,
+            "crawl_coverage_state": self.crawl_coverage_state,
+            "reason_codes": list(self.reason_codes),
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        value = self._body()
+        value["allowed"] = self.allowed
+        value["admission_digest"] = self.admission_digest
+        return value
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "OfferCatalogAdmission":
+        version = str(value.get("version") or "")
+        if version != OFFER_CATALOG_ADMISSION_VERSION:
+            raise OfferCatalogAdmissionError(
+                "Unsupported offer catalog admission version"
+            )
+        raw_reasons = value.get("reason_codes")
+        raw_receipts = value.get("source_evidence_receipts")
+        raw_signal_receipts = value.get("source_commercial_signal_receipts")
+        if isinstance(raw_reasons, (str, bytes)) or not isinstance(
+            raw_reasons, Sequence
+        ):
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission reason_codes are invalid"
+            )
+        if (
+            isinstance(raw_receipts, (str, bytes))
+            or not isinstance(raw_receipts, Sequence)
+            or any(not isinstance(item, Mapping) for item in raw_receipts)
+        ):
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission source receipts are invalid"
+            )
+        if (
+            isinstance(raw_signal_receipts, (str, bytes))
+            or not isinstance(raw_signal_receipts, Sequence)
+            or any(not isinstance(item, Mapping) for item in raw_signal_receipts)
+        ):
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission commercial signal receipts are invalid"
+            )
+        try:
+            admission = cls(
+                status=OfferCatalogAdmissionStatus(str(value.get("status") or "")),
+                site_kind=ZeroOfferSiteKind(str(value.get("site_kind") or "")),
+                catalog_digest=str(value.get("catalog_digest") or ""),
+                profile_digest=str(value.get("profile_digest") or ""),
+                accepted_offer_count=int(value.get("accepted_offer_count")),
+                site_type=str(value.get("site_type") or ""),
+                business_model=str(value.get("business_model") or ""),
+                model_confidence=str(value.get("model_confidence") or ""),
+                model_evidence_count=int(value.get("model_evidence_count")),
+                model_evidence_digest=str(value.get("model_evidence_digest") or ""),
+                source_manifest_digest=str(
+                    value.get("source_manifest_digest") or ""
+                ),
+                source_evidence_receipts=tuple(
+                    json.loads(_canonical_json(item)) for item in raw_receipts
+                ),
+                source_evidence_receipt_digest=str(
+                    value.get("source_evidence_receipt_digest") or ""
+                ),
+                source_commercial_signal_receipts=tuple(
+                    json.loads(_canonical_json(item))
+                    for item in raw_signal_receipts
+                ),
+                source_commercial_signal_receipt_digest=str(
+                    value.get("source_commercial_signal_receipt_digest") or ""
+                ),
+                source_absence_claims_allowed=(
+                    value.get("source_absence_claims_allowed") is True
+                ),
+                crawl_coverage_state=str(
+                    value.get("crawl_coverage_state") or ""
+                ),
+                reason_codes=tuple(str(item) for item in raw_reasons),
+                admission_digest=str(value.get("admission_digest") or ""),
+                version=version,
+            )
+        except (TypeError, ValueError) as exc:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission fields are invalid"
+            ) from exc
+        admission.validate()
+        if value.get("allowed") is not admission.allowed:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission allowed flag is inconsistent"
+            )
+        return admission
+
+    def validate(self) -> None:
+        _require_sha256(self.catalog_digest, field="catalog_digest")
+        _require_sha256(self.profile_digest, field="profile_digest")
+        _require_sha256(self.model_evidence_digest, field="model_evidence_digest")
+        _require_sha256(self.source_manifest_digest, field="source_manifest_digest")
+        _require_sha256(
+            self.source_evidence_receipt_digest,
+            field="source_evidence_receipt_digest",
+        )
+        _require_sha256(
+            self.source_commercial_signal_receipt_digest,
+            field="source_commercial_signal_receipt_digest",
+        )
+        _require_sha256(self.admission_digest, field="admission_digest")
+        if self.version != OFFER_CATALOG_ADMISSION_VERSION:
+            raise OfferCatalogAdmissionError(
+                "Unsupported offer catalog admission version"
+            )
+        if (
+            self.accepted_offer_count < 0
+            or self.accepted_offer_count > MAX_ACCEPTED_OFFERS
+        ):
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission count is outside product scope"
+            )
+        if self.model_evidence_count < 0:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission evidence count is invalid"
+            )
+        if type(self.source_absence_claims_allowed) is not bool:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog absence-claim flag is invalid"
+            )
+        if not self.crawl_coverage_state:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog crawl coverage state is missing"
+            )
+        if artifact_digest(
+            list(self.source_evidence_receipts)
+        ) != self.source_evidence_receipt_digest:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission source receipt digest mismatch"
+            )
+        for receipt in self.source_evidence_receipts:
+            if (
+                not str(receipt.get("source_unit_id") or "")
+                or not str(receipt.get("source_url") or "")
+                or receipt.get("match_policy")
+                != "exact_after_whitespace_normalization"
+            ):
+                raise OfferCatalogAdmissionError(
+                    "Offer catalog admission source receipt is incomplete"
+                )
+            _require_sha256(
+                str(receipt.get("source_sha256") or ""),
+                field="source_receipt.source_sha256",
+            )
+            _require_sha256(
+                str(receipt.get("evidence_sha256") or ""),
+                field="source_receipt.evidence_sha256",
+            )
+            evidence_excerpt = str(receipt.get("evidence_excerpt") or "")
+            if (
+                not evidence_excerpt
+                or _sha256_text(evidence_excerpt)
+                != str(receipt.get("evidence_sha256") or "")
+            ):
+                raise OfferCatalogAdmissionError(
+                    "Offer catalog admission source receipt excerpt is invalid"
+                )
+        if artifact_digest(
+            list(self.source_commercial_signal_receipts)
+        ) != self.source_commercial_signal_receipt_digest:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission commercial signal receipt digest mismatch"
+            )
+        for receipt in self.source_commercial_signal_receipts:
+            if (
+                not str(receipt.get("source_unit_id") or "")
+                or not str(receipt.get("source_url") or "")
+                or not str(receipt.get("signal_marker") or "")
+                or receipt.get("match_policy")
+                != "exact_clause_after_whitespace_normalization"
+            ):
+                raise OfferCatalogAdmissionError(
+                    "Offer catalog admission commercial signal receipt is incomplete"
+                )
+            _require_sha256(
+                str(receipt.get("source_sha256") or ""),
+                field="commercial_signal.source_sha256",
+            )
+            _require_sha256(
+                str(receipt.get("signal_sha256") or ""),
+                field="commercial_signal.signal_sha256",
+            )
+            signal_excerpt = str(receipt.get("signal_excerpt") or "")
+            if (
+                not signal_excerpt
+                or _sha256_text(signal_excerpt)
+                != str(receipt.get("signal_sha256") or "")
+            ):
+                raise OfferCatalogAdmissionError(
+                    "Offer catalog admission commercial signal excerpt is invalid"
+                )
+        if not self.reason_codes:
+            raise OfferCatalogAdmissionError(
+                "Offer catalog admission must include reason codes"
+            )
+        if artifact_digest(self._body()) != self.admission_digest:
+            raise OfferCatalogAdmissionError("Offer catalog admission digest mismatch")
+        if self.status is OfferCatalogAdmissionStatus.OFFERS_PRESENT:
+            if (
+                self.accepted_offer_count == 0
+                or self.site_kind is not ZeroOfferSiteKind.NOT_APPLICABLE
+            ):
+                raise OfferCatalogAdmissionError(
+                    "Offers-present admission has inconsistent site kind or count"
+                )
+        elif self.status is OfferCatalogAdmissionStatus.ZERO_OFFERS_ADMITTED:
+            if self.accepted_offer_count != 0 or self.site_kind not in {
+                ZeroOfferSiteKind.NONCOMMERCIAL,
+                ZeroOfferSiteKind.NO_PUBLIC_OFFER,
+            }:
+                raise OfferCatalogAdmissionError(
+                    "Zero-offer admission has inconsistent site kind or count"
+                )
+            if not self.source_evidence_receipts:
+                raise OfferCatalogAdmissionError(
+                    "Zero-offer admission has no source-bound evidence receipt"
+                )
+            if self.source_commercial_signal_receipts:
+                raise OfferCatalogAdmissionError(
+                    "Zero-offer admission conflicts with commercial source signals"
+                )
+            if (
+                not self.source_absence_claims_allowed
+                or self.crawl_coverage_state != "complete"
+            ):
+                raise OfferCatalogAdmissionError(
+                    "Zero-offer admission lacks complete absence-safe crawl coverage"
+                )
+        elif (
+            self.accepted_offer_count != 0
+            or self.site_kind is not ZeroOfferSiteKind.COMMERCIAL_OR_UNKNOWN
+        ):
+            raise OfferCatalogAdmissionError(
+                "Blocked zero-offer admission has inconsistent site kind or count"
+            )
+
+    def require_allowed(self) -> None:
+        self.validate()
+        if not self.allowed:
+            raise OfferCatalogAdmissionError(
+                "Zero accepted offers are not admissible for a commercial or "
+                "unclassified site; generic INTENT generation is blocked "
+                f"({', '.join(self.reason_codes)})"
+            )
+
+
+def assess_offer_catalog_admission(
+    *,
+    catalog: "OfferCatalog",
+    profile: Mapping[str, Any],
+    source_units: Iterable[SourceUnit | Mapping[str, Any]] = (),
+    source_absence_claims_allowed: bool = False,
+    crawl_coverage_state: str = "unknown",
+) -> OfferCatalogAdmission:
+    """Assess whether market research and INTENT generation may start."""
+
+    catalog.validate()
+    if not isinstance(profile, Mapping):
+        raise OfferCatalogAdmissionError("Site profile must be a mapping")
+
+    accepted_offer_count = len(catalog.accepted_offers)
+    sources = tuple(
+        raw if isinstance(raw, SourceUnit) else SourceUnit.from_mapping(raw)
+        for raw in source_units
+    )
+    site_type = str(profile.get("site_type") or "").strip()
+    business_model = str(profile.get("business_model") or "").strip()
+    confidence = str(profile.get("confidence") or "").strip().casefold()
+    evidence = _profile_model_evidence(profile)
+    all_source_receipts, source_manifest_digest = (
+        _source_bound_profile_evidence_receipts(
+            evidence=evidence,
+            source_units=sources,
+        )
+    )
+    source_manifest_matches = (
+        source_manifest_digest == catalog.source_manifest_digest
+    )
+    if not source_manifest_matches:
+        all_source_receipts = ()
+    combined_kind = " ".join(value for value in (site_type, business_model) if value)
+    explicit_noncommercial = _contains_site_kind_marker(
+        combined_kind,
+        _NONCOMMERCIAL_SITE_KIND_MARKERS,
+    )
+    explicit_no_public_offer = _contains_site_kind_marker(
+        combined_kind,
+        _NO_PUBLIC_OFFER_SITE_KIND_MARKERS,
+    )
+    claimed_zero_site_kind = (
+        ZeroOfferSiteKind.NONCOMMERCIAL
+        if explicit_noncommercial
+        else (
+            ZeroOfferSiteKind.NO_PUBLIC_OFFER
+            if explicit_no_public_offer
+            else ZeroOfferSiteKind.COMMERCIAL_OR_UNKNOWN
+        )
+    )
+    source_receipts = _site_kind_evidence_receipts(
+        all_source_receipts,
+        site_kind=claimed_zero_site_kind,
+    )
+    source_commercial_signal_receipts = _source_commercial_signal_receipts(
+        sources
+    )
+    profile_commercial_signals = _profile_has_commercial_offer_signals(profile)
+    source_commercial_signals = bool(source_commercial_signal_receipts)
+    absence_contract_complete = bool(
+        source_absence_claims_allowed is True
+        and crawl_coverage_state == "complete"
+    )
+    evidence_present = bool(evidence)
+    source_bound_site_kind_evidence_present = bool(source_receipts)
+    confidence_sufficient = confidence in {"high", "medium"}
+
+    if accepted_offer_count:
+        status = OfferCatalogAdmissionStatus.OFFERS_PRESENT
+        site_kind = ZeroOfferSiteKind.NOT_APPLICABLE
+        reasons = ("accepted_offers_present",)
+    elif (
+        (explicit_noncommercial or explicit_no_public_offer)
+        and source_bound_site_kind_evidence_present
+        and confidence_sufficient
+        and not profile_commercial_signals
+        and not source_commercial_signals
+        and absence_contract_complete
+    ):
+        status = OfferCatalogAdmissionStatus.ZERO_OFFERS_ADMITTED
+        site_kind = (
+            ZeroOfferSiteKind.NONCOMMERCIAL
+            if explicit_noncommercial
+            else ZeroOfferSiteKind.NO_PUBLIC_OFFER
+        )
+        reasons = (
+            "explicit_noncommercial_site_kind"
+            if explicit_noncommercial
+            else "explicit_no_public_offer_site_kind",
+            "source_bound_site_kind_evidence_present",
+            "model_confidence_sufficient",
+            "no_profile_commercial_offer_signals",
+            "no_source_commercial_offer_signals",
+            "complete_absence_safe_crawl_coverage",
+        )
+    else:
+        status = OfferCatalogAdmissionStatus.ZERO_OFFERS_BLOCKED
+        site_kind = ZeroOfferSiteKind.COMMERCIAL_OR_UNKNOWN
+        reason_items: list[str] = []
+        if not explicit_noncommercial and not explicit_no_public_offer:
+            reason_items.append("missing_explicit_noncommercial_site_kind")
+        if not evidence_present:
+            reason_items.append("missing_model_evidence")
+        elif not source_bound_site_kind_evidence_present:
+            reason_items.append("missing_source_bound_model_evidence")
+            reason_items.append("missing_source_bound_site_kind_evidence")
+        if not source_manifest_matches:
+            reason_items.append("source_manifest_mismatch")
+        if not confidence_sufficient:
+            reason_items.append("insufficient_model_confidence")
+        if profile_commercial_signals:
+            reason_items.append("commercial_offer_signals_present")
+            reason_items.append("profile_commercial_offer_signals_present")
+        if source_commercial_signals:
+            if "commercial_offer_signals_present" not in reason_items:
+                reason_items.append("commercial_offer_signals_present")
+            reason_items.append("source_commercial_offer_signals_present")
+        if source_absence_claims_allowed is not True:
+            reason_items.append("source_absence_claims_not_allowed")
+        if crawl_coverage_state != "complete":
+            reason_items.append("crawl_coverage_not_complete")
+        reasons = tuple(reason_items) or ("zero_offer_admission_not_proven",)
+
+    body = {
+        "version": OFFER_CATALOG_ADMISSION_VERSION,
+        "status": status.value,
+        "site_kind": site_kind.value,
+        "catalog_digest": catalog.catalog_digest,
+        "profile_digest": artifact_digest(profile),
+        "accepted_offer_count": accepted_offer_count,
+        "site_type": site_type,
+        "business_model": business_model,
+        "model_confidence": confidence,
+        "model_evidence_count": len(evidence),
+        "model_evidence_digest": artifact_digest(list(evidence)),
+        "source_manifest_digest": source_manifest_digest,
+        "source_evidence_receipts": list(source_receipts),
+        "source_evidence_receipt_digest": artifact_digest(
+            list(source_receipts)
+        ),
+        "source_commercial_signal_receipts": list(
+            source_commercial_signal_receipts
+        ),
+        "source_commercial_signal_receipt_digest": artifact_digest(
+            list(source_commercial_signal_receipts)
+        ),
+        "source_absence_claims_allowed": (
+            source_absence_claims_allowed is True
+        ),
+        "crawl_coverage_state": str(crawl_coverage_state or "unknown"),
+        "reason_codes": list(reasons),
+    }
+    admission = OfferCatalogAdmission(
+        status=status,
+        site_kind=site_kind,
+        catalog_digest=catalog.catalog_digest,
+        profile_digest=body["profile_digest"],
+        accepted_offer_count=accepted_offer_count,
+        site_type=site_type,
+        business_model=business_model,
+        model_confidence=confidence,
+        model_evidence_count=len(evidence),
+        model_evidence_digest=body["model_evidence_digest"],
+        source_manifest_digest=source_manifest_digest,
+        source_evidence_receipts=source_receipts,
+        source_evidence_receipt_digest=body[
+            "source_evidence_receipt_digest"
+        ],
+        source_commercial_signal_receipts=(
+            source_commercial_signal_receipts
+        ),
+        source_commercial_signal_receipt_digest=body[
+            "source_commercial_signal_receipt_digest"
+        ],
+        source_absence_claims_allowed=body[
+            "source_absence_claims_allowed"
+        ],
+        crawl_coverage_state=body["crawl_coverage_state"],
+        reason_codes=reasons,
+        admission_digest=artifact_digest(body),
+    )
+    admission.validate()
+    return admission
+
+
 def _normalize_domain(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -251,6 +1044,247 @@ def _normalize_domain(value: str) -> str:
     if not host:
         raise OfferCatalogError("client_domain must contain a valid host")
     return host
+
+
+_NON_IDENTITY_DOMAIN_LABELS = frozenset(
+    {
+        "aiv",
+        "app",
+        "blog",
+        "co",
+        "com",
+        "corp",
+        "dev",
+        "io",
+        "net",
+        "online",
+        "org",
+        "plus",
+        "ru",
+        "site",
+        "shop",
+        "store",
+        "web",
+        "www",
+    }
+)
+
+_OFFLINE_SUFFIX_EXTRACTOR = tldextract.TLDExtract(
+    suffix_list_urls=(),
+    include_psl_private_domains=False,
+)
+
+
+def _registrable_identity_label(domain: str) -> str:
+    """Return only the eTLD+1 registrable label from the bundled PSL."""
+
+    extracted = _OFFLINE_SUFFIX_EXTRACTOR(domain)
+    label = str(extracted.domain or "").strip().casefold()
+    if not _normalize_phrase(label).replace(" ", ""):
+        raise OfferCatalogError("client_domain has no registrable identity label")
+    return label
+
+def _source_bound_identity_receipt(
+    alias: str,
+    source: SourceUnit,
+    *,
+    client_domain: str,
+) -> dict[str, Any] | None:
+    """Prove a non-domain alias as the site's own identity.
+
+    A first-party page is necessary but not sufficient: it can discuss a
+    competitor.  Admission therefore requires an explicit identity statement,
+    not mere co-occurrence or a commercial action.  The accepted rules are
+    deliberately narrow and replayable from the exact, hashed page text.
+    """
+
+    if not _is_client_owned_url(source.source_url, client_domain):
+        return None
+    normalized_alias = _normalize_phrase(alias)
+    normalized_text = _normalize_phrase(source.text)
+    if not normalized_alias or not _contains_normalized_phrase(source.text, alias):
+        return None
+    alias_pattern = rf"(?<!\S){re.escape(normalized_alias)}(?!\S)"
+    rules: tuple[tuple[str, str], ...] = (
+        (
+            "explicit_official_site_identity",
+            rf"(?<!\S)(?:official\s+(?:web)?site(?:\s+of)?|"
+            rf"официальн\w*\s+сайт(?:\s+(?:компани\w*|бренд\w*|"
+            rf"агентств\w*|проект\w*))?)\s+{alias_pattern}",
+        ),
+        (
+            "explicit_first_person_identity",
+            rf"(?<!\S)(?:we\s+are|мы\s+(?:это|являемся)?)\s*"
+            rf"{alias_pattern}(?!\S)",
+        ),
+    )
+    for rule, pattern in rules:
+        match = re.search(pattern, normalized_text)
+        if match is not None:
+            return {
+                "source_unit_id": source.source_unit_id,
+                "source_url": source.source_url,
+                "source_sha256": source.source_sha256,
+                "rule": rule,
+                "normalized_claim": match.group(0),
+                "normalized_claim_sha256": _sha256_text(match.group(0)),
+            }
+
+    return None
+
+
+def _structured_identity_receipt(
+    alias: str,
+    record: Mapping[str, Any],
+    *,
+    source_by_id: Mapping[str, SourceUnit],
+    client_domain: str,
+) -> dict[str, Any] | None:
+    """Bind a body identity claim to a code-owned homepage title segment."""
+
+    source_unit_id = str(record.get("source_unit_id") or "").strip()
+    source = source_by_id.get(source_unit_id)
+    if source is None:
+        return None
+    source_url = str(record.get("source_url") or "").strip()
+    source_sha256 = str(record.get("source_sha256") or "").strip()
+    page_kind = str(record.get("page_kind") or "").strip().casefold()
+    title = str(record.get("title") or "").strip()
+    if (
+        page_kind != "home"
+        or not title
+        or _normalize_url(source_url) != source.source_url
+        or source_sha256 != source.source_sha256
+        or not _is_client_owned_url(source.source_url, client_domain)
+    ):
+        return None
+    # The first visual/title segment is the site identity; later segments are
+    # descriptors and may contain partners or competitors.  Hyphen is not a
+    # separator because it frequently belongs to a brand name.
+    leading_title = re.split(r"\s*(?:\||—|–|·|:)\s*", title, maxsplit=1)[0]
+    alias_compact = _normalize_phrase(alias).replace(" ", "")
+    title_compact = _normalize_phrase(leading_title).replace(" ", "")
+    if not alias_compact or title_compact != alias_compact:
+        return None
+    body_receipt = _source_bound_identity_receipt(
+        alias,
+        source,
+        client_domain=client_domain,
+    )
+    if body_receipt is None:
+        return None
+    core = {
+        "source_unit_id": source.source_unit_id,
+        "source_url": source.source_url,
+        "source_sha256": source.source_sha256,
+        "page_kind": page_kind,
+        "title": title,
+        "title_sha256": _sha256_text(title),
+        "leading_title_segment": leading_title,
+        "leading_title_segment_sha256": _sha256_text(leading_title),
+        "body_identity_receipt": body_receipt,
+        "rule": "homepage_title_identity_plus_literal_body_claim",
+    }
+    return {**core, "receipt_sha256": artifact_digest(core)}
+
+
+def admit_client_identity_aliases(
+    *,
+    client_domain: str,
+    requested_aliases: Sequence[str],
+    source_units: Iterable[SourceUnit | Mapping[str, Any]],
+    structured_identity_records: Iterable[Mapping[str, Any]] = (),
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """Derive identity from the domain or a two-source first-party receipt."""
+
+    domain = _normalize_domain(client_domain)
+    registrable_label = _registrable_identity_label(domain)
+    identity_labels = tuple(
+        label
+        for label in (registrable_label,)
+        if _normalize_phrase(label) not in _NON_IDENTITY_DOMAIN_LABELS
+        and len(_normalize_phrase(label).replace(" ", "")) >= 2
+    )
+    code_owned = _normalized_unique((domain, *identity_labels))
+    identity_compacts = {
+        _normalize_phrase(value).replace(" ", "") for value in code_owned
+    }
+    parsed_sources = tuple(
+        raw if isinstance(raw, SourceUnit) else SourceUnit.from_mapping(raw)
+        for raw in source_units
+    )
+    source_by_id = {source.source_unit_id: source for source in parsed_sources}
+    structured_records = tuple(dict(record) for record in structured_identity_records)
+    requested = _normalized_unique(requested_aliases)
+    admitted_requested: list[str] = []
+    rejected_requested: list[str] = []
+    alias_receipts: list[dict[str, Any]] = []
+    for alias in requested:
+        compact = _normalize_phrase(alias).replace(" ", "")
+        domain_derived = bool(compact and compact in identity_compacts)
+        source_identity_receipts = [
+            receipt
+            for record in structured_records
+            if (
+                receipt := _structured_identity_receipt(
+                    alias,
+                    record,
+                    source_by_id=source_by_id,
+                    client_domain=domain,
+                )
+            )
+            is not None
+        ]
+        if not domain_derived and not source_identity_receipts:
+            rejected_requested.append(alias)
+            continue
+        admitted_requested.append(alias)
+        occurrences = [
+            {
+                "source_unit_id": source.source_unit_id,
+                "source_url": source.source_url,
+                "source_sha256": source.source_sha256,
+            }
+            for source in parsed_sources
+            if _is_client_owned_url(source.source_url, domain)
+            and _contains_normalized_phrase(source.text, alias)
+        ]
+        alias_receipts.append(
+            {
+                "alias": alias,
+                "alias_sha256": _sha256_text(_normalize_phrase(alias)),
+                "derivation": (
+                    "exact_compact_match_to_target_domain_label"
+                    if domain_derived
+                    else "exact_first_party_identity_statement"
+                ),
+                "source_occurrences": occurrences,
+                "source_identity_receipts": source_identity_receipts,
+            }
+        )
+    trusted = _normalized_unique((*code_owned, *admitted_requested))
+    core = {
+        "version": CLIENT_IDENTITY_ADMISSION_VERSION,
+        "client_domain": domain,
+        "domain_identity_labels": list(identity_labels),
+        "requested_aliases": list(requested),
+        "trusted_aliases": list(trusted),
+        "rejected_aliases": list(rejected_requested),
+        "alias_receipts": alias_receipts,
+        "structured_identity_record_digest": artifact_digest(
+            list(structured_records)
+        ),
+        "source_manifest_digest": artifact_digest(
+            [source.descriptor() for source in sorted(
+                parsed_sources,
+                key=lambda item: item.source_unit_id,
+            )]
+        ),
+    }
+    return trusted, {
+        **core,
+        "admission_sha256": artifact_digest(core),
+    }
 
 
 def _normalize_url(value: str) -> str:
@@ -285,6 +1319,64 @@ def _contains_normalized_phrase(text: str, phrase: str) -> bool:
     normalized_text = f" {_normalize_phrase(text)} "
     normalized_phrase = _normalize_phrase(phrase)
     return bool(normalized_phrase) and f" {normalized_phrase} " in normalized_text
+
+
+def _user_job_bound_to_offer_excerpt(
+    excerpt: str,
+    *,
+    canonical_name: str,
+    user_job: str,
+) -> bool:
+    """Require the offer and customer job in the same exact source clause."""
+
+    return any(
+        _contains_normalized_phrase(clause, canonical_name)
+        and _contains_normalized_phrase(clause, user_job)
+        for clause in _OWNERSHIP_CLAUSE_SPLIT_RE.split(excerpt)
+        if clause.strip()
+    )
+
+
+def _alias_identity_proven(
+    evidence_excerpt: str,
+    *,
+    canonical_name: str,
+    alias: str,
+) -> bool:
+    """Require literal, local evidence that two names denote one offer."""
+
+    if not _contains_normalized_phrase(evidence_excerpt, canonical_name):
+        return False
+    if not _contains_normalized_phrase(evidence_excerpt, alias):
+        return False
+    # A short form embedded in the exact canonical name ("Compass" in
+    # "AdTech Compass") is a deterministic alias.  A generic service word in a
+    # different clause is not.
+    if _contains_normalized_phrase(
+        canonical_name,
+        alias,
+    ) or _contains_normalized_phrase(alias, canonical_name):
+        return True
+
+    canonical = re.escape(_normalize_phrase(canonical_name))
+    normalized_alias = re.escape(_normalize_phrase(alias))
+    excerpt = _normalize_phrase(evidence_excerpt)
+    connector = (
+        r"(?:aka|also known as|also called|"
+        r"также извест\w* как|также называ\w*|сокращенн\w*|далее|или)"
+    )
+    return bool(
+        re.search(
+            rf"(?<!\S){canonical}(?!\S)\s+{connector}\s+"
+            rf"(?<!\S){normalized_alias}(?!\S)",
+            excerpt,
+        )
+        or re.search(
+            rf"(?<!\S){normalized_alias}(?!\S)\s+{connector}\s+"
+            rf"(?<!\S){canonical}(?!\S)",
+            excerpt,
+        )
+    )
 
 
 def _is_generic_offer_name(value: str) -> bool:
@@ -681,6 +1773,68 @@ class OfferEvidenceRef:
 
 
 @dataclass(frozen=True, slots=True)
+class OfferUserJobEvidence:
+    """Exact first-party evidence for one customer job used in scenarios."""
+
+    user_job: str
+    source_url: str
+    evidence_excerpt: str
+    source_unit_id: str
+    source_sha256: str
+    evidence_sha256: str
+    user_job_sha256: str
+    version: str = OFFER_USER_JOB_EVIDENCE_VERSION
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "OfferUserJobEvidence":
+        user_job = str(value.get("user_job") or "").strip()
+        evidence_excerpt = value.get("evidence_excerpt", "")
+        if not user_job or not isinstance(evidence_excerpt, str):
+            raise OfferEvidenceError("Offer user-job evidence is incomplete")
+        source_sha256 = _require_sha256(
+            str(value.get("source_sha256") or ""),
+            field="source_sha256",
+        )
+        evidence_sha256 = _require_sha256(
+            str(value.get("evidence_sha256") or ""),
+            field="evidence_sha256",
+        )
+        user_job_sha256 = _require_sha256(
+            str(value.get("user_job_sha256") or ""),
+            field="user_job_sha256",
+        )
+        if _sha256_text(evidence_excerpt) != evidence_sha256:
+            raise OfferEvidenceError("Offer user-job excerpt digest mismatch")
+        if _sha256_text(_normalize_phrase(user_job)) != user_job_sha256:
+            raise OfferEvidenceError("Offer user-job digest mismatch")
+        if not _contains_normalized_phrase(evidence_excerpt, user_job):
+            raise OfferEvidenceError("Offer user job is not literal in evidence")
+        if str(value.get("version") or "") != OFFER_USER_JOB_EVIDENCE_VERSION:
+            raise OfferEvidenceError("Unsupported offer user-job evidence version")
+        return cls(
+            user_job=user_job,
+            source_url=_normalize_url(str(value.get("source_url") or "")),
+            evidence_excerpt=evidence_excerpt,
+            source_unit_id=str(value.get("source_unit_id") or "").strip(),
+            source_sha256=source_sha256,
+            evidence_sha256=evidence_sha256,
+            user_job_sha256=user_job_sha256,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "user_job": self.user_job,
+            "source_url": self.source_url,
+            "evidence_excerpt": self.evidence_excerpt,
+            "source_unit_id": self.source_unit_id,
+            "source_sha256": self.source_sha256,
+            "evidence_sha256": self.evidence_sha256,
+            "user_job_sha256": self.user_job_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AcceptedOffer:
     offer_id: str
     canonical_name: str
@@ -692,6 +1846,7 @@ class AcceptedOffer:
     source_sha256: str
     confidence: float
     user_jobs: tuple[str, ...]
+    user_job_evidence: tuple[OfferUserJobEvidence, ...]
     evidence_refs: tuple[OfferEvidenceRef, ...]
     generic_category_term: bool
 
@@ -700,12 +1855,20 @@ class AcceptedOffer:
         aliases = value.get("aliases", ())
         jobs = value.get("user_jobs", ())
         raw_refs = value.get("evidence_refs", ())
+        raw_job_evidence = value.get("user_job_evidence", ())
         if isinstance(aliases, str) or not isinstance(aliases, Sequence):
             raise OfferCatalogError("Accepted offer aliases must be an array")
         if isinstance(jobs, str) or not isinstance(jobs, Sequence):
             raise OfferCatalogError("Accepted offer user_jobs must be an array")
         if isinstance(raw_refs, (str, bytes)) or not isinstance(raw_refs, Sequence):
             raise OfferCatalogError("Accepted offer evidence_refs must be an array")
+        if isinstance(raw_job_evidence, (str, bytes)) or not isinstance(
+            raw_job_evidence,
+            Sequence,
+        ):
+            raise OfferCatalogError(
+                "Accepted offer user_job_evidence must be an array"
+            )
         try:
             kind = OfferKind(str(value.get("kind", "")))
         except ValueError as exc:
@@ -721,6 +1884,10 @@ class AcceptedOffer:
             source_sha256=str(value.get("source_sha256", "")),
             confidence=float(value.get("confidence", float("nan"))),
             user_jobs=tuple(str(item) for item in jobs),
+            user_job_evidence=tuple(
+                OfferUserJobEvidence.from_mapping(item)
+                for item in raw_job_evidence
+            ),
             evidence_refs=tuple(OfferEvidenceRef.from_mapping(item) for item in raw_refs),
             generic_category_term=value.get("generic_category_term") is True,
         )
@@ -737,6 +1904,9 @@ class AcceptedOffer:
             "source_sha256": self.source_sha256,
             "confidence": self.confidence,
             "user_jobs": list(self.user_jobs),
+            "user_job_evidence": [
+                item.as_dict() for item in self.user_job_evidence
+            ],
             "evidence_refs": [item.as_dict() for item in self.evidence_refs],
             "generic_category_term": self.generic_category_term,
         }
@@ -847,10 +2017,21 @@ class OfferCatalog:
             raise OfferCatalogError("Offer disposition candidate IDs must be unique")
         accepted_ids = set(offer_ids)
         for offer in self.accepted_offers:
-            if not offer.offer_id.startswith("offer:"):
-                raise OfferCatalogError("Accepted offer_id is invalid")
             if not offer.canonical_name.strip() or not offer.evidence_refs:
                 raise OfferCatalogError("Accepted offer lacks a name or evidence")
+            expected_offer_id = f"offer:{artifact_digest({
+                'canonical_name': offer.canonical_name,
+                'aliases': list(offer.aliases),
+                'kind': offer.kind.value,
+            })}"
+            if offer.offer_id != expected_offer_id:
+                raise OfferCatalogError("Accepted offer_id is invalid")
+            if offer.generic_category_term is not _is_generic_offer_name(
+                offer.canonical_name
+            ):
+                raise OfferCatalogError(
+                    "Accepted offer generic-category flag is inconsistent"
+                )
             if (
                 isinstance(offer.confidence, bool)
                 or not math.isfinite(offer.confidence)
@@ -876,6 +2057,77 @@ class OfferCatalog:
                 if not evidence.client_binding_proven:
                     raise OfferCatalogError(
                         "Accepted offer evidence lacks explicit client ownership"
+                    )
+            if not any(
+                _contains_normalized_phrase(
+                    evidence.evidence_excerpt,
+                    offer.canonical_name,
+                )
+                and _client_offer_binding_proven(
+                    evidence.evidence_excerpt,
+                    offer_names=(offer.canonical_name,),
+                    client_aliases=self.client_aliases,
+                    source_is_client_owned=_is_client_owned_url(
+                        evidence.source_url,
+                        self.client_domain,
+                    ),
+                )
+                for evidence in offer.evidence_refs
+            ):
+                raise OfferCatalogError(
+                    "Accepted offer canonical name lacks client-bound literal evidence"
+                )
+            for alias in offer.aliases:
+                if not any(
+                    not (
+                        _is_generic_offer_name(alias)
+                        and not _is_generic_offer_name(offer.canonical_name)
+                    )
+                    and _alias_identity_proven(
+                        evidence.evidence_excerpt,
+                        canonical_name=offer.canonical_name,
+                        alias=alias,
+                    )
+                    and _client_offer_binding_proven(
+                        evidence.evidence_excerpt,
+                        offer_names=(offer.canonical_name,),
+                        client_aliases=self.client_aliases,
+                        source_is_client_owned=_is_client_owned_url(
+                            evidence.source_url,
+                            self.client_domain,
+                        ),
+                    )
+                    for evidence in offer.evidence_refs
+                ):
+                    raise OfferCatalogError(
+                        "Accepted offer alias lacks client-bound literal evidence"
+                    )
+            receipt_jobs = _normalized_unique(
+                receipt.user_job for receipt in offer.user_job_evidence
+            )
+            if receipt_jobs != _normalized_unique(offer.user_jobs):
+                raise OfferCatalogError(
+                    "Accepted offer user jobs lack exact evidence coverage"
+                )
+            for receipt in offer.user_job_evidence:
+                if not _user_job_bound_to_offer_excerpt(
+                    receipt.evidence_excerpt,
+                    canonical_name=offer.canonical_name,
+                    user_job=receipt.user_job,
+                ):
+                    raise OfferCatalogError(
+                        "Accepted offer user job is not bound to the offer clause"
+                    )
+                if not any(
+                    evidence.source_url == receipt.source_url
+                    and evidence.source_unit_id == receipt.source_unit_id
+                    and evidence.source_sha256 == receipt.source_sha256
+                    and evidence.evidence_sha256 == receipt.evidence_sha256
+                    and evidence.evidence_excerpt == receipt.evidence_excerpt
+                    for evidence in offer.evidence_refs
+                ):
+                    raise OfferCatalogError(
+                        "Accepted offer user-job receipt is outside offer evidence"
                     )
             if offer.generic_category_term and offer.kind is OfferKind.PRODUCT:
                 raise OfferCatalogError("Generic category term cannot be an accepted product")
@@ -906,6 +2158,11 @@ class _AdmittedCandidate:
     generic: bool
     effective_kind: OfferKind
     kind_normalized: bool
+    grounded_aliases: tuple[str, ...]
+    aliases_pruned: bool
+    grounded_user_jobs: tuple[str, ...]
+    user_job_evidence: tuple[OfferUserJobEvidence, ...]
+    user_jobs_pruned: bool
     identity_keys: frozenset[str]
 
 
@@ -1067,9 +2324,13 @@ def normalize_offer_candidates_against_sources(
     }
 
 
-def _candidate_identity_keys(candidate: OfferCandidate) -> frozenset[str]:
+def _candidate_identity_keys(
+    candidate: OfferCandidate,
+    *,
+    grounded_aliases: Sequence[str],
+) -> frozenset[str]:
     canonical = _normalize_phrase(candidate.canonical_name)
-    all_names = (candidate.canonical_name, *candidate.aliases)
+    all_names = (candidate.canonical_name, *grounded_aliases)
     distinctive = {
         _normalize_phrase(value)
         for value in all_names
@@ -1095,9 +2356,11 @@ def _validate_candidate_evidence(
     if candidate.evidence_excerpt not in source.text:
         raise OfferEvidenceError("excerpt_not_found_verbatim_in_source")
 
-    names = (candidate.canonical_name, *candidate.aliases)
-    if not any(_contains_normalized_phrase(candidate.evidence_excerpt, name) for name in names):
-        raise OfferEvidenceError("offer_name_or_alias_not_literal_in_excerpt")
+    if not _contains_normalized_phrase(
+        candidate.evidence_excerpt,
+        candidate.canonical_name,
+    ):
+        raise OfferEvidenceError("canonical_offer_name_not_literal_in_excerpt")
     if not candidate.commercially_relevant:
         raise OfferEvidenceError("not_commercially_relevant")
 
@@ -1105,9 +2368,33 @@ def _validate_candidate_evidence(
     source_is_client_owned = _is_client_owned_url(source.source_url, client_domain)
     client_binding_proven = _client_offer_binding_proven(
         candidate.evidence_excerpt,
-        offer_names=names,
+        offer_names=(candidate.canonical_name,),
         client_aliases=client_aliases,
         source_is_client_owned=source_is_client_owned,
+    )
+    grounded_aliases = tuple(
+        alias
+        for alias in candidate.aliases
+        if _contains_normalized_phrase(candidate.evidence_excerpt, alias)
+        and not (
+            _is_generic_offer_name(alias)
+            and not generic
+        )
+        and client_binding_proven
+        and _alias_identity_proven(
+            candidate.evidence_excerpt,
+            canonical_name=candidate.canonical_name,
+            alias=alias,
+        )
+    )
+    grounded_user_jobs = tuple(
+        job
+        for job in candidate.user_jobs
+        if _user_job_bound_to_offer_excerpt(
+            candidate.evidence_excerpt,
+            canonical_name=candidate.canonical_name,
+            user_job=job,
+        )
     )
 
     if generic and candidate.kind is OfferKind.PRODUCT and not client_binding_proven:
@@ -1135,13 +2422,33 @@ def _validate_candidate_evidence(
         evidence_sha256=_sha256_text(candidate.evidence_excerpt),
         client_binding_proven=client_binding_proven,
     )
+    user_job_evidence = tuple(
+        OfferUserJobEvidence(
+            user_job=job,
+            source_url=source.source_url,
+            evidence_excerpt=candidate.evidence_excerpt,
+            source_unit_id=source.source_unit_id,
+            source_sha256=source.source_sha256,
+            evidence_sha256=evidence.evidence_sha256,
+            user_job_sha256=_sha256_text(_normalize_phrase(job)),
+        )
+        for job in grounded_user_jobs
+    )
     return _AdmittedCandidate(
         candidate=candidate,
         evidence=evidence,
         generic=generic,
         effective_kind=effective_kind,
         kind_normalized=effective_kind is not candidate.kind,
-        identity_keys=_candidate_identity_keys(candidate),
+        grounded_aliases=grounded_aliases,
+        aliases_pruned=len(grounded_aliases) != len(candidate.aliases),
+        grounded_user_jobs=grounded_user_jobs,
+        user_job_evidence=user_job_evidence,
+        user_jobs_pruned=len(grounded_user_jobs) != len(candidate.user_jobs),
+        identity_keys=_candidate_identity_keys(
+            candidate,
+            grounded_aliases=grounded_aliases,
+        ),
     )
 
 
@@ -1150,7 +2457,7 @@ def _candidate_preference(item: _AdmittedCandidate) -> tuple[Any, ...]:
     return (
         -candidate.confidence,
         -int(item.evidence.client_binding_proven),
-        -len(candidate.user_jobs),
+        -len(item.grounded_user_jobs),
         int(item.generic),
         _normalize_phrase(candidate.canonical_name),
         item.effective_kind.value,
@@ -1203,11 +2510,28 @@ def _accepted_offer(component: Sequence[_AdmittedCandidate]) -> AcceptedOffer:
     aliases = _normalized_unique(
         value
         for item in component
-        for value in (item.candidate.canonical_name, *item.candidate.aliases)
+        for value in (item.candidate.canonical_name, *item.grounded_aliases)
         if _normalize_phrase(value) != _normalize_phrase(candidate.canonical_name)
     )
     jobs = _normalized_unique(
-        job for item in component for job in item.candidate.user_jobs
+        job for item in component for job in item.grounded_user_jobs
+    )
+    user_job_evidence = tuple(
+        sorted(
+            {
+                (
+                    _normalize_phrase(receipt.user_job),
+                    receipt.evidence_sha256,
+                ): receipt
+                for item in component
+                for receipt in item.user_job_evidence
+            }.values(),
+            key=lambda item: (
+                _normalize_phrase(item.user_job),
+                item.source_unit_id,
+                item.evidence_sha256,
+            ),
+        )
     )
     evidence_refs = tuple(
         sorted(
@@ -1236,6 +2560,7 @@ def _accepted_offer(component: Sequence[_AdmittedCandidate]) -> AcceptedOffer:
         source_sha256=primary.source_sha256,
         confidence=candidate.confidence,
         user_jobs=jobs,
+        user_job_evidence=user_job_evidence,
         evidence_refs=evidence_refs,
         generic_category_term=representative.generic,
     )
@@ -1331,7 +2656,15 @@ def build_offer_catalog(
                 reason = (
                     "source_bound_commercial_offer_kind_normalized_to_service"
                     if item.kind_normalized
-                    else "source_bound_commercial_offer"
+                    else (
+                        "source_bound_commercial_offer_ungrounded_aliases_removed"
+                        if item.aliases_pruned
+                        else (
+                            "source_bound_commercial_offer_ungrounded_user_jobs_removed"
+                            if item.user_jobs_pruned
+                            else "source_bound_commercial_offer"
+                        )
+                    )
                 )
                 accepted_offer_id = offer.offer_id
             else:
@@ -1956,12 +3289,33 @@ def build_prompt_foundation(
     clusters: Sequence[OfferCluster],
     prompts: Sequence[IntentPrompt | Mapping[str, Any]],
     exclusions: Sequence[ClusterExclusion] = (),
+    profile: Mapping[str, Any] | None = None,
+    source_units: Iterable[SourceUnit | Mapping[str, Any]] = (),
+    source_absence_claims_allowed: bool = False,
+    crawl_coverage_state: str = "unknown",
 ) -> PromptFoundation:
     """Bind six INTENT prompts to every accepted offer cluster or exclusion."""
 
     catalog.validate()
     if upstream.catalog_digest != catalog.catalog_digest:
         raise PromptCoverageError("Upstream catalog digest does not match catalog")
+    if not catalog.accepted_offers:
+        if profile is None:
+            raise OfferCatalogAdmissionError(
+                "An empty offer catalog requires a grounded site profile admission"
+            )
+        admission = assess_offer_catalog_admission(
+            catalog=catalog,
+            profile=profile,
+            source_units=source_units,
+            source_absence_claims_allowed=source_absence_claims_allowed,
+            crawl_coverage_state=crawl_coverage_state,
+        )
+        if admission.profile_digest != upstream.profile_digest:
+            raise OfferCatalogAdmissionError(
+                "Zero-offer admission profile digest does not match upstream"
+            )
+        admission.require_allowed()
     parsed_prompts = tuple(
         item if isinstance(item, IntentPrompt) else IntentPrompt.from_mapping(item)
         for item in prompts
@@ -2231,11 +3585,13 @@ def validate_resume_compatibility(
 
 __all__ = [
     "ANSWER_SET_RECEIPT_VERSION",
+    "CLIENT_IDENTITY_ADMISSION_VERSION",
     "DOMAIN_RESEARCH_MANIFEST_VERSION",
     "DOMAIN_RESEARCH_PAYLOAD_VERSION",
     "INTENT_CODES",
     "MAX_ACCEPTED_OFFERS",
     "OFFER_CATALOG_VERSION",
+    "OFFER_USER_JOB_EVIDENCE_VERSION",
     "AcceptedOffer",
     "AnswerSetReceipt",
     "ClusterExclusion",
@@ -2249,6 +3605,7 @@ __all__ = [
     "OfferDisposition",
     "OfferEvidenceError",
     "OfferEvidenceRef",
+    "OfferUserJobEvidence",
     "OfferKind",
     "PayloadShard",
     "PromptCoverageError",
@@ -2258,6 +3615,7 @@ __all__ = [
     "SourceUnit",
     "UpstreamArtifactDigests",
     "artifact_digest",
+    "admit_client_identity_aliases",
     "audit_resume_compatibility",
     "build_answer_set_receipt",
     "build_domain_research_payload",

@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.models import RunStatus
+from app.services.publication_contract import has_visible_publication_snapshot
 
 
 class CreateRunRequest(BaseModel):
@@ -96,6 +97,62 @@ class RunDetail(BaseModel):
     report_json: dict[str, Any] | None
     error_message: str | None
     illustrations: list[ReportIllustrationOut]
+
+
+def canonical_report_illustrations(
+    report_json: dict[str, Any] | None,
+) -> list[ReportIllustrationOut]:
+    """Read public illustration copy only from the persisted report snapshot."""
+
+    if not isinstance(report_json, dict):
+        return []
+    raw_illustrations = report_json.get("illustrations")
+    if not isinstance(raw_illustrations, list):
+        return []
+
+    canonical: list[ReportIllustrationOut] = []
+    seen_sequences: set[int] = set()
+    for raw_item in raw_illustrations:
+        try:
+            item = ReportIllustrationOut.model_validate(raw_item)
+        except (TypeError, ValidationError):
+            continue
+        if not item.file_url:
+            continue
+        if item.sequence in seen_sequences:
+            continue
+        seen_sequences.add(item.sequence)
+        canonical.append(item)
+    return sorted(canonical, key=lambda item: item.sequence)
+
+
+def build_public_run_detail(
+    run: Any,
+    *,
+    queue_position: int | None,
+    queue_total: int | None,
+) -> RunDetail:
+    """Build a detail response without reading the mutable ORM illustration rows."""
+
+    payload = {
+        field_name: getattr(run, field_name)
+        for field_name in RunDetail.model_fields
+        if field_name not in {"illustrations", "queue_position", "queue_total"}
+    }
+    is_published = has_visible_publication_snapshot(run)
+    if not is_published:
+        payload["analysis_markdown"] = None
+        payload["report_json"] = None
+    payload.update(
+        {
+            "queue_position": queue_position,
+            "queue_total": queue_total,
+            "illustrations": (
+                canonical_report_illustrations(run.report_json) if is_published else []
+            ),
+        }
+    )
+    return RunDetail.model_validate(payload)
 
 
 class ShareTokenResponse(BaseModel):

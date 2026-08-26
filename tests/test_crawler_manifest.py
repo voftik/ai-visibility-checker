@@ -1,5 +1,8 @@
+import json
 import unittest
 import uuid
+from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import delete, select
@@ -37,6 +40,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
         self,
         *,
         artifact: RunArtifact | None = None,
+        artifacts: list[RunArtifact] | None = None,
         page_urls: list[tuple[str, str]] | None = None,
     ) -> str:
         run_id = f"test-manifest-{uuid.uuid4()}"
@@ -53,6 +57,9 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             if artifact is not None:
                 artifact.run_id = run_id
                 session.add(artifact)
+            for persisted in artifacts or []:
+                persisted.run_id = run_id
+                session.add(persisted)
             for url, page_kind in page_urls or []:
                 session.add(
                     SitePage(
@@ -77,7 +84,10 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
         return run_id
 
-    def _completed_artifact(self, pages: list[tuple[str, str]]) -> RunArtifact:
+    def _completed_artifacts(
+        self,
+        pages: list[tuple[str, str]],
+    ) -> list[RunArtifact]:
         receipt = {
             "expected_page_count": len(pages),
             "usable_page_count": len(pages),
@@ -88,9 +98,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     "page_kind": page_kind,
                     "http_status": 200,
                     "text_length": 10,
-                    "content_sha256": crawler.hashlib.sha256(
-                        b"Saved page"
-                    ).hexdigest(),
+                    "content_sha256": crawler.hashlib.sha256(b"Saved page").hexdigest(),
                     "source_body_sha256": "saved-source",
                     "body_policy_version": crawler.BODY_READ_POLICY_VERSION,
                     "usable": True,
@@ -103,7 +111,22 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             "complete": True,
         }
         receipt["receipt_sha256"] = crawler._json_sha256(receipt)
-        return RunArtifact(
+        candidates = [
+            crawler._candidate_evidence_record(url, source="test_fixture")
+            for url, _page_kind in pages[1:]
+        ]
+        attempts = [
+            crawler._candidate_attempt(page, outcome="usable") for page in pages
+        ]
+        relevance_receipt = crawler._selection_relevance_receipt(
+            homepage_url=pages[0][0],
+            candidates=candidates,
+            target=crawler.AUDIT_PAGE_DEFAULT,
+            proposed=pages,
+            attempts=attempts,
+            selected=pages,
+        )
+        manifest = RunArtifact(
             run_id="replaced-by-helper",
             stage_key="site_discovery",
             artifact_key=crawler.SITE_PAGE_MANIFEST_KEY,
@@ -118,17 +141,33 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 "selected_count": len(pages),
                 "selected_pages_sha256": crawler._selected_pages_sha256(pages),
                 "page_scope": crawler.PAGE_SCOPE,
-                "selection_policy": crawler._site_page_manifest_input(
-                    "example.com"
-                )["selection_policy"],
+                "selection_policy": crawler._site_page_manifest_input("example.com")[
+                    "selection_policy"
+                ],
                 "selection_exhausted": True,
                 "verified_exhaustion": len(pages) < crawler.AUDIT_PAGE_MIN,
                 "legacy_snapshot": False,
                 "discovery_state": "complete",
                 "coverage_state": "complete",
                 "site_page_receipt": receipt,
+                "commercial_relevance_receipt": (
+                    crawler._selection_relevance_projection(relevance_receipt)
+                ),
             },
         )
+        relevance = RunArtifact(
+            run_id="replaced-by-helper",
+            stage_key="site_discovery",
+            artifact_key=crawler.PAGE_RELEVANCE_ARTIFACT_KEY,
+            status="completed",
+            prompt_version=crawler.COMMERCIAL_RELEVANCE_POLICY_VERSION,
+            input_json={
+                "domain": "example.com",
+                "policy_version": crawler.COMMERCIAL_RELEVANCE_POLICY_VERSION,
+            },
+            output_json=relevance_receipt,
+        )
+        return [manifest, relevance]
 
     def test_manifest_rejects_pages_from_another_domain(self) -> None:
         manifest = {
@@ -153,13 +192,39 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_site_page_transient_probe_budget_becomes_terminal(self) -> None:
+        run_id = await self._create_run()
+        url = "https://example.com/"
+        for attempt in range(1, crawler.SITE_PAGE_MAX_PROBE_ATTEMPTS + 1):
+            await crawler._store_site_page(
+                run_id,
+                url=url,
+                page_kind="home",
+                probe=_probe(url, status=503, body="Unavailable"),
+            )
+            async with SessionLocal() as session:
+                page = (
+                    await session.execute(
+                        select(SitePage).where(
+                            SitePage.run_id == run_id,
+                            SitePage.url == url,
+                        )
+                    )
+                ).scalar_one()
+            self.assertEqual(
+                page.content_signals["_probe_attempts"],
+                attempt,
+            )
+            self.assertEqual(
+                crawler._site_page_is_retryable(page),
+                attempt < crawler.SITE_PAGE_MAX_PROBE_ATTEMPTS,
+            )
+
     def test_manifest_rejects_legacy_sampled_page_contract(self) -> None:
         self.assertIsNone(
             crawler._manifest_pages(
                 {
-                    "pages": [
-                        {"url": "https://example.com/", "page_kind": "home"}
-                    ],
+                    "pages": [{"url": "https://example.com/", "page_kind": "home"}],
                     "discovered_count": 20,
                     "selected_count": 1,
                     "selection_limit": 6,
@@ -208,7 +273,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
             ("https://example.com/about", "about"),
         ]
         run_id = await self._create_run(
-            artifact=self._completed_artifact(pages),
+            artifacts=self._completed_artifacts(pages),
             page_urls=[
                 ("https://example.com/", "other"),
                 ("https://example.com/stale", "other"),
@@ -305,9 +370,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 prompt_version="old-site-page-manifest",
                 input_json=exact_input,
                 output_json={
-                    "pages": [
-                        {"url": "https://example.com/", "page_kind": "home"}
-                    ],
+                    "pages": [{"url": "https://example.com/", "page_kind": "home"}],
                     "discovered_count": 1,
                     "selected_count": 1,
                     "page_scope": "complete_discovered_frontier_v1",
@@ -423,7 +486,9 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(manifest.output_json["discovered_count"], 2)
                     self.assertEqual(manifest.output_json["selected_count"], 2)
-                    self.assertEqual(manifest.output_json["page_scope"], crawler.PAGE_SCOPE)
+                    self.assertEqual(
+                        manifest.output_json["page_scope"], crawler.PAGE_SCOPE
+                    )
                     self.assertEqual(manifest.output_json["expected_page_count"], 2)
                     self.assertEqual(
                         manifest.output_json["selected_pages_sha256"],
@@ -493,8 +558,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(
                     select(RunArtifact).where(
                         RunArtifact.run_id == run_id,
-                        RunArtifact.artifact_key
-                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                        RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
                     )
                 )
             ).scalar_one()
@@ -529,6 +593,381 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(selected), crawler.AUDIT_PAGE_DEFAULT)
         self.assertEqual(selected[0], ("https://example.com/", "home"))
         self.assertIn(("https://example.com/pricing", "pricing"), selected)
+
+    def test_opaque_slug_is_ranked_from_source_grounded_link_evidence(
+        self,
+    ) -> None:
+        opaque = crawler._candidate_evidence_record(
+            "https://example.com/p/7f3a91",
+            source="rendered_navigation",
+            anchor_text="Enterprise AI analytics platform",
+            title="Book a demo",
+            primary_snippet="Product platform for revenue teams. Request a demo.",
+        )
+
+        relevance = crawler._commercial_relevance(opaque)
+
+        self.assertEqual(relevance["page_kind"], "product")
+        self.assertTrue(relevance["commercially_relevant"])
+        self.assertGreaterEqual(
+            relevance["commercial_relevance_score"],
+            crawler.COMMERCIAL_RELEVANCE_THRESHOLD,
+        )
+
+    def test_specific_noncommercial_anchor_is_not_poisoned_by_parent_copy(
+        self,
+    ) -> None:
+        about = crawler._candidate_evidence_record(
+            "https://example.com/x/7f3a91",
+            source="server_navigation",
+            anchor_text="About us",
+            primary_snippet=(
+                "Products and services. Book a demo. About us. Contact sales."
+            ),
+        )
+
+        relevance = crawler._commercial_relevance(about)
+
+        self.assertEqual(relevance["page_kind"], "about")
+        self.assertFalse(relevance["commercially_relevant"])
+
+    def test_relevance_receipt_rejects_rewritten_anchor_even_with_new_digest(
+        self,
+    ) -> None:
+        homepage = "https://example.com/"
+        candidate = crawler._candidate_evidence_record(
+            "https://example.com/p/opaque",
+            source="rendered_navigation",
+            anchor_text="Analytics product",
+            title="Book a demo",
+        )
+        pages = [
+            (homepage, "home"),
+            ("https://example.com/p/opaque", "product"),
+        ]
+        receipt = crawler._selection_relevance_receipt(
+            homepage_url=homepage,
+            candidates=[candidate],
+            target=crawler.AUDIT_PAGE_DEFAULT,
+            proposed=pages,
+            attempts=[
+                crawler._candidate_attempt(page, outcome="usable") for page in pages
+            ],
+            selected=pages,
+        )
+        self.assertTrue(
+            crawler._selection_relevance_receipt_is_valid(
+                receipt,
+                domain="example.com",
+            )
+        )
+
+        tampered = deepcopy(receipt)
+        tampered["candidates"][0]["discoveries"][0]["anchor_text"] = "About us"
+        tampered_body = dict(tampered)
+        tampered_body.pop("receipt_sha256")
+        tampered["receipt_sha256"] = crawler._json_sha256(tampered_body)
+
+        self.assertFalse(
+            crawler._selection_relevance_receipt_is_valid(
+                tampered,
+                domain="example.com",
+            )
+        )
+
+    async def test_client_shell_with_eight_ssr_links_admits_opaque_js_product(
+        self,
+    ) -> None:
+        run_id = await self._create_run()
+        generic_slugs = [
+            "about",
+            "contact",
+            "blog",
+            "news",
+            "faq",
+            "team",
+            "careers",
+            "partners",
+        ]
+        generic_urls = {f"https://example.com/{slug}" for slug in generic_slugs}
+        links = "".join(
+            f'<a href="/{slug}">{slug.title()}</a>' for slug in generic_slugs
+        )
+        homepage_html = (
+            "<html><head><title>Example</title></head><body>"
+            f'<div id="root">{links}</div>'
+            "<script></script><script></script><script></script>"
+            "</body></html>"
+        )
+        opaque_url = "https://example.com/p/7f3a91"
+        opaque_evidence = [
+            crawler._candidate_evidence_record(
+                opaque_url,
+                source="rendered_navigation",
+                anchor_text="Enterprise AI analytics platform",
+                title="Book a demo",
+                primary_snippet="Product platform for revenue teams. Request a demo.",
+            )
+        ]
+        rendered_receipt = {
+            "state": "completed",
+            "candidate_count": 1,
+            "candidate_urls_sha256": crawler._json_sha256([opaque_url]),
+            "candidate_evidence": opaque_evidence,
+            "candidate_evidence_sha256": crawler._json_sha256(opaque_evidence),
+        }
+
+        async def discovery_probe(**kwargs):
+            url = kwargs["url"]
+            if url == "https://example.com/":
+                return _probe(url, body=homepage_html), {}, None
+            if url in {
+                "https://example.com/robots.txt",
+                "https://example.com/sitemap.xml",
+            }:
+                return _probe(url, status=404), {}, None
+            if url == opaque_url or url in generic_urls:
+                return (
+                    _probe(
+                        url,
+                        body=f"<main>Readable content for {url}</main>",
+                    ),
+                    {},
+                    None,
+                )
+            self.fail(f"Unexpected URL: {url}")
+
+        with (
+            patch.object(
+                crawler,
+                "_probe_with_transport",
+                AsyncMock(side_effect=discovery_probe),
+            ),
+            patch.object(
+                crawler,
+                "_links_from_rendered_homepage",
+                AsyncMock(return_value=([opaque_url], rendered_receipt)),
+            ) as rendered,
+            patch.object(crawler, "update_progress", AsyncMock()),
+            patch.object(crawler.asyncio, "sleep", AsyncMock()),
+        ):
+            selected = await crawler.discover_site_pages(
+                run_id,
+                "example.com",
+                timeout_seconds=5,
+                concurrency=1,
+            )
+
+        rendered.assert_awaited_once()
+        self.assertEqual(len(selected), crawler.AUDIT_PAGE_DEFAULT)
+        self.assertLessEqual(len(selected), crawler.AUDIT_PAGE_HARD_MAX)
+        self.assertIn((opaque_url, "product"), selected)
+
+        async with SessionLocal() as session:
+            artifacts = {
+                artifact.artifact_key: artifact
+                for artifact in (
+                    await session.execute(
+                        select(RunArtifact).where(RunArtifact.run_id == run_id)
+                    )
+                ).scalars()
+            }
+        manifest = artifacts[crawler.SITE_PAGE_MANIFEST_KEY]
+        relevance_artifact = artifacts[crawler.PAGE_RELEVANCE_ARTIFACT_KEY]
+        self.assertNotIn(
+            "candidate_evidence",
+            manifest.output_json["rendered_navigation_discovery"],
+        )
+        self.assertNotIn(
+            "Enterprise AI analytics platform",
+            json.dumps(manifest.output_json, ensure_ascii=False),
+        )
+        opaque_record = next(
+            item
+            for item in relevance_artifact.output_json["candidates"]
+            if item["url"] == opaque_url
+        )
+        self.assertEqual(opaque_record["page_kind"], "product")
+        self.assertEqual(
+            opaque_record["discoveries"][0]["anchor_text"],
+            "Enterprise AI analytics platform",
+        )
+        self.assertTrue(
+            crawler._selection_relevance_receipt_is_valid(
+                relevance_artifact.output_json,
+                domain="example.com",
+            )
+        )
+        self.assertTrue(
+            crawler._relevance_artifact_matches_projection(
+                relevance_artifact,
+                manifest.output_json["commercial_relevance_receipt"],
+                domain="example.com",
+            )
+        )
+        tampered_projection = deepcopy(
+            manifest.output_json["commercial_relevance_receipt"]
+        )
+        opaque_projection = next(
+            item
+            for item in tampered_projection["selected_evidence"]
+            if item["url"] == opaque_url
+        )
+        opaque_projection["commercial_relevance_score"] += 1
+        projection_body = dict(tampered_projection)
+        projection_body.pop("projection_sha256")
+        tampered_projection["projection_sha256"] = crawler._json_sha256(projection_body)
+        self.assertFalse(
+            crawler._relevance_artifact_matches_projection(
+                relevance_artifact,
+                tampered_projection,
+                domain="example.com",
+            )
+        )
+
+    async def test_rendered_navigation_worker_uses_versioned_mode(self) -> None:
+        payload = {
+            "ok": True,
+            "worker_protocol_version": crawler.RENDERED_NAVIGATION_WORKER_PROTOCOL,
+            "mode": "navigation",
+            "final_url": "https://example.com/",
+            "anchors": [
+                {
+                    "href": "https://example.com/p/opaque",
+                    "anchor_text": "Analytics platform",
+                    "title": "Book a demo",
+                    "primary_snippet": "Product for revenue teams",
+                }
+            ],
+            "anchor_count": 1,
+            "truncated": False,
+        }
+        process = SimpleNamespace(
+            communicate=AsyncMock(
+                return_value=(json.dumps(payload).encode("utf-8"), b"")
+            ),
+            returncode=0,
+        )
+        with (
+            patch.object(
+                crawler.settings,
+                "SITE_PREVIEW_WORKER_COMMAND",
+                "/usr/local/bin/aiv-site-preview",
+            ),
+            patch.object(
+                crawler.asyncio,
+                "create_subprocess_exec",
+                AsyncMock(return_value=process),
+            ) as spawn,
+            patch.object(crawler, "_validate_public_url", AsyncMock()),
+        ):
+            links, receipt = await crawler._links_from_rendered_homepage(
+                "https://example.com/",
+                domain="example.com",
+                timeout_seconds=20,
+            )
+
+        command = spawn.await_args.args
+        self.assertIn("--mode", command)
+        self.assertEqual(command[command.index("--mode") + 1], "navigation")
+        self.assertEqual(links, ["https://example.com/p/opaque"])
+        self.assertEqual(receipt["state"], "completed")
+        self.assertEqual(
+            receipt["worker_protocol_version"],
+            crawler.RENDERED_NAVIGATION_WORKER_PROTOCOL,
+        )
+        self.assertEqual(
+            receipt["candidate_evidence"][0]["discoveries"][0]["title"],
+            "Book a demo",
+        )
+
+    async def test_failed_rendered_read_cannot_claim_complete_discovery(
+        self,
+    ) -> None:
+        run_id = await self._create_run()
+        slugs = [
+            "about",
+            "contact",
+            "blog",
+            "news",
+            "faq",
+            "team",
+            "careers",
+            "partners",
+        ]
+        urls = [f"https://example.com/{slug}" for slug in slugs]
+        links = "".join(f'<a href="/{slug}">{slug.title()}</a>' for slug in slugs)
+        homepage_html = (
+            "<html><head><title>Example</title></head><body>"
+            f'<div id="root">{links}</div>'
+            "<script></script><script></script><script></script>"
+            "</body></html>"
+        )
+        sitemap = (
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            "<url><loc>https://example.com/</loc></url>"
+            + "".join(f"<url><loc>{url}</loc></url>" for url in urls)
+            + "</urlset>"
+        )
+
+        async def discovery_probe(**kwargs):
+            url = kwargs["url"]
+            if url == "https://example.com/":
+                return _probe(url, body=homepage_html), {}, None
+            if url == "https://example.com/robots.txt":
+                return _probe(url, status=404), {}, None
+            if url == "https://example.com/sitemap.xml":
+                return _probe(url, body=sitemap), {}, None
+            if url in urls:
+                return _probe(url, body=f"<main>Content for {url}</main>"), {}, None
+            self.fail(f"Unexpected URL: {url}")
+
+        with (
+            patch.object(
+                crawler,
+                "_probe_with_transport",
+                AsyncMock(side_effect=discovery_probe),
+            ),
+            patch.object(
+                crawler,
+                "_links_from_rendered_homepage",
+                AsyncMock(
+                    return_value=(
+                        [],
+                        {
+                            "state": "failed_non_blocking",
+                            "candidate_count": 0,
+                            "error_class": "RuntimeError",
+                        },
+                    )
+                ),
+            ),
+            patch.object(crawler, "update_progress", AsyncMock()),
+            patch.object(crawler.asyncio, "sleep", AsyncMock()),
+        ):
+            await crawler.discover_site_pages(
+                run_id,
+                "example.com",
+                timeout_seconds=5,
+                concurrency=1,
+            )
+
+        async with SessionLocal() as session:
+            manifest = (
+                await session.execute(
+                    select(RunArtifact).where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
+                    )
+                )
+            ).scalar_one()
+        self.assertTrue(manifest.output_json["sitemap_discovery"]["complete"])
+        self.assertEqual(
+            manifest.output_json["rendered_navigation_discovery"]["state"],
+            "failed_non_blocking",
+        )
+        self.assertEqual(manifest.output_json["discovery_state"], "terminal_partial")
+        self.assertEqual(manifest.output_json["coverage_state"], "bounded")
 
     async def test_more_than_eight_semantic_pages_are_bounded_in_manifest(
         self,
@@ -576,8 +1015,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(
                     select(RunArtifact).where(
                         RunArtifact.run_id == run_id,
-                        RunArtifact.artifact_key
-                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                        RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
                     )
                 )
             ).scalar_one()
@@ -656,8 +1094,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(
                     select(RunArtifact).where(
                         RunArtifact.run_id == run_id,
-                        RunArtifact.artifact_key
-                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                        RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
                     )
                 )
             ).scalar_one()
@@ -725,8 +1162,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                     await session.execute(
                         select(RunArtifact).where(
                             RunArtifact.run_id == run_id,
-                            RunArtifact.artifact_key
-                            == crawler.SITE_PAGE_MANIFEST_KEY,
+                            RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
                         )
                     )
                 ).scalar_one()
@@ -765,8 +1201,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(
                     select(RunArtifact).where(
                         RunArtifact.run_id == run_id,
-                        RunArtifact.artifact_key
-                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                        RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
                     )
                 )
             ).scalar_one()
@@ -871,8 +1306,7 @@ class SitePageManifestTests(unittest.IsolatedAsyncioTestCase):
                 await session.execute(
                     select(RunArtifact).where(
                         RunArtifact.run_id == run_id,
-                        RunArtifact.artifact_key
-                        == crawler.SITE_PAGE_MANIFEST_KEY,
+                        RunArtifact.artifact_key == crawler.SITE_PAGE_MANIFEST_KEY,
                     )
                 )
             ).scalar_one()

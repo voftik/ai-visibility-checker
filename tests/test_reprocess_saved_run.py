@@ -93,14 +93,10 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
                     VisibilityPrompt(
                         run_id=run_id,
                         prompt_key=(
-                            f"u-{sequence}"
-                            if sequence <= 6
-                            else f"b-{sequence - 6}"
+                            f"u-{sequence}" if sequence <= 6 else f"b-{sequence - 6}"
                         ),
                         intent_class=(
-                            ("I", "E", "T", "NB", "NAV", "TR")[
-                                sequence - 1
-                            ]
+                            ("I", "E", "T", "NB", "NAV", "TR")[sequence - 1]
                             if sequence <= 6
                             else "B"
                         ),
@@ -307,9 +303,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             execution_slot=1,
             lease_owner="another-operator",
             heartbeat_at=datetime.now(timezone.utc),
-            lease_expires_at=(
-                datetime.now(timezone.utc) + timedelta(minutes=2)
-            ),
+            lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=2)),
         )
 
         with self.assertRaisesRegex(
@@ -317,6 +311,75 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             "durable queue занята",
         ):
             await reprocess_cli.reprocess_saved_run(target_id)
+
+    async def test_saved_guard_keeps_sealed_historical_lane_topology(self) -> None:
+        run_id = await self._create_run(
+            status=RunStatus.failed,
+            response_text="Сохранённый ответ.",
+        )
+        async with self.SessionLocal() as session:
+            prompt_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            VisibilityPrompt.id,
+                            VisibilityPrompt.role,
+                        )
+                        .where(VisibilityPrompt.run_id == run_id)
+                        .order_by(VisibilityPrompt.sequence)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            answer_rows = [
+                dict(row)
+                for row in (
+                    (
+                        await session.execute(
+                            select(
+                                ModelAnswer.prompt_id,
+                                ModelAnswer.provider_key,
+                                ModelAnswer.model,
+                                ModelAnswer.mode,
+                                ModelAnswer.status,
+                            )
+                            .where(ModelAnswer.run_id == run_id)
+                            .order_by(ModelAnswer.id)
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+            ]
+        sealed_cells = [
+            {
+                key: row[key]
+                for key in ("prompt_id", "provider_key", "model", "mode")
+            }
+            for row in answer_rows
+        ]
+
+        reprocess_cli._validate_complete_saved_panel(
+            prompt_rows,
+            answer_rows,
+            sealed_expected_cells=sealed_cells,
+        )
+
+        current_grid_rows = [dict(row) for row in answer_rows]
+        for row in current_grid_rows:
+            if row["mode"] == "memory" and row["provider_key"] == "claude":
+                row["provider_key"] = "perplexity"
+                row["model"] = "test/perplexity"
+        with self.assertRaisesRegex(
+            reprocess_cli.ReprocessGuardError,
+            "outside its sealed historical grid",
+        ):
+            reprocess_cli._validate_complete_saved_panel(
+                prompt_rows,
+                current_grid_rows,
+                sealed_expected_cells=sealed_cells,
+            )
 
     async def test_accepts_complete_nine_prompt_eighty_one_cell_corpus(
         self,
@@ -341,9 +404,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             answer_ids = list(
                 (
                     await session.execute(
-                        select(ModelAnswer.id).where(
-                            ModelAnswer.run_id == run_id
-                        )
+                        select(ModelAnswer.id).where(ModelAnswer.run_id == run_id)
                     )
                 ).scalars()
             )
@@ -361,9 +422,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
                     (run.lease_owner or "").startswith("operator-reprocess:")
                 )
                 self.assertIsNotNone(run.lease_expires_at)
-                marker = run.config_json.get(
-                    SAVED_ANSWERS_ONLY_MARKER_KEY
-                )
+                marker = run.config_json.get(SAVED_ANSWERS_ONLY_MARKER_KEY)
                 self.assertIsInstance(marker, dict)
                 self.assertEqual(marker["mode"], "saved_answers_only")
                 self.assertEqual(marker["run_id"], value)
@@ -683,9 +742,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             run = (
                 await session.execute(select(Run).where(Run.id == run_id))
             ).scalar_one()
-            run.lease_expires_at = datetime.now(timezone.utc) - timedelta(
-                seconds=1
-            )
+            run.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
             await session.commit()
 
         with patch.object(
@@ -712,9 +769,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(run.execution_slot)
         self.assertEqual(run.config_json, {"page_limit": 6})
         self.assertEqual(answer.response_text, raw_text)
-        count, raw_sha256 = await reprocess_cli._model_answer_fingerprint(
-            run_id
-        )
+        count, raw_sha256 = await reprocess_cli._model_answer_fingerprint(run_id)
         self.assertEqual(count, claim.total_answers)
         self.assertEqual(raw_sha256, claim.raw_answers_sha256)
 
@@ -802,7 +857,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.alt_text, public["alt_text"])
         self.assertEqual(
             row.alt_text,
-            "Фактическая сцена на сохранённой картинке.",
+            "Описание другой, ещё не созданной сцены.",
         )
         self.assertEqual(row.file_url, "/static/generated/test/01.png")
         self.assertEqual(row.generation_prompt, "original-generation-prompt")
@@ -826,9 +881,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).scalar_one()
                 run = (
-                    await session.execute(
-                        select(Run).where(Run.id == value)
-                    )
+                    await session.execute(select(Run).where(Run.id == value))
                 ).scalar_one()
                 answer.response_text = "Случайно изменённый ответ."
                 run.status = RunStatus.completed
@@ -879,15 +932,14 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             async with self.SessionLocal() as session:
                 answer = (
                     await session.execute(
-                        select(ModelAnswer).where(ModelAnswer.run_id == value)
+                        select(ModelAnswer)
+                        .where(ModelAnswer.run_id == value)
                         .order_by(ModelAnswer.id)
                         .limit(1)
                     )
                 ).scalar_one()
                 run = (
-                    await session.execute(
-                        select(Run).where(Run.id == value)
-                    )
+                    await session.execute(select(Run).where(Run.id == value))
                 ).scalar_one()
                 answer.response_text = "Повреждённый raw-ответ."
                 run.status = RunStatus.failed
@@ -932,7 +984,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             run.config_json,
         )
 
-    async def test_rejects_noncompleted_cell_before_downstream_tokens(
+    async def test_terminal_failed_cell_is_preserved_for_coverage_admission(
         self,
     ) -> None:
         run_id = await self._create_run(
@@ -952,23 +1004,22 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
             answer.error_message = "Сохранённая ошибка."
             await session.commit()
 
-        with (
-            patch.object(
-                reprocess_cli.analyzer,
-                "reprocess_saved_answers",
-                new_callable=AsyncMock,
-            ) as reprocess,
-            self.assertRaisesRegex(
-                reprocess_cli.ReprocessGuardError,
-                "Every saved panel cell must be completed",
-            ),
-        ):
-            await reprocess_cli.reprocess_saved_run(
-                run_id,
-                announce=lambda _message: None,
+        claim = await reprocess_cli._claim_eligible_run(run_id)
+        try:
+            self.assertEqual(claim.total_answers, 81)
+            self.assertEqual(claim.completed_answers, 80)
+            failed = [
+                row
+                for row in claim.raw_answer_snapshot
+                if row.get("status") == "failed"
+            ]
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(failed[0].get("error_message"), "Сохранённая ошибка.")
+        finally:
+            await reprocess_cli._release_reprocess_claim(
+                claim,
+                successful=False,
             )
-
-        reprocess.assert_not_awaited()
 
     async def test_concurrent_operator_run_cannot_bypass_slot(self) -> None:
         first_id = await self._create_run(
@@ -1023,9 +1074,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
         async with self.SessionLocal() as session:
             second_status, second_slot = (
                 await session.execute(
-                    select(Run.status, Run.execution_slot).where(
-                        Run.id == second_id
-                    )
+                    select(Run.status, Run.execution_slot).where(Run.id == second_id)
                 )
             ).one()
         self.assertEqual(second_status, RunStatus.completed)
@@ -1200,9 +1249,7 @@ class SavedRunReprocessCliTests(unittest.IsolatedAsyncioTestCase):
 class ReprocessServiceContractTests(unittest.TestCase):
     def test_systemd_does_not_impose_a_total_reprocess_duration_cap(self) -> None:
         service_path = (
-            Path(__file__).resolve().parents[1]
-            / "scripts"
-            / "aiv-reprocess@.service"
+            Path(__file__).resolve().parents[1] / "scripts" / "aiv-reprocess@.service"
         )
         service = service_path.read_text(encoding="utf-8")
 

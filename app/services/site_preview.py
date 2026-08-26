@@ -29,6 +29,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 SITE_PREVIEW_ARTIFACT_KEY = "site_preview"
 SITE_PREVIEW_VERSION = "site-preview-v1"
+SITE_PREVIEW_ASSET_RECEIPT_VERSION = "aiv-site-preview-asset-receipt-v1"
 SITE_PREVIEW_WIDTH = 1440
 SITE_PREVIEW_HEIGHT = 900
 SITE_PREVIEW_TIMEOUT_SECONDS = 40
@@ -61,13 +62,45 @@ def _path_for_file_url(file_url: str) -> Path | None:
     return path
 
 
-def public_site_preview(value: Any, *, require_file: bool = True) -> dict[str, Any] | None:
+def public_site_preview(
+    value: Any,
+    *,
+    run_id: str | None = None,
+    require_file: bool = True,
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     file_url = str(value.get("file_url") or "")
+    match = _FILE_URL_RX.fullmatch(file_url)
+    if match is None:
+        return None
+    if run_id is not None:
+        try:
+            if match.group(1) != str(uuid.UUID(run_id)):
+                return None
+        except (TypeError, ValueError, AttributeError):
+            return None
+    digest = str(value.get("sha256") or "")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or match.group(2) != digest[:12]
+    ):
+        return None
     file_path = _path_for_file_url(file_url)
     if file_path is None or (require_file and not file_path.is_file()):
         return None
+    if require_file:
+        try:
+            if file_path.stat().st_size > MAX_JPEG_BYTES:
+                return None
+            image = file_path.read_bytes()
+        except OSError:
+            return None
+        if (
+            not image.startswith(b"\xff\xd8\xff")
+            or hashlib.sha256(image).hexdigest() != digest
+        ):
+            return None
     width = value.get("width")
     height = value.get("height")
     if not isinstance(width, int) or not 1024 <= width <= 1920:
@@ -81,8 +114,61 @@ def public_site_preview(value: Any, *, require_file: bool = True) -> dict[str, A
         "width": width,
         "height": height,
         "captured_at": str(value.get("captured_at") or "")[:64],
-        "sha256": str(value.get("sha256") or "")[:64],
+        "sha256": digest,
     }
+
+
+def site_preview_asset_receipt(
+    run_id: str,
+    value: Any,
+) -> dict[str, Any]:
+    """Return an exact, content-addressed receipt for a public preview."""
+
+    preview = public_site_preview(value, run_id=run_id, require_file=True)
+    if preview is None:
+        raise ValueError("site_preview_asset_invalid")
+    path = _path_for_file_url(preview["file_url"])
+    if path is None:
+        raise ValueError("site_preview_asset_path_invalid")
+    core = {
+        "version": SITE_PREVIEW_ASSET_RECEIPT_VERSION,
+        "run_id": str(uuid.UUID(run_id)),
+        "file_url": preview["file_url"],
+        "image_sha256": preview["sha256"],
+        "image_bytes": path.stat().st_size,
+        "width": preview["width"],
+        "height": preview["height"],
+        "source_domain": preview["source_domain"],
+        "captured_at": preview["captured_at"],
+    }
+    return {
+        **core,
+        "receipt_sha256": hashlib.sha256(
+            json.dumps(
+                core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _preview_matches_input(
+    preview: dict[str, Any],
+    input_json: Any,
+) -> bool:
+    if not isinstance(input_json, dict):
+        return False
+    viewport = input_json.get("viewport")
+    return bool(
+        isinstance(viewport, dict)
+        and preview.get("source_domain") == str(input_json.get("domain") or "")
+        and preview.get("width") == viewport.get("width")
+        and preview.get("height") == viewport.get("height")
+        and isinstance(input_json.get("source_url"), str)
+        and bool(str(input_json.get("source_url") or "").strip())
+    )
 
 
 async def _artifact(run_id: str) -> RunArtifact | None:
@@ -144,7 +230,14 @@ async def get_saved_site_preview(
         or artifact.prompt_version != SITE_PREVIEW_VERSION
     ):
         return None
-    return public_site_preview(artifact.output_json, require_file=require_file)
+    preview = public_site_preview(
+        artifact.output_json,
+        run_id=run_id,
+        require_file=require_file,
+    )
+    if preview is None or not _preview_matches_input(preview, artifact.input_json):
+        return None
+    return preview
 
 
 async def _run_worker(
@@ -257,8 +350,8 @@ async def capture_site_preview(
         and cached_artifact.prompt_version == SITE_PREVIEW_VERSION
         and cached_artifact.input_json == input_json
     ):
-        cached = public_site_preview(cached_artifact.output_json)
-        if cached is not None:
+        cached = public_site_preview(cached_artifact.output_json, run_id=run_id)
+        if cached is not None and _preview_matches_input(cached, input_json):
             return cached
 
     try:
@@ -292,7 +385,7 @@ async def capture_site_preview(
             input_json=input_json,
             output_json=output,
         )
-        return public_site_preview(output)
+        return public_site_preview(output, run_id=run_id)
     except asyncio.CancelledError:
         raise
     except Exception as exc:

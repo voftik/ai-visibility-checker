@@ -281,7 +281,7 @@ class CriticGateAdversarialTests(unittest.TestCase):
         self.assertEqual(fallback["verdict"], "block")
         self.assertEqual(
             fallback["fallback"]["kind"],
-            "deterministic_block",
+            "deterministic_actionability_block",
         )
 
 

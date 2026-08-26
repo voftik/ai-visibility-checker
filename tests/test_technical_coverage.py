@@ -240,6 +240,22 @@ class TechnicalSummaryCoverageIntegrationTests(
             pages,
             {home.url: home, services.url: services},
         )
+        relevance_receipt = crawler._selection_relevance_receipt(
+            homepage_url=pages[0][0],
+            candidates=[
+                crawler._candidate_evidence_record(
+                    pages[1][0],
+                    source="test_fixture",
+                )
+            ],
+            target=crawler.AUDIT_PAGE_DEFAULT,
+            proposed=pages,
+            attempts=[
+                crawler._candidate_attempt(page, outcome="usable")
+                for page in pages
+            ],
+            selected=pages,
+        )
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -275,6 +291,11 @@ class TechnicalSummaryCoverageIntegrationTests(
                         "discovery_state": "complete",
                         "coverage_state": "complete",
                         "site_page_receipt": page_receipt,
+                        "commercial_relevance_receipt": (
+                            crawler._selection_relevance_projection(
+                                relevance_receipt
+                            )
+                        ),
                     },
                 )
             )

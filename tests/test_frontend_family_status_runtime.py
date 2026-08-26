@@ -81,7 +81,7 @@ const html = familyStatusPanelHTML([
   { name: "Unknown AI" }
 ], "example.ru");
 assert.match(html, /aria-label="Доступ сайта example\.ru для семейств ИИ-краулеров"/);
-assert.match(html, /Лампа горит — доступ открыт/);
+assert.match(html, /Лампа горит: доступ открыт/);
 assert.match(html, /class="family-status-card is-available"/);
 assert.match(html, /class="family-status-card is-blocked"/);
 assert.match(html, /class="family-status-card is-partial"/);
