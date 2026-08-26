@@ -60,6 +60,7 @@ from app.services.long_response import split_lossless_text
 from app.services.analyzer import (
     ANALYSIS_CRITIC_VERSION,
     _AnalysisCriticRecoveryBlocked,
+    _ConfirmedCriticIntegrityBlock,
     ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
     ANNOTATION_VERSION,
     _analysis_critic_artifact,
@@ -2376,7 +2377,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             "validated",
         )
 
-    async def test_recovery_final_never_promotes_invalid_primary_via_repair(
+    async def test_recovery_final_uses_one_bounded_contract_repair(
         self,
     ) -> None:
         payload = _critic_payload(
@@ -2410,17 +2411,14 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                 return_value=_critic_review("pass"),
             ) as repair,
         ):
-            with self.assertRaisesRegex(
-                OpenRouterError,
-                "Final recovery critic primary decision is inconsistent",
-            ):
-                await _analysis_critic_artifact(
-                    "run-final-primary-only",
-                    iteration=3,
-                    payload=payload,
-                    recovery_final=True,
-                )
-        repair.assert_not_awaited()
+            result = await _analysis_critic_artifact(
+                "run-final-primary-only",
+                iteration=3,
+                payload=payload,
+                recovery_final=True,
+            )
+        self.assertEqual(result["verdict"], "pass")
+        repair.assert_awaited_once()
 
     async def test_incomplete_review_repair_gets_compact_audit_context(
         self,
@@ -3749,7 +3747,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["verdict"], "block")
         self.assertEqual(
             result["fallback"]["kind"],
-            "deterministic_actionability_block",
+            "deterministic_degraded_advisory",
         )
         self.assertEqual(result["anomalies"], still_invalid["anomalies"])
         fallback_writes = [
@@ -3871,7 +3869,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["verdict"], "block")
         self.assertEqual(
             result["fallback"]["kind"],
-            "deterministic_actionability_block",
+            "deterministic_degraded_advisory",
         )
         self.assertEqual(result["anomalies"], incomplete["anomalies"])
         failed_writes = [
@@ -3942,7 +3940,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(
             result["fallback"]["kind"],
-            "deterministic_safe_pass",
+            "deterministic_degraded_advisory",
         )
         main_terminal = [
             call.kwargs
@@ -4002,6 +4000,8 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(gate["provenance"], expected)
         self.assertEqual(gate["metrics_sha256"], expected["metrics_sha256"])
+        self.assertEqual(gate["quality_state"], "complete")
+        self.assertEqual(gate["reason_codes"], [])
         self.assertTrue(gate["corpus_manifest"]["complete"])
         self.assertEqual(gate["corpus_manifest"]["answer_ids"], [11])
         self.assertEqual(
@@ -4115,6 +4115,171 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         annotate_mock.assert_not_awaited()
         rows_mock.assert_not_awaited()
         metrics_mock.assert_not_called()
+
+    async def test_critic_provider_failure_publishes_degraded_gate(self) -> None:
+        gate = {
+            "passed": True,
+            "quality_state": "degraded",
+            "reason_codes": ["critic_provider_schema_or_cache_unavailable"],
+        }
+        with (
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+                side_effect=OpenRouterError("provider 503"),
+            ),
+            patch(
+                "app.services.analyzer._save_critic_gate",
+                new_callable=AsyncMock,
+                return_value=gate,
+            ) as gate_mock,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._annotate_answers",
+                new_callable=AsyncMock,
+            ) as annotate_mock,
+        ):
+            _catalog, returned_rows, returned_metrics, returned_gate = (
+                await _run_analysis_critic_loop(
+                    "run-critic-provider-outage",
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=ROWS,
+                    metrics=METRICS,
+                )
+            )
+
+        self.assertIs(returned_rows, ROWS)
+        self.assertIs(returned_metrics, METRICS)
+        self.assertEqual(returned_gate, gate)
+        self.assertTrue(gate_mock.await_args.kwargs["passed"])
+        self.assertEqual(gate_mock.await_args.kwargs["quality_state"], "degraded")
+        self.assertEqual(
+            gate_mock.await_args.kwargs["reason_codes"],
+            ["critic_provider_schema_or_cache_unavailable"],
+        )
+        annotate_mock.assert_not_awaited()
+
+    async def test_critic_provider_failure_cannot_hide_confirmed_integrity_error(
+        self,
+    ) -> None:
+        warning = {
+            "code": "target_mention_false_negative",
+            "severity": "important",
+            "finding": "Raw evidence contains the exact target alias.",
+            "answer_ids": [11],
+            "entities": ["Example"],
+        }
+        with (
+            patch(
+                "app.services.analyzer._deterministic_annotation_warnings",
+                return_value=[warning],
+            ),
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+                side_effect=OpenRouterError("provider 503"),
+            ),
+            patch(
+                "app.services.analyzer._save_critic_gate",
+                new_callable=AsyncMock,
+                return_value={"passed": False},
+            ) as gate_mock,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with self.assertRaises(_ConfirmedCriticIntegrityBlock) as caught:
+                await _run_analysis_critic_loop(
+                    "run-critic-provider-outage-confirmed-anomaly",
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=ROWS,
+                    metrics=METRICS,
+                )
+
+        self.assertIn(
+            "annotation_integrity:target_mention_false_negative",
+            caught.exception.reason_codes,
+        )
+        gate_mock.assert_awaited_once()
+        self.assertFalse(gate_mock.await_args.kwargs["passed"])
+        self.assertEqual(
+            gate_mock.await_args.kwargs["critic_outcome"],
+            "confirmed_integrity_block",
+        )
+
+    async def test_critic_provider_failure_cannot_hide_stale_annotation_lineage(
+        self,
+    ) -> None:
+        stale_rows = copy.deepcopy(ROWS)
+        stale_rows[0]["annotation"]["_answer_sha256"] = "0" * 64
+        with (
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+                side_effect=OpenRouterError("provider 503"),
+            ),
+            patch(
+                "app.services.analyzer._save_critic_gate",
+                new_callable=AsyncMock,
+                return_value={"passed": False},
+            ) as gate_mock,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with self.assertRaises(_ConfirmedCriticIntegrityBlock) as caught:
+                await _run_analysis_critic_loop(
+                    "run-critic-provider-outage-stale-lineage",
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=stale_rows,
+                    metrics=METRICS,
+                )
+
+        self.assertIn(
+            "corpus_lineage:annotation_raw_hash_mismatch",
+            caught.exception.reason_codes,
+        )
+        gate_mock.assert_awaited_once()
+        self.assertFalse(gate_mock.await_args.kwargs["passed"])
+
+    async def test_zero_eligible_evidence_still_blocks_degraded_gate(self) -> None:
+        ineligible_rows = [copy.deepcopy(ROWS[0])]
+        ineligible_rows[0]["metric_eligible"] = False
+        ineligible_rows[0]["metric_evidence_state"] = "provider_limited_prefix"
+        ineligible_rows[0]["metric_limitation"] = "provider_output_limit"
+        with patch(
+            "app.services.analyzer._save_artifact",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaises(_ConfirmedCriticIntegrityBlock) as caught:
+                await _save_critic_gate(
+                    "run-zero-eligible",
+                    passed=True,
+                    iteration=1,
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=ineligible_rows,
+                    metrics=METRICS,
+                    policy_history=[],
+                    reason="Critic unavailable.",
+                    quality_state="degraded",
+                    reason_codes=["critic_provider_unavailable"],
+                )
+
+        self.assertTrue(
+            any(
+                code.startswith("panel_integrity:")
+                for code in caught.exception.reason_codes
+            )
+        )
 
     async def test_revise_then_pass_reannotates_and_recomputes_once(
         self,
@@ -4267,7 +4432,9 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_second_revise_blocks_without_a_second_repair(self) -> None:
+    async def test_second_revise_publishes_degraded_without_a_second_repair(
+        self,
+    ) -> None:
         adjustment = {
             "action": "require_alias_attribution",
             "entity_name": "Campaign 360",
@@ -4290,6 +4457,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._save_critic_gate",
                 new_callable=AsyncMock,
+                return_value={"passed": True, "quality_state": "degraded"},
             ) as gate_mock,
             patch(
                 "app.services.analyzer._save_artifact",
@@ -4313,10 +4481,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                 return_value=METRICS,
             ) as metrics_mock,
         ):
-            with self.assertRaisesRegex(
-                OpenRouterError,
-                "blocked report publication",
-            ):
+            _catalog, returned_rows, returned_metrics, returned_gate = (
                 await _run_analysis_critic_loop(
                     "run-second-revise",
                     profile=PROFILE,
@@ -4324,17 +4489,26 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                     rows=ROWS,
                     metrics=METRICS,
                 )
+            )
 
         self.assertEqual(critic_mock.await_count, MAX_CRITIC_ITERATIONS)
         annotate_mock.assert_awaited_once()
         metrics_mock.assert_called_once()
         artifact_mock.assert_awaited_once()
         gate_mock.assert_awaited_once()
-        self.assertFalse(gate_mock.await_args.kwargs["passed"])
+        self.assertTrue(gate_mock.await_args.kwargs["passed"])
+        self.assertEqual(gate_mock.await_args.kwargs["quality_state"], "degraded")
+        self.assertEqual(
+            gate_mock.await_args.kwargs["critic_outcome"],
+            "non_convergent",
+        )
         self.assertEqual(
             gate_mock.await_args.kwargs["iteration"],
             MAX_CRITIC_ITERATIONS,
         )
+        self.assertIs(returned_rows, ROWS)
+        self.assertIs(returned_metrics, METRICS)
+        self.assertTrue(returned_gate["passed"])
 
     async def test_r2_exhaustion_uses_fable_targeted_repair_then_final_gate(
         self,
@@ -4737,7 +4911,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             stable_digest(recovery_receipts),
         )
 
-    async def test_r2_targeted_repair_fails_closed_when_final_critic_blocks(
+    async def test_r2_targeted_repair_keeps_recovered_state_when_final_critic_blocks(
         self,
     ) -> None:
         adjustment = {
@@ -4801,6 +4975,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._save_critic_gate",
                 new_callable=AsyncMock,
+                return_value={"passed": True, "quality_state": "degraded"},
             ) as gate,
             patch(
                 "app.services.analyzer._save_artifact",
@@ -4824,10 +4999,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=[METRICS, {**METRICS, "recovered": True}],
             ),
         ):
-            with self.assertRaisesRegex(
-                OpenRouterError,
-                "blocked report publication",
-            ):
+            _catalog, returned_rows, returned_metrics, returned_gate = (
                 await _run_analysis_critic_loop(
                     "run-fable-final-block",
                     profile=PROFILE,
@@ -4835,14 +5007,19 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                     rows=ROWS,
                     metrics=METRICS,
                 )
+            )
 
         self.assertEqual(critic.await_count, 3)
         finish.assert_awaited_once()
-        self.assertFalse(finish.await_args.kwargs["succeeded"])
+        self.assertTrue(finish.await_args.kwargs["succeeded"])
         gate.assert_awaited_once()
-        self.assertFalse(gate.await_args.kwargs["passed"])
+        self.assertTrue(gate.await_args.kwargs["passed"])
+        self.assertEqual(gate.await_args.kwargs["quality_state"], "degraded")
         self.assertEqual(gate.await_args.kwargs["rows"], recovered_rows)
         self.assertTrue(gate.await_args.kwargs["metrics"]["recovered"])
+        self.assertEqual(returned_rows, recovered_rows)
+        self.assertTrue(returned_metrics["recovered"])
+        self.assertTrue(returned_gate["passed"])
 
     async def test_r2_fable_stop_preserves_checkpoint_without_repair(self) -> None:
         adjustment = {
@@ -4894,7 +5071,8 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._save_critic_gate",
                 new_callable=AsyncMock,
-            ),
+                return_value={"passed": True, "quality_state": "degraded"},
+            ) as gate,
             patch(
                 "app.services.analyzer._save_artifact",
                 new_callable=AsyncMock,
@@ -4917,7 +5095,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                 return_value=METRICS,
             ),
         ):
-            with self.assertRaises(OpenRouterError):
+            _catalog, returned_rows, returned_metrics, returned_gate = (
                 await _run_analysis_critic_loop(
                     "run-fable-stop",
                     profile=PROFILE,
@@ -4925,6 +5103,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                     rows=ROWS,
                     metrics=METRICS,
                 )
+            )
 
         self.assertEqual(critic.await_count, 2)
         self.assertEqual(
@@ -4940,6 +5119,11 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             finish.await_args.kwargs["before_digest"],
             finish.await_args.kwargs["after_digest"],
         )
+        self.assertIs(returned_rows, ROWS)
+        self.assertIs(returned_metrics, METRICS)
+        self.assertTrue(returned_gate["passed"])
+        self.assertTrue(gate.await_args.kwargs["passed"])
+        self.assertEqual(gate.await_args.kwargs["quality_state"], "degraded")
 
     def test_targeted_repair_provenance_survives_standard_resume(self) -> None:
         resume_digest = _annotation_context_sha256(PROFILE, CATALOG)
@@ -5137,7 +5321,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             payload["raw_evidence_selection"]["optional_char_window"]
         )
 
-    def test_coverage_only_block_is_rejected_and_fallback_stays_closed(
+    def test_coverage_only_block_becomes_degraded_advisory(
         self,
     ) -> None:
         degraded_rows = [copy.deepcopy(ROWS[0]), copy.deepcopy(ROWS[0])]
@@ -5175,7 +5359,57 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fallback["verdict"], "block")
         self.assertEqual(
             fallback["fallback"]["kind"],
-            "deterministic_actionability_block",
+            "deterministic_degraded_advisory",
+        )
+        self.assertIn(
+            "critic_unconfirmed_block",
+            fallback["fallback"]["reason_codes"],
+        )
+
+    async def test_coverage_only_block_publishes_degraded_gate(self) -> None:
+        degraded_rows = [copy.deepcopy(ROWS[0]), copy.deepcopy(ROWS[0])]
+        degraded_rows[1]["answer_id"] = 12
+        degraded_rows[1]["provider_key"] = "gemini"
+        degraded_rows[1]["model"] = "google/gemini-3.1-pro-preview"
+        degraded_rows[1]["metric_eligible"] = False
+        degraded_rows[1]["metric_evidence_state"] = "provider_limited_prefix"
+        degraded_rows[1]["metric_limitation"] = "provider_output_limit"
+        degraded_rows[1]["annotation"]["_answer_model"] = degraded_rows[1]["model"]
+        coverage_block = _critic_review("block")
+        gate = {"passed": True, "quality_state": "degraded"}
+        with (
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+                return_value=coverage_block,
+            ),
+            patch(
+                "app.services.analyzer._save_critic_gate",
+                new_callable=AsyncMock,
+                return_value=gate,
+            ) as gate_mock,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+        ):
+            _catalog, returned_rows, _metrics, returned_gate = (
+                await _run_analysis_critic_loop(
+                    "run-coverage-only-advisory",
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=degraded_rows,
+                    metrics=METRICS,
+                )
+            )
+
+        self.assertIs(returned_rows, degraded_rows)
+        self.assertEqual(returned_gate, gate)
+        self.assertTrue(gate_mock.await_args.kwargs["passed"])
+        self.assertEqual(gate_mock.await_args.kwargs["quality_state"], "degraded")
+        self.assertEqual(
+            gate_mock.await_args.kwargs["critic_outcome"],
+            "advisory_block",
         )
 
     async def test_coverage_only_block_gets_one_bounded_repair_to_pass(
@@ -5240,7 +5474,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             repair_mock.await_args.kwargs["validation_errors"],
         )
 
-    def test_malformed_non_coverage_block_remains_fail_closed(self) -> None:
+    def test_malformed_non_coverage_block_becomes_degraded_advisory(self) -> None:
         degraded_rows = [copy.deepcopy(ROWS[0]), copy.deepcopy(ROWS[0])]
         degraded_rows[1]["answer_id"] = 12
         degraded_rows[1]["provider_key"] = "gemini"
@@ -5266,12 +5500,12 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(fallback["verdict"], "block")
-        self.assertNotEqual(
+        self.assertEqual(
             fallback.get("fallback", {}).get("kind"),
-            "deterministic_safe_pass",
+            "deterministic_degraded_advisory",
         )
 
-    def test_answer_bound_missing_as_zero_can_still_block(self) -> None:
+    def test_model_only_missing_as_zero_cannot_hard_block(self) -> None:
         payload = _critic_payload(
             profile=PROFILE,
             catalog=CATALOG,
@@ -5295,9 +5529,86 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertEqual(
+        self.assertIn(
+            "block is not backed by a code-owned confirmed integrity anomaly",
             _critic_review_validation_errors(review, payload=payload),
-            [],
+        )
+
+    def test_context_only_truncated_prefix_is_not_an_integrity_block(self) -> None:
+        limited_rows = [copy.deepcopy(ROWS[0])]
+        limited_rows[0]["metric_eligible"] = False
+        limited_rows[0]["context_eligible"] = True
+        limited_rows[0]["metric_evidence_state"] = "provider_limited_prefix"
+        limited_rows[0]["metric_limitation"] = "provider_output_limit"
+        payload = _critic_payload(
+            profile=PROFILE,
+            catalog=CATALOG,
+            rows=limited_rows,
+            metrics=METRICS,
+            policy_history=[],
+        )
+        payload["answers"][0]["raw_answer_truncated"] = True
+
+        errors = _critic_review_validation_errors(
+            _critic_review("pass"),
+            payload=payload,
+        )
+
+        self.assertFalse(
+            any("truncated raw answers require block" in error for error in errors)
+        )
+
+    async def test_code_owned_annotation_anomaly_still_hard_blocks(self) -> None:
+        warning = {
+            "code": "target_mention_false_negative",
+            "severity": "important",
+            "finding": (
+                "Код нашёл буквальный exact-target alias в raw-ответе, "
+                "но текущая разметка не засчитала его."
+            ),
+            "answer_ids": [11],
+            "entities": ["Example"],
+        }
+        review = _critic_review(
+            "block",
+            anomalies=[copy.deepcopy(warning)],
+        )
+        with (
+            patch(
+                "app.services.analyzer._deterministic_annotation_warnings",
+                return_value=[warning],
+            ),
+            patch(
+                "app.services.analyzer._analysis_critic_artifact",
+                new_callable=AsyncMock,
+                return_value=review,
+            ),
+            patch(
+                "app.services.analyzer._save_critic_gate",
+                new_callable=AsyncMock,
+            ) as save_gate,
+            patch(
+                "app.services.analyzer.update_progress",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with self.assertRaises(_ConfirmedCriticIntegrityBlock) as caught:
+                await _run_analysis_critic_loop(
+                    "run-confirmed-annotation-integrity",
+                    profile=PROFILE,
+                    catalog=CATALOG,
+                    rows=ROWS,
+                    metrics=METRICS,
+                )
+
+        self.assertIn(
+            "annotation_integrity:target_mention_false_negative",
+            caught.exception.reason_codes,
+        )
+        self.assertFalse(save_gate.await_args.kwargs["passed"])
+        self.assertEqual(
+            save_gate.await_args.kwargs["critic_outcome"],
+            "confirmed_integrity_block",
         )
 
     async def test_r2_block_never_invokes_fable_recovery(self) -> None:
@@ -5329,7 +5640,8 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._save_critic_gate",
                 new_callable=AsyncMock,
-            ),
+                return_value={"passed": True, "quality_state": "degraded"},
+            ) as save_gate,
             patch(
                 "app.services.analyzer._save_artifact",
                 new_callable=AsyncMock,
@@ -5352,7 +5664,7 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                 return_value=METRICS,
             ),
         ):
-            with self.assertRaises(OpenRouterError):
+            _catalog, returned_rows, returned_metrics, gate = (
                 await _run_analysis_critic_loop(
                     "run-r2-block",
                     profile=PROFILE,
@@ -5360,7 +5672,16 @@ class AnalysisCriticTests(unittest.IsolatedAsyncioTestCase):
                     rows=ROWS,
                     metrics=METRICS,
                 )
+            )
         planner.assert_not_awaited()
+        self.assertIs(returned_rows, ROWS)
+        self.assertIs(returned_metrics, METRICS)
+        self.assertTrue(gate["passed"])
+        self.assertEqual(save_gate.await_args.kwargs["quality_state"], "degraded")
+        self.assertEqual(
+            save_gate.await_args.kwargs["critic_outcome"],
+            "advisory_block",
+        )
 
     def test_policy_application_can_only_narrow_known_entities(self) -> None:
         catalog = {
@@ -6333,6 +6654,8 @@ class AnalysisCriticRecoveryPersistenceTests(
         state_digest = _critic_analysis_state_digest(
             repaired_rows,
             METRICS,
+            profile=PROFILE,
+            catalog=scoped_catalog,
         )
         before_digest = stable_digest({"pre_repair": state_digest})
         return (
@@ -6568,15 +6891,21 @@ class AnalysisCriticRecoveryPersistenceTests(
             side_effect=fail_after_paid_calls,
         ):
             with bind_run_lease(self.run_id, "current-owner"):
-                with self.assertRaisesRegex(
-                    OpenRouterError,
-                    "synthetic reducer sibling failure",
-                ):
-                    await _analysis_critic_artifact(
-                        self.run_id,
-                        iteration=1,
-                        payload=payload,
-                    )
+                result = await _analysis_critic_artifact(
+                    self.run_id,
+                    iteration=1,
+                    payload=payload,
+                )
+
+        self.assertEqual(result["verdict"], "block")
+        self.assertEqual(
+            result["fallback"]["kind"],
+            "deterministic_degraded_advisory",
+        )
+        self.assertIn(
+            "critic_provider_schema_or_cache_unavailable",
+            result["fallback"]["reason_codes"],
+        )
 
         async with self.SessionLocal() as session:
             artifacts = list(
@@ -6847,7 +7176,7 @@ class AnalysisCriticRecoveryPersistenceTests(
         self,
     ) -> None:
         (
-            _scoped_catalog,
+            scoped_catalog,
             repaired_rows,
             plan,
             _recovery_step,
@@ -6994,7 +7323,7 @@ class AnalysisCriticRecoveryPersistenceTests(
         self,
     ) -> None:
         (
-            _scoped_catalog,
+            scoped_catalog,
             repaired_rows,
             plan,
             _recovery_step,
@@ -7007,6 +7336,8 @@ class AnalysisCriticRecoveryPersistenceTests(
         tampered_state_digest = _critic_analysis_state_digest(
             repaired_rows,
             METRICS,
+            profile=PROFILE,
+            catalog=scoped_catalog,
         )
         await self._insert_recovery_epoch(
             status="executing",
@@ -7101,7 +7432,7 @@ class AnalysisCriticRecoveryPersistenceTests(
         critic.assert_not_awaited()
         progress.assert_not_awaited()
 
-    async def test_crash_during_r3_reservation_fails_closed_without_call(
+    async def test_crash_during_r3_reservation_publishes_degraded_without_call(
         self,
     ) -> None:
         (
@@ -7150,7 +7481,7 @@ class AnalysisCriticRecoveryPersistenceTests(
             ) as progress,
             bind_run_lease(self.run_id, "current-owner"),
         ):
-            with self.assertRaises(_AnalysisCriticRecoveryBlocked):
+            _catalog, returned_rows, returned_metrics, gate = (
                 await _run_analysis_critic_loop(
                     self.run_id,
                     profile=PROFILE,
@@ -7158,6 +7489,7 @@ class AnalysisCriticRecoveryPersistenceTests(
                     rows=repaired_rows,
                     metrics=METRICS,
                 )
+            )
 
         critic.assert_not_awaited()
         progress.assert_not_awaited()
@@ -7177,13 +7509,27 @@ class AnalysisCriticRecoveryPersistenceTests(
                     )
                 )
             ).scalar_one()
+            gate_output = (
+                await session.execute(
+                    select(RunArtifact.output_json).where(
+                        RunArtifact.run_id == self.run_id,
+                        RunArtifact.artifact_key == "analysis_critic_gate",
+                    )
+                )
+            ).scalar_one()
         self.assertEqual(epoch_status, "failed")
-        self.assertEqual(gate_status, "failed")
+        self.assertEqual(gate_status, "completed")
+        self.assertEqual(gate_output["quality_state"], "degraded")
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["quality_state"], "degraded")
+        self.assertEqual(returned_rows, repaired_rows)
+        self.assertEqual(returned_metrics, METRICS)
 
     async def _insert_terminal_analysis_block(
         self,
         *,
         state_digest: str,
+        confirmed: bool = True,
     ) -> None:
         async with self.SessionLocal() as session:
             session.add(
@@ -7202,16 +7548,52 @@ class AnalysisCriticRecoveryPersistenceTests(
                             "terminal_analysis_critic_block": True,
                             "terminal_analysis_state_digest": state_digest,
                             "error": "Gemini r3 blocked the repair",
+                            **(
+                                {
+                                    "terminal_analysis_critic_reason_code": (
+                                        "confirmed_integrity_block"
+                                    ),
+                                    "terminal_integrity_codes": [
+                                        "corpus_lineage:annotation_raw_hash_mismatch"
+                                    ],
+                                }
+                                if confirmed
+                                else {}
+                            ),
                         },
                     },
                 )
             )
             await session.commit()
 
+    async def test_legacy_model_only_terminal_boolean_is_ignored(self) -> None:
+        state_digest = _critic_analysis_state_digest(
+            ROWS,
+            METRICS,
+            profile=PROFILE,
+            catalog=_scope_entity_catalog_to_profile(CATALOG, PROFILE),
+        )
+        await self._insert_terminal_analysis_block(
+            state_digest=state_digest,
+            confirmed=False,
+        )
+
+        self.assertIsNone(
+            await _terminal_analysis_critic_recovery_reason(
+                self.run_id,
+                state_digest=state_digest,
+            )
+        )
+
     async def test_terminal_post_repair_state_blocks_resume_before_r1(
         self,
     ) -> None:
-        state_digest = _critic_analysis_state_digest(ROWS, METRICS)
+        state_digest = _critic_analysis_state_digest(
+            ROWS,
+            METRICS,
+            profile=PROFILE,
+            catalog=_scope_entity_catalog_to_profile(CATALOG, PROFILE),
+        )
         await self._insert_terminal_analysis_block(
             state_digest=state_digest,
         )
@@ -7246,8 +7628,52 @@ class AnalysisCriticRecoveryPersistenceTests(
         critic.assert_not_awaited()
         progress.assert_not_awaited()
 
+    async def test_terminal_latch_is_bound_to_profile_catalog_and_raw_corpus(
+        self,
+    ) -> None:
+        scoped_catalog = _scope_entity_catalog_to_profile(CATALOG, PROFILE)
+        baseline_state = _critic_analysis_state_digest(
+            ROWS,
+            METRICS,
+            profile=PROFILE,
+            catalog=scoped_catalog,
+        )
+        await self._insert_terminal_analysis_block(state_digest=baseline_state)
+
+        changed_profile = copy.deepcopy(PROFILE)
+        changed_profile["brand_name"] = "Corrected brand"
+        changed_catalog = copy.deepcopy(scoped_catalog)
+        changed_catalog["entities"][0]["aliases"] = ["Corrected alias"]
+        changed_rows = copy.deepcopy(ROWS)
+        changed_rows[0]["answer_text"] += " Corrected raw evidence."
+        variants = (
+            (changed_profile, scoped_catalog, ROWS),
+            (PROFILE, changed_catalog, ROWS),
+            (PROFILE, scoped_catalog, changed_rows),
+        )
+
+        for profile, catalog, rows in variants:
+            changed_state = _critic_analysis_state_digest(
+                rows,
+                METRICS,
+                profile=profile,
+                catalog=catalog,
+            )
+            self.assertNotEqual(changed_state, baseline_state)
+            self.assertIsNone(
+                await _terminal_analysis_critic_recovery_reason(
+                    self.run_id,
+                    state_digest=changed_state,
+                )
+            )
+
     async def test_terminal_scope_upgrade_permits_a_fresh_r1(self) -> None:
-        baseline_state = _critic_analysis_state_digest(ROWS, METRICS)
+        baseline_state = _critic_analysis_state_digest(
+            ROWS,
+            METRICS,
+            profile=PROFILE,
+            catalog=_scope_entity_catalog_to_profile(CATALOG, PROFILE),
+        )
         await self._insert_terminal_analysis_block(
             state_digest=baseline_state,
         )

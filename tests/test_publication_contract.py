@@ -17,14 +17,19 @@ from app.db import SessionLocal, init_db
 from app.main import app
 from app.models import ReportIllustration, Run, RunArtifact, RunStatus
 from app.services.analyzer import (
+    _editorial_receipt_state,
     _immutable_editorial_cache_proof,
     _revalidate_reused_illustration_assets,
 )
 from app.services.live_russian_policy import LIVE_RUSSIAN_POLICY_MANIFEST
 from app.services.publication_contract import (
+    FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX,
+    FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
     IMMUTABLE_ILLUSTRATION_QA_PREFIX,
     IMMUTABLE_READER_COPY_PREFIX,
     LEGACY_PUBLICATION_BASELINE_VERSION,
+    OPTIONAL_ASSET_ADMISSION_PREFIX,
+    OPTIONAL_ASSET_ADMISSION_VERSION,
     PUBLICATION_RECEIPT_PREFIX,
     PUBLICATION_RECEIPT_VERSION,
     READER_COPY_MANIFEST_VERSION,
@@ -35,7 +40,8 @@ from app.services.publication_contract import (
     publication_snapshot_digest,
     replace_completed_publication,
     stable_json_sha256,
-    stage_publication_receipt,
+    stage_publication_receipt as _stage_publication_receipt,
+    validate_reader_copy_manifest,
 )
 from app.services.reader_copy_registry import READER_COPY_REGISTRY_MANIFEST
 from app.services.report_editor import (
@@ -72,15 +78,18 @@ async def _valid_editorial_receipt() -> dict:
     prose_paths = illustration_copy_narrative_paths(source)
 
     async def editor(payload: dict) -> dict:
+        edited_text = str(payload["core_text"])
+        if payload.get("path") == "/illustrations/0/title":
+            edited_text = "Как сайт передаёт текст краулеру"
         return {
             "source_unit_id": payload["source_unit_id"],
             "source_sha256": payload["source_sha256"],
-            "edited_text": str(payload["core_text"]),
+            "edited_text": edited_text,
             "claim_receipts": [
                 {
                     "claim_sha256": claim["claim_sha256"],
                     "preserved": True,
-                    "target_excerpt": claim["source_excerpt"],
+                    "target_excerpt": edited_text,
                     "note": "Смысл сохранён.",
                 }
                 for claim in payload["source_claims"]
@@ -117,19 +126,28 @@ async def _valid_editorial_receipt() -> dict:
         critic_call=critic,
         prose_paths=prose_paths,
     )
+    editorial_input = {
+        "source_report_sha256": stable_json_sha256(source),
+        "public_report_sha256": stable_json_sha256(
+            {"fixture": "semantic-public-report"}
+        ),
+        "policy_version": "test-editorial-v1",
+    }
     proof, revalidated = _immutable_editorial_cache_proof(
         source=source,
         result=result,
         audit=audit,
         prose_paths=prose_paths,
         protected_terms=[],
-        source_artifact_key="test_editorial_source",
+        source_artifact_key="final_report",
+        editorial_artifact_key="final_report_editorial",
+        editorial_input=editorial_input,
     )
     if not revalidated or not isinstance(proof, dict):
         raise AssertionError("Test editorial fixture is not publication-valid")
     return {
         "accepted": True,
-        "artifact_key": "test_editorial_result",
+        "artifact_key": "final_report_editorial",
         "prompt_version": "test-editorial-v1",
         "audit_sha256": audit["audit_sha256"],
         "result_report_sha256": stable_json_sha256(result),
@@ -145,6 +163,8 @@ async def _reader_copy_manifest(
     markdown: str,
     asset_receipts: list[dict],
     site_preview_receipt: dict | None = None,
+    *,
+    run_id: str,
 ) -> dict:
     published_count = len(report_json.get("illustrations") or [])
     editorial_receipt = await _valid_editorial_receipt()
@@ -155,6 +175,85 @@ async def _reader_copy_manifest(
         "analysis_markdown_sha256": hashlib.sha256(
             markdown.encode("utf-8")
         ).hexdigest(),
+    }
+    final_editorial_proof = editorial_receipt["cache_proof"]
+    selected_report_sha256 = final_editorial_proof["source_sha256"]
+    published_report_sha256 = final_editorial_proof["result_sha256"]
+    public_snapshot_sha256 = stable_json_sha256(
+        {"fixture": "reader-public-report"}
+    )
+    publication.update(
+        {
+            "final_report_sha256": published_report_sha256,
+            "public_report_sha256": public_snapshot_sha256,
+        }
+    )
+    optional_asset_core = {
+        "version": OPTIONAL_ASSET_ADMISSION_VERSION,
+        "run_id": run_id,
+        "state": "pass",
+        "degraded": False,
+        "reason_codes": [],
+        "report_json_before_sha256": stable_json_sha256(report_json),
+        "report_json_after_sha256": stable_json_sha256(report_json),
+        "illustrations": {
+            "candidate_count": published_count,
+            "published_count": published_count,
+            "rejected_count": 0,
+            "published_sequences": [
+                int(row["sequence"])
+                for row in report_json.get("illustrations") or []
+                if isinstance(row, dict) and isinstance(row.get("sequence"), int)
+            ],
+            "rejected": [],
+        },
+        "site_preview": {
+            "requested": report_json.get("site_preview") is not None,
+            "published": report_json.get("site_preview") is not None,
+            "reason_codes": [],
+        },
+    }
+    optional_asset_sha256 = stable_json_sha256(optional_asset_core)
+    optional_asset_admission = {
+        **optional_asset_core,
+        "receipt_sha256": optional_asset_sha256,
+        "artifact_key": OPTIONAL_ASSET_ADMISSION_PREFIX + optional_asset_sha256,
+    }
+    semantic_admission_core = {
+        "version": FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+        "run_id": run_id,
+        "requested_decision": "pass",
+        "decision": "pass",
+        "quality_state": "complete",
+        "reviewer_has_hard_veto": False,
+        "reviewer_state": "completed",
+        "reviewer_verdict": "pass",
+        "review_sha256": stable_json_sha256({"verdict": "pass"}),
+        "reviewed_candidate_sha256": selected_report_sha256,
+        "selected_report_sha256": selected_report_sha256,
+        "public_report_sha256": stable_json_sha256(
+            {"fixture": "semantic-public-report-with-foundation"}
+        ),
+        "public_snapshot_sha256": public_snapshot_sha256,
+        "semantic_evidence_document_sha256": stable_json_sha256(
+            {"fixture": "semantic-evidence"}
+        ),
+        "deterministic_checks_passed": True,
+        "deterministic_errors": [],
+        "reviewer_findings": [],
+        "degraded_reason_codes": [],
+        "repair_attempts_used": 0,
+        "repair_budget": 1,
+        "fallback_to_deterministically_safe_candidate": False,
+    }
+    semantic_admission_sha256 = stable_json_sha256(semantic_admission_core)
+    semantic_admission = {
+        **semantic_admission_core,
+        "receipt_sha256": semantic_admission_sha256,
+        "artifact_key": (
+            FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX
+            + semantic_admission_sha256[:32]
+        ),
     }
     core = {
         "version": READER_COPY_MANIFEST_VERSION,
@@ -170,6 +269,8 @@ async def _reader_copy_manifest(
         "publication_contract": publication,
         "decision": "pass",
         "blocking_reasons": [],
+        "degraded_reasons": [],
+        "deterministic_complete": True,
         "quality_complete": True,
         "illustration_asset_receipts": asset_receipts,
         "illustration_asset_receipts_sha256": stable_json_sha256(asset_receipts),
@@ -179,6 +280,10 @@ async def _reader_copy_manifest(
             if isinstance(site_preview_receipt, dict)
             else None
         ),
+        "optional_asset_admission": optional_asset_admission,
+        "optional_asset_admission_sha256": optional_asset_sha256,
+        "final_report_semantic_admission": semantic_admission,
+        "final_report_semantic_admission_sha256": semantic_admission_sha256,
         "editorial_receipts": {
             "final_report": copy.deepcopy(editorial_receipt),
             "technical_review": copy.deepcopy(editorial_receipt),
@@ -200,17 +305,127 @@ async def _reader_copy_manifest(
                 ),
                 "state": "published" if published_count else "not_published",
                 "published_count": published_count,
-                "publication_policy": TEST_ILLUSTRATION_POLICY,
+                "publication_policy": copy.deepcopy(TEST_ILLUSTRATION_POLICY),
             },
             "illustration_assets": {
                 "accepted": True,
                 "published_count": published_count,
                 "verified_count": published_count,
-                "publication_policy": TEST_ILLUSTRATION_POLICY,
+                "publication_policy": copy.deepcopy(TEST_ILLUSTRATION_POLICY),
+            },
+            "optional_assets": {
+                "accepted": True,
+                "reasons": [],
+                "state": "pass",
+                "receipt_sha256": optional_asset_sha256,
             },
         },
     }
     return {**core, "manifest_sha256": stable_json_sha256(core)}
+
+
+def _admission_artifacts(
+    *,
+    run_id: str,
+    manifest: dict,
+) -> list[RunArtifact]:
+    """Persist the independent analysis proofs required by publication."""
+
+    optional = manifest["optional_asset_admission"]
+    semantic = manifest["final_report_semantic_admission"]
+    return [
+        RunArtifact(
+            run_id=run_id,
+            stage_key="report",
+            artifact_key=optional["artifact_key"],
+            status="completed",
+            model=None,
+            prompt_version=optional["version"],
+            input_json={
+                "report_json_before_sha256": optional[
+                    "report_json_before_sha256"
+                ],
+                "optional_asset_policy_version": optional["version"],
+            },
+            output_json=copy.deepcopy(optional),
+        ),
+        RunArtifact(
+            run_id=run_id,
+            stage_key="report",
+            artifact_key=semantic["artifact_key"],
+            status="completed",
+            model=None,
+            prompt_version=semantic["version"],
+            input_json={
+                "version": semantic["version"],
+                "run_id": run_id,
+                "reviewed_candidate_sha256": semantic[
+                    "reviewed_candidate_sha256"
+                ],
+                "selected_report_sha256": semantic[
+                    "selected_report_sha256"
+                ],
+                "public_report_sha256": semantic["public_report_sha256"],
+                "public_snapshot_sha256": semantic[
+                    "public_snapshot_sha256"
+                ],
+                "semantic_evidence_document_sha256": semantic[
+                    "semantic_evidence_document_sha256"
+                ],
+                "receipt_sha256": semantic["receipt_sha256"],
+            },
+            output_json=copy.deepcopy(semantic),
+        ),
+    ]
+
+
+async def _persist_admission_artifacts(
+    session,
+    *,
+    run_id: str,
+    reader_copy_manifest: dict,
+) -> None:
+    """Persist independent analysis proofs for a synthetic test manifest."""
+
+    for artifact in _admission_artifacts(
+        run_id=run_id,
+        manifest=reader_copy_manifest,
+    ):
+        existing = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == artifact.artifact_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            session.add(artifact)
+    await session.flush()
+
+
+async def stage_publication_receipt(
+    session,
+    *,
+    run_id: str,
+    report_json: dict,
+    analysis_markdown: str,
+    reader_copy_manifest: dict,
+) -> dict:
+    """Test fixture wrapper for analysis-produced admission artifacts."""
+
+    await _persist_admission_artifacts(
+        session,
+        run_id=run_id,
+        reader_copy_manifest=reader_copy_manifest,
+    )
+    return await _stage_publication_receipt(
+        session,
+        run_id=run_id,
+        report_json=report_json,
+        analysis_markdown=analysis_markdown,
+        reader_copy_manifest=reader_copy_manifest,
+    )
 
 
 def _qa_receipt(
@@ -261,6 +476,689 @@ def _qa_receipt(
         },
     )
     return receipt, artifact
+
+
+class OptionalAssetAdmissionContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reader_copy_manifest_binds_optional_asset_admission(self) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+        admission_core = {
+            "version": OPTIONAL_ASSET_ADMISSION_VERSION,
+            "run_id": run_id,
+            "state": "degraded",
+            "degraded": True,
+            "reason_codes": ["site_preview_asset_invalid_or_missing"],
+            "report_json_before_sha256": "a" * 64,
+            "report_json_after_sha256": stable_json_sha256(report_json),
+            "illustrations": {
+                "candidate_count": 0,
+                "published_count": 0,
+                "rejected_count": 0,
+                "published_sequences": [],
+                "rejected": [],
+            },
+            "site_preview": {
+                "requested": True,
+                "published": False,
+                "reason_codes": ["site_preview_asset_invalid_or_missing"],
+            },
+        }
+        receipt_sha256 = stable_json_sha256(admission_core)
+        admission = {
+            **admission_core,
+            "receipt_sha256": receipt_sha256,
+            "artifact_key": OPTIONAL_ASSET_ADMISSION_PREFIX + receipt_sha256,
+        }
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
+        manifest_core = {
+            key: value
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+        manifest_core.update(
+            {
+                "optional_asset_admission": admission,
+                "optional_asset_admission_sha256": receipt_sha256,
+                "decision": "degraded_safe",
+                "quality_complete": False,
+                "degraded_reasons": ["optional_assets_receipt_incomplete"],
+            }
+        )
+        manifest_core["editorial_receipts"]["optional_assets"] = {
+            "accepted": False,
+            "reasons": admission["reason_codes"],
+            "state": "degraded",
+            "receipt_sha256": receipt_sha256,
+        }
+        manifest = {
+            **manifest_core,
+            "manifest_sha256": stable_json_sha256(manifest_core),
+        }
+
+        self.assertEqual(
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=manifest,
+            ),
+            [],
+        )
+
+        resealed = copy.deepcopy(manifest)
+        resealed_admission = resealed["optional_asset_admission"]
+        resealed_admission["report_json_after_sha256"] = "0" * 64
+        resealed_core = {
+            key: value
+            for key, value in resealed_admission.items()
+            if key not in {"artifact_key", "receipt_sha256"}
+        }
+        resealed_sha256 = stable_json_sha256(resealed_core)
+        resealed_admission["receipt_sha256"] = resealed_sha256
+        resealed_admission["artifact_key"] = (
+            OPTIONAL_ASSET_ADMISSION_PREFIX + resealed_sha256
+        )
+        resealed["optional_asset_admission_sha256"] = resealed_sha256
+        resealed_manifest_core = {
+            key: value
+            for key, value in resealed.items()
+            if key != "manifest_sha256"
+        }
+        resealed["manifest_sha256"] = stable_json_sha256(resealed_manifest_core)
+        self.assertIn(
+            "optional_asset_admission_report_binding_mismatch",
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=resealed,
+            ),
+        )
+
+        sequence_resealed = copy.deepcopy(manifest)
+        sequence_admission = sequence_resealed["optional_asset_admission"]
+        sequence_admission["illustrations"]["published_sequences"] = [999]
+        sequence_core = {
+            key: value
+            for key, value in sequence_admission.items()
+            if key not in {"artifact_key", "receipt_sha256"}
+        }
+        sequence_sha256 = stable_json_sha256(sequence_core)
+        sequence_admission["receipt_sha256"] = sequence_sha256
+        sequence_admission["artifact_key"] = (
+            OPTIONAL_ASSET_ADMISSION_PREFIX + sequence_sha256
+        )
+        sequence_resealed["optional_asset_admission_sha256"] = sequence_sha256
+        sequence_resealed["editorial_receipts"]["optional_assets"][
+            "receipt_sha256"
+        ] = sequence_sha256
+        sequence_manifest_core = {
+            key: value
+            for key, value in sequence_resealed.items()
+            if key != "manifest_sha256"
+        }
+        sequence_resealed["manifest_sha256"] = stable_json_sha256(
+            sequence_manifest_core
+        )
+        self.assertIn(
+            "optional_asset_admission_sequence_ledger_mismatch",
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=sequence_resealed,
+            ),
+        )
+
+        removed = copy.deepcopy(manifest)
+        removed.pop("optional_asset_admission")
+        removed.pop("optional_asset_admission_sha256")
+        removed["editorial_receipts"].pop("optional_assets")
+        removed_core = {
+            key: value for key, value in removed.items() if key != "manifest_sha256"
+        }
+        removed["manifest_sha256"] = stable_json_sha256(removed_core)
+        self.assertIn(
+            "optional_asset_admission_missing",
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=removed,
+            ),
+        )
+
+        historical_v5 = copy.deepcopy(removed)
+        historical_v5.pop("final_report_semantic_admission")
+        historical_v5.pop("final_report_semantic_admission_sha256")
+        historical_v5["version"] = "aiv-reader-copy-manifest-v5"
+        historical_v5["decision"] = "pass"
+        historical_v5["deterministic_complete"] = True
+        historical_v5["quality_complete"] = True
+        historical_v5["degraded_reasons"] = []
+        historical_v5_core = {
+            key: value
+            for key, value in historical_v5.items()
+            if key != "manifest_sha256"
+        }
+        historical_v5["manifest_sha256"] = stable_json_sha256(
+            historical_v5_core
+        )
+        self.assertEqual(
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=historical_v5,
+                require_current_policy=False,
+            ),
+            [],
+        )
+
+        historical_v6 = copy.deepcopy(manifest)
+        historical_v6.pop("final_report_semantic_admission")
+        historical_v6.pop("final_report_semantic_admission_sha256")
+        historical_v6["version"] = "aiv-reader-copy-manifest-v6"
+        historical_v6_core = {
+            key: value
+            for key, value in historical_v6.items()
+            if key != "manifest_sha256"
+        }
+        historical_v6["manifest_sha256"] = stable_json_sha256(
+            historical_v6_core
+        )
+        with patch(
+            "app.services.publication_contract.OPTIONAL_ASSET_ADMISSION_VERSION",
+            "aiv-optional-report-asset-admission-v2",
+        ):
+            self.assertEqual(
+                validate_reader_copy_manifest(
+                    run_id=run_id,
+                    report_json=report_json,
+                    analysis_markdown=markdown,
+                    manifest=historical_v6,
+                    require_current_policy=False,
+                ),
+                [],
+            )
+
+
+class ReaderCopyDegradedContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lint_and_incomplete_editorial_receipt_are_publishable_degradation(
+        self,
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
+        core = {
+            key: copy.deepcopy(value)
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+        core["decision"] = "degraded_safe"
+        core["deterministic_complete"] = False
+        core["quality_complete"] = False
+        core["degraded_reasons"] = [
+            "copy_lint_findings",
+            "copy_lint_not_exhaustive",
+            "technical_review_receipt_incomplete",
+        ]
+        core["lint"].update(
+            {
+                "blocking": True,
+                "issues": [{"code": "long_dash"}],
+                "omitted_issue_count": 4,
+            }
+        )
+        core["editorial_receipts"]["technical_review"] = {
+            "accepted": False,
+            "reasons": ["quality_incomplete"],
+        }
+        degraded = {**core, "manifest_sha256": stable_json_sha256(core)}
+
+        self.assertEqual(
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=degraded,
+            ),
+            [],
+        )
+
+    async def test_degraded_receipt_cannot_hide_canonical_policy_tamper(
+        self,
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
+        core = {
+            key: copy.deepcopy(value)
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+        core["decision"] = "degraded_safe"
+        core["quality_complete"] = False
+        core["degraded_reasons"] = ["technical_review_receipt_incomplete"]
+        core["editorial_receipts"]["technical_review"] = {
+            "accepted": False,
+            "reasons": ["canonical_policy_mismatch"],
+        }
+        degraded = {**core, "manifest_sha256": stable_json_sha256(core)}
+
+        reasons = validate_reader_copy_manifest(
+            run_id=run_id,
+            report_json=report_json,
+            analysis_markdown=markdown,
+            manifest=degraded,
+        )
+        self.assertIn(
+            "reader_copy_technical_review_declared_tamper:canonical_policy_mismatch",
+            reasons,
+        )
+
+        hidden_core = {
+            key: copy.deepcopy(value)
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+        hidden_core["decision"] = "degraded_safe"
+        hidden_core["quality_complete"] = False
+        hidden_core["degraded_reasons"] = [
+            "technical_review_receipt_incomplete"
+        ]
+        hidden_receipt = hidden_core["editorial_receipts"]["technical_review"]
+        hidden_receipt["accepted"] = False
+        hidden_receipt["reasons"] = ["quality_incomplete"]
+        proof = hidden_receipt["cache_proof"]
+        audit = proof["audit"]
+        audit["canonical_policy"] = {
+            **LIVE_RUSSIAN_POLICY_MANIFEST.as_dict(),
+            "version": "tampered-policy",
+        }
+        audit_core = {
+            key: value for key, value in audit.items() if key != "audit_sha256"
+        }
+        audit["audit_sha256"] = stable_json_sha256(audit_core)
+        proof["audit_sha256"] = audit["audit_sha256"]
+        proof_core = {
+            key: value for key, value in proof.items() if key != "proof_sha256"
+        }
+        proof["proof_sha256"] = stable_json_sha256(proof_core)
+        hidden_receipt["cache_proof_sha256"] = proof["proof_sha256"]
+        hidden_receipt["audit_sha256"] = audit["audit_sha256"]
+        hidden = {
+            **hidden_core,
+            "manifest_sha256": stable_json_sha256(hidden_core),
+        }
+        hidden_reasons = validate_reader_copy_manifest(
+            run_id=run_id,
+            report_json=report_json,
+            analysis_markdown=markdown,
+            manifest=hidden,
+        )
+        self.assertIn(
+            "reader_copy_technical_review_cache_canonical_policy_mismatch",
+            hidden_reasons,
+        )
+
+
+class SemanticAdmissionContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_editorial_receipt_freezes_exact_artifact_input(self) -> None:
+        fixture = await _valid_editorial_receipt()
+        fixture_proof = fixture["cache_proof"]
+        editorial_input = copy.deepcopy(fixture_proof["editorial_input"])
+        artifact = RunArtifact(
+            run_id="run-id",
+            stage_key="report",
+            artifact_key="final_report_editorial",
+            status="completed",
+            model="test-model",
+            prompt_version="test-editorial-v1",
+            input_json=editorial_input,
+            output_json={
+                "report": copy.deepcopy(fixture_proof["result"]),
+                "audit": copy.deepcopy(fixture_proof["audit"]),
+            },
+        )
+
+        receipt = _editorial_receipt_state(
+            artifact,
+            output_key="report",
+            published_value=copy.deepcopy(fixture_proof["result"]),
+            source_value=copy.deepcopy(fixture_proof["source"]),
+            prose_paths=fixture_proof["prose_paths"],
+            protected_terms=fixture_proof["protected_terms"],
+            source_artifact_key="final_report",
+        )
+
+        self.assertTrue(receipt["accepted"])
+        proof = receipt["cache_proof"]
+        self.assertEqual(proof["editorial_input"], editorial_input)
+        self.assertEqual(
+            proof["editorial_input_sha256"],
+            stable_json_sha256(editorial_input),
+        )
+        self.assertEqual(
+            proof["editorial_input"]["source_report_sha256"],
+            proof["source_sha256"],
+        )
+
+    async def test_v7_requires_self_sealed_semantic_admission(self) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
+        missing = copy.deepcopy(manifest)
+        missing.pop("final_report_semantic_admission")
+        missing.pop("final_report_semantic_admission_sha256")
+        missing_core = {
+            key: value
+            for key, value in missing.items()
+            if key != "manifest_sha256"
+        }
+        missing["manifest_sha256"] = stable_json_sha256(missing_core)
+        self.assertIn(
+            "final_report_semantic_admission_missing",
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=missing,
+            ),
+        )
+
+        resealed = copy.deepcopy(manifest)
+        semantic = resealed["final_report_semantic_admission"]
+        semantic["selected_report_sha256"] = "f" * 64
+        semantic_core = {
+            key: value
+            for key, value in semantic.items()
+            if key not in {"artifact_key", "receipt_sha256"}
+        }
+        semantic_sha256 = stable_json_sha256(semantic_core)
+        semantic["receipt_sha256"] = semantic_sha256
+        semantic["artifact_key"] = (
+            FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX + semantic_sha256[:32]
+        )
+        resealed["final_report_semantic_admission_sha256"] = semantic_sha256
+        resealed_core = {
+            key: value
+            for key, value in resealed.items()
+            if key != "manifest_sha256"
+        }
+        resealed["manifest_sha256"] = stable_json_sha256(resealed_core)
+        self.assertIn(
+            "final_report_lineage_semantic_to_editorial_input_mismatch",
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=resealed,
+            ),
+        )
+
+    async def test_safe_editorial_change_has_transitive_author_lineage(
+        self,
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
+        proof = manifest["editorial_receipts"]["final_report"]["cache_proof"]
+        self.assertNotEqual(proof["source"], proof["result"])
+        self.assertEqual(
+            manifest["final_report_semantic_admission"][
+                "selected_report_sha256"
+            ],
+            proof["source_sha256"],
+        )
+        self.assertEqual(
+            manifest["publication_contract"]["final_report_sha256"],
+            proof["result_sha256"],
+        )
+        self.assertEqual(
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=manifest,
+            ),
+            [],
+        )
+
+    async def test_every_author_editor_publication_link_is_fail_closed(
+        self,
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+
+        def reseal_manifest(value: dict) -> None:
+            core = {
+                key: item
+                for key, item in value.items()
+                if key != "manifest_sha256"
+            }
+            value["manifest_sha256"] = stable_json_sha256(core)
+
+        def reseal_semantic(value: dict) -> None:
+            semantic = value["final_report_semantic_admission"]
+            core = {
+                key: item
+                for key, item in semantic.items()
+                if key not in {"artifact_key", "receipt_sha256"}
+            }
+            digest = stable_json_sha256(core)
+            semantic["receipt_sha256"] = digest
+            semantic["artifact_key"] = (
+                FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX + digest[:32]
+            )
+            value["final_report_semantic_admission_sha256"] = digest
+
+        def reseal_editorial(value: dict) -> None:
+            receipt = value["editorial_receipts"]["final_report"]
+            proof = receipt["cache_proof"]
+            proof_core = {
+                key: item
+                for key, item in proof.items()
+                if key != "proof_sha256"
+            }
+            proof["proof_sha256"] = stable_json_sha256(proof_core)
+            receipt["cache_proof_sha256"] = proof["proof_sha256"]
+
+        mutations = {
+            "semantic_to_editorial_input": (
+                lambda value: value["final_report_semantic_admission"].__setitem__(
+                    "selected_report_sha256", "f" * 64
+                ),
+                "final_report_lineage_semantic_to_editorial_input_mismatch",
+                reseal_semantic,
+            ),
+            "editorial_input_to_source": (
+                lambda value: value["editorial_receipts"]["final_report"][
+                    "cache_proof"
+                ]["editorial_input"].__setitem__(
+                    "source_report_sha256", "f" * 64
+                ),
+                "final_report_lineage_editorial_input_to_source_mismatch",
+                reseal_editorial,
+            ),
+            "proof_to_receipt_result": (
+                lambda value: value["editorial_receipts"]["final_report"][
+                    "cache_proof"
+                ].__setitem__("result_sha256", "f" * 64),
+                "final_report_lineage_proof_to_receipt_result_mismatch",
+                reseal_editorial,
+            ),
+            "editorial_result_to_publication": (
+                lambda value: value["publication_contract"].__setitem__(
+                    "final_report_sha256", "f" * 64
+                ),
+                "final_report_lineage_editorial_result_to_publication_mismatch",
+                lambda _value: None,
+            ),
+        }
+        for name, (mutate, expected_reason, reseal_inner) in mutations.items():
+            with self.subTest(link=name):
+                manifest = await _reader_copy_manifest(
+                    report_json,
+                    markdown,
+                    [],
+                    run_id=run_id,
+                )
+                mutate(manifest)
+                if name == "editorial_input_to_source":
+                    proof = manifest["editorial_receipts"]["final_report"][
+                        "cache_proof"
+                    ]
+                    proof["editorial_input_sha256"] = stable_json_sha256(
+                        proof["editorial_input"]
+                    )
+                reseal_inner(manifest)
+                reseal_manifest(manifest)
+                self.assertIn(
+                    expected_reason,
+                    validate_reader_copy_manifest(
+                        run_id=run_id,
+                        report_json=report_json,
+                        analysis_markdown=markdown,
+                        manifest=manifest,
+                    ),
+                )
+
+    async def test_editor_outage_identity_lineage_is_publishable_degradation(
+        self,
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        markdown = "# Отчёт"
+        report_json = {
+            "narrative": {"headline": "Отчёт готов"},
+            "illustrations": [],
+        }
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
+        accepted_receipt = manifest["editorial_receipts"]["final_report"]
+        source = copy.deepcopy(accepted_receipt["cache_proof"]["source"])
+        prose_paths = illustration_copy_narrative_paths(source)
+
+        async def unavailable_editor(_payload: dict) -> dict:
+            raise RuntimeError("editor unavailable")
+
+        result, audit = await edit_report(
+            source,
+            editor_call=unavailable_editor,
+            critic_call=AsyncMock(),
+            prose_paths=prose_paths,
+        )
+        self.assertEqual(result, source)
+        self.assertFalse(audit["quality_complete"])
+        editorial_input = {
+            "source_report_sha256": stable_json_sha256(source),
+            "public_report_sha256": stable_json_sha256(
+                {"fixture": "semantic-public-report"}
+            ),
+            "policy_version": "test-editorial-v1",
+        }
+        proof, revalidated = _immutable_editorial_cache_proof(
+            source=source,
+            result=result,
+            audit=audit,
+            prose_paths=prose_paths,
+            protected_terms=[],
+            source_artifact_key="final_report",
+            editorial_artifact_key="final_report_editorial",
+            editorial_input=editorial_input,
+        )
+        self.assertFalse(revalidated)
+        self.assertIsInstance(proof, dict)
+        manifest["editorial_receipts"]["final_report"] = {
+            "accepted": False,
+            "artifact_key": "final_report_editorial",
+            "prompt_version": "test-editorial-v1",
+            "audit_sha256": audit["audit_sha256"],
+            "result_report_sha256": stable_json_sha256(result),
+            "cache_revalidated": False,
+            "cache_proof": proof,
+            "cache_proof_sha256": proof["proof_sha256"],
+            "reasons": [
+                "quality_incomplete",
+                "fallback_units_present",
+                "editorial_cache_revalidation_failed",
+            ],
+        }
+        manifest["publication_contract"]["final_report_sha256"] = (
+            stable_json_sha256(result)
+        )
+        manifest["decision"] = "degraded_safe"
+        manifest["quality_complete"] = False
+        manifest["degraded_reasons"] = ["final_report_receipt_incomplete"]
+        manifest_core = {
+            key: value
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+        manifest["manifest_sha256"] = stable_json_sha256(manifest_core)
+
+        self.assertEqual(
+            validate_reader_copy_manifest(
+                run_id=run_id,
+                report_json=report_json,
+                analysis_markdown=markdown,
+                manifest=manifest,
+            ),
+            [],
+        )
 
 
 class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -542,6 +1440,7 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 markdown,
                 [],
                 preview_receipt,
+                run_id=run_id,
             )
             async with SessionLocal() as session:
                 session.add(
@@ -690,6 +1589,7 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
             report_json,
             markdown,
             asset_receipts,
+            run_id=run_id,
         )
         with (
             patch(
@@ -876,6 +1776,7 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         report_json,
                         markdown,
                         receipts,
+                        run_id=run_id,
                     )
                     async with SessionLocal() as session:
                         session.add(
@@ -964,7 +1865,12 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         run_id = f"immutable-reader-manifest-{uuid.uuid4()}"
         report_json = {"narrative": {"headline": "Отчёт"}, "illustrations": []}
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         immutable_key = IMMUTABLE_READER_COPY_PREFIX + manifest["manifest_sha256"]
         async with SessionLocal() as session:
             session.add(
@@ -1018,13 +1924,77 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self._delete_run(run_id)
 
+    async def test_public_read_requires_persisted_admission_artifacts(self) -> None:
+        for admission_field in (
+            "optional_asset_admission",
+            "final_report_semantic_admission",
+        ):
+            with self.subTest(admission_field=admission_field):
+                run_id = f"missing-admission-{uuid.uuid4()}"
+                report_json = {
+                    "narrative": {"headline": "Отчёт"},
+                    "illustrations": [],
+                }
+                markdown = "# Отчёт"
+                manifest = await _reader_copy_manifest(
+                    report_json,
+                    markdown,
+                    [],
+                    run_id=run_id,
+                )
+                async with SessionLocal() as session:
+                    session.add(
+                        Run(
+                            id=run_id,
+                            domain="missing-admission.example",
+                            status=RunStatus.completed,
+                            config_json={},
+                            analysis_markdown=markdown,
+                            report_json=report_json,
+                        )
+                    )
+                    await session.flush()
+                    await stage_publication_receipt(
+                        session,
+                        run_id=run_id,
+                        report_json=report_json,
+                        analysis_markdown=markdown,
+                        reader_copy_manifest=manifest,
+                    )
+                    await session.commit()
+                try:
+                    self.assertEqual(
+                        (await self.client.get(f"/api/runs/{run_id}")).status_code,
+                        200,
+                    )
+                    artifact_key = manifest[admission_field]["artifact_key"]
+                    async with SessionLocal() as session:
+                        await session.execute(
+                            delete(RunArtifact).where(
+                                RunArtifact.run_id == run_id,
+                                RunArtifact.artifact_key == artifact_key,
+                            )
+                        )
+                        await session.commit()
+                    self.assertEqual(
+                        (await self.client.get(f"/api/runs/{run_id}")).status_code,
+                        409,
+                    )
+                finally:
+                    await self._delete_run(run_id)
+
     async def test_trusted_archived_reader_contract_survives_current_version_bump(
         self,
     ) -> None:
         run_id = f"archived-reader-contract-{uuid.uuid4()}"
         report_json = {"narrative": {"headline": "Отчёт"}, "illustrations": []}
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -1062,7 +2032,7 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch(
                     "app.services.publication_contract.READER_COPY_MANIFEST_VERSION",
-                    "aiv-reader-copy-manifest-v6",
+                    "aiv-reader-copy-manifest-v8",
                 ),
                 patch(
                     "app.services.publication_contract.LIVE_RUSSIAN_POLICY_MANIFEST",
@@ -1113,7 +2083,12 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         run_id = f"unknown-reader-contract-{uuid.uuid4()}"
         report_json = {"narrative": {"headline": "Отчёт"}, "illustrations": []}
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         unknown_manifest = copy.deepcopy(manifest)
         unknown_manifest["code_owned_copy_registry"]["version"] = (
             "aiv-reader-copy-registry-unknown"
@@ -1195,7 +2170,12 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         run_id = f"snapshot-field-tamper-{uuid.uuid4()}"
         report_json = {"narrative": {"headline": "Отчёт"}, "illustrations": []}
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -1241,7 +2221,12 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         run_id = f"fake-reader-manifest-{uuid.uuid4()}"
         report_json = {"narrative": {"headline": "Отчёт"}, "illustrations": []}
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         manifest["manifest_sha256"] = "0" * 64
         async with SessionLocal() as session:
             session.add(
@@ -1256,7 +2241,7 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             await session.flush()
             with self.assertRaises(PublicationContractError):
-                await stage_publication_receipt(
+                await _stage_publication_receipt(
                     session,
                     run_id=run_id,
                     report_json=report_json,
@@ -1273,7 +2258,13 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         markdown = "# Отчёт"
         for field in ("version", "canonical_policy", "code_owned_copy_registry"):
             with self.subTest(field=field):
-                manifest = await _reader_copy_manifest(report_json, markdown, [])
+                run_id = f"stale-reader-policy-{uuid.uuid4()}"
+                manifest = await _reader_copy_manifest(
+                    report_json,
+                    markdown,
+                    [],
+                    run_id=run_id,
+                )
                 if field == "version":
                     manifest["version"] = "aiv-reader-copy-manifest-stale"
                 elif field == "canonical_policy":
@@ -1294,9 +2285,9 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 manifest["manifest_sha256"] = stable_json_sha256(core)
                 async with SessionLocal() as session:
                     with self.assertRaises(PublicationContractError):
-                        await stage_publication_receipt(
+                        await _stage_publication_receipt(
                             session,
-                            run_id=f"stale-reader-policy-{uuid.uuid4()}",
+                            run_id=run_id,
                             report_json=report_json,
                             analysis_markdown=markdown,
                             reader_copy_manifest=manifest,
@@ -1311,7 +2302,13 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "illustrations": [],
         }
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        run_id = f"invalid-editorial-cache-{uuid.uuid4()}"
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         receipt = manifest["editorial_receipts"]["final_report"]
         proof = receipt["cache_proof"]
         self.assertTrue(proof["audit"]["quality_complete"])
@@ -1332,9 +2329,9 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         manifest["manifest_sha256"] = stable_json_sha256(manifest_core)
         async with SessionLocal() as session:
             with self.assertRaises(PublicationContractError):
-                await stage_publication_receipt(
+                await _stage_publication_receipt(
                     session,
-                    run_id=f"invalid-editorial-cache-{uuid.uuid4()}",
+                    run_id=run_id,
                     report_json=report_json,
                     analysis_markdown=markdown,
                     reader_copy_manifest=manifest,
@@ -1347,7 +2344,12 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         run_id = f"zero-policy-{uuid.uuid4()}"
         report_json = {"narrative": {"headline": "Отчёт"}, "illustrations": []}
         markdown = "# Отчёт"
-        manifest = await _reader_copy_manifest(report_json, markdown, [])
+        manifest = await _reader_copy_manifest(
+            report_json,
+            markdown,
+            [],
+            run_id=run_id,
+        )
         manifest["editorial_receipts"]["illustration_assets"]["publication_policy"].pop(
             "zero_assets_allowed"
         )
@@ -1383,7 +2385,12 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         run_id = f"operator-publication-{uuid.uuid4()}"
         old_report = {"narrative": {"headline": "Было"}, "illustrations": []}
         old_markdown = "# Было"
-        old_manifest = await _reader_copy_manifest(old_report, old_markdown, [])
+        old_manifest = await _reader_copy_manifest(
+            old_report,
+            old_markdown,
+            [],
+            run_id=run_id,
+        )
         async with SessionLocal() as session:
             session.add(
                 Run(
@@ -1412,7 +2419,19 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         new_report = {"narrative": {"headline": "Стало"}, "illustrations": []}
         new_markdown = "# Стало"
-        new_manifest = await _reader_copy_manifest(new_report, new_markdown, [])
+        new_manifest = await _reader_copy_manifest(
+            new_report,
+            new_markdown,
+            [],
+            run_id=run_id,
+        )
+        async with SessionLocal() as session:
+            await _persist_admission_artifacts(
+                session,
+                run_id=run_id,
+                reader_copy_manifest=new_manifest,
+            )
+            await session.commit()
         try:
             receipt = await replace_completed_publication(
                 run_id=run_id,
@@ -1489,6 +2508,7 @@ class PublicationContractIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         },
                         "# Подмена",
                         [],
+                        run_id=run_id,
                     ),
                 )
         finally:

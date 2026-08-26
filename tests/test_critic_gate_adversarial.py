@@ -241,7 +241,7 @@ class CriticGateAdversarialTests(unittest.TestCase):
             _scope_leakage_warning_machine_resolved(payload, warning)
         )
 
-    def test_malformed_critic_can_fallback_only_after_machine_resolution(
+    def test_malformed_critic_machine_resolution_is_recorded_as_degraded(
         self,
     ) -> None:
         payload = self._limited_scope_payload()
@@ -257,14 +257,14 @@ class CriticGateAdversarialTests(unittest.TestCase):
         self.assertEqual(fallback["verdict"], "pass")
         self.assertEqual(
             fallback["fallback"]["kind"],
-            "deterministic_safe_pass",
+            "deterministic_degraded_advisory",
         )
         self.assertEqual(
             _critic_review_validation_errors(fallback, payload=payload),
             [],
         )
 
-    def test_malformed_critic_fallback_blocks_unresolved_warning(self) -> None:
+    def test_malformed_critic_unresolved_warning_is_advisory(self) -> None:
         payload = self._limited_scope_payload()
         payload["deterministic_warnings"][0]["code"] = (
             "generic_term_leakage"
@@ -281,7 +281,7 @@ class CriticGateAdversarialTests(unittest.TestCase):
         self.assertEqual(fallback["verdict"], "block")
         self.assertEqual(
             fallback["fallback"]["kind"],
-            "deterministic_actionability_block",
+            "deterministic_degraded_advisory",
         )
 
 

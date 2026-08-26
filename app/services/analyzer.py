@@ -52,6 +52,7 @@ from app.services.openrouter import (
     WEB_ATTESTATION_VERSION,
     ChatResult,
     ImageResult,
+    OpenRouterAuditCheckpointError,
     OpenRouterError,
     OpenRouterOutputLimitError,
     OpenRouterPolicyError,
@@ -243,6 +244,10 @@ from app.services.recovery_state import (
 from app.services.progress import fail_run, update_progress
 from app.services.publication_contract import (
     EDITORIAL_CACHE_PROOF_VERSION,
+    FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX,
+    FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+    OPTIONAL_ASSET_ADMISSION_PREFIX,
+    OPTIONAL_ASSET_ADMISSION_VERSION,
     PublicationContractError,
     READER_COPY_MANIFEST_VERSION,
     persist_immutable_illustration_qa_receipt,
@@ -380,6 +385,18 @@ class _EntityCatalogRecoverySingletonContextError(OpenRouterError):
     """One minimum recovery core cannot be continued or split losslessly."""
 
 
+class _FinalInputExactCoverageError(OpenRouterError):
+    """A complete mapper response omitted or repeated expected source rows."""
+
+
+class _FinalSemanticReviewerUnavailable(OpenRouterError):
+    """The advisory semantic reviewer produced no independently usable verdict."""
+
+
+class _FinalSemanticAuditIntegrityError(OpenRouterError):
+    """A persisted semantic receipt or checkpoint violates its code contract."""
+
+
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v21"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v23"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
@@ -397,10 +414,13 @@ FINAL_CONTEXT_SELECTION_VERSION = f"{PROMPT_VERSION}-final-context-v5"
 FINAL_CONTEXT_MAX_ANSWERS: None = None
 FINAL_REPORT_AUTHOR_ARTIFACT_KEY = "final_report_author_candidate"
 MAX_FINAL_STRUCTURE_REPAIRS = 1
-FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v10"
+FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v12"
+FINAL_INPUT_MAP_SPLIT_VERSION = "aiv-final-input-map-split-v1"
 FINAL_INPUT_CLAIM_LEDGER_VERSION = "aiv-final-input-claim-ledger-v2"
 FINAL_ANSWER_ACCOUNTING_VERSION = "aiv-final-answer-accounting-v1"
 FINAL_INPUT_ROOT_SUMMARY_VERSION = "aiv-final-input-bounded-root-v3"
+FINAL_INPUT_GROUNDING_FILTER_VERSION = "aiv-final-input-grounding-filter-v1"
+FINAL_INPUT_GROUNDING_FILTER_KEY = "_aiv_final_input_grounding_filter"
 # Per-call working windows.  They trigger more map/reduce leaves; they never
 # cap the source payload or the number of leaves.
 FINAL_INPUT_FALLBACK_WINDOW_BYTES = 192_000
@@ -410,10 +430,11 @@ FINAL_INPUT_FALLBACK_WINDOW_BYTES = 192_000
 # directly instead.
 FINAL_INPUT_SAFETY_TOKENS = 0
 FINAL_INPUT_MAP_UNIT_CHARS = 32_000
-# Mapper leaves contain exact one-to-one claim receipts.  A separate, larger
-# fan-in keeps small semantic scalars from degenerating into thousands of paid
-# calls, while exact serialized-request admission still bounds every pack.
-FINAL_INPUT_MAP_FAN_IN = 128
+# Mapper leaves contain exact one-to-one claim receipts.  This is a per-call
+# claim workload, not a corpus limit: larger inputs create more lossless leaves.
+# Eight claims keep the dependent observations + unit/claim coverage contract
+# small enough for the model to satisfy reliably even when excerpts are long.
+FINAL_INPUT_MAP_FAN_IN = 8
 FINAL_INPUT_REDUCE_FAN_IN = 6
 FINAL_INPUT_CLAIM_FRAGMENT_UTF8_BYTES = 4_096
 FINAL_ANALYSIS_DIMENSIONS = (
@@ -26077,6 +26098,159 @@ def _deterministic_warning_machine_resolved(
     return False
 
 
+_CRITIC_DEGRADED_FALLBACK_KIND = "deterministic_degraded_advisory"
+_CRITIC_CONFIRMED_BLOCK_FALLBACK_KIND = "confirmed_integrity_block"
+_CRITIC_CONFIRMED_WARNING_CODES = frozenset(
+    {
+        "target_mention_false_negative",
+        "annotation_evidence_mismatch",
+        "brand_knowledge_false_negative",
+    }
+)
+
+
+class _ConfirmedCriticIntegrityBlock(OpenRouterError):
+    """A publication blocker independently reproduced by application code."""
+
+    def __init__(self, message: str, *, reason_codes: list[str]) -> None:
+        super().__init__(message)
+        self.reason_codes = list(dict.fromkeys(reason_codes))
+
+
+def _code_owned_critic_integrity_reason_codes(
+    payload: dict[str, Any],
+) -> list[str]:
+    """Return only integrity defects independently proved by application code.
+
+    The critic is an advisory semantic layer.  Its prose, severity or verdict is
+    never proof by itself.  Hard failure remains available for the immutable
+    panel contract, warning-linked evidence loss and deterministic annotation
+    contradictions that were derived directly from raw rows.
+    """
+
+    reasons: list[str] = []
+    admission = payload.get("panel_metric_coverage_admission")
+    if isinstance(admission, dict) and admission.get("allowed") is not True:
+        for code in admission.get("reason_codes") or []:
+            normalized = str(code or "").strip()
+            if normalized:
+                reasons.append(f"panel_integrity:{normalized}")
+        if not reasons:
+            reasons.append("panel_integrity:not_admitted")
+
+    raw_selection = payload.get("raw_evidence_selection")
+    if isinstance(raw_selection, dict):
+        missing_mandatory_ids = {
+            value
+            for value in raw_selection.get("omitted_mandatory_answer_ids") or []
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        if missing_mandatory_ids:
+            reasons.append("critic_lineage:mandatory_raw_evidence_missing")
+
+    for warning in payload.get("deterministic_warnings") or []:
+        if not isinstance(warning, dict):
+            continue
+        code = str(warning.get("code") or "").strip()
+        if code in _CRITIC_CONFIRMED_WARNING_CODES:
+            reasons.append(f"annotation_integrity:{code}")
+    return list(dict.fromkeys(reasons))
+
+
+def _critic_block_has_code_owned_confirmation(
+    review: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+) -> bool:
+    """Bind a hard critic verdict to an independently reproduced defect."""
+
+    confirmed_reasons = set(_code_owned_critic_integrity_reason_codes(payload))
+    if not confirmed_reasons:
+        return False
+    fallback = review.get("fallback")
+    if isinstance(fallback, dict) and fallback.get("kind") == (
+        _CRITIC_CONFIRMED_BLOCK_FALLBACK_KIND
+    ):
+        fallback_reasons = {
+            str(value)
+            for value in fallback.get("reason_codes") or []
+            if isinstance(value, str) and value
+        }
+        return bool(fallback_reasons and fallback_reasons <= confirmed_reasons)
+
+    warning_by_code = {
+        str(warning.get("code") or ""): warning
+        for warning in payload.get("deterministic_warnings") or []
+        if isinstance(warning, dict)
+    }
+    valid_answer_ids = {
+        int(answer["answer_id"])
+        for answer in payload.get("answers") or []
+        if isinstance(answer, dict)
+        and isinstance(answer.get("answer_id"), int)
+        and not isinstance(answer.get("answer_id"), bool)
+    }
+    for anomaly in review.get("anomalies") or []:
+        if (
+            not isinstance(anomaly, dict)
+            or anomaly.get("severity") not in {"critical", "important"}
+        ):
+            continue
+        anomaly_code = str(anomaly.get("code") or "")
+        warning_code = (
+            "annotation_evidence_mismatch"
+            if anomaly_code == "fabricated_evidence"
+            else anomaly_code
+        )
+        warning = warning_by_code.get(warning_code)
+        if not isinstance(warning, dict):
+            continue
+        anomaly_ids = {
+            value
+            for value in anomaly.get("answer_ids") or []
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        if not anomaly_ids or not anomaly_ids <= valid_answer_ids:
+            continue
+        warning_ids = {
+            value
+            for value in warning.get("answer_ids") or []
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        if warning_ids and not anomaly_ids <= warning_ids:
+            continue
+        if warning_code in _CRITIC_CONFIRMED_WARNING_CODES:
+            return True
+    return False
+
+
+def _critic_fallback_reason_codes(
+    payload: dict[str, Any],
+    incomplete_review: dict[str, Any],
+    *,
+    validation_errors: list[str],
+    reason_codes: list[str] | None = None,
+) -> list[str]:
+    output = [str(value) for value in reason_codes or [] if str(value).strip()]
+    verdict = str(incomplete_review.get("verdict") or "")
+    if verdict == "block":
+        output.append("critic_unconfirmed_block")
+    elif verdict == "revise":
+        output.append("critic_optional_repair_unresolved")
+    elif verdict != "pass":
+        output.append("critic_response_unavailable")
+    if validation_errors:
+        output.append("critic_contract_or_optional_repair_failed")
+    admission = payload.get("panel_metric_coverage_admission")
+    if isinstance(admission, dict):
+        output.extend(
+            f"panel_coverage:{code}"
+            for code in admission.get("warning_codes") or []
+            if str(code or "").strip()
+        )
+    return list(dict.fromkeys(output or ["critic_auxiliary_unavailable"]))
+
+
 def _critic_review_errors(
     review: dict[str, Any],
     *,
@@ -26163,36 +26337,17 @@ def _critic_review_errors(
             not isinstance(value, str) for value in anomaly.get("entities") or []
         ):
             errors.append(f"anomaly {index} has invalid entities")
-    truncated_answer_ids = [
-        item.get("answer_id")
-        for item in (payload or {}).get("answers") or []
-        if isinstance(item, dict) and item.get("raw_answer_truncated") is True
-    ]
-    if truncated_answer_ids and verdict != "block":
-        errors.append(
-            "truncated raw answers require block: "
-            + ", ".join(str(value) for value in truncated_answer_ids)
-        )
     raw_selection = (payload or {}).get("raw_evidence_selection")
-    omitted_warning_ids = (
-        raw_selection.get("omitted_warning_answer_ids") or []
+    omitted_mandatory_ids = (
+        raw_selection.get("omitted_mandatory_answer_ids") or []
         if isinstance(raw_selection, dict)
         else []
     )
-    missing_warning_ids = (
-        raw_selection.get("missing_warning_answer_ids") or []
-        if isinstance(raw_selection, dict)
-        else []
-    )
-    incomplete_warning_ids = [
-        *omitted_warning_ids,
-        *missing_warning_ids,
-    ]
-    if incomplete_warning_ids and verdict != "block":
+    if omitted_mandatory_ids and verdict != "block":
         errors.append(
-            "warning-linked raw answers missing or omitted by primary budget "
+            "mandatory raw answers missing or omitted by primary budget "
             "require block: "
-            + ", ".join(str(value) for value in incomplete_warning_ids)
+            + ", ".join(str(value) for value in omitted_mandatory_ids)
         )
     if verdict == "pass":
         unresolved = [
@@ -26307,20 +26462,25 @@ def _critic_review_errors(
             if isinstance(item, dict)
             and item.get("severity") in {"critical", "important"}
         ]
-        if (
-            not material_anomalies
-            and fallback_kind != "deterministic_actionability_block"
-        ):
+        if not material_anomalies and fallback_kind not in {
+            _CRITIC_DEGRADED_FALLBACK_KIND,
+            _CRITIC_CONFIRMED_BLOCK_FALLBACK_KIND,
+        }:
             errors.append("block contains no critical/important anomalies")
         integrity_codes = {
             "scope_leakage",
             "fabricated_evidence",
             "annotation_evidence_mismatch",
+            "target_mention_false_negative",
+            "brand_knowledge_false_negative",
             "denominator_error",
             "missing_data_as_zero",
         }
         for anomaly in material_anomalies:
-            if fallback_kind == "deterministic_actionability_block":
+            if fallback_kind in {
+                _CRITIC_DEGRADED_FALLBACK_KIND,
+                _CRITIC_CONFIRMED_BLOCK_FALLBACK_KIND,
+            }:
                 continue
             if anomaly.get("code") not in integrity_codes:
                 errors.append(
@@ -26332,6 +26492,14 @@ def _critic_review_errors(
                 errors.append(
                     "block anomaly has no answer-bound evidence: "
                     + str(anomaly.get("code") or "unknown")
+                )
+        if payload is not None and fallback_kind != _CRITIC_DEGRADED_FALLBACK_KIND:
+            if not _critic_block_has_code_owned_confirmation(
+                review,
+                payload=payload,
+            ):
+                errors.append(
+                    "block is not backed by a code-owned confirmed integrity anomaly"
                 )
     return errors
 
@@ -26378,8 +26546,9 @@ def _deterministic_critic_fallback_review(
     incomplete_review: dict[str, Any],
     *,
     validation_errors: list[str],
+    reason_codes: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Fail open only when code independently proves a model ``pass`` safe."""
+    """Preserve critic diagnostics without granting them publication veto power."""
 
     anomalies = incomplete_review.get("anomalies")
     adjustments = incomplete_review.get("policy_adjustments")
@@ -26410,18 +26579,12 @@ def _deterministic_critic_fallback_review(
             for warning in material_warnings
         )
     )
-    has_truncated_raw = any(
-        isinstance(item, dict) and item.get("raw_answer_truncated") is True
-        for item in payload.get("answers") or []
-    )
-    raw_selection = payload.get("raw_evidence_selection")
-    incomplete_warning_ids = (
-        [
-            *(raw_selection.get("omitted_warning_answer_ids") or []),
-            *(raw_selection.get("missing_warning_answer_ids") or []),
-        ]
-        if isinstance(raw_selection, dict)
-        else []
+    confirmed_reason_codes = _code_owned_critic_integrity_reason_codes(payload)
+    fallback_reason_codes = _critic_fallback_reason_codes(
+        payload,
+        incomplete_review,
+        validation_errors=validation_errors,
+        reason_codes=reason_codes,
     )
     safe_pass = bool(
         incomplete_review.get("verdict") == "pass"
@@ -26431,9 +26594,8 @@ def _deterministic_critic_fallback_review(
         and not adjustments
         and isinstance(guidance, str)
         and not guidance.strip()
-        and not has_truncated_raw
-        and not incomplete_warning_ids
         and warnings_are_resolved
+        and not confirmed_reason_codes
     )
     if safe_pass:
         fallback = {
@@ -26472,7 +26634,50 @@ def _deterministic_critic_fallback_review(
                 "полноты по исходным ответам."
             ],
             "fallback": {
-                "kind": "deterministic_safe_pass",
+                "kind": _CRITIC_DEGRADED_FALLBACK_KIND,
+                "reason_codes": fallback_reason_codes,
+                "critic_validation_errors": list(validation_errors),
+            },
+        }
+    elif confirmed_reason_codes:
+        confirmed_warnings = [
+            warning
+            for warning in material_warnings
+            if (
+                str(warning.get("code") or "") in _CRITIC_CONFIRMED_WARNING_CODES
+            )
+        ]
+        fallback = {
+            "verdict": "block",
+            "summary": (
+                "Кодовая проверка независимо воспроизвела нарушение "
+                "целостности аналитики; публикация остановлена."
+            ),
+            "anomalies": [
+                {
+                    "code": str(warning.get("code") or "other"),
+                    "severity": str(warning.get("severity") or "important"),
+                    "finding": str(warning.get("finding") or "")
+                    or "Кодовая проверка воспроизвела нарушение целостности.",
+                    "answer_ids": [
+                        value
+                        for value in warning.get("answer_ids") or []
+                        if isinstance(value, int) and not isinstance(value, bool)
+                    ],
+                    "entities": [
+                        value
+                        for value in warning.get("entities") or []
+                        if isinstance(value, str) and value.strip()
+                    ],
+                }
+                for warning in confirmed_warnings
+            ],
+            "policy_adjustments": [],
+            "annotation_guidance": "",
+            "acceptance_checks": [],
+            "fallback": {
+                "kind": _CRITIC_CONFIRMED_BLOCK_FALLBACK_KIND,
+                "reason_codes": confirmed_reason_codes,
                 "critic_validation_errors": list(validation_errors),
             },
         }
@@ -26486,17 +26691,18 @@ def _deterministic_critic_fallback_review(
         fallback = {
             "verdict": "block",
             "summary": (
-                "Решение независимого критика содержит материальную находку, "
-                "но код не смог безопасно скомпилировать предложенное "
-                "исправление; публикация остановлена без потери диагностики."
+                "Независимый критик не завершил проверку по строгому контракту. "
+                "Его диагностика сохранена, но не считается доказанным "
+                "нарушением целостности."
             ),
             "anomalies": preserved_anomalies,
             "policy_adjustments": preserved_adjustments,
             "annotation_guidance": guidance if isinstance(guidance, str) else "",
             "acceptance_checks": [],
             "fallback": {
-                "kind": "deterministic_actionability_block",
+                "kind": _CRITIC_DEGRADED_FALLBACK_KIND,
                 "original_verdict": incomplete_review.get("verdict"),
+                "reason_codes": fallback_reason_codes,
                 "critic_validation_errors": list(validation_errors),
             },
         }
@@ -26544,7 +26750,7 @@ def _critic_review_cache_status(
         if (
             allow_deterministic_fallback
             and verdict == "pass"
-            and fallback_kind == "deterministic_safe_pass"
+            and fallback_kind == _CRITIC_DEGRADED_FALLBACK_KIND
         ):
             return "completed"
         return "failed"
@@ -26718,6 +26924,7 @@ async def _analysis_critic_fallback_artifact(
     payload: dict[str, Any],
     incomplete_review: dict[str, Any],
     validation_errors: list[str],
+    reason_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persist the bounded non-LLM fallback after one failed repair."""
 
@@ -26725,12 +26932,14 @@ async def _analysis_critic_fallback_artifact(
     fallback_input = {
         "incomplete_review": incomplete_review,
         "validation_errors": validation_errors,
+        "reason_codes": list(reason_codes or []),
         "deterministic_warnings": payload.get("deterministic_warnings") or [],
     }
     fallback = _deterministic_critic_fallback_review(
         payload,
         incomplete_review,
         validation_errors=validation_errors,
+        reason_codes=reason_codes,
     )
     await _save_artifact(
         run_id,
@@ -26847,6 +27056,10 @@ async def _analysis_critic_repair_artifact(
                 "Analysis critic repair is inconsistent: " + "; ".join(errors)
             )
         usage = _validated_critic_usage(usage)
+    except asyncio.CancelledError:
+        raise
+    except RunLeaseLostError:
+        raise
     except Exception as exc:
         await _save_artifact(
             run_id,
@@ -26867,6 +27080,7 @@ async def _analysis_critic_repair_artifact(
             payload=payload,
             incomplete_review=incomplete_review,
             validation_errors=[*validation_errors, str(exc)],
+            reason_codes=["critic_optional_repair_failed"],
         )
     repaired_status = _critic_review_cache_status(repaired)
     await _save_artifact(
@@ -26897,14 +27111,28 @@ async def _analysis_critic_artifact(
     recovery_final: bool = False,
 ) -> dict[str, Any]:
     artifact_key = f"analysis_critic_r{iteration}"
-    cached = await _artifact_output(
-        run_id,
-        artifact_key,
-        input_json=payload,
-        model=CRITIC_MODEL,
-        prompt_version=ANALYSIS_CRITIC_VERSION,
-        require_validated_critic_usage=True,
-    )
+    try:
+        cached = await _artifact_output(
+            run_id,
+            artifact_key,
+            input_json=payload,
+            model=CRITIC_MODEL,
+            prompt_version=ANALYSIS_CRITIC_VERSION,
+            require_validated_critic_usage=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except RunLeaseLostError:
+        raise
+    except Exception as exc:
+        return await _analysis_critic_fallback_artifact(
+            run_id,
+            iteration=iteration,
+            payload=payload,
+            incomplete_review={},
+            validation_errors=[str(exc)],
+            reason_codes=["critic_cache_unavailable"],
+        )
     if isinstance(cached, dict):
         errors = _critic_review_validation_errors(
             cached,
@@ -26912,9 +27140,16 @@ async def _analysis_critic_artifact(
         )
         if errors:
             if recovery_final:
-                raise OpenRouterError(
-                    "Cached final recovery critic decision is inconsistent: "
-                    + "; ".join(errors)
+                return await _analysis_critic_fallback_artifact(
+                    run_id,
+                    iteration=iteration,
+                    payload=payload,
+                    incomplete_review=cached,
+                    validation_errors=[
+                        "Cached final recovery critic decision is inconsistent: "
+                        + "; ".join(errors)
+                    ],
+                    reason_codes=["critic_cache_contract_unavailable"],
                 )
             return await _analysis_critic_repair_artifact(
                 run_id,
@@ -27093,14 +27328,6 @@ async def _analysis_critic_artifact(
             payload=payload,
         )
         if errors:
-            if recovery_final:
-                # Round 3 accepts only the complete primary decision.
-                # Transport, schema and semantic repairs are all forbidden:
-                # any rewrite could promote revise/block to pass.
-                raise OpenRouterError(
-                    "Final recovery critic primary decision is inconsistent: "
-                    + "; ".join(errors)
-                )
             prior_attempts = (
                 usage.get("_aiv_critic_attempts") if isinstance(usage, dict) else None
             )
@@ -27118,6 +27345,7 @@ async def _analysis_critic_artifact(
                         "Compact critic repair budget already consumed: "
                         + "; ".join(errors)
                     ],
+                    reason_codes=["critic_optional_repair_budget_exhausted"],
                 )
             else:
                 review = await _analysis_critic_repair_artifact(
@@ -27145,6 +27373,10 @@ async def _analysis_critic_artifact(
             )
         else:
             usage = _validated_critic_usage(usage)
+    except asyncio.CancelledError:
+        raise
+    except RunLeaseLostError:
+        raise
     except Exception as exc:
         await _save_artifact(
             run_id,
@@ -27159,7 +27391,14 @@ async def _analysis_critic_artifact(
             error_message=str(exc),
             prompt_version=ANALYSIS_CRITIC_VERSION,
         )
-        raise
+        return await _analysis_critic_fallback_artifact(
+            run_id,
+            iteration=iteration,
+            payload=payload,
+            incomplete_review=(review if isinstance(review, dict) else {}),
+            validation_errors=[str(exc)],
+            reason_codes=["critic_provider_schema_or_cache_unavailable"],
+        )
     fallback = review.get("fallback")
     is_deterministic_fallback = bool(
         isinstance(fallback, dict) and fallback.get("kind")
@@ -28016,6 +28255,9 @@ async def _save_critic_gate(
     policy_history: list[dict[str, Any]],
     reason: str,
     expected_corpus_cells: list[dict[str, Any]] | None = None,
+    quality_state: str | None = None,
+    reason_codes: list[str] | None = None,
+    critic_outcome: str | None = None,
 ) -> dict[str, Any]:
     provenance = _critic_provenance_digests(
         profile=profile,
@@ -28037,18 +28279,87 @@ async def _save_critic_gate(
         expected_cells=normalized_expected_cells,
         observed_rows=rows,
     )
+    normalized_reason_codes = [
+        str(value)
+        for value in reason_codes or []
+        if isinstance(value, str) and value.strip()
+    ]
+    normalized_reason_codes.extend(
+        f"panel_coverage:{value}"
+        for value in coverage_admission.get("warning_codes") or []
+        if str(value or "").strip()
+    )
+    normalized_reason_codes = list(dict.fromkeys(normalized_reason_codes))
     if passed:
         if corpus_manifest.get("structural_complete") is not True:
-            raise OpenRouterError(
-                "Analysis critic cannot pass an incomplete panel structure"
+            structural_reason_codes = sorted(
+                {
+                    "corpus_structure:" + str(reason)
+                    for cell in corpus_manifest.get("structural_invalid_cells") or []
+                    if isinstance(cell, dict)
+                    for reason in cell.get("reasons") or []
+                }
+                | {
+                    "corpus_structure:missing_cell"
+                    for _cell in corpus_manifest.get("missing_cells") or []
+                }
+                | {
+                    "corpus_structure:unexpected_cell"
+                    for _cell in corpus_manifest.get("unexpected_cells") or []
+                }
+                | {
+                    "corpus_structure:duplicate_cell"
+                    for _cell in corpus_manifest.get("duplicate_cells") or []
+                }
+                | {
+                    "corpus_structure:duplicate_expected_cell"
+                    for _cell in corpus_manifest.get("duplicate_expected_cells") or []
+                }
+            ) or ["corpus_structure:incomplete"]
+            raise _ConfirmedCriticIntegrityBlock(
+                "Analysis critic cannot pass an incomplete panel structure",
+                reason_codes=structural_reason_codes,
             )
         if corpus_manifest.get("evidentiary_complete") is not True:
-            raise OpenRouterError(
-                "Analysis critic cannot pass stale or incomplete evidence"
+            evidence_reason_codes = sorted(
+                {
+                    "corpus_lineage:" + str(reason)
+                    for cell in corpus_manifest.get("evidentiary_invalid_cells") or []
+                    if isinstance(cell, dict)
+                    for reason in cell.get("reasons") or []
+                }
+            ) or ["corpus_lineage:incomplete"]
+            raise _ConfirmedCriticIntegrityBlock(
+                "Analysis critic cannot pass stale or incomplete evidence",
+                reason_codes=evidence_reason_codes,
             )
-        require_panel_metric_coverage(coverage_admission)
+        try:
+            require_panel_metric_coverage(coverage_admission)
+        except PanelMetricCoverageError as exc:
+            coverage_reason_codes = [
+                "panel_integrity:" + str(value)
+                for value in coverage_admission.get("reason_codes") or []
+                if str(value or "").strip()
+            ] or ["panel_integrity:not_admitted"]
+            raise _ConfirmedCriticIntegrityBlock(
+                str(exc),
+                reason_codes=coverage_reason_codes,
+            ) from exc
+    if not passed:
+        normalized_quality_state = "blocked"
+    elif quality_state == "degraded" or coverage_admission.get(
+        "quality_state"
+    ) == "degraded":
+        normalized_quality_state = "degraded"
+    else:
+        normalized_quality_state = "complete"
+    if normalized_quality_state == "degraded" and not normalized_reason_codes:
+        normalized_reason_codes = ["critic_auxiliary_degraded"]
     output = {
         "passed": passed,
+        "quality_state": normalized_quality_state,
+        "reason_codes": normalized_reason_codes,
+        "critic_outcome": critic_outcome or ("pass" if passed else "blocked"),
         "iteration": iteration,
         "critic_model": CRITIC_MODEL,
         "metrics_sha256": provenance["metrics_sha256"],
@@ -28074,12 +28385,165 @@ async def _save_critic_gate(
                 "admission_sha256"
             ],
             "iteration": iteration,
+            "quality_state": normalized_quality_state,
+            "reason_codes": normalized_reason_codes,
+            "critic_outcome": output["critic_outcome"],
         },
         output_json=output,
         error_message=None if passed else output["reason"],
         prompt_version=ANALYSIS_CRITIC_VERSION,
     )
     return output
+
+
+def _recomputed_code_owned_critic_integrity_reason_codes(
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    policy_history: list[dict[str, Any]],
+    expected_corpus_cells: list[dict[str, Any]] | None = None,
+    integrity_payload: dict[str, Any] | None = None,
+) -> list[str]:
+    """Rebuild code-owned blockers for the exact state about to be published."""
+
+    normalized_expected_cells = (
+        expected_corpus_cells
+        if expected_corpus_cells is not None
+        else _expected_corpus_cells_from_rows(rows)
+    )
+    corpus_manifest = _final_corpus_manifest(
+        rows,
+        expected_cells=normalized_expected_cells,
+    )
+    reasons: list[str] = []
+    if corpus_manifest.get("structural_complete") is not True:
+        reasons.extend(
+            sorted(
+                {
+                    "corpus_structure:" + str(reason)
+                    for cell in corpus_manifest.get("structural_invalid_cells") or []
+                    if isinstance(cell, dict)
+                    for reason in cell.get("reasons") or []
+                }
+                | {
+                    "corpus_structure:missing_cell"
+                    for _cell in corpus_manifest.get("missing_cells") or []
+                }
+                | {
+                    "corpus_structure:unexpected_cell"
+                    for _cell in corpus_manifest.get("unexpected_cells") or []
+                }
+                | {
+                    "corpus_structure:duplicate_cell"
+                    for _cell in corpus_manifest.get("duplicate_cells") or []
+                }
+                | {
+                    "corpus_structure:duplicate_expected_cell"
+                    for _cell in corpus_manifest.get("duplicate_expected_cells") or []
+                }
+            )
+            or ["corpus_structure:incomplete"]
+        )
+    if corpus_manifest.get("evidentiary_complete") is not True:
+        reasons.extend(
+            sorted(
+                {
+                    "corpus_lineage:" + str(reason)
+                    for cell in corpus_manifest.get("evidentiary_invalid_cells") or []
+                    if isinstance(cell, dict)
+                    for reason in cell.get("reasons") or []
+                }
+            )
+            or ["corpus_lineage:incomplete"]
+        )
+    rebuilt_payload = _critic_payload(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        metrics=metrics,
+        policy_history=policy_history,
+        expected_corpus_cells=expected_corpus_cells,
+    )
+    reasons.extend(_code_owned_critic_integrity_reason_codes(rebuilt_payload))
+    if isinstance(integrity_payload, dict):
+        reasons.extend(_code_owned_critic_integrity_reason_codes(integrity_payload))
+    return list(dict.fromkeys(reasons))
+
+
+async def _save_degraded_critic_gate(
+    run_id: str,
+    *,
+    iteration: int,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    policy_history: list[dict[str, Any]],
+    reason: str,
+    reason_codes: list[str],
+    critic_outcome: str,
+    expected_corpus_cells: list[dict[str, Any]] | None = None,
+    integrity_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Publish deterministic-safe analytics with an explicit critic limitation."""
+
+    # Every fail-soft caller converges here.  Rebuild the deterministic payload
+    # from the exact rows that would be published instead of trusting the model
+    # failure mode (or a caller-provided verdict) as evidence of safety.  An
+    # exact recovery payload may additionally carry mandatory raw-selection
+    # receipts that cannot be reconstructed from rows alone, so merge both
+    # independently derived sets of blockers.
+    confirmed_reason_codes = (
+        _recomputed_code_owned_critic_integrity_reason_codes(
+            profile=profile,
+            catalog=catalog,
+            rows=rows,
+            metrics=metrics,
+            policy_history=policy_history,
+            expected_corpus_cells=expected_corpus_cells,
+            integrity_payload=integrity_payload,
+        )
+    )
+    if confirmed_reason_codes:
+        await _save_critic_gate(
+            run_id,
+            passed=False,
+            iteration=iteration,
+            profile=profile,
+            catalog=catalog,
+            rows=rows,
+            metrics=metrics,
+            policy_history=policy_history,
+            reason=(
+                "Кодовая проверка независимо воспроизвела нарушение "
+                "целостности; fail-soft critic-режим не может открыть публикацию."
+            ),
+            expected_corpus_cells=expected_corpus_cells,
+            reason_codes=confirmed_reason_codes,
+            critic_outcome="confirmed_integrity_block",
+        )
+        raise _ConfirmedCriticIntegrityBlock(
+            "A degraded critic gate cannot override code-owned integrity proof",
+            reason_codes=confirmed_reason_codes,
+        )
+
+    return await _save_critic_gate(
+        run_id,
+        passed=True,
+        iteration=iteration,
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        metrics=metrics,
+        policy_history=policy_history,
+        reason=reason,
+        expected_corpus_cells=expected_corpus_cells,
+        quality_state="degraded",
+        reason_codes=reason_codes,
+        critic_outcome=critic_outcome,
+    )
 
 
 ANALYSIS_CRITIC_RECOVERY_STAGE = "analysis_critic"
@@ -28150,6 +28614,8 @@ def _critic_analysis_state_digest(
     rows: list[dict[str, Any]],
     metrics: dict[str, Any],
     *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
     expected_corpus_cells: list[dict[str, Any]] | None = None,
 ) -> str:
     normalized_expected_cells = sorted(
@@ -28213,6 +28679,16 @@ def _critic_analysis_state_digest(
     return stable_digest(
         {
             "execution_scope": execution_scope,
+            # Terminal latches are availability-affecting decisions.  Bind them
+            # to the complete deterministic provenance, not only the derived
+            # annotations/metrics, so a corrected profile, catalog or raw corpus
+            # always receives a fresh bounded attempt.
+            "profile_sha256": _stable_json_sha256(profile),
+            "catalog_sha256": _stable_json_sha256(catalog),
+            "raw_corpus_sha256": _raw_corpus_digest(rows),
+            "critic_rows_sha256": _stable_json_sha256(
+                _critic_row_provenance(rows)
+            ),
             "annotations": [
                 {
                     "answer_id": row.get("answer_id"),
@@ -28298,6 +28774,13 @@ async def _terminal_analysis_critic_recovery_reason(
         if (
             details.get("terminal_analysis_state_digest") == state_digest
             and details.get("terminal_analysis_critic_block") is True
+            and details.get("terminal_analysis_critic_reason_code")
+            == "confirmed_integrity_block"
+            and isinstance(details.get("terminal_integrity_codes"), list)
+            and any(
+                isinstance(value, str) and value.strip()
+                for value in details.get("terminal_integrity_codes") or []
+            )
         ):
             return str(
                 details.get("error")
@@ -28361,15 +28844,16 @@ async def _successful_analysis_critic_recovery_gate(
     if (
         artifact is None
         or not isinstance(artifact.output_json, dict)
-        or primary_artifact is None
     ):
         return None
     gate = dict(artifact.output_json)
+    gate_is_degraded = gate.get("quality_state") == "degraded"
     if (
         gate.get("passed") is not True
         or gate.get("iteration")
         != MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
         or gate.get("critic_model") != CRITIC_MODEL
+        or (primary_artifact is None and not gate_is_degraded)
     ):
         return None
 
@@ -28498,27 +28982,28 @@ async def _successful_analysis_critic_recovery_gate(
             }
         ),
     }
-    if not _artifact_cache_matches(
-        primary_artifact,
-        input_json=final_payload,
-        model=CRITIC_MODEL,
-        prompt_version=ANALYSIS_CRITIC_VERSION,
-        require_validated_critic_usage=True,
-    ):
-        return None
-    primary_review = primary_artifact.output_json
-    if not isinstance(primary_review, dict):
-        return None
-    primary_fallback = primary_review.get("fallback")
-    if (
-        primary_review.get("verdict") != "pass"
-        or (isinstance(primary_fallback, dict) and primary_fallback.get("kind"))
-        or _critic_review_validation_errors(
-            primary_review,
-            payload=final_payload,
-        )
-    ):
-        return None
+    if not gate_is_degraded:
+        if primary_artifact is None or not _artifact_cache_matches(
+            primary_artifact,
+            input_json=final_payload,
+            model=CRITIC_MODEL,
+            prompt_version=ANALYSIS_CRITIC_VERSION,
+            require_validated_critic_usage=True,
+        ):
+            return None
+        primary_review = primary_artifact.output_json
+        if not isinstance(primary_review, dict):
+            return None
+        primary_fallback = primary_review.get("fallback")
+        if (
+            primary_review.get("verdict") != "pass"
+            or (isinstance(primary_fallback, dict) and primary_fallback.get("kind"))
+            or _critic_review_validation_errors(
+                primary_review,
+                payload=final_payload,
+            )
+        ):
+            return None
     if (
         gate.get("provenance") != provenance
         or gate.get("metrics_sha256") != provenance["metrics_sha256"]
@@ -28909,9 +29394,25 @@ async def _resume_executing_analysis_critic_recovery(
                 and gate_input.get("iteration") == final_iteration
             )
         if final_artifact is None and exact_gate_without_primary:
-            raise OpenRouterError(
-                "Analysis critic gate exists without its exact primary r3 artifact"
+            gate = copy.deepcopy(gate_output)
+            await finish_recovery(
+                plan,
+                succeeded=True,
+                before_digest=before_digest,
+                after_digest=state_digest,
+                details={
+                    "target_answer_ids": sorted(target_answer_ids),
+                    "raw_corpus_sha256": raw_digest,
+                    "executed_acceptance_checks": sorted(required_checks),
+                    "final_critic_iteration": final_iteration,
+                    "successful_analysis_state_digest": state_digest,
+                    "successful_gate_sha256": stable_digest(gate),
+                    "critic_quality_state": gate.get("quality_state"),
+                    "resumed_after_targeted_annotation_commit": True,
+                    "resumed_from_exact_gate_receipt": True,
+                },
             )
+            return gate
         if final_artifact is None:
             final_review = await _analysis_critic_artifact(
                 run_id,
@@ -28944,36 +29445,126 @@ async def _resume_executing_analysis_critic_recovery(
                     + "; ".join(validation_errors)
                 )
         fallback = final_review.get("fallback")
-        if final_review.get("verdict") != "pass" or (
-            isinstance(fallback, dict) and fallback.get("kind")
-        ):
-            raise OpenRouterError(
-                "Independent final critic did not pass resumed recovery: "
-                + str(final_review.get("summary") or "block")
-            )
-        gate = await _save_critic_gate(
-            run_id,
-            passed=True,
-            iteration=final_iteration,
-            profile=profile,
-            catalog=catalog,
-            rows=rows,
-            metrics=metrics,
-            policy_history=policy_history,
-            reason=str(
-                final_review.get("summary")
-                or "Финальная проверка восстановления пройдена."
-            ),
-            expected_corpus_cells=expected_corpus_cells,
+        fallback_kind = (
+            str(fallback.get("kind") or "") if isinstance(fallback, dict) else ""
         )
+        if _critic_block_has_code_owned_confirmation(
+            final_review,
+            payload=final_payload,
+        ):
+            raise _ConfirmedCriticIntegrityBlock(
+                "Independent final critic confirmed a code-owned integrity defect",
+                reason_codes=_code_owned_critic_integrity_reason_codes(final_payload),
+            )
+        if final_review.get("verdict") == "pass" and not fallback_kind:
+            gate = await _save_critic_gate(
+                run_id,
+                passed=True,
+                iteration=final_iteration,
+                profile=profile,
+                catalog=catalog,
+                rows=rows,
+                metrics=metrics,
+                policy_history=policy_history,
+                reason=str(
+                    final_review.get("summary")
+                    or "Финальная проверка восстановления пройдена."
+                ),
+                expected_corpus_cells=expected_corpus_cells,
+            )
+        else:
+            fallback_reason_codes = (
+                [
+                    str(value)
+                    for value in fallback.get("reason_codes") or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                if isinstance(fallback, dict)
+                else []
+            )
+            gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=final_iteration,
+                profile=profile,
+                catalog=catalog,
+                rows=rows,
+                metrics=metrics,
+                policy_history=policy_history,
+                reason=str(
+                    final_review.get("summary")
+                    or "Финальный critic-контроль недоступен."
+                ),
+                reason_codes=(
+                    fallback_reason_codes
+                    or _critic_fallback_reason_codes(
+                        final_payload,
+                        final_review,
+                        validation_errors=[],
+                        reason_codes=["critic_final_review_degraded"],
+                    )
+                ),
+                critic_outcome="final_review_degraded",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=final_payload,
+            )
     except asyncio.CancelledError:
         raise
     except RunLeaseLostError:
         raise
     except Exception as exc:
-        await _save_critic_gate(
+        if not isinstance(exc, _ConfirmedCriticIntegrityBlock):
+            confirmed_reason_codes = (
+                _recomputed_code_owned_critic_integrity_reason_codes(
+                    profile=profile,
+                    catalog=catalog,
+                    rows=rows,
+                    metrics=metrics,
+                    policy_history=policy_history,
+                    expected_corpus_cells=expected_corpus_cells,
+                    integrity_payload=final_payload,
+                )
+            )
+            if confirmed_reason_codes:
+                exc = _ConfirmedCriticIntegrityBlock(
+                    "Resumed recovery cannot degrade over code-owned integrity proof",
+                    reason_codes=confirmed_reason_codes,
+                )
+        if isinstance(exc, _ConfirmedCriticIntegrityBlock):
+            await _save_critic_gate(
+                run_id,
+                passed=False,
+                iteration=final_iteration,
+                profile=profile,
+                catalog=catalog,
+                rows=rows,
+                metrics=metrics,
+                policy_history=policy_history,
+                reason=str(exc),
+                expected_corpus_cells=expected_corpus_cells,
+                reason_codes=exc.reason_codes,
+                critic_outcome="confirmed_integrity_block",
+            )
+            await finish_recovery(
+                plan,
+                succeeded=False,
+                before_digest=before_digest,
+                after_digest=state_digest,
+                details={
+                    "error": str(exc)[:2000],
+                    "target_answer_ids": sorted(target_answer_ids),
+                    "raw_corpus_sha256": raw_digest,
+                    "terminal_analysis_critic_block": True,
+                    "terminal_analysis_critic_reason_code": (
+                        "confirmed_integrity_block"
+                    ),
+                    "terminal_integrity_codes": list(exc.reason_codes),
+                    "terminal_analysis_state_digest": state_digest,
+                    "resumed_after_targeted_annotation_commit": True,
+                },
+            )
+            raise exc
+        gate = await _save_degraded_critic_gate(
             run_id,
-            passed=False,
             iteration=final_iteration,
             profile=profile,
             catalog=catalog,
@@ -28981,10 +29572,13 @@ async def _resume_executing_analysis_critic_recovery(
             metrics=metrics,
             policy_history=policy_history,
             reason=(
-                "Возобновлённое восстановление не прошло финальный контроль: "
-                + str(exc)
+                "Возобновлённое восстановление не завершило необязательный "
+                "critic-контроль; сохранены проверенные кодом метрики."
             ),
+            reason_codes=["critic_resumed_final_review_unavailable"],
+            critic_outcome="final_review_degraded",
             expected_corpus_cells=expected_corpus_cells,
+            integrity_payload=final_payload,
         )
         await finish_recovery(
             plan,
@@ -28995,12 +29589,11 @@ async def _resume_executing_analysis_critic_recovery(
                 "error": str(exc)[:2000],
                 "target_answer_ids": sorted(target_answer_ids),
                 "raw_corpus_sha256": raw_digest,
-                "terminal_analysis_critic_block": True,
-                "terminal_analysis_state_digest": state_digest,
+                "terminal_analysis_critic_block": False,
                 "resumed_after_targeted_annotation_commit": True,
             },
         )
-        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+        return gate
 
     await finish_recovery(
         plan,
@@ -29014,6 +29607,7 @@ async def _resume_executing_analysis_critic_recovery(
             "final_critic_iteration": final_iteration,
             "successful_analysis_state_digest": state_digest,
             "successful_gate_sha256": stable_digest(gate),
+            "critic_quality_state": gate.get("quality_state"),
             "resumed_after_targeted_annotation_commit": True,
         },
     )
@@ -29097,6 +29691,8 @@ async def _recover_analysis_critic_exhaustion(
     before_digest = _critic_analysis_state_digest(
         rows,
         metrics,
+        profile=profile,
+        catalog=catalog,
         expected_corpus_cells=expected_corpus_cells,
     )
     facts = {
@@ -29236,7 +29832,7 @@ async def _recover_analysis_critic_exhaustion(
             details={
                 "missing_acceptance_checks": missing_checks,
                 "unsupported_acceptance_checks": unsupported_checks,
-                "terminal_analysis_critic_block": True,
+                "terminal_analysis_critic_block": False,
                 "terminal_analysis_state_digest": before_digest,
             },
         )
@@ -29251,7 +29847,7 @@ async def _recover_analysis_critic_exhaustion(
             after_digest=before_digest,
             details={
                 "reason": "planner_requested_stop",
-                "terminal_analysis_critic_block": True,
+                "terminal_analysis_critic_block": False,
                 "terminal_analysis_state_digest": before_digest,
             },
         )
@@ -29266,7 +29862,7 @@ async def _recover_analysis_critic_exhaustion(
             after_digest=before_digest,
             details={
                 "error": f"unsupported_action:{action}",
-                "terminal_analysis_critic_block": True,
+                "terminal_analysis_critic_block": False,
                 "terminal_analysis_state_digest": before_digest,
             },
         )
@@ -29283,7 +29879,7 @@ async def _recover_analysis_critic_exhaustion(
             after_digest=before_digest,
             details={
                 "error": "target_answer_ids_do_not_cover_all_critic_issues",
-                "terminal_analysis_critic_block": True,
+                "terminal_analysis_critic_block": False,
                 "terminal_analysis_state_digest": before_digest,
             },
         )
@@ -29299,7 +29895,7 @@ async def _recover_analysis_critic_exhaustion(
             after_digest=before_digest,
             details={
                 "error": "planner_guidance_missing",
-                "terminal_analysis_critic_block": True,
+                "terminal_analysis_critic_block": False,
                 "terminal_analysis_state_digest": before_digest,
             },
         )
@@ -29365,6 +29961,7 @@ async def _recover_analysis_critic_exhaustion(
     gate_rows = rows
     gate_metrics = metrics
     gate_policy_history = policy_history
+    gate_integrity_payload: dict[str, Any] | None = None
     final_iteration = MAX_CRITIC_ITERATIONS + MAX_CRITIC_RECOVERY_FINAL_REVIEWS
     targeted_annotation_started = False
     try:
@@ -29397,18 +29994,57 @@ async def _recover_analysis_critic_exhaustion(
         after_digest = _critic_analysis_state_digest(
             recovered_rows,
             recovered_metrics,
+            profile=profile,
+            catalog=catalog,
             expected_corpus_cells=expected_corpus_cells,
         )
         gate_rows = recovered_rows
         gate_metrics = recovered_metrics
         if raw_digest_after != raw_digest_before:
-            raise OpenRouterError(
-                "Targeted analysis recovery changed the immutable raw corpus"
+            raise _ConfirmedCriticIntegrityBlock(
+                "Targeted analysis recovery changed the immutable raw corpus",
+                reason_codes=["raw_lineage:immutable_corpus_changed"],
             )
         if after_digest == before_digest:
-            raise OpenRouterError(
-                "Targeted analysis recovery made no verifiable progress"
+            no_progress_payload = _critic_payload(
+                profile=profile,
+                catalog=catalog,
+                rows=recovered_rows,
+                metrics=recovered_metrics,
+                policy_history=policy_history,
+                mandatory_raw_answer_ids=target_answer_ids,
+                expected_corpus_cells=expected_corpus_cells,
             )
+            gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=MAX_CRITIC_ITERATIONS,
+                profile=profile,
+                catalog=catalog,
+                rows=recovered_rows,
+                metrics=recovered_metrics,
+                policy_history=policy_history,
+                reason=(
+                    "Ограниченная переразметка не изменила проверяемое "
+                    "состояние; сохранены исходные детерминированные метрики."
+                ),
+                reason_codes=["critic_optional_repair_no_progress"],
+                critic_outcome="repair_failed",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=no_progress_payload,
+            )
+            await finish_recovery(
+                plan,
+                succeeded=False,
+                before_digest=before_digest,
+                after_digest=after_digest,
+                details={
+                    "reason": "optional_repair_no_progress",
+                    "target_answer_ids": sorted(target_answer_ids),
+                    "raw_corpus_sha256": raw_digest_before,
+                    "terminal_analysis_critic_block": False,
+                },
+            )
+            return catalog, recovered_rows, recovered_metrics, gate
 
         recovered_policy_history = [
             *policy_history,
@@ -29431,6 +30067,7 @@ async def _recover_analysis_critic_exhaustion(
             "raw_corpus_sha256": raw_digest_after,
             "required_acceptance_checks": sorted(required_checks),
         }
+        gate_integrity_payload = final_payload
         final_review = await _analysis_critic_artifact(
             run_id,
             iteration=final_iteration,
@@ -29438,33 +30075,86 @@ async def _recover_analysis_critic_exhaustion(
             recovery_final=True,
         )
         fallback = final_review.get("fallback")
-        if final_review.get("verdict") != "pass" or (
-            isinstance(fallback, dict) and fallback.get("kind")
-        ):
-            raise OpenRouterError(
-                "Independent final critic did not pass the targeted recovery: "
-                + str(final_review.get("summary") or "block")
-            )
-        gate = await _save_critic_gate(
-            run_id,
-            passed=True,
-            iteration=final_iteration,
-            profile=profile,
-            catalog=catalog,
-            rows=recovered_rows,
-            metrics=recovered_metrics,
-            policy_history=recovered_policy_history,
-            reason=str(
-                final_review.get("summary")
-                or "Финальная проверка восстановления пройдена."
-            ),
-            expected_corpus_cells=expected_corpus_cells,
+        fallback_kind = (
+            str(fallback.get("kind") or "") if isinstance(fallback, dict) else ""
         )
+        if _critic_block_has_code_owned_confirmation(
+            final_review,
+            payload=final_payload,
+        ):
+            reason_codes = _code_owned_critic_integrity_reason_codes(final_payload)
+            raise _ConfirmedCriticIntegrityBlock(
+                "Independent final critic confirmed a code-owned integrity defect",
+                reason_codes=reason_codes,
+            )
+        if final_review.get("verdict") == "pass" and not fallback_kind:
+            gate = await _save_critic_gate(
+                run_id,
+                passed=True,
+                iteration=final_iteration,
+                profile=profile,
+                catalog=catalog,
+                rows=recovered_rows,
+                metrics=recovered_metrics,
+                policy_history=recovered_policy_history,
+                reason=str(
+                    final_review.get("summary")
+                    or "Финальная проверка восстановления пройдена."
+                ),
+                expected_corpus_cells=expected_corpus_cells,
+            )
+        else:
+            fallback_reason_codes = (
+                [
+                    str(value)
+                    for value in fallback.get("reason_codes") or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                if isinstance(fallback, dict)
+                else []
+            )
+            gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=final_iteration,
+                profile=profile,
+                catalog=catalog,
+                rows=recovered_rows,
+                metrics=recovered_metrics,
+                policy_history=recovered_policy_history,
+                reason=str(
+                    final_review.get("summary")
+                    or "Финальный critic-контроль недоступен."
+                ),
+                reason_codes=(
+                    fallback_reason_codes
+                    or _critic_fallback_reason_codes(
+                        final_payload,
+                        final_review,
+                        validation_errors=[],
+                        reason_codes=["critic_final_review_degraded"],
+                    )
+                ),
+                critic_outcome="final_review_degraded",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=final_payload,
+            )
     except asyncio.CancelledError:
         raise
     except RunLeaseLostError:
         raise
     except Exception as exc:
+        if isinstance(exc, OrchestratorContractError) and any(
+            marker in str(exc)
+            for marker in (
+                "Targeted annotation repair CAS input changed",
+                "Targeted annotation repair input rows changed",
+                "Targeted annotation repair lost its run lease",
+            )
+        ):
+            exc = _ConfirmedCriticIntegrityBlock(
+                str(exc),
+                reason_codes=["recovery_lineage:targeted_annotation_cas_changed"],
+            )
         if targeted_annotation_started and gate_rows is rows:
             # The all-or-nothing CAS may have committed before a later local
             # completion/metric/final-gate step failed.  Reload the actual DB
@@ -29482,18 +30172,26 @@ async def _recover_analysis_critic_exhaustion(
                     catalog,
                 )
                 if _raw_corpus_digest(persisted_rows) != raw_digest_before:
-                    raise OpenRouterError(
-                        "Persisted raw corpus changed during targeted repair"
+                    raise _ConfirmedCriticIntegrityBlock(
+                        "Persisted raw corpus changed during targeted repair",
+                        reason_codes=["raw_lineage:persisted_corpus_changed"],
                     )
                 gate_rows = persisted_rows
                 gate_metrics = persisted_metrics
                 after_digest = _critic_analysis_state_digest(
                     persisted_rows,
                     persisted_metrics,
+                    profile=profile,
+                    catalog=catalog,
                     expected_corpus_cells=expected_corpus_cells,
                 )
             except RunLeaseLostError:
                 raise
+            except _ConfirmedCriticIntegrityBlock as persisted_integrity_error:
+                # Keep the confirmed post-commit defect inside the outer
+                # recovery finalizer so the failed gate and terminal latch are
+                # written against the exact reloaded state.
+                exc = persisted_integrity_error
             except Exception:
                 # Preserve the original failure.  The normal path already
                 # captured post-state whenever metric reload was available.
@@ -29501,11 +30199,68 @@ async def _recover_analysis_critic_exhaustion(
                     "Could not reload targeted critic recovery state for %s",
                     run_id,
                 )
+        if not isinstance(exc, _ConfirmedCriticIntegrityBlock):
+            confirmed_reason_codes = (
+                _recomputed_code_owned_critic_integrity_reason_codes(
+                    profile=profile,
+                    catalog=catalog,
+                    rows=gate_rows,
+                    metrics=gate_metrics,
+                    policy_history=gate_policy_history,
+                    expected_corpus_cells=expected_corpus_cells,
+                    integrity_payload=gate_integrity_payload,
+                )
+            )
+            if confirmed_reason_codes:
+                exc = _ConfirmedCriticIntegrityBlock(
+                    "Recovery cannot degrade over code-owned integrity proof",
+                    reason_codes=confirmed_reason_codes,
+                )
+        confirmed_integrity_block = isinstance(
+            exc,
+            _ConfirmedCriticIntegrityBlock,
+        )
+        if not confirmed_integrity_block:
+            degraded_gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=(
+                    final_iteration if gate_rows is not rows else MAX_CRITIC_ITERATIONS
+                ),
+                profile=profile,
+                catalog=catalog,
+                rows=gate_rows,
+                metrics=gate_metrics,
+                policy_history=gate_policy_history,
+                reason=(
+                    "Необязательное восстановление critic-слоя не завершилось; "
+                    "сохранены последние детерминированно проверенные метрики."
+                ),
+                reason_codes=["critic_optional_recovery_failed"],
+                critic_outcome="repair_failed",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=gate_integrity_payload,
+            )
+            await finish_recovery(
+                plan,
+                succeeded=False,
+                before_digest=before_digest,
+                after_digest=after_digest,
+                details={
+                    "error": str(exc)[:2000],
+                    "target_answer_ids": sorted(target_answer_ids),
+                    "raw_corpus_sha256": _raw_corpus_digest(gate_rows),
+                    "terminal_analysis_critic_block": False,
+                },
+            )
+            return catalog, gate_rows, gate_metrics, degraded_gate
+
         terminal_details = {
             "error": str(exc)[:2000],
             "target_answer_ids": sorted(target_answer_ids),
             "raw_corpus_sha256": _raw_corpus_digest(gate_rows),
             "terminal_analysis_critic_block": True,
+            "terminal_analysis_critic_reason_code": "confirmed_integrity_block",
+            "terminal_integrity_codes": list(exc.reason_codes),
             "terminal_analysis_state_digest": after_digest,
         }
         # Persist the failed gate against the actual post-repair state.  The
@@ -29528,6 +30283,8 @@ async def _recover_analysis_critic_exhaustion(
                     "финальный контроль: " + str(exc)
                 ),
                 expected_corpus_cells=expected_corpus_cells,
+                reason_codes=list(exc.reason_codes),
+                critic_outcome="confirmed_integrity_block",
             )
         except RunLeaseLostError:
             raise
@@ -29541,8 +30298,8 @@ async def _recover_analysis_critic_exhaustion(
             details=terminal_details,
         )
         if gate_error is not None:
-            raise gate_error from exc
-        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+            raise exc from gate_error
+        raise exc
 
     await finish_recovery(
         plan,
@@ -29556,6 +30313,7 @@ async def _recover_analysis_critic_exhaustion(
             "final_critic_iteration": final_iteration,
             "successful_analysis_state_digest": after_digest,
             "successful_gate_sha256": stable_digest(gate),
+            "critic_quality_state": gate.get("quality_state"),
         },
     )
     return catalog, recovered_rows, recovered_metrics, gate
@@ -29599,6 +30357,8 @@ async def _run_analysis_critic_loop(
     current_state_digest = _critic_analysis_state_digest(
         current_rows,
         current_metrics,
+        profile=profile,
+        catalog=current_catalog,
         expected_corpus_cells=expected_corpus_cells,
     )
     successful_gate = await _successful_analysis_critic_recovery_gate(
@@ -29664,11 +30424,74 @@ async def _run_analysis_critic_loop(
             policy_history=policy_history,
             expected_corpus_cells=expected_corpus_cells,
         )
-        review = await _analysis_critic_artifact(
-            run_id,
-            iteration=iteration,
-            payload=payload,
+        try:
+            review = await _analysis_critic_artifact(
+                run_id,
+                iteration=iteration,
+                payload=payload,
+            )
+        except asyncio.CancelledError:
+            raise
+        except RunLeaseLostError:
+            raise
+        except _ConfirmedCriticIntegrityBlock:
+            raise
+        except Exception as exc:
+            gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=iteration,
+                profile=profile,
+                catalog=current_catalog,
+                rows=current_rows,
+                metrics=current_metrics,
+                policy_history=policy_history,
+                reason=(
+                    "Независимый критик недоступен; опубликованы повторно "
+                    "проверенные кодом строки и метрики."
+                ),
+                reason_codes=["critic_provider_schema_or_cache_unavailable"],
+                critic_outcome="unavailable",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=payload,
+            )
+            logger.warning(
+                "Analysis critic is unavailable for %s; continuing degraded: %s",
+                run_id,
+                exc,
+            )
+            return current_catalog, current_rows, current_metrics, gate
+
+        fallback = review.get("fallback")
+        fallback_kind = (
+            str(fallback.get("kind") or "") if isinstance(fallback, dict) else ""
         )
+        if fallback_kind == _CRITIC_DEGRADED_FALLBACK_KIND:
+            fallback_reason_codes = [
+                str(value)
+                for value in fallback.get("reason_codes") or []
+                if isinstance(value, str) and value.strip()
+            ]
+            gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=iteration,
+                profile=profile,
+                catalog=current_catalog,
+                rows=current_rows,
+                metrics=current_metrics,
+                policy_history=policy_history,
+                reason=str(
+                    review.get("summary")
+                    or "Строгий critic-контракт не завершён; кодовые проверки пройдены."
+                ),
+                reason_codes=(
+                    fallback_reason_codes or ["critic_auxiliary_degraded"]
+                ),
+                critic_outcome="repair_failed",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=payload,
+            )
+            return current_catalog, current_rows, current_metrics, gate
+
         verdict = str(review.get("verdict") or "block")
         if verdict == "pass":
             gate = await _save_critic_gate(
@@ -29685,15 +30508,56 @@ async def _run_analysis_critic_loop(
             )
             return current_catalog, current_rows, current_metrics, gate
 
-        if verdict == "block" or iteration >= MAX_CRITIC_ITERATIONS:
+        if verdict == "block":
             reason = str(
                 review.get("summary") or "Критик не подтвердил корректность аналитики."
             )
-            if (
-                iteration >= MAX_CRITIC_ITERATIONS
-                and verdict == "revise"
-                and settings.PIPELINE_ORCHESTRATOR_ENABLED
-            ):
+            if _critic_block_has_code_owned_confirmation(review, payload=payload):
+                reason_codes = _code_owned_critic_integrity_reason_codes(payload)
+                await _save_critic_gate(
+                    run_id,
+                    passed=False,
+                    iteration=iteration,
+                    profile=profile,
+                    catalog=current_catalog,
+                    rows=current_rows,
+                    metrics=current_metrics,
+                    policy_history=policy_history,
+                    reason=reason,
+                    expected_corpus_cells=expected_corpus_cells,
+                    reason_codes=reason_codes,
+                    critic_outcome="confirmed_integrity_block",
+                )
+                raise _ConfirmedCriticIntegrityBlock(
+                    "Analysis critic confirmed a code-owned integrity block: "
+                    + reason,
+                    reason_codes=reason_codes,
+                )
+            gate = await _save_degraded_critic_gate(
+                run_id,
+                iteration=iteration,
+                profile=profile,
+                catalog=current_catalog,
+                rows=current_rows,
+                metrics=current_metrics,
+                policy_history=policy_history,
+                reason=reason,
+                reason_codes=_critic_fallback_reason_codes(
+                    payload,
+                    review,
+                    validation_errors=[],
+                ),
+                critic_outcome="advisory_block",
+                expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=payload,
+            )
+            return current_catalog, current_rows, current_metrics, gate
+
+        if iteration >= MAX_CRITIC_ITERATIONS:
+            reason = str(
+                review.get("summary") or "Критик не подтвердил корректность аналитики."
+            )
+            if settings.PIPELINE_ORCHESTRATOR_ENABLED:
                 try:
                     return await _recover_analysis_critic_exhaustion(
                         run_id,
@@ -29713,22 +30577,39 @@ async def _run_analysis_critic_loop(
                     )
                 except RunLeaseLostError:
                     raise
-                except _AnalysisCriticRecoveryBlocked as recovery_error:
-                    raise OpenRouterError(
-                        "Analysis critic blocked report publication: "
-                        + reason
-                        + " Ограниченное восстановление не прошло: "
-                        + str(recovery_error)
-                    ) from recovery_error
+                except _ConfirmedCriticIntegrityBlock:
+                    raise
                 except Exception as recovery_error:
                     reason = (
                         reason
                         + " Ограниченное восстановление не прошло: "
                         + str(recovery_error)
                     )
-            await _save_critic_gate(
+            confirmed_reason_codes = _code_owned_critic_integrity_reason_codes(
+                payload
+            )
+            if confirmed_reason_codes:
+                await _save_critic_gate(
+                    run_id,
+                    passed=False,
+                    iteration=iteration,
+                    profile=profile,
+                    catalog=current_catalog,
+                    rows=current_rows,
+                    metrics=current_metrics,
+                    policy_history=policy_history,
+                    reason=reason,
+                    expected_corpus_cells=expected_corpus_cells,
+                    reason_codes=confirmed_reason_codes,
+                    critic_outcome="confirmed_integrity_block",
+                )
+                raise _ConfirmedCriticIntegrityBlock(
+                    "Analysis critic repair exhausted with a confirmed integrity "
+                    "defect: " + reason,
+                    reason_codes=confirmed_reason_codes,
+                )
+            gate = await _save_degraded_critic_gate(
                 run_id,
-                passed=False,
                 iteration=iteration,
                 profile=profile,
                 catalog=current_catalog,
@@ -29736,11 +30617,12 @@ async def _run_analysis_critic_loop(
                 metrics=current_metrics,
                 policy_history=policy_history,
                 reason=reason,
+                reason_codes=["critic_optional_repair_exhausted"],
+                critic_outcome="non_convergent",
                 expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=payload,
             )
-            raise OpenRouterError(
-                "Analysis critic blocked report publication: " + reason
-            )
+            return current_catalog, current_rows, current_metrics, gate
 
         tightened, applied, guidance = _apply_critic_policy(
             current_catalog,
@@ -29759,9 +30641,30 @@ async def _run_analysis_critic_loop(
                 "Критик запросил переработку, но не предложил безопасного "
                 "ужесточения политики."
             )
-            await _save_critic_gate(
+            confirmed_reason_codes = _code_owned_critic_integrity_reason_codes(
+                payload
+            )
+            if confirmed_reason_codes:
+                await _save_critic_gate(
+                    run_id,
+                    passed=False,
+                    iteration=iteration,
+                    profile=profile,
+                    catalog=current_catalog,
+                    rows=current_rows,
+                    metrics=current_metrics,
+                    policy_history=policy_history,
+                    reason=reason,
+                    expected_corpus_cells=expected_corpus_cells,
+                    reason_codes=confirmed_reason_codes,
+                    critic_outcome="confirmed_integrity_block",
+                )
+                raise _ConfirmedCriticIntegrityBlock(
+                    reason,
+                    reason_codes=confirmed_reason_codes,
+                )
+            gate = await _save_degraded_critic_gate(
                 run_id,
-                passed=False,
                 iteration=iteration,
                 profile=profile,
                 catalog=current_catalog,
@@ -29769,9 +30672,12 @@ async def _run_analysis_critic_loop(
                 metrics=current_metrics,
                 policy_history=policy_history,
                 reason=reason,
+                reason_codes=["critic_optional_repair_not_actionable"],
+                critic_outcome="repair_failed",
                 expected_corpus_cells=expected_corpus_cells,
+                integrity_payload=payload,
             )
-            raise OpenRouterError(reason)
+            return current_catalog, current_rows, current_metrics, gate
 
         policy_step = {
             "iteration": iteration,
@@ -31168,6 +32074,8 @@ def _immutable_editorial_cache_proof(
     prose_paths: Iterable[str] | None,
     protected_terms: Iterable[str],
     source_artifact_key: str | None,
+    editorial_artifact_key: str | None = None,
+    editorial_input: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Freeze all inputs needed to re-run ``validate_editorial_cache``."""
 
@@ -31189,6 +32097,13 @@ def _immutable_editorial_cache_proof(
     proof_core = {
         "version": EDITORIAL_CACHE_PROOF_VERSION,
         "source_artifact_key": source_artifact_key,
+        "editorial_artifact_key": editorial_artifact_key,
+        "editorial_input": copy.deepcopy(editorial_input),
+        "editorial_input_sha256": (
+            _stable_json_sha256(editorial_input)
+            if isinstance(editorial_input, dict)
+            else None
+        ),
         "source": copy.deepcopy(source),
         "result": copy.deepcopy(result),
         "audit": copy.deepcopy(audit),
@@ -31252,6 +32167,14 @@ def _editorial_receipt_state(
         prose_paths=prose_paths,
         protected_terms=protected_terms,
         source_artifact_key=source_artifact_key,
+        editorial_artifact_key=(
+            artifact.artifact_key if artifact is not None else None
+        ),
+        editorial_input=(
+            artifact.input_json
+            if artifact is not None and isinstance(artifact.input_json, dict)
+            else None
+        ),
     )
     if not cache_revalidated:
         reasons.append("editorial_cache_revalidation_failed")
@@ -31364,6 +32287,14 @@ def _illustration_receipt_state(
         prose_paths=prose_paths,
         protected_terms=protected_terms,
         source_artifact_key=source_artifact_key,
+        editorial_artifact_key=(
+            artifact.artifact_key if artifact is not None else None
+        ),
+        editorial_input=(
+            artifact.input_json
+            if artifact is not None and isinstance(artifact.input_json, dict)
+            else None
+        ),
     )
     if not cache_revalidated:
         reasons.append("editorial_cache_revalidation_failed")
@@ -31442,7 +32373,13 @@ def _reader_copy_gate_decision(
     lint: dict[str, Any],
     receipts: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Fail closed when published reader copy escaped a complete audit."""
+    """Separate publication integrity from best-effort copy quality.
+
+    The immutable publication snapshot and deterministic tamper signals remain
+    fail-closed.  Editorial/lint coverage is a quality receipt: when it is
+    incomplete but the published bytes are still bound exactly, publication is
+    admitted as ``degraded_safe`` instead of discarding the whole report.
+    """
 
     receipt_quality_complete = all(
         receipt.get("accepted") is True for receipt in receipts.values()
@@ -31455,7 +32392,7 @@ def _reader_copy_gate_decision(
     )
     degraded_reasons: list[str] = []
     if lint.get("blocking") is True:
-        degraded_reasons.append("blocking_copy_lint")
+        degraded_reasons.append("copy_lint_findings")
     if lint.get("omitted_issue_count"):
         degraded_reasons.append("copy_lint_not_exhaustive")
     if lint.get("issues") and not lint.get("blocking"):
@@ -31467,20 +32404,12 @@ def _reader_copy_gate_decision(
     receipt_tamper_codes = {
         "published_value_mismatch",
         "published_copy_mismatch",
-        "canonical_policy_mismatch",
         "published_digest_mismatch",
         "audit_digest_mismatch",
+        "canonical_policy_mismatch",
     }
     blocking_reasons = list(publication.get("blocking_reasons") or [])
-    if lint.get("blocking") is True:
-        blocking_reasons.append("blocking_copy_lint")
-    if lint.get("omitted_issue_count"):
-        blocking_reasons.append("copy_lint_not_exhaustive")
-    if lint.get("issues"):
-        blocking_reasons.append("reader_copy_policy_issues_present")
     for name, receipt in receipts.items():
-        if receipt.get("accepted") is not True:
-            blocking_reasons.append(f"{name}_receipt_incomplete")
         for reason in receipt.get("reasons") or []:
             if reason in receipt_tamper_codes:
                 blocking_reasons.append(f"{name}:{reason}")
@@ -31509,6 +32438,7 @@ async def _save_reader_copy_manifest(
     illustrations: list[dict[str, Any]],
     analysis_markdown: str,
     report_json: dict[str, Any],
+    optional_asset_admission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Audit all reader copy and block an unaudited presentation from publish."""
 
@@ -31545,6 +32475,20 @@ async def _save_reader_copy_manifest(
                 )
             ).scalars()
         )
+        semantic_admission_artifacts = list(
+            (
+                await session.execute(
+                    select(RunArtifact)
+                    .where(
+                        RunArtifact.run_id == run_id,
+                        RunArtifact.artifact_key.like(
+                            FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX + "%"
+                        ),
+                    )
+                    .order_by(RunArtifact.id.desc())
+                )
+            ).scalars()
+        )
     by_key = {artifact.artifact_key: artifact for artifact in artifacts}
 
     def completed_output(artifact_key: str) -> dict[str, Any] | None:
@@ -31569,6 +32513,28 @@ async def _save_reader_copy_manifest(
         # field before invoking the lossless editor.  Recreate that exact
         # source rather than trusting only the editorial result's self-seal.
         final_source["headline_emphasis"] = []
+    semantic_admission_artifact = (
+        semantic_admission_artifacts[0]
+        if semantic_admission_artifacts
+        else None
+    )
+    semantic_admission_errors = (
+        _final_report_semantic_admission_artifact_errors(
+            semantic_admission_artifact,
+            run_id=run_id,
+            selected_report=final_source,
+            public_report=public_report,
+        )
+        if isinstance(final_source, dict)
+        else ["final_report_semantic_admission_source_missing"]
+    )
+    semantic_admission_receipt = (
+        copy.deepcopy(semantic_admission_artifact.output_json)
+        if not semantic_admission_errors
+        and semantic_admission_artifact is not None
+        and isinstance(semantic_admission_artifact.output_json, dict)
+        else None
+    )
     final_editorial_input = editorial_inputs("final_report_editorial")
     technical_source = completed_output("technical_review")
     technical_editorial_input = editorial_inputs("technical_review_editorial")
@@ -31640,13 +32606,115 @@ async def _save_reader_copy_manifest(
         "verified_count": len(illustration_asset_receipts),
         "publication_policy": copy.deepcopy(ILLUSTRATION_PUBLICATION_POLICY),
     }
+    optional_asset_reason_codes = (
+        [
+            str(reason)
+            for reason in optional_asset_admission.get("reason_codes") or []
+            if isinstance(reason, str) and reason
+        ]
+        if isinstance(optional_asset_admission, dict)
+        else ["optional_asset_admission_missing"]
+    )
+    optional_assets_degraded = bool(
+        not isinstance(optional_asset_admission, dict)
+        or optional_asset_admission.get("state") == "degraded"
+        or optional_asset_admission.get("degraded") is True
+        or optional_asset_reason_codes
+    )
+    receipts["optional_assets"] = {
+        "accepted": not optional_assets_degraded,
+        "reasons": optional_asset_reason_codes,
+        "state": (
+            optional_asset_admission.get("state")
+            if isinstance(optional_asset_admission, dict)
+            else "missing"
+        ),
+        "receipt_sha256": (
+            optional_asset_admission.get("receipt_sha256")
+            if isinstance(optional_asset_admission, dict)
+            else None
+        ),
+    }
     gate = _reader_copy_gate_decision(
         publication=publication,
         lint=lint,
         receipts=receipts,
     )
-    blocking_reasons = gate["blocking_reasons"]
-    decision = gate["decision"]
+    publication_checks = publication.get("checks")
+    if not isinstance(publication_checks, dict):
+        publication_checks = {}
+        publication["checks"] = publication_checks
+    publication_checks["final_report_semantic_admission_bound"] = (
+        not semantic_admission_errors
+    )
+    final_editorial_receipt = receipts.get("final_report")
+    final_editorial_proof = (
+        final_editorial_receipt.get("cache_proof")
+        if isinstance(final_editorial_receipt, dict)
+        else None
+    )
+    final_editorial_artifact_input = (
+        final_editorial_proof.get("editorial_input")
+        if isinstance(final_editorial_proof, dict)
+        else None
+    )
+    semantic_selected_sha256 = (
+        semantic_admission_receipt.get("selected_report_sha256")
+        if isinstance(semantic_admission_receipt, dict)
+        else None
+    )
+    published_final_sha256 = publication.get("final_report_sha256")
+    final_report_lineage_bound = bool(
+        isinstance(final_editorial_receipt, dict)
+        and isinstance(final_editorial_proof, dict)
+        and isinstance(final_editorial_artifact_input, dict)
+        and final_editorial_receipt.get("artifact_key")
+        == "final_report_editorial"
+        and final_editorial_proof.get("source_artifact_key") == "final_report"
+        and final_editorial_proof.get("editorial_artifact_key")
+        == final_editorial_receipt.get("artifact_key")
+        and final_editorial_proof.get("editorial_input_sha256")
+        == _stable_json_sha256(final_editorial_artifact_input)
+        and final_editorial_artifact_input.get("source_report_sha256")
+        == semantic_selected_sha256
+        and final_editorial_proof.get("source_sha256")
+        == semantic_selected_sha256
+        and final_editorial_proof.get("result_sha256")
+        == published_final_sha256
+        and final_editorial_receipt.get("result_report_sha256")
+        == published_final_sha256
+    )
+    publication_checks[
+        "final_report_semantic_editorial_publication_lineage_bound"
+    ] = final_report_lineage_bound
+    lineage_errors = (
+        []
+        if final_report_lineage_bound
+        else ["final_report_semantic_editorial_publication_lineage_mismatch"]
+    )
+    blocking_reasons = list(
+        dict.fromkeys(
+            [
+                *gate["blocking_reasons"],
+                *semantic_admission_errors,
+                *lineage_errors,
+            ]
+        )
+    )
+    degraded_reasons = list(gate["degraded_reasons"])
+    if (
+        isinstance(semantic_admission_receipt, dict)
+        and semantic_admission_receipt.get("decision") == "degraded_safe"
+    ):
+        degraded_reasons.append("final_report_semantic_admission_degraded")
+    degraded_reasons = list(dict.fromkeys(degraded_reasons))
+    decision = (
+        "block"
+        if blocking_reasons
+        else "degraded_safe"
+        if degraded_reasons
+        else "pass"
+    )
     manifest_core = {
         "version": READER_COPY_MANIFEST_VERSION,
         "canonical_policy": LIVE_RUSSIAN_POLICY_MANIFEST.as_dict(),
@@ -31667,12 +32735,24 @@ async def _save_reader_copy_manifest(
             if isinstance(preview_asset_receipt, dict)
             else None
         ),
+        "optional_asset_admission": copy.deepcopy(optional_asset_admission),
+        "optional_asset_admission_sha256": (
+            optional_asset_admission.get("receipt_sha256")
+            if isinstance(optional_asset_admission, dict)
+            else None
+        ),
+        "final_report_semantic_admission": semantic_admission_receipt,
+        "final_report_semantic_admission_sha256": (
+            semantic_admission_receipt.get("receipt_sha256")
+            if isinstance(semantic_admission_receipt, dict)
+            else None
+        ),
         "publication_contract": publication,
         "decision": decision,
         "blocking_reasons": blocking_reasons,
         "deterministic_complete": gate["deterministic_complete"],
-        "quality_complete": gate["quality_complete"],
-        "degraded_reasons": gate["degraded_reasons"],
+        "quality_complete": not degraded_reasons and gate["quality_complete"],
+        "degraded_reasons": degraded_reasons,
     }
     manifest = {
         **manifest_core,
@@ -31692,6 +32772,12 @@ async def _save_reader_copy_manifest(
             "code_owned_copy_registry": READER_COPY_REGISTRY_MANIFEST.as_dict(),
             "site_preview_asset_receipt_sha256": manifest[
                 "site_preview_asset_receipt_sha256"
+            ],
+            "optional_asset_admission_sha256": manifest[
+                "optional_asset_admission_sha256"
+            ],
+            "final_report_semantic_admission_sha256": manifest[
+                "final_report_semantic_admission_sha256"
             ],
         },
         output_json=manifest,
@@ -31778,10 +32864,14 @@ async def _persist_final_semantic_physical_event(
         or event.get("event_kind") != "provider_post"
         or event.get("model") != REPORT_SEMANTIC_MODEL
     ):
-        raise OpenRouterError("Invalid semantic physical-post audit event")
+        raise _FinalSemanticAuditIntegrityError(
+            "Invalid semantic physical-post audit event"
+        )
     event_id = str(event.get("event_id") or "")
     if re.fullmatch(r"[0-9a-f]{32}", event_id) is None:
-        raise OpenRouterError("Semantic physical-post event id is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-post event id is invalid"
+        )
     request_payload = event.get("request_payload")
     request_sha256 = str(event.get("request_sha256") or "")
     if (
@@ -31789,7 +32879,9 @@ async def _persist_final_semantic_physical_event(
         or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
         or _stable_json_sha256(request_payload) != request_sha256
     ):
-        raise OpenRouterError("Semantic physical-post request is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-post request is invalid"
+        )
     status = str(event.get("status") or "")
     if status not in {
         "accepted",
@@ -31799,16 +32891,22 @@ async def _persist_final_semantic_physical_event(
         "transport_error",
         "cancelled",
     }:
-        raise OpenRouterError("Semantic physical-post status is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-post status is invalid"
+        )
     event_copy = copy.deepcopy(event)
     event_sha256 = _stable_json_sha256(event_copy)
     artifact_key = f"frsg_a{attempt}_post_{request_sha256[:16]}_{event_sha256[:32]}"
     raw_text = event_copy.pop("raw_text", None)
     usage = event_copy.pop("usage", None)
     if raw_text is not None and not isinstance(raw_text, str):
-        raise OpenRouterError("Semantic physical-post raw response is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-post raw response is invalid"
+        )
     if not isinstance(usage, dict):
-        raise OpenRouterError("Semantic physical-post usage is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-post usage is invalid"
+        )
     event_input = {
         "version": PHYSICAL_POST_AUDIT_VERSION,
         "event_id": event_id,
@@ -31861,7 +32959,9 @@ async def _persist_final_semantic_physical_event(
         or not isinstance(existing.output_json, dict)
         or not isinstance(existing.usage_json, dict)
     ):
-        raise OpenRouterError("Semantic physical-post conflict is corrupt")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-post conflict is corrupt"
+        )
     existing_event = {
         **copy.deepcopy(existing.output_json),
         "raw_text": existing.raw_text,
@@ -31871,7 +32971,7 @@ async def _persist_final_semantic_physical_event(
         existing.input_json != event_input
         or _stable_json_sha256(existing_event) != event_sha256
     ):
-        raise OpenRouterError(
+        raise _FinalSemanticAuditIntegrityError(
             "Semantic physical-post append-only key mutation detected"
         )
 
@@ -31892,17 +32992,25 @@ async def _persist_final_semantic_audit_event(
         )
         return
     if event.get("version") != REPORT_SEMANTIC_PARTITION_VERSION:
-        raise OpenRouterError("Unknown semantic checkpoint event version")
+        raise _FinalSemanticAuditIntegrityError(
+            "Unknown semantic checkpoint event version"
+        )
     kind = str(event.get("kind") or "")
     kind_key = _SEMANTIC_AUDIT_KIND_KEYS.get(kind)
     if kind_key is None:
-        raise OpenRouterError("Unknown semantic checkpoint event kind")
+        raise _FinalSemanticAuditIntegrityError(
+            "Unknown semantic checkpoint event kind"
+        )
     candidate_sha256 = str(event.get("candidate_sha256") or "")
     manifest_sha256 = str(event.get("source_part_receipts_sha256") or "")
     if re.fullmatch(r"[0-9a-f]{64}", candidate_sha256) is None:
-        raise OpenRouterError("Semantic checkpoint candidate digest is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic checkpoint candidate digest is invalid"
+        )
     if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
-        raise OpenRouterError("Semantic checkpoint manifest digest is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic checkpoint manifest digest is invalid"
+        )
     event_copy = copy.deepcopy(event)
     event_sha256 = _stable_json_sha256(event_copy)
     artifact_key = (
@@ -31911,9 +33019,13 @@ async def _persist_final_semantic_audit_event(
     raw_text = event_copy.pop("raw_text", None)
     usage = event_copy.pop("usage", None)
     if not isinstance(raw_text, str):
-        raise OpenRouterError("Semantic checkpoint raw response is missing")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic checkpoint raw response is missing"
+        )
     if not isinstance(usage, dict):
-        raise OpenRouterError("Semantic checkpoint usage is missing")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic checkpoint usage is missing"
+        )
     event_input = {
         "version": REPORT_SEMANTIC_PARTITION_VERSION,
         "kind": kind,
@@ -31962,7 +33074,9 @@ async def _persist_final_semantic_audit_event(
         or not isinstance(existing.output_json, dict)
         or not isinstance(existing.usage_json, dict)
     ):
-        raise OpenRouterError("Semantic checkpoint conflict is corrupt")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic checkpoint conflict is corrupt"
+        )
     existing_event = {
         **copy.deepcopy(existing.output_json),
         "raw_text": str(existing.raw_text or ""),
@@ -31972,7 +33086,9 @@ async def _persist_final_semantic_audit_event(
         existing.input_json != event_input
         or _stable_json_sha256(existing_event) != event_sha256
     ):
-        raise OpenRouterError("Semantic checkpoint append-only key mutation detected")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic checkpoint append-only key mutation detected"
+        )
 
 
 async def _load_final_semantic_part_checkpoint(
@@ -32008,7 +33124,9 @@ async def _load_final_semantic_part_checkpoint(
             or not isinstance(row.output_json, dict)
             or not isinstance(row.usage_json, dict)
         ):
-            raise OpenRouterError("Stored semantic part checkpoint is corrupt")
+            raise _FinalSemanticAuditIntegrityError(
+                "Stored semantic part checkpoint is corrupt"
+            )
         event = {
             **copy.deepcopy(row.output_json),
             "raw_text": str(row.raw_text or ""),
@@ -32017,7 +33135,9 @@ async def _load_final_semantic_part_checkpoint(
         if event.get("kind") != "semantic_part_accepted" or row.input_json.get(
             "event_sha256"
         ) != _stable_json_sha256(event):
-            raise OpenRouterError("Stored semantic part checkpoint digest is invalid")
+            raise _FinalSemanticAuditIntegrityError(
+                "Stored semantic part checkpoint digest is invalid"
+            )
         events.append(event)
     if not events:
         return None
@@ -32051,7 +33171,9 @@ async def _load_final_semantic_physical_result(
         or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
         or _stable_json_sha256(request_payload) != request_sha256
     ):
-        raise OpenRouterError("Semantic physical-resume descriptor is invalid")
+        raise _FinalSemanticAuditIntegrityError(
+            "Semantic physical-resume descriptor is invalid"
+        )
     prefix = f"frsg_a{attempt}_post_{request_sha256[:16]}_"
     await assert_run_lease(run_id)
     async with SessionLocal() as session:
@@ -32077,7 +33199,9 @@ async def _load_final_semantic_physical_result(
             or not isinstance(row.output_json, dict)
             or not isinstance(row.usage_json, dict)
         ):
-            raise OpenRouterError("Stored semantic physical receipt is corrupt")
+            raise _FinalSemanticAuditIntegrityError(
+                "Stored semantic physical receipt is corrupt"
+            )
         event = {
             **copy.deepcopy(row.output_json),
             "raw_text": row.raw_text,
@@ -32088,19 +33212,19 @@ async def _load_final_semantic_physical_result(
             or event.get("request_sha256") != request_sha256
             or event.get("request_payload") != request_payload
         ):
-            raise OpenRouterError(
+            raise _FinalSemanticAuditIntegrityError(
                 "Stored semantic physical receipt identity is invalid"
             )
         if event.get("status") == "accepted":
             if row.status != "completed" or not isinstance(row.raw_text, str):
-                raise OpenRouterError(
+                raise _FinalSemanticAuditIntegrityError(
                     "Accepted semantic physical receipt is incomplete"
                 )
             accepted.append((row, event))
     if not accepted:
         return None
     if len(accepted) != 1:
-        raise OpenRouterError(
+        raise _FinalSemanticAuditIntegrityError(
             "Multiple accepted semantic physical receipts exist for one exact request"
         )
     row, _event = accepted[0]
@@ -32149,6 +33273,34 @@ async def _bounded_semantic_model_evidence_context(
     return context, plan
 
 
+def _semantic_reviewer_failure_is_fail_soft(exc: Exception) -> bool:
+    """Admit provider/reviewer failure without hiding durable-state corruption."""
+
+    if isinstance(
+        exc,
+        (
+            RunLeaseLostError,
+            OpenRouterAuditCheckpointError,
+            _FinalSemanticAuditIntegrityError,
+        ),
+    ):
+        return False
+    if not isinstance(exc, OpenRouterError):
+        return False
+    message = str(exc).casefold()
+    integrity_markers = (
+        "append-only",
+        "conflict is corrupt",
+        "digest is invalid",
+        "identity is invalid",
+        "multiple accepted",
+        "mutation detected",
+        "receipt is corrupt",
+        "checkpoint is corrupt",
+    )
+    return not any(marker in message for marker in integrity_markers)
+
+
 async def _final_report_semantic_review_artifact(
     run_id: str,
     *,
@@ -32159,7 +33311,7 @@ async def _final_report_semantic_review_artifact(
     attempt: int,
     artifact_namespace: str = "final_report_semantic_gate",
 ) -> dict[str, Any]:
-    """Run and persist one independent, fail-closed semantic review."""
+    """Run and persist one independent advisory semantic review."""
 
     if not 1 <= attempt <= MAX_FINAL_REPORT_REPAIRS + 1:
         raise ValueError("Final report semantic review is outside the bounded loop")
@@ -32170,15 +33322,23 @@ async def _final_report_semantic_review_artifact(
         selected_answer_context=selected_answer_context,
         answer_selection_manifest=answer_selection_manifest,
     )
-    (
-        model_evidence_context,
-        semantic_input_plan,
-    ) = await _bounded_semantic_model_evidence_context(
-        run_id,
-        review_input=review_input,
-        attempt=attempt,
-        artifact_namespace=artifact_namespace,
-    )
+    try:
+        (
+            model_evidence_context,
+            semantic_input_plan,
+        ) = await _bounded_semantic_model_evidence_context(
+            run_id,
+            review_input=review_input,
+            attempt=attempt,
+            artifact_namespace=artifact_namespace,
+        )
+    except Exception as exc:
+        if _semantic_reviewer_failure_is_fail_soft(exc):
+            raise _FinalSemanticReviewerUnavailable(
+                "Final semantic evidence preparation is unavailable or returned "
+                "an unusable advisory result"
+            ) from exc
+        raise
     review_input["model_evidence_context"] = model_evidence_context
     await _save_artifact(
         run_id,
@@ -32317,6 +33477,11 @@ async def _final_report_semantic_review_artifact(
             error_message=str(exc),
             prompt_version=REPORT_SEMANTIC_GATE_VERSION,
         )
+        if _semantic_reviewer_failure_is_fail_soft(exc):
+            raise _FinalSemanticReviewerUnavailable(
+                "Final semantic reviewer is unavailable or returned an "
+                "unusable advisory result"
+            ) from exc
         raise
 
 
@@ -33344,6 +34509,7 @@ def _pack_final_input_units(
     *,
     window_bytes: int,
     request_utf8_bytes: Callable[[int, list[dict[str, Any]]], int],
+    claim_count: Callable[[list[dict[str, Any]]], int] | None = None,
 ) -> list[list[dict[str, Any]]]:
     packs: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
@@ -33351,7 +34517,12 @@ def _pack_final_input_units(
         candidate = [*current, unit]
         pack_index = len(packs) + 1
         if current and (
-            len(candidate) > FINAL_INPUT_MAP_FAN_IN
+            (
+                claim_count(candidate)
+                if claim_count is not None
+                else len(candidate)
+            )
+            > FINAL_INPUT_MAP_FAN_IN
             or request_utf8_bytes(pack_index, candidate) > window_bytes
         ):
             packs.append(current)
@@ -33366,6 +34537,18 @@ def _pack_final_input_units(
             )
     if current:
         packs.append(current)
+    if claim_count is not None:
+        invalid_claim_counts = [
+            count
+            for pack in packs
+            if not (1 <= (count := claim_count(pack)) <= FINAL_INPUT_MAP_FAN_IN)
+        ]
+        if invalid_claim_counts:
+            raise OpenRouterError(
+                "Final evidence mapper pack exceeds its exact claim workload "
+                f"contract: counts={invalid_claim_counts}, "
+                f"limit={FINAL_INPUT_MAP_FAN_IN}"
+            )
     return packs
 
 
@@ -33697,6 +34880,275 @@ def _deterministic_final_evidence_packet(
     )
 
 
+def _precheck_final_mapper_exact_coverage(
+    packet: dict[str, Any],
+    *,
+    expected_unit_ids: list[str],
+    expected_claim_ids: list[str],
+) -> None:
+    """Classify only dependent-list incompleteness as safely splittable.
+
+    JSON Schema can require the arrays but cannot express that their ids equal
+    the ids supplied in this particular request.  Unknown ids remain an
+    integrity error.  Missing or repeated expected ids are a workload-shape
+    failure: the same immutable subset may be divided into smaller leaves.
+    """
+
+    expected_units = set(expected_unit_ids)
+    expected_claims = set(expected_claim_ids)
+    observations = packet.get("observations")
+    if not isinstance(observations, list):
+        return
+
+    observed_units: set[str] = set()
+    observed_claims: list[str] = []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise OpenRouterError("Final evidence mapper emitted an invalid observation")
+        unit_ids = observation.get("source_unit_ids")
+        claim_ids = observation.get("source_claim_ids")
+        if not isinstance(unit_ids, list) or any(
+            not isinstance(value, str) for value in unit_ids
+        ):
+            raise OpenRouterError("Final evidence mapper emitted invalid unit ids")
+        if not isinstance(claim_ids, list) or any(
+            not isinstance(value, str) for value in claim_ids
+        ):
+            raise OpenRouterError("Final evidence mapper emitted invalid claim ids")
+        unknown_units = set(unit_ids) - expected_units
+        unknown_claims = set(claim_ids) - expected_claims
+        if unknown_units or unknown_claims:
+            raise OpenRouterError(
+                "Final evidence mapper invented source identities: "
+                f"units={sorted(unknown_units)}, claims={sorted(unknown_claims)}"
+            )
+        observed_units.update(unit_ids)
+        observed_claims.extend(claim_ids)
+
+    unit_coverage = packet.get("unit_coverage")
+    claim_coverage = packet.get("claim_coverage")
+    if not isinstance(unit_coverage, list) or not isinstance(claim_coverage, list):
+        return
+    covered_units: list[str] = []
+    for item in unit_coverage:
+        if not isinstance(item, dict) or not isinstance(
+            item.get("source_unit_id"), str
+        ):
+            raise OpenRouterError("Final evidence mapper emitted invalid unit coverage")
+        unit_id = str(item["source_unit_id"])
+        if unit_id not in expected_units:
+            raise OpenRouterError(
+                f"Final evidence mapper invented covered unit {unit_id}"
+            )
+        covered_units.append(unit_id)
+    covered_claims: list[str] = []
+    for item in claim_coverage:
+        if not isinstance(item, dict) or not isinstance(item.get("claim_id"), str):
+            raise OpenRouterError("Final evidence mapper emitted invalid claim coverage")
+        claim_id = str(item["claim_id"])
+        if claim_id not in expected_claims:
+            raise OpenRouterError(
+                f"Final evidence mapper invented covered claim {claim_id}"
+            )
+        covered_claims.append(claim_id)
+
+    failures: list[str] = []
+    if observed_units != expected_units:
+        failures.append(
+            "observation_units="
+            f"{len(observed_units)}/{len(expected_units)}"
+        )
+    if Counter(observed_claims) != Counter(expected_claim_ids):
+        failures.append(
+            "observation_claims="
+            f"{len(observed_claims)}/{len(expected_claim_ids)}"
+        )
+    if Counter(covered_units) != Counter(expected_unit_ids):
+        failures.append(
+            f"unit_coverage={len(covered_units)}/{len(expected_unit_ids)}"
+        )
+    if Counter(covered_claims) != Counter(expected_claim_ids):
+        failures.append(
+            f"claim_coverage={len(covered_claims)}/{len(expected_claim_ids)}"
+        )
+    if failures:
+        raise _FinalInputExactCoverageError(
+            "Final evidence mapper returned incomplete dependent coverage: "
+            + ", ".join(failures)
+        )
+
+
+_FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
+    {
+        "drop_ungrounded_exact_value",
+        "drop_ungrounded_uncertainty",
+        "drop_ungrounded_report_focus",
+        "replace_ungrounded_unit_coverage_rationale",
+        "replace_ungrounded_claim_coverage_rationale",
+        "replace_ungrounded_node_coverage_rationale",
+    }
+)
+_FINAL_INPUT_UNIT_COVERAGE_RATIONALE = (
+    "Исходная единица учтена в покрытии."
+)
+_FINAL_INPUT_CLAIM_COVERAGE_RATIONALE = (
+    "Исходный фрагмент учтён в покрытии."
+)
+_FINAL_INPUT_NODE_COVERAGE_RATIONALE = (
+    "Дочерний узел учтён в покрытии."
+)
+
+
+def _final_input_grounding_filter_operation(
+    *,
+    scope: str,
+    operation: str,
+    path: str,
+    binding_sha256: str,
+    value: str,
+    replacement: str | None = None,
+) -> dict[str, Any]:
+    """Describe one fail-soft auxiliary edit without retaining its raw text."""
+
+    if operation not in _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS:
+        raise OpenRouterError("Final input grounding filter operation is unknown")
+    item = {
+        "scope": scope,
+        "operation": operation,
+        "path": path,
+        "binding_sha256": binding_sha256,
+        "value_sha256": text_sha256(value),
+    }
+    if replacement is not None:
+        item["replacement_sha256"] = text_sha256(replacement)
+    return item
+
+
+def _final_input_grounding_filter_operations(
+    packet: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Read and verify code-owned auxiliary-sanitization audit metadata."""
+
+    ledger = packet.get(FINAL_INPUT_GROUNDING_FILTER_KEY)
+    if ledger is None:
+        return []
+    if not isinstance(ledger, dict):
+        raise OpenRouterError("Final input grounding filter audit is invalid")
+    operations = ledger.get("operations")
+    if (
+        ledger.get("version") != FINAL_INPUT_GROUNDING_FILTER_VERSION
+        or not isinstance(operations, list)
+        or not operations
+        or any(
+            not isinstance(item, dict)
+            or item.get("scope") not in {"mapper", "bounded_root"}
+            or item.get("operation")
+            not in _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS
+            or not isinstance(item.get("path"), str)
+            or not item.get("path")
+            or not isinstance(item.get("binding_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", item["binding_sha256"])
+            or not isinstance(item.get("value_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", item["value_sha256"])
+            or (
+                str(item.get("operation") or "").startswith("replace_")
+                and "replacement_sha256" not in item
+            )
+            or (
+                str(item.get("operation") or "").startswith("drop_")
+                and "replacement_sha256" in item
+            )
+            or (
+                "replacement_sha256" in item
+                and (
+                    not isinstance(item.get("replacement_sha256"), str)
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(item.get("replacement_sha256") or ""),
+                    )
+                )
+            )
+            for item in operations
+        )
+        or ledger.get("operation_count") != len(operations)
+        or ledger.get("drop_count")
+        != sum(
+            str(item.get("operation") or "").startswith("drop_")
+            for item in operations
+        )
+        or ledger.get("replacement_count")
+        != sum(
+            str(item.get("operation") or "").startswith("replace_")
+            for item in operations
+        )
+        or ledger.get("quality_state") != "degraded"
+        or ledger.get("operations_sha256") != _stable_json_sha256(operations)
+    ):
+        raise OpenRouterError("Final input grounding filter audit is invalid")
+    return copy.deepcopy(operations)
+
+
+def _final_input_grounding_filter_audit(
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a stable, content-addressed audit ledger for auxiliary edits."""
+
+    unique: dict[str, dict[str, Any]] = {}
+    for operation in operations:
+        unique[_stable_json_sha256(operation)] = copy.deepcopy(operation)
+    normalized = sorted(
+        unique.values(),
+        key=lambda item: (
+            str(item.get("scope") or ""),
+            str(item.get("binding_sha256") or ""),
+            str(item.get("path") or ""),
+            str(item.get("operation") or ""),
+            str(item.get("value_sha256") or ""),
+        ),
+    )
+    return {
+        "version": FINAL_INPUT_GROUNDING_FILTER_VERSION,
+        "quality_state": "degraded",
+        "operation_count": len(normalized),
+        "drop_count": sum(
+            str(item.get("operation") or "").startswith("drop_")
+            for item in normalized
+        ),
+        "replacement_count": sum(
+            str(item.get("operation") or "").startswith("replace_")
+            for item in normalized
+        ),
+        "operations_sha256": _stable_json_sha256(normalized),
+        "operations": normalized,
+    }
+
+
+def _record_final_input_grounding_filter(
+    output: dict[str, Any],
+    *,
+    scope: str,
+    operations: list[dict[str, Any]],
+) -> None:
+    """Persist and log fail-soft edits after all hard invariants pass."""
+
+    existing = _final_input_grounding_filter_operations(output)
+    if existing or operations:
+        output[FINAL_INPUT_GROUNDING_FILTER_KEY] = (
+            _final_input_grounding_filter_audit([*existing, *operations])
+        )
+    if operations:
+        audit = _final_input_grounding_filter_audit(operations)
+        logger.warning(
+            "Final input grounding filter sanitized auxiliary output: "
+            "scope=%s operations=%d drops=%d replacements=%d audit_sha256=%s",
+            scope,
+            audit["operation_count"],
+            audit["drop_count"],
+            audit["replacement_count"],
+            audit["operations_sha256"],
+        )
+
+
 def _normalize_final_evidence_packet(
     packet: dict[str, Any],
     *,
@@ -33707,9 +35159,33 @@ def _normalize_final_evidence_packet(
     output = copy.deepcopy(packet)
     allowed_unit_ids = set(allowed_unit_paths)
     allowed_paths = set(allowed_unit_paths.values())
+    claim_excerpt_by_id = {
+        str(claim_id): str(claim.get("excerpt") or "")
+        for claim_id, claim in (allowed_claims or {}).items()
+        if isinstance(claim, dict)
+    }
+    claim_texts_by_unit: dict[str, list[str]] = defaultdict(list)
+    for claim_id, claim in (allowed_claims or {}).items():
+        if not isinstance(claim, dict):
+            continue
+        unit_id = str(claim.get("source_unit_id") or "")
+        if unit_id:
+            claim_texts_by_unit[unit_id].append(
+                claim_excerpt_by_id.get(str(claim_id), "")
+            )
+    all_claim_texts = list(claim_excerpt_by_id.values())
+    grounding_filter_operations: list[dict[str, Any]] = []
+    packet_binding_sha256 = _stable_json_sha256(
+        {
+            "source_unit_ids": sorted(allowed_unit_ids),
+            "source_claim_ids": sorted(claim_excerpt_by_id),
+        }
+    )
     observed_unit_ids: set[str] = set()
     observed_claim_ids: list[str] = []
-    for observation in output.get("observations") or []:
+    for observation_index, observation in enumerate(
+        output.get("observations") or []
+    ):
         if not isinstance(observation, dict):
             raise OpenRouterError("Final evidence observation is not an object")
         paths = observation.get("source_paths")
@@ -33801,12 +35277,36 @@ def _normalize_final_evidence_packet(
                 )
             exact_values = observation.get("exact_values")
             if not isinstance(exact_values, list) or any(
-                not isinstance(value, str) or value not in claim_excerpt
-                for value in exact_values
+                not isinstance(value, str) for value in exact_values
             ):
                 raise OpenRouterError(
-                    "Final evidence observation invented an exact value"
+                    "Final evidence observation has invalid exact values"
                 )
+            grounded_exact_values: list[str] = []
+            for value_index, value in enumerate(exact_values):
+                if (
+                    value.strip()
+                    and value in claim_excerpt
+                    and _final_root_tokens_are_grounded(
+                        value,
+                        source_texts=[claim_excerpt],
+                    )
+                ):
+                    grounded_exact_values.append(value)
+                    continue
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation="drop_ungrounded_exact_value",
+                        path=(
+                            f"observations[{observation_index}]."
+                            f"exact_values[{value_index}]"
+                        ),
+                        binding_sha256=text_sha256(claim_id),
+                        value=value,
+                    )
+                )
+            observation["exact_values"] = grounded_exact_values
             if not _final_root_tokens_are_grounded(
                 str(observation.get("statement") or ""),
                 source_texts=[claim_excerpt],
@@ -33823,11 +35323,39 @@ def _normalize_final_evidence_packet(
             observation["analysis_dimension"] = domain_context["analysis_dimension"]
             observation["domain_context_id"] = domain_context["domain_context_id"]
             observed_claim_ids.append(claim_id)
+    for field in ("uncertainties", "report_focus"):
+        items = output.get(field)
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) for item in items
+        ):
+            raise OpenRouterError(f"Final evidence packet has invalid {field}")
+        grounded_items: list[str] = []
+        for item_index, item in enumerate(items):
+            if allowed_claims is None or _final_root_tokens_are_grounded(
+                item,
+                source_texts=all_claim_texts,
+            ):
+                grounded_items.append(item)
+                continue
+            grounding_filter_operations.append(
+                _final_input_grounding_filter_operation(
+                    scope="mapper",
+                    operation=(
+                        "drop_ungrounded_uncertainty"
+                        if field == "uncertainties"
+                        else "drop_ungrounded_report_focus"
+                    ),
+                    path=f"{field}[{item_index}]",
+                    binding_sha256=packet_binding_sha256,
+                    value=item,
+                )
+            )
+        output[field] = grounded_items
     coverage = output.get("unit_coverage")
     if not isinstance(coverage, list):
         raise OpenRouterError("Final evidence packet has no unit coverage")
     coverage_ids: list[str] = []
-    for item in coverage:
+    for coverage_index, item in enumerate(coverage):
         if not isinstance(item, dict):
             raise OpenRouterError(
                 "Final evidence packet has an invalid unit coverage item"
@@ -33849,6 +35377,25 @@ def _normalize_final_evidence_packet(
             )
         if not isinstance(rationale, str) or not rationale.strip():
             raise OpenRouterError("Final evidence packet coverage has no rationale")
+        if (
+            allowed_claims is not None
+            and rationale != _FINAL_INPUT_UNIT_COVERAGE_RATIONALE
+            and not _final_root_tokens_are_grounded(
+                rationale,
+                source_texts=claim_texts_by_unit.get(unit_id) or all_claim_texts,
+            )
+        ):
+            grounding_filter_operations.append(
+                _final_input_grounding_filter_operation(
+                    scope="mapper",
+                    operation="replace_ungrounded_unit_coverage_rationale",
+                    path=f"unit_coverage[{coverage_index}].rationale",
+                    binding_sha256=text_sha256(unit_id),
+                    value=rationale,
+                    replacement=_FINAL_INPUT_UNIT_COVERAGE_RATIONALE,
+                )
+            )
+            item["rationale"] = _FINAL_INPUT_UNIT_COVERAGE_RATIONALE
         coverage_ids.append(unit_id)
     if len(coverage_ids) != len(coverage) or Counter(coverage_ids) != Counter(
         allowed_unit_ids
@@ -33878,7 +35425,7 @@ def _normalize_final_evidence_packet(
         coverage = output.get("claim_coverage")
         if not isinstance(coverage, list):
             raise OpenRouterError("Final evidence packet has no claim coverage")
-        for item in coverage:
+        for claim_coverage_index, item in enumerate(coverage):
             if not isinstance(item, dict):
                 raise OpenRouterError(
                     "Final evidence packet has an invalid claim coverage item"
@@ -33898,6 +35445,26 @@ def _normalize_final_evidence_packet(
                 raise OpenRouterError(
                     "Final evidence packet claim coverage has no rationale"
                 )
+            claim_id = str(item.get("claim_id") or "")
+            if (
+                claim_id in claim_excerpt_by_id
+                and item["rationale"] != _FINAL_INPUT_CLAIM_COVERAGE_RATIONALE
+                and not _final_root_tokens_are_grounded(
+                    str(item["rationale"]),
+                    source_texts=[claim_excerpt_by_id[claim_id]],
+                )
+            ):
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation="replace_ungrounded_claim_coverage_rationale",
+                        path=f"claim_coverage[{claim_coverage_index}].rationale",
+                        binding_sha256=text_sha256(claim_id),
+                        value=str(item["rationale"]),
+                        replacement=_FINAL_INPUT_CLAIM_COVERAGE_RATIONALE,
+                    )
+                )
+                item["rationale"] = _FINAL_INPUT_CLAIM_COVERAGE_RATIONALE
         if claim_objects is None or set(claim_objects) != set(allowed_claims):
             raise OpenRouterError(
                 "Final evidence packet has no exact code-owned claim objects"
@@ -33912,6 +35479,11 @@ def _normalize_final_evidence_packet(
             raise OpenRouterError(
                 f"Final evidence packet claim coverage failed: {exc}"
             ) from exc
+    _record_final_input_grounding_filter(
+        output,
+        scope="mapper",
+        operations=grounding_filter_operations,
+    )
     return output
 
 
@@ -34021,6 +35593,15 @@ def _preserve_final_evidence_reduction(
     output["claim_coverage"] = [
         claim_coverage_by_id[claim_id] for claim_id in sorted(claim_coverage_by_id)
     ]
+    audit_operations: list[dict[str, Any]] = []
+    for packet in [merged, *inputs]:
+        audit_operations.extend(_final_input_grounding_filter_operations(packet))
+    if audit_operations:
+        output[FINAL_INPUT_GROUNDING_FILTER_KEY] = (
+            _final_input_grounding_filter_audit(audit_operations)
+        )
+    else:
+        output.pop(FINAL_INPUT_GROUNDING_FILTER_KEY, None)
     return output
 
 
@@ -34271,6 +35852,112 @@ _FINAL_ROOT_STATE_LITERAL = re.compile(
 _FINAL_ROOT_RARE_LITERAL = re.compile(
     r"(?<!\w)[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9._:/+@-]{5,}(?!\w)"
 )
+_FINAL_GROUNDING_DOMAIN_LITERAL = re.compile(
+    r"(?<![@/\w-])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}(?![\w-]|\.[a-z0-9])",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_EMAIL_LITERAL = re.compile(
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,63}"
+    r"(?![\w-]|\.[A-Z0-9])",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_MODEL_ID_LITERAL = re.compile(
+    r"(?<![.\w/:])"
+    r"[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?/"
+    r"[a-z0-9](?:[a-z0-9._:-]{0,125}[a-z0-9])?"
+    r"(?![\w/:-]|\.[a-z0-9])",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_MODEL_ID_PROVIDERS = frozenset(
+    {
+        "amazon",
+        "anthropic",
+        "cohere",
+        "deepseek",
+        "google",
+        "meta-llama",
+        "microsoft",
+        "mistralai",
+        "moonshotai",
+        "nvidia",
+        "openai",
+        "perplexity",
+        "qwen",
+        "x-ai",
+    }
+)
+_FINAL_GROUNDING_MODEL_ID_MARKER = re.compile(
+    r"(?:\d|gpt|claude|gemini|deepseek|sonar|llama|mistral|qwen|command|nova|grok)",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_MODEL_VERSION_LITERAL = re.compile(
+    r"(?<![\w/])(?:gpt|claude|gemini|deepseek|sonar)"
+    r"[-_.][a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?"
+    r"(?![\w/-]|\.[a-z0-9])",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_MODEL_ALIAS_LITERAL = re.compile(
+    r"(?<!\w)(?:chatgpt|openai|gpt|gemini|google|claude|anthropic|"
+    r"deepseek|perplexity|sonar)(?!\w)",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_NUMBER_LITERAL = re.compile(
+    r"(?<![\w№])[+\-−]?(?:(?:\d{1,3}"
+    r"(?:[ \u00a0\u2007\u2009\u202f]\d{3})+)|\d+)(?:[.,]\d+)?"
+)
+_FINAL_GROUNDING_UNIT_LITERAL = re.compile(
+    r"^[ \u00a0\u2007\u2009\u202f]*(?:percentage[- ]points?|"
+    r"percent(?:age)?[- ]points?|"
+    r"p\.?\s*p\.?|п\.?\s*п\.?|"
+    r"процентн(?:ый|ая|ое|ые|ого|ой|ых|ому|ым|ыми)\s+"
+    r"пункт(?:а|ов|у|ом|ы)?|%|percent(?:age)?|"
+    r"процент(?:а|ов)?|us\$|usd|rub|eur|gbp|₽|"
+    r"руб(?:\.|ль|ля|лей)?|\$|€|£)(?!\w)",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_PREFIX_CURRENCY_LITERAL = re.compile(
+    r"(?<!\w)(?:us\$|usd|rub|eur|gbp|₽|"
+    r"руб(?:\.|ль|ля|лей)?|\$|€|£)"
+    r"[ \u00a0\u2007\u2009\u202f]*$",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_HEX_LITERAL = re.compile(
+    r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32,}(?![A-Fa-f0-9])"
+)
+_FINAL_GROUNDING_UUID_LITERAL = re.compile(
+    r"(?<![A-Fa-f0-9])"
+    r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+    r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}"
+    r"(?![A-Fa-f0-9])"
+)
+
+_FINAL_GROUNDING_STATE_CANONICAL = {
+    "complete": "complete",
+    "completed": "complete",
+    "failed": "failed",
+    "limited": "limited",
+    "missing": "missing",
+    "n/a": "n/a",
+    "na": "n/a",
+    "null": "null",
+    "partial": "partial",
+    "true": "true",
+    "false": "false",
+    "unverified": "unverified",
+    "unknown": "unknown",
+    "unavailable": "unavailable",
+    "available": "available",
+    "verified": "verified",
+    "доступно": "available",
+    "завершено": "complete",
+    "недоступно": "unavailable",
+    "неизвестно": "unknown",
+    "ограничено": "limited",
+    "подтверждено": "verified",
+}
 
 
 def _final_root_literal_tokens(value: Any) -> list[str]:
@@ -34302,12 +35989,194 @@ def _final_root_tokens_are_grounded(
     *,
     source_texts: list[str],
 ) -> bool:
-    combined = "\n".join(source_texts)
-    combined_folded = combined.casefold()
-    return all(
-        token in combined or token.casefold() in combined_folded
-        for token in _final_root_literal_tokens(text)
-    )
+    """Allow semantic prose while source-binding assertion-grade literals."""
+
+    def canonical_number(value: str) -> str:
+        return re.sub(
+            r"[ \u00a0\u2007\u2009\u202f]",
+            "",
+            value,
+        ).replace(",", ".").replace("−", "-")
+
+    def canonical_unit(value: str) -> str:
+        folded = re.sub(
+            r"[ \u00a0\u2007\u2009\u202f]",
+            "",
+            value.casefold().rstrip("."),
+        )
+        if (
+            "point" in folded
+            or "пункт" in folded
+            or folded in {"pp", "p.p", "пп", "п.п"}
+        ):
+            return "percentage_points"
+        if folded in {"%", "percent", "percentage"} or folded.startswith(
+            "процент"
+        ):
+            return "percent"
+        if folded in {"$", "us$", "usd"}:
+            return "usd"
+        if folded in {"₽", "rub"} or folded.startswith("руб"):
+            return "rub"
+        if folded in {"€", "eur"}:
+            return "eur"
+        if folded in {"£", "gbp"}:
+            return "gbp"
+        return folded
+
+    def canonical_state(
+        state_value: str,
+        *,
+        source_text: str,
+        start: int,
+    ) -> str:
+        prefix = source_text[max(0, start - 80) : start].casefold()
+        modal_negated = bool(
+            re.search(
+                r"(?:"
+                r"(?:^|[^\w])not[ \t]+necessarily[ \t]*|"
+                r"(?:^|[^\w])не[ \t]+всегда[ \t]*"
+                r")$",
+                prefix,
+                re.IGNORECASE,
+            )
+        )
+        if modal_negated:
+            return f"not_necessarily:{state_value}"
+        negated = bool(
+            re.search(
+                r"(?:"
+                r"(?:^|[^\w])(?:not|never|no[ -]longer)"
+                r"(?:[ \t]+(?:currently|yet|already|still|now|anymore))*"
+                r"[ \t]*|"
+                r"(?:^|[^\w])(?:не|никогда|уже[ \t]+не)"
+                r"(?:[ \t]+(?:пока|ещ[её]|сейчас|было|был|была|были))*"
+                r"[ \t]*"
+                r")$",
+                prefix,
+                re.IGNORECASE,
+            )
+        )
+        if not negated:
+            return state_value
+        if state_value == "available":
+            return "unavailable"
+        if state_value == "verified":
+            return "unverified"
+        return f"not:{state_value}"
+
+    def assertion_literals(value: str) -> set[tuple[str, str]]:
+        literals: set[tuple[str, str]] = set()
+        for match in _FINAL_ROOT_URL_LITERAL.finditer(value):
+            literals.add(("url", match.group(0).rstrip(".,;:!?)]}").casefold()))
+        for match in _FINAL_GROUNDING_EMAIL_LITERAL.finditer(value):
+            literals.add(("email", match.group(0).casefold()))
+        for match in _FINAL_GROUNDING_DOMAIN_LITERAL.finditer(value):
+            literals.add(("domain", match.group(0).casefold()))
+        for match in _FINAL_GROUNDING_MODEL_ID_LITERAL.finditer(value):
+            model_id = match.group(0).casefold()
+            provider, model_name = model_id.split("/", 1)
+            if (
+                provider in _FINAL_GROUNDING_MODEL_ID_PROVIDERS
+                and _FINAL_GROUNDING_MODEL_ID_MARKER.search(model_name)
+            ):
+                literals.add(("model_id", model_id))
+        for match in _FINAL_GROUNDING_MODEL_VERSION_LITERAL.finditer(value):
+            literals.add(("model_version", match.group(0).casefold()))
+        for match in _FINAL_GROUNDING_MODEL_ALIAS_LITERAL.finditer(value):
+            alias = match.group(0).casefold()
+            literals.add(("model_alias", alias))
+        for match in _FINAL_ROOT_STATE_LITERAL.finditer(value):
+            state = match.group(0).casefold().replace("/", "")
+            canonical = _FINAL_GROUNDING_STATE_CANONICAL.get(state)
+            if canonical is not None:
+                literals.add(
+                    (
+                        "state",
+                        canonical_state(
+                            canonical,
+                            source_text=value,
+                            start=match.start(),
+                        ),
+                    )
+                )
+        for state, canonical in _FINAL_GROUNDING_STATE_CANONICAL.items():
+            if state in {"n/a", "na"}:
+                continue
+            for match in re.finditer(
+                rf"(?<![\w-]){re.escape(state)}(?![\w-])",
+                value,
+                re.IGNORECASE,
+            ):
+                literals.add(
+                    (
+                        "state",
+                        canonical_state(
+                            canonical,
+                            source_text=value,
+                            start=match.start(),
+                        ),
+                    )
+                )
+        for match in _FINAL_GROUNDING_UUID_LITERAL.finditer(value):
+            literals.add(("uuid", match.group(0).casefold()))
+        for match in _FINAL_GROUNDING_HEX_LITERAL.finditer(value):
+            literals.add(("hex", match.group(0).casefold()))
+        for match in _FINAL_GROUNDING_NUMBER_LITERAL.finditer(value):
+            prefix = value[: match.start()]
+            suffix = value[match.end() :]
+            if re.search(r"№\s*$", prefix):
+                continue
+            if re.search(
+                r"[A-Za-zА-Яа-яЁё]{2,16}[-‐‑‒–—]$",
+                prefix,
+            ):
+                continue
+            if re.match(r"^[-‐‑‒–—][A-Za-zА-Яа-яЁё]", suffix):
+                continue
+            if re.search(r"(?:^|\n)\s*$", prefix) and re.match(r"^[.)]\s", suffix):
+                continue
+            prefix_unit_match = _FINAL_GROUNDING_PREFIX_CURRENCY_LITERAL.search(
+                prefix
+            )
+            unit_match = _FINAL_GROUNDING_UNIT_LITERAL.match(suffix)
+            number = canonical_number(match.group(0))
+            if prefix_unit_match is not None:
+                if not number.startswith(("+", "-")):
+                    sign_match = re.search(
+                        r"([+\-−])[ \u00a0\u2007\u2009\u202f]*$",
+                        prefix[: prefix_unit_match.start()],
+                    )
+                    if sign_match is not None:
+                        number = canonical_number(sign_match.group(1)) + number
+                literals.add(
+                    (
+                        "quantity",
+                        f"{number}:{canonical_unit(prefix_unit_match.group(0))}",
+                    )
+                )
+            if unit_match is not None:
+                literals.add(
+                    ("quantity", f"{number}:{canonical_unit(unit_match.group(0))}")
+                )
+            if prefix_unit_match is None and unit_match is None:
+                literals.add(("number", number))
+        return literals
+
+    grounded = set().union(*(assertion_literals(value) for value in source_texts))
+    for literal_type, literal_value in assertion_literals(text):
+        if (literal_type, literal_value) in grounded:
+            continue
+        if literal_type == "hex" and any(
+            grounded_type == "hex" and literal_value in grounded_value
+            for grounded_type, grounded_value in grounded
+        ):
+            # A bounded exact excerpt may end inside a long transport hash.
+            # Such a substring is not a new quantitative or semantic fact;
+            # it is still literally committed by the complete source hash.
+            continue
+        return False
+    return True
 
 
 _FINAL_ROOT_NON_SEMANTIC_WORDS = frozenset(
@@ -34510,11 +36379,13 @@ def _normalize_final_root_summary_packet(
     )
     if set(fact_bindings_by_node) != allowed_node_ids:
         raise OpenRouterError("Bounded root fact ledger mismatches its child-node set")
+    grounding_filter_operations: list[dict[str, Any]] = []
+    packet_binding_sha256 = _stable_json_sha256(sorted(allowed_node_ids))
     observed_node_ids: list[str] = []
     observations = output.get("observations")
     if not isinstance(observations, list):
         raise OpenRouterError("Bounded root packet has no observations")
-    for observation in observations:
+    for observation_index, observation in enumerate(observations):
         if not isinstance(observation, dict):
             raise OpenRouterError("Bounded root observation is not an object")
         statement = observation.get("statement")
@@ -34605,18 +36476,50 @@ def _normalize_final_root_summary_packet(
                 "Bounded root observation is a generic acknowledgement, not "
                 "a grounded semantic summary"
             )
+        grounding_texts = [
+            *referenced_text,
+            *(
+                candidate
+                for binding in fact_bindings_by_node[node_ids[0]]
+                for candidate in _final_root_fact_assertion_candidates(binding)
+                if candidate
+            ),
+        ]
         exact_values = observation.get("exact_values")
         if not isinstance(exact_values, list) or any(
-            not isinstance(value, str)
-            or not any(value in text for text in referenced_text)
-            for value in exact_values
+            not isinstance(value, str) for value in exact_values
         ):
             raise OpenRouterError(
-                "Bounded root exact value is not present in its children"
+                "Bounded root exact values are structurally invalid"
             )
+        grounded_exact_values: list[str] = []
+        for value_index, value in enumerate(exact_values):
+            if (
+                value.strip()
+                and any(value in text for text in grounding_texts)
+                and _final_root_tokens_are_grounded(
+                    value,
+                    source_texts=grounding_texts,
+                )
+            ):
+                grounded_exact_values.append(value)
+                continue
+            grounding_filter_operations.append(
+                _final_input_grounding_filter_operation(
+                    scope="bounded_root",
+                    operation="drop_ungrounded_exact_value",
+                    path=(
+                        f"observations[{observation_index}]."
+                        f"exact_values[{value_index}]"
+                    ),
+                    binding_sha256=text_sha256(node_ids[0]),
+                    value=value,
+                )
+            )
+        observation["exact_values"] = grounded_exact_values
         if not _final_root_tokens_are_grounded(
             statement,
-            source_texts=referenced_text,
+            source_texts=grounding_texts,
         ):
             raise OpenRouterError(
                 "Bounded root statement invented an exact literal or state"
@@ -34641,7 +36544,8 @@ def _normalize_final_root_summary_packet(
         items = output.get(field)
         if not isinstance(items, list):
             raise OpenRouterError(f"Bounded root packet has invalid {field}")
-        for item in items:
+        grounded_items: list[dict[str, Any]] = []
+        for item_index, item in enumerate(items):
             if not isinstance(item, dict):
                 raise OpenRouterError(f"Bounded root {field} item has no provenance")
             text = item.get("text")
@@ -34655,20 +36559,45 @@ def _normalize_final_root_summary_packet(
                     not isinstance(node_id, str) or node_id not in allowed_node_ids
                     for node_id in node_ids
                 )
-                or not _final_root_tokens_are_grounded(
-                    text,
-                    source_texts=[allowed_node_text[node_id] for node_id in node_ids],
-                )
             ):
                 raise OpenRouterError(
-                    f"Bounded root {field} item invented or lost provenance"
+                    f"Bounded root {field} item lost structural provenance"
                 )
+            source_texts = [
+                *[allowed_node_text[node_id] for node_id in node_ids],
+                *(
+                    candidate
+                    for node_id in node_ids
+                    for binding in fact_bindings_by_node[node_id]
+                    for candidate in _final_root_fact_assertion_candidates(
+                        binding
+                    )
+                    if candidate
+                ),
+            ]
+            if _final_root_tokens_are_grounded(text, source_texts=source_texts):
+                grounded_items.append(item)
+                continue
+            grounding_filter_operations.append(
+                _final_input_grounding_filter_operation(
+                    scope="bounded_root",
+                    operation=(
+                        "drop_ungrounded_uncertainty"
+                        if field == "uncertainties"
+                        else "drop_ungrounded_report_focus"
+                    ),
+                    path=f"{field}[{item_index}]",
+                    binding_sha256=packet_binding_sha256,
+                    value=text,
+                )
+            )
+        output[field] = grounded_items
 
     coverage = output.get("node_coverage")
     if not isinstance(coverage, list):
         raise OpenRouterError("Bounded root packet has no node coverage")
     coverage_ids: list[str] = []
-    for item in coverage:
+    for coverage_index, item in enumerate(coverage):
         if not isinstance(item, dict):
             raise OpenRouterError("Bounded root packet has invalid node coverage")
         node_id = item.get("source_node_id")
@@ -34683,11 +36612,42 @@ def _normalize_final_root_summary_packet(
         rationale = item.get("rationale")
         if not isinstance(rationale, str) or not rationale.strip():
             raise OpenRouterError("Bounded root coverage has no rationale")
+        if (
+            rationale != _FINAL_INPUT_NODE_COVERAGE_RATIONALE
+            and not _final_root_tokens_are_grounded(
+                rationale,
+                source_texts=[
+                    allowed_node_text[node_id],
+                    *(
+                        candidate
+                        for binding in fact_bindings_by_node[node_id]
+                        for candidate in _final_root_fact_assertion_candidates(binding)
+                        if candidate
+                    ),
+                ],
+            )
+        ):
+            grounding_filter_operations.append(
+                _final_input_grounding_filter_operation(
+                    scope="bounded_root",
+                    operation="replace_ungrounded_node_coverage_rationale",
+                    path=f"node_coverage[{coverage_index}].rationale",
+                    binding_sha256=text_sha256(node_id),
+                    value=rationale,
+                    replacement=_FINAL_INPUT_NODE_COVERAGE_RATIONALE,
+                )
+            )
+            item["rationale"] = _FINAL_INPUT_NODE_COVERAGE_RATIONALE
         coverage_ids.append(node_id)
     if Counter(coverage_ids) != Counter(allowed_node_ids):
         raise OpenRouterError(
             "Bounded root packet does not cover every child exactly once"
         )
+    _record_final_input_grounding_filter(
+        output,
+        scope="bounded_root",
+        operations=grounding_filter_operations,
+    )
     return output
 
 
@@ -36277,11 +38237,24 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             ]
             return [claim_row_by_id[claim_id] for claim_id in claim_ids]
 
+        def map_subset_identity(pack: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "version": FINAL_INPUT_HARNESS_VERSION,
+                "source_payload_sha256": source_payload_sha256,
+                "source_unit_ids": [
+                    str(unit["source_unit_id"]) for unit in pack
+                ],
+                "source_claim_ids": [
+                    str(claim["claim_id"]) for claim in claims_for_pack(pack)
+                ],
+            }
+
         def map_request_bytes(
-            index: int,
+            _index: int,
             pack: list[dict[str, Any]],
             source_digest: str = source_payload_sha256,
         ) -> int:
+            subset_digest = _stable_json_sha256(map_subset_identity(pack))[:20]
             return _structured_provider_request_utf8_bytes(
                 model=PROCESSING_MODEL,
                 model_envelope=mapper_window["model_envelope"],
@@ -36293,7 +38266,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
                     "source_claims": claims_for_pack(pack),
                 },
                 schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-                schema_name=f"aiv_final_input_map_{index}",
+                schema_name=f"aiv_final_input_map_{subset_digest}",
                 reasoning_effort="high",
                 temperature=0.15,
             )
@@ -36311,6 +38284,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         ]
         if all(
             map_request_bytes(index, [unit]) <= mapper_window_bytes
+            and len(claims_for_pack([unit])) == 1
             for index, unit in enumerate(semantic_units, start=1)
         ):
             break
@@ -36382,6 +38356,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         semantic_units,
         window_bytes=mapper_window_bytes,
         request_utf8_bytes=map_request_bytes,
+        claim_count=lambda pack: len(claims_for_pack(pack)),
     )
     max_mapper_request_bytes = max(
         (
@@ -36393,41 +38368,242 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
     unit_path_by_id = {
         str(unit["source_unit_id"]): str(unit["source_path"]) for unit in units
     }
-    async def map_pack(index: int, pack: list[dict[str, Any]]) -> dict[str, Any]:
+
+    async def map_pack(
+        index: int,
+        pack: list[dict[str, Any]],
+        *,
+        depth: int = 0,
+        active_subsets: frozenset[str] = frozenset(),
+    ) -> list[dict[str, Any]]:
         unit_ids = [str(item["source_unit_id"]) for item in pack]
-        digest = _stable_json_sha256(unit_ids)[:20]
+        claim_rows_for_pack = claims_for_pack(pack)
+        claim_ids = [str(item["claim_id"]) for item in claim_rows_for_pack]
+        subset_identity = map_subset_identity(pack)
+        digest = _stable_json_sha256(subset_identity)[:20]
+        if digest in active_subsets:
+            raise OpenRouterError("Final evidence mapper split tree repeated a subset")
+        if not pack:
+            raise OpenRouterError("Final evidence mapper split tree created an empty leaf")
+        active = frozenset({*active_subsets, digest})
+        artifact_key = f"{artifact_namespace}_map_{digest}"
+        user_payload = {
+            "contract_version": FINAL_INPUT_HARNESS_VERSION,
+            "source_payload_sha256": manifest["source_payload_sha256"],
+            "source_units": pack,
+            "source_claims": claim_rows_for_pack,
+        }
+        split_input = {
+            "version": FINAL_INPUT_MAP_SPLIT_VERSION,
+            "subset_identity": subset_identity,
+        }
+        split_artifact_key = f"{artifact_namespace}_map_split_{digest}"
+
+        async def split_children() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+            if len(pack) <= 1:
+                raise _FinalInputExactCoverageError(
+                    "One final evidence mapper unit still has incomplete exact coverage"
+                )
+            midpoint = len(pack) // 2
+            children = [pack[:midpoint], pack[midpoint:]]
+            if any(not child or len(child) >= len(pack) for child in children):
+                raise OpenRouterError(
+                    "Final evidence mapper split did not reduce the workload"
+                )
+            child_identities = [map_subset_identity(child) for child in children]
+            child_digests = [
+                _stable_json_sha256(identity)[:20] for identity in child_identities
+            ]
+            leaves: list[dict[str, Any]] = []
+            for child_index, child in enumerate(children, start=1):
+                leaves.extend(
+                    await map_pack(
+                        index * 2 + child_index,
+                        child,
+                        depth=depth + 1,
+                        active_subsets=active,
+                    )
+                )
+            _long_response_lineage(leaves, expected_unit_ids=unit_ids)
+            covered_claim_ids = [
+                str(item["claim_id"])
+                for leaf in leaves
+                for item in leaf.get("claim_coverage") or []
+                if isinstance(item, dict) and isinstance(item.get("claim_id"), str)
+            ]
+            if Counter(covered_claim_ids) != Counter(claim_ids):
+                raise OpenRouterError(
+                    "Final evidence mapper split tree changed claim coverage"
+                )
+            return leaves, {
+                "version": FINAL_INPUT_MAP_SPLIT_VERSION,
+                "parent_subset_digest": digest,
+                "parent_unit_count": len(unit_ids),
+                "parent_claim_count": len(claim_ids),
+                "depth": depth,
+                "child_subset_digests": child_digests,
+                "child_subset_identities": child_identities,
+                "coverage_complete": True,
+            }
+
+        saved_split = await _artifact_output(
+            run_id,
+            split_artifact_key,
+            input_json=split_input,
+            model=None,
+            prompt_version=prompt_version,
+        )
+        if isinstance(saved_split, dict):
+            if len(pack) <= 1:
+                raise OpenRouterError(
+                    "Final evidence mapper singleton has an invalid split manifest"
+                )
+            expected_children = [
+                map_subset_identity(child)
+                for child in (pack[: len(pack) // 2], pack[len(pack) // 2 :])
+            ]
+            if saved_split.get("child_subset_identities") != expected_children:
+                raise OpenRouterError(
+                    "Final evidence mapper split manifest mismatches immutable input"
+                )
+            # A process may stop after persisting the immutable split plan but
+            # before downgrading the known-incomplete parent.  Reconcile that
+            # owner idempotently on resume so a cached partial response never
+            # remains eligible merely because of the crash timing.
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=user_payload,
+                prompt_version=prompt_version,
+                error=_FinalInputExactCoverageError(
+                    str(saved_split.get("reason") or (
+                        "Final evidence mapper resumed a persisted exact-coverage split"
+                    ))
+                ),
+            )
+            leaves, completed_split = await split_children()
+            await _save_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=split_artifact_key,
+                status="completed",
+                input_json=split_input,
+                output_json=completed_split,
+                prompt_version=prompt_version,
+            )
+            return leaves
+
         result = await _structured_artifact(
             run_id,
             stage_key=stage_key,
-            artifact_key=f"{artifact_namespace}_map_{digest}",
+            artifact_key=artifact_key,
             schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-            schema_name=f"aiv_final_input_map_{index}",
+            schema_name=f"aiv_final_input_map_{digest}",
             system=map_system,
-            user_payload={
-                "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                "source_payload_sha256": manifest["source_payload_sha256"],
-                "source_units": pack,
-                "source_claims": claims_for_pack(pack),
-            },
+            user_payload=user_payload,
             model=PROCESSING_MODEL,
             reasoning_effort="high",
             prompt_version=prompt_version,
         )
-        normalized = _normalize_final_evidence_packet(
-            result,
-            allowed_unit_paths={
-                str(item["source_unit_id"]): str(item["source_path"]) for item in pack
-            },
-            allowed_claims={
-                str(item["claim_id"]): item for item in claims_for_pack(pack)
-            },
-            claim_objects={
-                claim_id: claim_objects_by_id[claim_id]
-                for item in pack
-                for claim_id in claim_ids_by_unit[str(item["source_unit_id"])]
-            },
-        )
-        return _long_response_leaf(normalized, unit_ids)
+        try:
+            _precheck_final_mapper_exact_coverage(
+                result,
+                expected_unit_ids=unit_ids,
+                expected_claim_ids=claim_ids,
+            )
+            normalized = _normalize_final_evidence_packet(
+                result,
+                allowed_unit_paths={
+                    str(item["source_unit_id"]): str(item["source_path"])
+                    for item in pack
+                },
+                allowed_claims={
+                    str(item["claim_id"]): item for item in claim_rows_for_pack
+                },
+                claim_objects={
+                    claim_id: claim_objects_by_id[claim_id]
+                    for item in pack
+                    for claim_id in claim_ids_by_unit[str(item["source_unit_id"])]
+                },
+            )
+        except _FinalInputExactCoverageError as exc:
+            if len(pack) <= 1:
+                await _mark_completed_artifact_contract_failed(
+                    run_id,
+                    stage_key=stage_key,
+                    artifact_key=artifact_key,
+                    model=PROCESSING_MODEL,
+                    input_json=user_payload,
+                    prompt_version=prompt_version,
+                    error=exc,
+                )
+                raise
+            midpoint = len(pack) // 2
+            child_packs = [pack[:midpoint], pack[midpoint:]]
+            split_plan = {
+                "version": FINAL_INPUT_MAP_SPLIT_VERSION,
+                "parent_subset_digest": digest,
+                "parent_unit_count": len(unit_ids),
+                "parent_claim_count": len(claim_ids),
+                "depth": depth,
+                "child_subset_digests": [
+                    _stable_json_sha256(map_subset_identity(child))[:20]
+                    for child in child_packs
+                ],
+                "child_subset_identities": [
+                    map_subset_identity(child) for child in child_packs
+                ],
+                "coverage_complete": False,
+                "reason": str(exc),
+            }
+            # Persist the immutable split coordinate before changing the
+            # parent owner status.  A crash can then resume at the children
+            # without paying for the known-incomplete parent again.
+            await _save_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=split_artifact_key,
+                status="completed",
+                input_json=split_input,
+                output_json=split_plan,
+                prompt_version=prompt_version,
+            )
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=user_payload,
+                prompt_version=prompt_version,
+                error=exc,
+            )
+            leaves, completed_split = await split_children()
+            await _save_artifact(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=split_artifact_key,
+                status="completed",
+                input_json=split_input,
+                output_json=completed_split,
+                prompt_version=prompt_version,
+            )
+            return leaves
+        except (asyncio.CancelledError, RunLeaseLostError):
+            raise
+        except Exception as exc:
+            await _mark_completed_artifact_contract_failed(
+                run_id,
+                stage_key=stage_key,
+                artifact_key=artifact_key,
+                model=PROCESSING_MODEL,
+                input_json=user_payload,
+                prompt_version=prompt_version,
+                error=exc,
+            )
+            raise
+        return [_long_response_leaf(normalized, unit_ids)]
 
     packets: list[dict[str, Any]] = []
     if packs:
@@ -36435,7 +38611,7 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         # enqueueing the full corpus.  Later work is admitted in bounded waves;
         # an error finishes only the already-started siblings and schedules no
         # further leaves.
-        packets.append(await map_pack(1, packs[0]))
+        packets.extend(await map_pack(1, packs[0]))
         for start in range(1, len(packs), PROCESSING_BATCH_CONCURRENCY):
             wave = list(
                 enumerate(
@@ -36457,164 +38633,45 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             )
             if first_error is not None:
                 raise first_error
-            packets.extend(outcome for outcome in outcomes if isinstance(outcome, dict))
+            for outcome in outcomes:
+                if isinstance(outcome, list):
+                    packets.extend(outcome)
+    mapped_leaf_count = len(packets)
 
-    reduce_system = f"""
-Ты иерархический reducer evidence-пакетов AI visibility. Синтезируй дубли и
-связанные наблюдения, но не теряй critical/important факт, точное число,
-ограничение или действие. source_paths оставляй только из входных пакетов.
-В каждом observation поле source_paths должно быть точным уникальным набором
-путей для всех перечисленных там же source_unit_id.
-Нельзя пересчитывать метрики, повышать уверенность или превращать unknown в
-ноль. Supporting-наблюдения можно синтезировать по смыслу, но каждая выходная
-строка по-прежнему должна относиться ровно к одному claim_id, одному
-source_unit_id и одному source_path. Верни ту же строгую схему.
-Каждый входной source_unit_id сохрани ровно один раз в unit_coverage и хотя бы
-в одном observation: ни один leaf нельзя молча удалить. То же относится к
-source_claim_ids и claim_coverage: каждый входной claim_id должен сохраниться
-ровно один раз с исходным excerpt_sha256. Не объединяй claims в одной строке.
-evidence_excerpt оставляй дословной цитатой соответствующего единственного
-claim, а не пересказом. Сохраняй analysis_dimension и domain_context_id,
-которые код привязал к claim: это join key для последующего тематического
-сжатия, а не повод объединять claim receipts.
-
-{LIVE_RUSSIAN_RULES}
-""".strip()
+    # Every mapper leaf below is already schema-valid, claim-bound and
+    # byte-attested.  Another LLM cannot compress that atomic ledger: the
+    # preservation contract would restore all claim rows verbatim anyway.
+    # Union it in code and reserve semantic compression for the later bounded
+    # root, where a proof tree preserves every source binding.
     reducer_window = await _final_model_input_window(model=ANALYSIS_MODEL)
     reducer_window_bytes = int(reducer_window["input_utf8_window"])
     level = 0
     max_reducer_request_bytes = 0
     terminal_reducer_mode: str | None = None
-    while len(packets) > 1:
-
-        def reducer_request_bytes(
-            group_index: int,
-            group: list[dict[str, Any]],
-            current_level: int = level,
-        ) -> int:
-            return _structured_provider_request_utf8_bytes(
-                model=ANALYSIS_MODEL,
-                model_envelope=reducer_window["model_envelope"],
-                system=reduce_system,
-                user_payload={
-                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                    "source_payload_sha256": manifest["source_payload_sha256"],
-                    "evidence_packets": group,
-                },
-                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-                schema_name=(f"aiv_final_input_reduce_{current_level}_{group_index}"),
-                reasoning_effort="high",
-                temperature=0.15,
-            )
-
-        groups = _pack_final_evidence_packets(
-            packets,
-            window_bytes=reducer_window_bytes,
-            request_utf8_bytes=reducer_request_bytes,
-        )
-        group_request_bytes = [
-            reducer_request_bytes(group_index, group)
-            for group_index, group in enumerate(groups, start=1)
+    if len(packets) > 1:
+        lineage = _long_response_lineage(packets)
+        lineage_claim_ids = [
+            claim_id
+            for unit_id in lineage
+            for claim_id in claim_ids_by_unit[unit_id]
         ]
-        fitting_group_request_bytes = [
-            value for value in group_request_bytes if value <= reducer_window_bytes
-        ]
-        if fitting_group_request_bytes:
-            max_reducer_request_bytes = max(
-                max_reducer_request_bytes,
-                *fitting_group_request_bytes,
-            )
-        if len(groups) >= len(packets):
-            lineage = _long_response_lineage(packets)
-            lineage_claim_ids = [
-                claim_id
-                for unit_id in lineage
-                for claim_id in claim_ids_by_unit[unit_id]
-            ]
-            terminal = _deterministic_final_evidence_union(packets)
-            terminal = _normalize_final_evidence_packet(
-                terminal,
-                allowed_unit_paths={
-                    unit_id: unit_path_by_id[unit_id] for unit_id in lineage
-                },
-                allowed_claims={
-                    claim_id: claim_row_by_id[claim_id]
-                    for claim_id in lineage_claim_ids
-                },
-                claim_objects={
-                    claim_id: claim_objects_by_id[claim_id]
-                    for claim_id in lineage_claim_ids
-                },
-            )
-            packets = [_long_response_leaf(terminal, lineage)]
-            terminal_reducer_mode = "deterministic_lossless_union"
-            break
-
-        async def reduce_group(
-            group_index: int,
-            group: list[dict[str, Any]],
-            current_level: int = level,
-        ) -> dict[str, Any]:
-            inputs = group
-            lineage = _long_response_lineage(inputs)
-            lineage_claim_ids = [
-                claim_id
-                for unit_id in lineage
-                for claim_id in claim_ids_by_unit[unit_id]
-            ]
-            digest = _stable_json_sha256(lineage)[:20]
-            merged = await _structured_artifact(
-                run_id,
-                stage_key=stage_key,
-                artifact_key=(
-                    f"{artifact_namespace}_reduce_l{current_level}_"
-                    f"{group_index}_{digest}"
-                ),
-                schema=FINAL_INPUT_EVIDENCE_SCHEMA,
-                schema_name=(f"aiv_final_input_reduce_{current_level}_{group_index}"),
-                system=reduce_system,
-                user_payload={
-                    "contract_version": FINAL_INPUT_HARNESS_VERSION,
-                    "source_payload_sha256": manifest["source_payload_sha256"],
-                    "evidence_packets": inputs,
-                },
-                model=ANALYSIS_MODEL,
-                reasoning_effort="high",
-                prompt_version=prompt_version,
-            )
-            normalized = _normalize_final_evidence_packet(
-                merged,
-                allowed_unit_paths={
-                    unit_id: unit_path_by_id[unit_id] for unit_id in lineage
-                },
-                allowed_claims={
-                    claim_id: claim_row_by_id[claim_id]
-                    for claim_id in lineage_claim_ids
-                },
-                claim_objects={
-                    claim_id: claim_objects_by_id[claim_id]
-                    for claim_id in lineage_claim_ids
-                },
-            )
-            normalized = _preserve_final_evidence_reduction(
-                normalized,
-                inputs,
-            )
-            return _long_response_leaf(normalized, lineage)
-
-        reduced = await asyncio.gather(
-            *(
-                reduce_group(group_index, group)
-                for group_index, group in enumerate(groups, start=1)
-            ),
-            return_exceptions=True,
+        terminal = _deterministic_final_evidence_union(packets)
+        terminal = _normalize_final_evidence_packet(
+            terminal,
+            allowed_unit_paths={
+                unit_id: unit_path_by_id[unit_id] for unit_id in lineage
+            },
+            allowed_claims={
+                claim_id: claim_row_by_id[claim_id]
+                for claim_id in lineage_claim_ids
+            },
+            claim_objects={
+                claim_id: claim_objects_by_id[claim_id]
+                for claim_id in lineage_claim_ids
+            },
         )
-        packets = []
-        for outcome in reduced:
-            if isinstance(outcome, BaseException):
-                raise outcome
-            packets.append(outcome)
-        level += 1
+        packets = [_long_response_leaf(terminal, lineage)]
+        terminal_reducer_mode = "deterministic_lossless_union"
 
     deterministic_leaf: dict[str, Any] | None = None
     if deterministic_units:
@@ -36791,7 +38848,8 @@ claim, а не пересказом. Сохраняй analysis_dimension и doma
         "source_payload_sha256": manifest["source_payload_sha256"],
         "source_payload_utf8_bytes": manifest["source_payload_utf8_bytes"],
         "source_unit_count": manifest["source_unit_count"],
-        "map_leaf_count": len(packs),
+        "map_leaf_count": mapped_leaf_count,
+        "map_root_pack_count": len(packs),
         "mapped_source_unit_count": len(semantic_units),
         "code_owned_source_unit_count": len(deterministic_units),
         "reduce_levels": level,
@@ -39456,6 +41514,372 @@ async def _invalidate_blocked_final_report_author_candidate(
     )
 
 
+def _final_report_reader_text_rows(
+    report: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Return every reader-visible prose field with its exact JSON path."""
+
+    rows: list[tuple[str, str]] = []
+    for field in ("headline", "verdict", "executive_summary"):
+        value = report.get(field)
+        if isinstance(value, str) and value.strip():
+            rows.append((f"/{field}", value))
+    emphasis = report.get("headline_emphasis")
+    if isinstance(emphasis, list):
+        rows.extend(
+            (f"/headline_emphasis/{index}", value)
+            for index, value in enumerate(emphasis)
+            if isinstance(value, str) and value.strip()
+        )
+    for collection, fields in (
+        ("sections", ("heading", "body")),
+        ("actions", ("title", "why", "step", "evidence")),
+    ):
+        items = report.get(collection)
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            rows.extend(
+                (f"/{collection}/{index}/{field}", value)
+                for field in fields
+                if isinstance((value := item.get(field)), str) and value.strip()
+            )
+    limitations = report.get("limitations")
+    if isinstance(limitations, list):
+        rows.extend(
+            (f"/limitations/{index}", value)
+            for index, value in enumerate(limitations)
+            if isinstance(value, str) and value.strip()
+        )
+    return rows
+
+
+def _final_report_grounding_source_texts(value: Any) -> list[str]:
+    """Project canonical evidence into the typed-literal grounding domain.
+
+    Numeric report fields are serialized exactly.  Percentage-like fields also
+    receive their code-owned display unit because report metrics store
+    ``66.7`` while reader copy correctly renders ``66,7%``.  Other units are
+    never inferred: currencies, URLs, domains, model ids and explicit states
+    must occur in canonical string evidence.
+    """
+
+    output: list[str] = []
+
+    def walk(current: Any, path: tuple[str, ...]) -> None:
+        if isinstance(current, str):
+            if current:
+                output.append(current)
+            return
+        if isinstance(current, bool):
+            output.append("true" if current else "false")
+            return
+        if isinstance(current, (int, float)) and not isinstance(current, bool):
+            if isinstance(current, float) and not math.isfinite(current):
+                return
+            literal = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+            output.append(literal)
+            field = path[-1].casefold() if path else ""
+            if any(
+                marker in field
+                for marker in ("rate", "percent", "percentage", "share")
+            ):
+                output.append(f"{literal}%")
+            if any(
+                marker in field
+                for marker in ("lift", "percentage_point", "percent_point", "pp")
+            ):
+                output.append(f"{literal} percentage points")
+            return
+        if current is None:
+            output.append("null")
+            return
+        if isinstance(current, dict):
+            for key, child in current.items():
+                walk(child, (*path, str(key)))
+            return
+        if isinstance(current, list):
+            for index, child in enumerate(current):
+                walk(child, (*path, str(index)))
+
+    walk(value, ())
+    return list(dict.fromkeys(output))
+
+
+def _final_report_typed_grounding_errors(
+    candidate: dict[str, Any],
+    *,
+    public_report: dict[str, Any],
+    evidence_document: dict[str, Any] | None,
+) -> list[str]:
+    """Hard-block only exact assertion literals absent from canonical facts."""
+
+    source_document = (
+        evidence_document
+        if isinstance(evidence_document, dict)
+        else {"report_data": public_report}
+    )
+    source_texts = _final_report_grounding_source_texts(
+        {
+            "report_data": public_report,
+            "evidence_document": source_document,
+        }
+    )
+    return [
+        (
+            f"{path}: основной текст содержит неподтверждённый точный "
+            "литерал, число, единицу, идентификатор или состояние."
+        )
+        for path, text in _final_report_reader_text_rows(candidate)
+        if not _final_root_tokens_are_grounded(text, source_texts=source_texts)
+    ]
+
+
+def _deterministic_final_report_errors(
+    candidate: dict[str, Any],
+    public_report: dict[str, Any],
+    *,
+    evidence_document: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return only code-owned report blockers; no model verdict participates."""
+
+    return list(
+        dict.fromkeys(
+            [
+                *_validate_final_report(candidate),
+                *deterministic_report_semantic_errors(candidate, public_report),
+                *_final_report_typed_grounding_errors(
+                    candidate,
+                    public_report=public_report,
+                    evidence_document=evidence_document,
+                ),
+            ]
+        )
+    )
+
+
+async def _save_final_report_semantic_admission(
+    run_id: str,
+    *,
+    decision: str,
+    selected_report: dict[str, Any] | None,
+    reviewed_candidate: dict[str, Any],
+    public_report: dict[str, Any],
+    semantic_evidence_document: dict[str, Any],
+    deterministic_errors: list[str],
+    review: dict[str, Any] | None,
+    reviewer_state: str,
+    reviewer_findings: list[str],
+    degraded_reason_codes: list[str],
+    repair_attempts_used: int,
+    fallback_used: bool,
+) -> dict[str, Any]:
+    """Persist a code-owned admission receipt separate from the LLM opinion."""
+
+    if decision not in {"pass", "degraded_safe", "block"}:
+        raise ValueError("Unknown final semantic admission decision")
+    if reviewer_state not in {"completed", "unavailable", "not_run"}:
+        raise ValueError("Unknown final semantic reviewer state")
+    requested_decision = decision
+    publication_requested = requested_decision in {"pass", "degraded_safe"}
+    deterministic_target = (
+        selected_report
+        if isinstance(selected_report, dict)
+        else reviewed_candidate
+    )
+    recomputed_deterministic_errors = _deterministic_final_report_errors(
+        deterministic_target,
+        public_report,
+        evidence_document=semantic_evidence_document,
+    )
+    admission_integrity_error: str | None = None
+    if publication_requested and not isinstance(selected_report, dict):
+        admission_integrity_error = (
+            "Publishable semantic admission has no selected report"
+        )
+    elif publication_requested and recomputed_deterministic_errors:
+        admission_integrity_error = (
+            "Publishable semantic admission failed recomputed deterministic checks"
+        )
+    # The caller argument is retained for API compatibility and diagnostics,
+    # but it never authorizes publication.  The receipt records only checks
+    # recomputed here from the exact selected bytes.
+    _ = deterministic_errors
+    if admission_integrity_error is not None:
+        decision = "block"
+    reviewed_sha256 = _stable_json_sha256(reviewed_candidate)
+    public_snapshot = copy.deepcopy(public_report)
+    public_snapshot.pop("_analysis_foundation", None)
+    selected_sha256 = (
+        _stable_json_sha256(selected_report)
+        if isinstance(selected_report, dict)
+        else None
+    )
+    receipt_core = {
+        "version": FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+        "run_id": run_id,
+        "requested_decision": requested_decision,
+        "decision": decision,
+        "quality_state": (
+            "complete"
+            if decision == "pass"
+            else "degraded"
+            if decision == "degraded_safe"
+            else "blocked"
+        ),
+        "reviewer_has_hard_veto": False,
+        "reviewer_state": reviewer_state,
+        "reviewer_verdict": review.get("verdict") if isinstance(review, dict) else None,
+        "review_sha256": (
+            _stable_json_sha256(review) if isinstance(review, dict) else None
+        ),
+        "reviewed_candidate_sha256": reviewed_sha256,
+        "selected_report_sha256": selected_sha256,
+        "public_report_sha256": _stable_json_sha256(public_report),
+        "public_snapshot_sha256": _stable_json_sha256(public_snapshot),
+        "semantic_evidence_document_sha256": _stable_json_sha256(
+            semantic_evidence_document
+        ),
+        "deterministic_checks_passed": not recomputed_deterministic_errors,
+        "deterministic_errors": list(recomputed_deterministic_errors),
+        "reviewer_findings": list(reviewer_findings),
+        "degraded_reason_codes": list(dict.fromkeys(degraded_reason_codes)),
+        "repair_attempts_used": repair_attempts_used,
+        "repair_budget": MAX_FINAL_REPORT_REPAIRS,
+        "fallback_to_deterministically_safe_candidate": fallback_used,
+    }
+    receipt = {
+        **receipt_core,
+        "receipt_sha256": _stable_json_sha256(receipt_core),
+    }
+    artifact_key = (
+        FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX
+        + receipt["receipt_sha256"][:32]
+    )
+    receipt["artifact_key"] = artifact_key
+    artifact_input = {
+        "version": FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+        "run_id": run_id,
+        "reviewed_candidate_sha256": reviewed_sha256,
+        "selected_report_sha256": selected_sha256,
+        "public_report_sha256": receipt["public_report_sha256"],
+        "public_snapshot_sha256": receipt["public_snapshot_sha256"],
+        "semantic_evidence_document_sha256": receipt[
+            "semantic_evidence_document_sha256"
+        ],
+        "receipt_sha256": receipt["receipt_sha256"],
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key=artifact_key,
+        status="failed" if decision == "block" else "completed",
+        model=None,
+        input_json=artifact_input,
+        output_json=receipt,
+        error_message=(
+            "Deterministic final semantic checks blocked publication"
+            if decision == "block"
+            else None
+        ),
+        prompt_version=FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+    )
+    if admission_integrity_error is not None:
+        raise _FinalSemanticAuditIntegrityError(admission_integrity_error)
+    return receipt
+
+
+def _final_report_semantic_admission_artifact_errors(
+    artifact: RunArtifact | None,
+    *,
+    run_id: str,
+    selected_report: dict[str, Any],
+    public_report: dict[str, Any],
+) -> list[str]:
+    """Revalidate the exact semantic admission artifact used for publication."""
+
+    if artifact is None:
+        return ["final_report_semantic_admission_missing"]
+    errors: list[str] = []
+    receipt = artifact.output_json
+    if not isinstance(receipt, dict):
+        return ["final_report_semantic_admission_output_missing"]
+    receipt_core = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"artifact_key", "receipt_sha256"}
+    }
+    receipt_sha256 = str(receipt.get("receipt_sha256") or "")
+    expected_artifact_key = (
+        FINAL_REPORT_SEMANTIC_ADMISSION_PREFIX + receipt_sha256[:32]
+    )
+    selected_sha256 = _stable_json_sha256(selected_report)
+    public_snapshot_sha256 = _stable_json_sha256(public_report)
+    expected_input = {
+        "version": FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+        "run_id": run_id,
+        "reviewed_candidate_sha256": receipt.get(
+            "reviewed_candidate_sha256"
+        ),
+        "selected_report_sha256": selected_sha256,
+        "public_report_sha256": receipt.get("public_report_sha256"),
+        "public_snapshot_sha256": public_snapshot_sha256,
+        "semantic_evidence_document_sha256": receipt.get(
+            "semantic_evidence_document_sha256"
+        ),
+        "receipt_sha256": receipt_sha256,
+    }
+    if artifact.run_id != run_id or receipt.get("run_id") != run_id:
+        errors.append("final_report_semantic_admission_run_mismatch")
+    if artifact.stage_key != "report":
+        errors.append("final_report_semantic_admission_stage_mismatch")
+    if artifact.status != "completed":
+        errors.append("final_report_semantic_admission_not_completed")
+    if artifact.model is not None:
+        errors.append("final_report_semantic_admission_model_mismatch")
+    if artifact.prompt_version != FINAL_REPORT_SEMANTIC_ADMISSION_VERSION:
+        errors.append("final_report_semantic_admission_version_mismatch")
+    if receipt.get("version") != FINAL_REPORT_SEMANTIC_ADMISSION_VERSION:
+        errors.append("final_report_semantic_admission_receipt_version_mismatch")
+    if receipt_sha256 != _stable_json_sha256(receipt_core):
+        errors.append("final_report_semantic_admission_digest_mismatch")
+    if (
+        artifact.artifact_key != expected_artifact_key
+        or receipt.get("artifact_key") != expected_artifact_key
+    ):
+        errors.append("final_report_semantic_admission_key_mismatch")
+    if artifact.input_json != expected_input:
+        errors.append("final_report_semantic_admission_input_mismatch")
+    if receipt.get("decision") not in {"pass", "degraded_safe"}:
+        errors.append("final_report_semantic_admission_not_publishable")
+    if receipt.get("requested_decision") != receipt.get("decision"):
+        errors.append("final_report_semantic_admission_requested_decision_mismatch")
+    if (
+        receipt.get("deterministic_checks_passed") is not True
+        or receipt.get("deterministic_errors") != []
+    ):
+        errors.append("final_report_semantic_admission_checks_failed")
+    if receipt.get("reviewer_has_hard_veto") is not False:
+        errors.append("final_report_semantic_admission_reviewer_veto_invalid")
+    if receipt.get("selected_report_sha256") != selected_sha256:
+        errors.append("final_report_semantic_admission_report_mismatch")
+    if receipt.get("public_snapshot_sha256") != public_snapshot_sha256:
+        errors.append("final_report_semantic_admission_public_report_mismatch")
+    if not re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(receipt.get("public_report_sha256") or ""),
+    ):
+        errors.append("final_report_semantic_admission_full_report_digest_invalid")
+    if not re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(receipt.get("semantic_evidence_document_sha256") or ""),
+    ):
+        errors.append("final_report_semantic_admission_evidence_digest_invalid")
+    return list(dict.fromkeys(errors))
+
+
 def _final_editor_protected_terms(
     public_report: dict[str, Any],
 ) -> list[str]:
@@ -39634,7 +42058,11 @@ async def _edit_final_report_language(
                 audit=cached_audit,
                 cache_input=cache_input,
             )
-            and not _validate_final_report(cached_report)
+            and not _deterministic_final_report_errors(
+                cached_report,
+                public_report,
+                evidence_document=semantic_evidence_document,
+            )
         ):
             return copy.deepcopy(cached_report)
 
@@ -39718,7 +42146,11 @@ async def _edit_final_report_language(
             protected_terms=cache_input["protected_terms"],
             concurrency=max(1, min(4, PROCESSING_BATCH_CONCURRENCY)),
         )
-        errors = _validate_final_report(edited)
+        errors = _deterministic_final_report_errors(
+            edited,
+            public_report,
+            evidence_document=semantic_evidence_document,
+        )
         semantic_review: dict[str, Any] | None = None
         semantic_binding = {
             "semantic_gate_version": REPORT_SEMANTIC_GATE_VERSION,
@@ -40039,119 +42471,334 @@ report_data. Строку с context_access=metadata_only разрешено и�
         else:
             candidate = final_cache_candidate
 
-        semantic_attempt = 1
-        semantic_review = await _final_report_semantic_review_artifact(
-            run_id,
-            public_report=public_report,
-            candidate_report=candidate,
-            selected_answer_context=payload["selected_full_answers"],
-            answer_selection_manifest=payload["answer_selection_manifest"],
-            attempt=semantic_attempt,
-        )
-        last_errors = report_semantic_blockers(
+        async def complete_report(
+            value: dict[str, Any],
+            *,
+            raw_text: str | None,
+            usage: dict[str, Any] | None,
+            already_cached: bool,
+        ) -> dict[str, Any]:
+            if not already_cached:
+                await _save_artifact(
+                    run_id,
+                    stage_key="report",
+                    artifact_key="final_report",
+                    status="completed",
+                    model=ANALYSIS_MODEL,
+                    input_json=payload,
+                    output_json=value,
+                    raw_text=raw_text,
+                    usage_json=usage,
+                    prompt_version=FINAL_REPORT_VERSION,
+                )
+            return await finalize_language(value)
+
+        # The reviewer is advisory.  Every candidate that passes the code-owned
+        # structure, semantic-state and typed-literal guards is a safe fallback;
+        # model findings may spend the bounded repair budget, but they cannot
+        # veto that candidate after the budget is exhausted.
+        deterministic_errors = _deterministic_final_report_errors(
             candidate,
             public_report,
-            semantic_review,
             evidence_document=semantic_evidence_document,
         )
-        if not last_errors:
-            if final_cache_candidate is not None:
-                return await finalize_language(candidate)
-            await _save_artifact(
-                run_id,
-                stage_key="report",
-                artifact_key="final_report",
-                status="completed",
-                model=ANALYSIS_MODEL,
-                input_json=payload,
-                output_json=candidate,
-                raw_text=candidate_raw_text,
-                usage_json=candidate_usage,
-                prompt_version=FINAL_REPORT_VERSION,
+        last_deterministic_errors = list(deterministic_errors)
+        last_safe: tuple[
+            dict[str, Any],
+            str | None,
+            dict[str, Any] | None,
+            bool,
+        ] | None = None
+        outage_fallback: tuple[
+            dict[str, Any],
+            str | None,
+            dict[str, Any] | None,
+            bool,
+        ] | None = None
+        if not deterministic_errors:
+            last_safe = (
+                copy.deepcopy(candidate),
+                candidate_raw_text,
+                candidate_usage,
+                final_cache_candidate is not None,
             )
-            return await finalize_language(candidate)
-        if semantic_review.get("verdict") == "block":
-            await _invalidate_blocked_final_report_author_candidate(
-                run_id,
-                payload=model_payload,
-                candidate=candidate,
-                semantic_review=semantic_review,
-                blockers=last_errors,
-            )
-            raise OpenRouterError(
-                "Final report semantic gate blocked publication: "
-                + "; ".join(last_errors)
-            )
+            outage_fallback = last_safe
 
-        rejected_report = candidate
-        last_semantic_review = semantic_review
-        for _attempt in range(MAX_FINAL_REPORT_REPAIRS):
-            user_payload = dict(model_payload)
-            user_payload["validation_errors_to_fix"] = last_errors
-            user_payload["semantic_review_to_fix"] = last_semantic_review
-            user_payload["rejected_report"] = rejected_report
-            user_payload, _repair_input_plan = await _prepare_final_model_payload(
-                run_id,
-                payload=user_payload,
-                system=system,
-                target_model=ANALYSIS_MODEL,
-                stage_key="report",
-                artifact_namespace=(f"final_semantic_repair_input_a{_attempt}"),
-                prompt_version=FINAL_REPORT_VERSION,
-            )
-            result = await _final_report_structured_attempt(
-                run_id,
-                system=system,
-                user_payload=user_payload,
-                artifact_role="semantic_repair",
-                attempt=_attempt,
-            )
-            if not isinstance(result.parsed, dict):
-                last_errors = ["Ответ не является объектом."]
-                continue
-            repaired = _sanitize_headline_emphasis(result.parsed)
-            last_errors = _validate_final_report(repaired)
-            if last_errors:
-                continue
-            semantic_attempt += 1
+        semantic_attempt = 1
+        semantic_review: dict[str, Any] | None = None
+        reviewer_state = "not_run"
+        reviewer_findings: list[str] = []
+        degraded_reason_codes: list[str] = []
+        reviewed_candidate = candidate
+        concrete_reviewer_findings_seen = False
+        unresolved_reviewer_findings: list[str] = []
+        try:
             semantic_review = await _final_report_semantic_review_artifact(
                 run_id,
                 public_report=public_report,
-                candidate_report=repaired,
+                candidate_report=candidate,
                 selected_answer_context=payload["selected_full_answers"],
                 answer_selection_manifest=payload["answer_selection_manifest"],
                 attempt=semantic_attempt,
             )
-            last_errors = report_semantic_blockers(
-                repaired,
+            reviewer_state = "completed"
+            combined_errors = report_semantic_blockers(
+                candidate,
                 public_report,
                 semantic_review,
                 evidence_document=semantic_evidence_document,
             )
-            if last_errors:
-                if semantic_review.get("verdict") == "block":
-                    raise OpenRouterError(
-                        "Final report semantic gate blocked publication: "
-                        + "; ".join(last_errors)
-                    )
-                last_semantic_review = semantic_review
-                rejected_report = repaired
-                continue
-            await _save_artifact(
+            reviewer_findings = [
+                error for error in combined_errors if error not in deterministic_errors
+            ]
+        except _FinalSemanticReviewerUnavailable:
+            reviewer_state = "unavailable"
+            degraded_reason_codes.append("semantic_reviewer_unavailable")
+
+        if reviewer_findings:
+            concrete_reviewer_findings_seen = True
+            unresolved_reviewer_findings = list(reviewer_findings)
+
+        last_errors = list(
+            dict.fromkeys([*deterministic_errors, *reviewer_findings])
+        )
+        if not last_errors:
+            if reviewer_state == "completed":
+                last_safe = (
+                    copy.deepcopy(candidate),
+                    candidate_raw_text,
+                    candidate_usage,
+                    final_cache_candidate is not None,
+                )
+                selected, raw_text, usage, already_cached = last_safe
+                decision = "pass"
+            else:
+                assert outage_fallback is not None
+                selected, raw_text, usage, already_cached = outage_fallback
+                decision = "degraded_safe"
+            await _save_final_report_semantic_admission(
                 run_id,
-                stage_key="report",
-                artifact_key="final_report",
-                status="completed",
-                model=ANALYSIS_MODEL,
-                input_json=payload,
-                output_json=repaired,
-                raw_text=result.text,
-                usage_json=result.usage,
-                prompt_version=FINAL_REPORT_VERSION,
+                decision=decision,
+                selected_report=selected,
+                reviewed_candidate=reviewed_candidate,
+                public_report=public_report,
+                semantic_evidence_document=semantic_evidence_document,
+                deterministic_errors=[],
+                review=semantic_review,
+                reviewer_state=reviewer_state,
+                reviewer_findings=[],
+                degraded_reason_codes=degraded_reason_codes,
+                repair_attempts_used=0,
+                fallback_used=decision == "degraded_safe",
             )
-            return await finalize_language(repaired)
+            return await complete_report(
+                selected,
+                raw_text=raw_text,
+                usage=usage,
+                already_cached=already_cached,
+            )
+
+        if reviewer_findings:
+            degraded_reason_codes.append("semantic_reviewer_unproven_violations")
+        rejected_report = candidate
+        last_semantic_review = semantic_review
+        repair_attempts_used = 0
+        for repair_attempt in range(MAX_FINAL_REPORT_REPAIRS):
+            repair_attempts_used += 1
+            repair_payload = dict(model_payload)
+            repair_payload["validation_errors_to_fix"] = last_errors
+            if isinstance(last_semantic_review, dict):
+                repair_payload["semantic_review_to_fix"] = last_semantic_review
+            repair_payload["rejected_report"] = rejected_report
+            try:
+                prepared_repair, _repair_input_plan = (
+                    await _prepare_final_model_payload(
+                        run_id,
+                        payload=repair_payload,
+                        system=system,
+                        target_model=ANALYSIS_MODEL,
+                        stage_key="report",
+                        artifact_namespace=(
+                            f"final_semantic_repair_input_a{repair_attempt}"
+                        ),
+                        prompt_version=FINAL_REPORT_VERSION,
+                    )
+                )
+                result = await _final_report_structured_attempt(
+                    run_id,
+                    system=system,
+                    user_payload=prepared_repair,
+                    artifact_role="semantic_repair",
+                    attempt=repair_attempt,
+                )
+            except Exception as exc:
+                if (
+                    last_safe is None
+                    or not _semantic_reviewer_failure_is_fail_soft(exc)
+                ):
+                    raise
+                degraded_reason_codes.append("semantic_repair_unavailable")
+                break
+            if not isinstance(result.parsed, dict):
+                last_errors = ["Ответ не является объектом."]
+                last_deterministic_errors = list(last_errors)
+                degraded_reason_codes.append("semantic_repair_invalid_candidate")
+                continue
+            repaired = _sanitize_headline_emphasis(result.parsed)
+            reviewed_candidate = repaired
+            deterministic_errors = _deterministic_final_report_errors(
+                repaired,
+                public_report,
+                evidence_document=semantic_evidence_document,
+            )
+            if deterministic_errors:
+                last_errors = deterministic_errors
+                last_deterministic_errors = list(deterministic_errors)
+                rejected_report = repaired
+                last_semantic_review = None
+                semantic_review = None
+                reviewer_state = "not_run"
+                reviewer_findings = list(unresolved_reviewer_findings)
+                continue
+
+            last_deterministic_errors = []
+            deterministic_candidate = (
+                copy.deepcopy(repaired),
+                result.text,
+                result.usage,
+                False,
+            )
+            # Keep the newest machine-verified candidate before consulting the
+            # advisory reviewer.  A later reviewer outage or an unresolved
+            # model-only finding can then roll back without losing a valid
+            # report; a candidate with any deterministic error never reaches
+            # this assignment.
+            last_safe = deterministic_candidate
+            semantic_attempt += 1
+            try:
+                semantic_review = await _final_report_semantic_review_artifact(
+                    run_id,
+                    public_report=public_report,
+                    candidate_report=repaired,
+                    selected_answer_context=payload["selected_full_answers"],
+                    answer_selection_manifest=payload[
+                        "answer_selection_manifest"
+                    ],
+                    attempt=semantic_attempt,
+                )
+                reviewer_state = "completed"
+                combined_errors = report_semantic_blockers(
+                    repaired,
+                    public_report,
+                    semantic_review,
+                    evidence_document=semantic_evidence_document,
+                )
+                reviewer_findings = list(dict.fromkeys(combined_errors))
+            except _FinalSemanticReviewerUnavailable:
+                semantic_review = None
+                reviewer_state = "unavailable"
+                degraded_reason_codes.append("semantic_reviewer_unavailable")
+                if concrete_reviewer_findings_seen:
+                    reviewer_findings = list(unresolved_reviewer_findings)
+                    last_errors = list(reviewer_findings)
+                    last_semantic_review = None
+                    rejected_report = repaired
+                    degraded_reason_codes.append(
+                        "semantic_reviewer_unavailable_after_findings"
+                    )
+                    continue
+                reviewer_findings = []
+
+            if not reviewer_findings:
+                if reviewer_state == "completed":
+                    last_safe = deterministic_candidate
+                    selected, raw_text, usage, already_cached = last_safe
+                    decision = "pass"
+                else:
+                    selected, raw_text, usage, already_cached = (
+                        deterministic_candidate
+                    )
+                    decision = "degraded_safe"
+                await _save_final_report_semantic_admission(
+                    run_id,
+                    decision=decision,
+                    selected_report=selected,
+                    reviewed_candidate=reviewed_candidate,
+                    public_report=public_report,
+                    semantic_evidence_document=semantic_evidence_document,
+                    deterministic_errors=[],
+                    review=semantic_review,
+                    reviewer_state=reviewer_state,
+                    reviewer_findings=[],
+                    degraded_reason_codes=(
+                        [] if decision == "pass" else degraded_reason_codes
+                    ),
+                    repair_attempts_used=repair_attempts_used,
+                    fallback_used=decision == "degraded_safe",
+                )
+                return await complete_report(
+                    selected,
+                    raw_text=raw_text,
+                    usage=usage,
+                    already_cached=already_cached,
+                )
+            degraded_reason_codes.append(
+                "semantic_reviewer_unproven_violations"
+            )
+            concrete_reviewer_findings_seen = True
+            unresolved_reviewer_findings = list(reviewer_findings)
+            last_errors = reviewer_findings
+            last_semantic_review = semantic_review
+            rejected_report = repaired
+
+        if (
+            concrete_reviewer_findings_seen
+            and repair_attempts_used >= MAX_FINAL_REPORT_REPAIRS
+        ):
+            degraded_reason_codes.append("semantic_repair_exhausted")
+        if last_safe is not None:
+            degraded_reason_codes.append("semantic_safe_rollback")
+            selected, raw_text, usage, already_cached = last_safe
+            await _save_final_report_semantic_admission(
+                run_id,
+                decision="degraded_safe",
+                selected_report=selected,
+                reviewed_candidate=reviewed_candidate,
+                public_report=public_report,
+                semantic_evidence_document=semantic_evidence_document,
+                deterministic_errors=[],
+                review=semantic_review,
+                reviewer_state=reviewer_state,
+                reviewer_findings=reviewer_findings,
+                degraded_reason_codes=degraded_reason_codes,
+                repair_attempts_used=repair_attempts_used,
+                fallback_used=True,
+            )
+            return await complete_report(
+                selected,
+                raw_text=raw_text,
+                usage=usage,
+                already_cached=already_cached,
+            )
+
+        await _save_final_report_semantic_admission(
+            run_id,
+            decision="block",
+            selected_report=None,
+            reviewed_candidate=reviewed_candidate,
+            public_report=public_report,
+            semantic_evidence_document=semantic_evidence_document,
+            deterministic_errors=last_deterministic_errors,
+            review=semantic_review,
+            reviewer_state=reviewer_state,
+            reviewer_findings=reviewer_findings,
+            degraded_reason_codes=degraded_reason_codes,
+            repair_attempts_used=repair_attempts_used,
+            fallback_used=False,
+        )
         raise OpenRouterError(
-            "; ".join(last_errors) or "Final report validation failed"
+            "Final report semantic admission failed: "
+            + "; ".join(last_errors)
         )
     except Exception as exc:
         await _save_artifact(
@@ -41768,6 +44415,160 @@ async def _verified_illustration_asset_receipts(
     return receipts
 
 
+async def _sanitize_optional_report_assets(
+    run_id: str,
+    *,
+    report_json: dict[str, Any],
+    illustrations: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Quarantine broken optional media without weakening report integrity.
+
+    The report snapshot and the separately supplied public illustration rows
+    must agree before this function runs.  That structural binding remains a
+    hard publication boundary.  Once bound, each optional bitmap is admitted
+    independently so a missing file or QA receipt cannot discard the analysis.
+    """
+
+    if not isinstance(report_json, dict):
+        raise PublicationContractError("Report JSON snapshot is invalid")
+    if report_json.get("illustrations") != illustrations:
+        raise PublicationContractError(
+            "Report JSON illustration snapshot does not match publication input"
+        )
+
+    before_sha256 = _stable_json_sha256(report_json)
+    sanitized_report = copy.deepcopy(report_json)
+    published: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    seen_sequences: set[int] = set()
+
+    for position, item in enumerate(illustrations, start=1):
+        sequence = (
+            _non_negative_int(item.get("sequence"))
+            if isinstance(item, dict)
+            else None
+        )
+        reason_code: str | None = None
+        error_type: str | None = None
+        if not isinstance(item, dict):
+            reason_code = "illustration_row_invalid"
+        elif sequence is None or sequence < 1:
+            reason_code = "illustration_sequence_invalid"
+        elif sequence in seen_sequences:
+            reason_code = "illustration_sequence_duplicate"
+        else:
+            seen_sequences.add(sequence)
+            try:
+                receipts = await _verified_illustration_asset_receipts(
+                    run_id,
+                    [item],
+                )
+                if len(receipts) != 1:
+                    reason_code = "illustration_asset_receipt_incomplete"
+                else:
+                    published_item = copy.deepcopy(item)
+                    published_item["sequence"] = sequence
+                    published.append(published_item)
+            except (OSError, PublicationContractError, TypeError, ValueError) as exc:
+                reason_code = "illustration_asset_or_qa_receipt_invalid"
+                error_type = type(exc).__name__
+        if reason_code is not None:
+            rejected_row = {
+                "position": position,
+                "sequence": sequence,
+                "reason_codes": [reason_code],
+            }
+            if error_type is not None:
+                rejected_row["error_type"] = error_type
+            if isinstance(item, dict) and isinstance(item.get("file_url"), str):
+                rejected_row["file_url_sha256"] = hashlib.sha256(
+                    item["file_url"].encode("utf-8")
+                ).hexdigest()
+            rejected.append(rejected_row)
+
+    sanitized_report["illustrations"] = published
+    preview_candidate = sanitized_report.get("site_preview")
+    # The crawler always attempts a first-screen capture.  Its absence is an
+    # optional-asset failure, not evidence that no preview was requested.
+    preview_requested = True
+    preview_published = preview_candidate is not None
+    preview_reason_codes: list[str] = []
+    if preview_candidate is None:
+        preview_reason_codes.append("site_preview_asset_missing")
+    else:
+        try:
+            site_preview_asset_receipt(run_id, preview_candidate)
+        except (OSError, TypeError, ValueError):
+            sanitized_report.pop("site_preview", None)
+            preview_published = False
+            preview_reason_codes.append("site_preview_asset_invalid_or_missing")
+
+    reason_codes = list(
+        dict.fromkeys(
+            [
+                reason
+                for row in rejected
+                for reason in row.get("reason_codes") or []
+            ]
+            + preview_reason_codes
+        )
+    )
+    after_sha256 = _stable_json_sha256(sanitized_report)
+    receipt_core = {
+        "version": OPTIONAL_ASSET_ADMISSION_VERSION,
+        "run_id": run_id,
+        "state": "degraded" if reason_codes else "pass",
+        "degraded": bool(reason_codes),
+        "reason_codes": reason_codes,
+        "report_json_before_sha256": before_sha256,
+        "report_json_after_sha256": after_sha256,
+        "illustrations": {
+            "candidate_count": len(illustrations),
+            "published_count": len(published),
+            "rejected_count": len(rejected),
+            "published_sequences": [
+                int(item["sequence"])
+                for item in published
+                if _non_negative_int(item.get("sequence")) is not None
+            ],
+            "rejected": rejected,
+        },
+        "site_preview": {
+            "requested": preview_requested,
+            "published": preview_published,
+            "reason_codes": preview_reason_codes,
+        },
+    }
+    receipt_sha256 = _stable_json_sha256(receipt_core)
+    artifact_key = OPTIONAL_ASSET_ADMISSION_PREFIX + receipt_sha256
+    receipt = {
+        **receipt_core,
+        "receipt_sha256": receipt_sha256,
+        "artifact_key": artifact_key,
+    }
+    await _save_artifact(
+        run_id,
+        stage_key="report",
+        artifact_key=artifact_key,
+        status="completed",
+        model=None,
+        input_json={
+            "report_json_before_sha256": before_sha256,
+            "optional_asset_policy_version": OPTIONAL_ASSET_ADMISSION_VERSION,
+        },
+        output_json=receipt,
+        error_message=(", ".join(reason_codes) if reason_codes else None),
+        prompt_version=OPTIONAL_ASSET_ADMISSION_VERSION,
+    )
+    if reason_codes:
+        logger.warning(
+            "Optional report assets degraded for run %s: %s",
+            run_id,
+            ", ".join(reason_codes),
+        )
+    return sanitized_report, published, receipt
+
+
 async def _revalidate_reused_illustration_assets(
     run_id: str,
     *,
@@ -43119,6 +45920,15 @@ async def _finish_saved_answer_analysis(
         "illustrations": illustrations,
         **({"site_preview": site_preview} if site_preview else {}),
     }
+    (
+        report_json,
+        illustrations,
+        optional_asset_admission,
+    ) = await _sanitize_optional_report_assets(
+        run_id,
+        report_json=report_json,
+        illustrations=illustrations,
+    )
     reader_copy_manifest = await _save_reader_copy_manifest(
         run_id,
         final_report=final,
@@ -43126,6 +45936,7 @@ async def _finish_saved_answer_analysis(
         illustrations=illustrations,
         analysis_markdown=markdown,
         report_json=report_json,
+        optional_asset_admission=optional_asset_admission,
     )
     owner = lease_owner_for(run_id)
     report_conditions = [Run.id == run_id]

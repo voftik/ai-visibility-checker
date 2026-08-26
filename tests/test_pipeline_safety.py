@@ -59,6 +59,7 @@ from app.services.panel_coverage import build_panel_metric_coverage_admission
 from app.services.openrouter import (
     OUTPUT_ENVELOPE_VERSION,
     WEB_ATTESTATION_VERSION,
+    OpenRouterAuditCheckpointError,
     OpenRouterOutputLimitError,
     OpenRouterError,
     OpenRouterPolicyError,
@@ -143,6 +144,7 @@ from app.services.analyzer import (
     _evidence_contains_complete_alias,
     _evidence_is_literal,
     _ensure_answer_rows,
+    _FinalSemanticReviewerUnavailable,
     _expected_corpus_cells,
     _final_corpus_manifest,
     _final_input_deterministic_passthrough,
@@ -152,6 +154,7 @@ from app.services.analyzer import (
     _final_model_input_window,
     _normalize_final_evidence_packet,
     _normalize_final_root_summary_packet,
+    _final_root_tokens_are_grounded,
     _final_root_fact_refs,
     _final_root_fact_table,
     _final_root_parent_node,
@@ -231,7 +234,9 @@ from app.services.analyzer import (
     _run_report_branches,
     _run_reused_report_branches,
     _rows_from_full_answer_models,
+    _sanitize_optional_report_assets,
     _sanitize_headline_emphasis,
+    _semantic_reviewer_failure_is_fail_soft,
     _select_final_answer_context,
     _site_context,
     _stable_json_sha256,
@@ -243,6 +248,10 @@ from app.services.analyzer import (
     analyze_run,
     MarketResearchGateError,
     PanelCheckpointMismatchError,
+)
+from app.services.publication_contract import (
+    OPTIONAL_ASSET_ADMISSION_PREFIX,
+    PublicationContractError,
 )
 from app.services.report_editor import (
     edit_report,
@@ -7275,6 +7284,160 @@ class IllustrationPublicationSubsetTests(unittest.IsolatedAsyncioTestCase):
                             await session.commit()
 
 
+class OptionalReportAssetAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quarantines_only_broken_optional_assets_and_seals_receipt(
+        self,
+    ) -> None:
+        valid = {
+            "sequence": 1,
+            "title": "Рабочая схема",
+            "caption": "Подпись",
+            "alt_text": "Описание",
+            "file_url": "/static/generated/run-id/01.png",
+        }
+        broken = {
+            "sequence": 2,
+            "title": "Повреждённая схема",
+            "caption": "Подпись",
+            "alt_text": "Описание",
+            "file_url": "/static/generated/run-id/02.png",
+        }
+        preview = {"file_url": "/static/generated/run-id/preview.jpg"}
+        report_json = {
+            "narrative": {"headline": "Готовый аналитический отчёт"},
+            "illustrations": [valid, broken],
+            "site_preview": preview,
+        }
+
+        async def verify(_run_id: str, rows: list[dict[str, Any]]) -> list[dict]:
+            if rows[0]["sequence"] == 2:
+                raise PublicationContractError("QA receipt is missing")
+            return [{"sequence": 1, "qa_verified": True}]
+
+        with (
+            patch(
+                "app.services.analyzer._verified_illustration_asset_receipts",
+                new=AsyncMock(side_effect=verify),
+            ),
+            patch(
+                "app.services.analyzer.site_preview_asset_receipt",
+                side_effect=ValueError("site_preview_asset_invalid"),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            sanitized, illustrations, receipt = (
+                await _sanitize_optional_report_assets(
+                    "run-id",
+                    report_json=report_json,
+                    illustrations=[valid, broken],
+                )
+            )
+
+        self.assertEqual(illustrations, [valid])
+        self.assertEqual(sanitized["illustrations"], [valid])
+        self.assertNotIn("site_preview", sanitized)
+        self.assertEqual(report_json["illustrations"], [valid, broken])
+        self.assertIn("site_preview", report_json)
+        self.assertEqual(receipt["state"], "degraded")
+        self.assertTrue(receipt["degraded"])
+        self.assertEqual(
+            receipt["reason_codes"],
+            [
+                "illustration_asset_or_qa_receipt_invalid",
+                "site_preview_asset_invalid_or_missing",
+            ],
+        )
+        self.assertEqual(receipt["illustrations"]["published_sequences"], [1])
+        self.assertEqual(receipt["illustrations"]["rejected_count"], 1)
+        self.assertFalse(receipt["site_preview"]["published"])
+        receipt_core = {
+            key: value
+            for key, value in receipt.items()
+            if key not in {"artifact_key", "receipt_sha256"}
+        }
+        self.assertEqual(receipt["receipt_sha256"], _stable_json_sha256(receipt_core))
+        self.assertEqual(
+            receipt["artifact_key"],
+            OPTIONAL_ASSET_ADMISSION_PREFIX + receipt["receipt_sha256"],
+        )
+        save_artifact.assert_awaited_once()
+        saved = save_artifact.await_args.kwargs
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["output_json"], receipt)
+
+    async def test_report_illustration_snapshot_mismatch_remains_hard_failure(
+        self,
+    ) -> None:
+        public_row = {
+            "sequence": 1,
+            "file_url": "/static/generated/run-id/01.png",
+        }
+        with (
+            patch(
+                "app.services.analyzer._verified_illustration_asset_receipts",
+                new_callable=AsyncMock,
+            ) as verify,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            with self.assertRaises(PublicationContractError):
+                await _sanitize_optional_report_assets(
+                    "run-id",
+                    report_json={"illustrations": []},
+                    illustrations=[public_row],
+                )
+
+        verify.assert_not_awaited()
+        save_artifact.assert_not_awaited()
+
+    async def test_missing_preview_degrades_without_blocking_report(self) -> None:
+        report_json = {
+            "narrative": {"headline": "Готовый аналитический отчёт"},
+            "illustrations": [],
+        }
+        with (
+            patch(
+                "app.services.analyzer._verified_illustration_asset_receipts",
+                new_callable=AsyncMock,
+            ) as verify,
+            patch(
+                "app.services.analyzer.site_preview_asset_receipt",
+            ) as preview_receipt,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            sanitized, illustrations, receipt = (
+                await _sanitize_optional_report_assets(
+                    "run-id",
+                    report_json=report_json,
+                    illustrations=[],
+                )
+            )
+
+        self.assertEqual(sanitized, report_json)
+        self.assertEqual(illustrations, [])
+        self.assertEqual(receipt["state"], "degraded")
+        self.assertEqual(receipt["reason_codes"], ["site_preview_asset_missing"])
+        self.assertEqual(
+            receipt["site_preview"],
+            {
+                "requested": True,
+                "published": False,
+                "reason_codes": ["site_preview_asset_missing"],
+            },
+        )
+        verify.assert_not_awaited()
+        preview_receipt.assert_not_called()
+        save_artifact.assert_awaited_once()
+
+
 class ReaderCopyManifestTests(unittest.TestCase):
     @staticmethod
     def _accepted_receipts() -> dict[str, dict[str, object]]:
@@ -7284,7 +7447,7 @@ class ReaderCopyManifestTests(unittest.TestCase):
             "illustrations": {"accepted": True, "reasons": []},
         }
 
-    def test_gate_blocks_lint_findings_and_incomplete_editorial_receipts(
+    def test_gate_degrades_copy_quality_but_blocks_snapshot_or_receipt_tamper(
         self,
     ) -> None:
         publication = {"blocking_reasons": []}
@@ -7301,7 +7464,7 @@ class ReaderCopyManifestTests(unittest.TestCase):
         self.assertEqual(accepted["decision"], "pass")
         self.assertTrue(accepted["quality_complete"])
 
-        lint_blocked = _reader_copy_gate_decision(
+        lint_degraded = _reader_copy_gate_decision(
             publication=publication,
             lint={
                 **clean_lint,
@@ -7310,24 +7473,79 @@ class ReaderCopyManifestTests(unittest.TestCase):
             },
             receipts=self._accepted_receipts(),
         )
-        self.assertEqual(lint_blocked["decision"], "block")
-        self.assertIn("blocking_copy_lint", lint_blocked["blocking_reasons"])
+        self.assertEqual(lint_degraded["decision"], "degraded_safe")
+        self.assertEqual(lint_degraded["blocking_reasons"], [])
+        self.assertIn("copy_lint_findings", lint_degraded["degraded_reasons"])
+
+        truncated_lint = _reader_copy_gate_decision(
+            publication=publication,
+            lint={
+                **clean_lint,
+                "omitted_issue_count": 9,
+            },
+            receipts=self._accepted_receipts(),
+        )
+        self.assertEqual(truncated_lint["decision"], "degraded_safe")
+        self.assertIn(
+            "copy_lint_not_exhaustive",
+            truncated_lint["degraded_reasons"],
+        )
 
         receipts = self._accepted_receipts()
         receipts["technical_review"] = {
             "accepted": False,
             "reasons": ["quality_incomplete"],
         }
-        receipt_blocked = _reader_copy_gate_decision(
+        receipt_degraded = _reader_copy_gate_decision(
             publication=publication,
             lint=clean_lint,
             receipts=receipts,
         )
-        self.assertEqual(receipt_blocked["decision"], "block")
+        self.assertEqual(receipt_degraded["decision"], "degraded_safe")
         self.assertIn(
             "technical_review_receipt_incomplete",
-            receipt_blocked["blocking_reasons"],
+            receipt_degraded["degraded_reasons"],
         )
+        self.assertEqual(receipt_degraded["blocking_reasons"], [])
+
+        receipts = self._accepted_receipts()
+        receipts["optional_assets"] = {
+            "accepted": False,
+            "reasons": ["site_preview_asset_missing"],
+        }
+        optional_asset_degraded = _reader_copy_gate_decision(
+            publication=publication,
+            lint=clean_lint,
+            receipts=receipts,
+        )
+        self.assertEqual(optional_asset_degraded["decision"], "degraded_safe")
+        self.assertIn(
+            "optional_assets_receipt_incomplete",
+            optional_asset_degraded["degraded_reasons"],
+        )
+        self.assertEqual(optional_asset_degraded["blocking_reasons"], [])
+
+        receipts["technical_review"] = {
+            "accepted": False,
+            "reasons": ["published_digest_mismatch"],
+        }
+        receipt_tamper = _reader_copy_gate_decision(
+            publication=publication,
+            lint=clean_lint,
+            receipts=receipts,
+        )
+        self.assertEqual(receipt_tamper["decision"], "block")
+        self.assertIn(
+            "technical_review:published_digest_mismatch",
+            receipt_tamper["blocking_reasons"],
+        )
+
+        snapshot_mismatch = _reader_copy_gate_decision(
+            publication={"blocking_reasons": ["report_json_snapshot_mismatch"]},
+            lint=clean_lint,
+            receipts=self._accepted_receipts(),
+        )
+        self.assertEqual(snapshot_mismatch["decision"], "block")
 
     def test_illustration_copy_receipt_accepts_verified_one_or_two_row_subset(
         self,
@@ -8818,6 +9036,468 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             1 + PROCESSING_BATCH_CONCURRENCY,
         )
 
+    async def test_incomplete_mapper_pack_splits_without_losing_claims(
+        self,
+    ) -> None:
+        payload = {
+            "report_data": {
+                "notes": [f"Содержательный вывод {index}" for index in range(4)]
+            }
+        }
+        successful_mapper = self._successful_mapper()
+        parent_sizes: list[int] = []
+
+        def one_pack(
+            units: list[dict[str, Any]],
+            **_kwargs: Any,
+        ) -> list[list[dict[str, Any]]]:
+            return [units]
+
+        async def partial_then_complete(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            source_units = user_payload.get("source_units")
+            if isinstance(source_units, list):
+                parent_sizes.append(len(source_units))
+                if len(source_units) > 2:
+                    accepted_units = source_units[:2]
+                    accepted_ids = {
+                        str(unit["source_unit_id"]) for unit in accepted_units
+                    }
+                    accepted_claims = [
+                        claim
+                        for claim in user_payload.get("source_claims") or []
+                        if str(claim["source_unit_id"]) in accepted_ids
+                    ]
+                    return self._packet_for_units(
+                        accepted_units,
+                        source_claims=accepted_claims,
+                    )
+            return await successful_mapper(*_args, **kwargs)
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._pack_final_input_units",
+                side_effect=one_pack,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=partial_then_complete,
+            ),
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertEqual(parent_sizes[:3], [4, 2, 2])
+        self.assertEqual(plan["covered_claim_count"], plan["source_claim_count"])
+        self.assertEqual(
+            model_payload["long_input_contract"]["covered_unit_count"],
+            plan["source_unit_count"],
+        )
+        self.assertEqual(
+            len(model_payload["evidence_digest"]["claim_coverage"]),
+            plan["source_claim_count"],
+        )
+        split_outputs = [
+            call.kwargs.get("output_json")
+            for call in save_artifact.await_args_list
+            if "_map_split_" in str(call.kwargs.get("artifact_key") or "")
+        ]
+        self.assertTrue(split_outputs)
+        self.assertTrue(split_outputs[-1]["coverage_complete"])
+
+    async def test_saved_split_reconciles_partial_parent_after_crash(
+        self,
+    ) -> None:
+        payload = {
+            "report_data": {
+                "notes": [f"Содержательный вывод {index}" for index in range(4)]
+            }
+        }
+        persisted: dict[str, Any] = {}
+        parent_artifact_key: str | None = None
+        successful_mapper = self._successful_mapper()
+
+        def one_pack(
+            units: list[dict[str, Any]],
+            **_kwargs: Any,
+        ) -> list[list[dict[str, Any]]]:
+            return [units]
+
+        async def partial_parent(
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal parent_artifact_key
+            user_payload = kwargs["user_payload"]
+            units = list(user_payload.get("source_units") or [])
+            if len(units) > 2:
+                parent_artifact_key = str(kwargs["artifact_key"])
+                accepted_units = units[:2]
+                accepted_ids = {
+                    str(unit["source_unit_id"]) for unit in accepted_units
+                }
+                accepted_claims = [
+                    claim
+                    for claim in user_payload.get("source_claims") or []
+                    if str(claim["source_unit_id"]) in accepted_ids
+                ]
+                return self._packet_for_units(
+                    accepted_units,
+                    source_claims=accepted_claims,
+                )
+            return await successful_mapper(*args, **kwargs)
+
+        async def persist_then_crash(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> None:
+            output = kwargs.get("output_json")
+            artifact_key = str(kwargs.get("artifact_key") or "")
+            if (
+                "_map_split_" in artifact_key
+                and isinstance(output, dict)
+                and output.get("coverage_complete") is False
+            ):
+                persisted["artifact_key"] = artifact_key
+                persisted["output"] = copy.deepcopy(output)
+                raise RuntimeError("simulated crash after persisted split plan")
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._pack_final_input_units",
+                side_effect=one_pack,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=partial_parent,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+                side_effect=persist_then_crash,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "simulated crash after persisted split plan",
+            ):
+                await _prepare_final_model_payload(
+                    "run-id",
+                    payload=payload,
+                    system="author",
+                    force_hierarchical=True,
+                )
+
+        self.assertIsNotNone(parent_artifact_key)
+        self.assertIn("output", persisted)
+
+        async def saved_split_output(
+            _run_id: str,
+            artifact_key: str,
+            **_kwargs: Any,
+        ) -> dict[str, Any] | None:
+            if artifact_key == persisted["artifact_key"]:
+                return copy.deepcopy(persisted["output"])
+            return None
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                side_effect=saved_split_output,
+            ),
+            patch(
+                "app.services.analyzer._pack_final_input_units",
+                side_effect=one_pack,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=successful_mapper,
+            ) as structured_artifact,
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+        ):
+            _model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertEqual(plan["covered_claim_count"], plan["source_claim_count"])
+        self.assertTrue(
+            any(
+                call.kwargs.get("artifact_key") == parent_artifact_key
+                and call.kwargs.get("status") == "failed"
+                and call.kwargs.get("preserve_existing_evidence") is True
+                for call in save_artifact.await_args_list
+            )
+        )
+        self.assertFalse(
+            any(
+                call.kwargs.get("artifact_key") == parent_artifact_key
+                for call in structured_artifact.await_args_list
+            )
+        )
+
+    async def test_incomplete_singleton_mapper_leaf_fails_once_without_loop(
+        self,
+    ) -> None:
+        async def incomplete_mapper(
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            return {
+                "observations": [],
+                "uncertainties": [],
+                "report_focus": [],
+                "unit_coverage": [],
+                "claim_coverage": [],
+            }
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=incomplete_mapper,
+            ) as structured_artifact,
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "incomplete dependent coverage",
+            ):
+                await _prepare_final_model_payload(
+                    "run-id",
+                    payload={"report_data": {"note": "Содержательный вывод"}},
+                    system="author",
+                    force_hierarchical=True,
+                )
+
+        self.assertEqual(structured_artifact.await_count, 1)
+        self.assertFalse(
+            any(
+                "_map_split_" in str(call.kwargs.get("artifact_key") or "")
+                for call in save_artifact.await_args_list
+            )
+        )
+
+    async def test_mapper_unknown_identity_is_hard_failure_not_split(self) -> None:
+        async def invented_identity(
+            *_args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            packet = self._packet_for_units(
+                user_payload["source_units"],
+                source_claims=user_payload.get("source_claims"),
+            )
+            packet["observations"][0]["source_claim_ids"] = ["invented-claim"]
+            return packet
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=invented_identity,
+            ) as structured_artifact,
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "invented source identities",
+            ):
+                await _prepare_final_model_payload(
+                    "run-id",
+                    payload={
+                        "report_data": {
+                            "notes": ["Первый вывод", "Второй вывод"]
+                        }
+                    },
+                    system="author",
+                    force_hierarchical=True,
+                )
+
+        self.assertEqual(structured_artifact.await_count, 1)
+        self.assertFalse(
+            any(
+                "_map_split_" in str(call.kwargs.get("artifact_key") or "")
+                for call in save_artifact.await_args_list
+            )
+        )
+
+    async def test_mapper_pack_workload_is_bounded_by_claim_count(self) -> None:
+        successful_mapper = self._successful_mapper()
+        mapper_claim_counts: list[int] = []
+
+        async def capture_workload(
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            if "source_units" in user_payload:
+                mapper_claim_counts.append(len(user_payload.get("source_claims") or []))
+            return await successful_mapper(*args, **kwargs)
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=capture_workload,
+            ),
+        ):
+            _model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload={
+                    "report_data": {
+                        "notes": [
+                            f"Содержательный вывод {index}" for index in range(17)
+                        ]
+                    }
+                },
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertGreater(len(mapper_claim_counts), 1)
+        self.assertTrue(all(0 < count <= 8 for count in mapper_claim_counts))
+        self.assertEqual(sum(mapper_claim_counts), plan["source_claim_count"])
+
+    async def test_long_cyrillic_scalar_is_split_into_atomic_mapper_units(
+        self,
+    ) -> None:
+        successful_mapper = self._successful_mapper()
+        mapper_claim_counts: list[int] = []
+        mapper_unit_claim_counts: list[list[int]] = []
+
+        async def capture_workload(
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            if "source_units" in user_payload:
+                claims = list(user_payload.get("source_claims") or [])
+                mapper_claim_counts.append(len(claims))
+                counts = Counter(str(claim["source_unit_id"]) for claim in claims)
+                mapper_unit_claim_counts.append(list(counts.values()))
+            return await successful_mapper(*args, **kwargs)
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=capture_workload,
+            ),
+        ):
+            _model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload={"report_data": {"note": "я" * 32_000}},
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertGreater(len(mapper_claim_counts), 1)
+        self.assertTrue(all(0 < count <= 8 for count in mapper_claim_counts))
+        self.assertTrue(
+            all(count == 1 for pack in mapper_unit_claim_counts for count in pack)
+        )
+        self.assertEqual(sum(mapper_claim_counts), plan["source_claim_count"])
+
     @staticmethod
     def _packet_for_units(
         units: list[dict[str, Any]],
@@ -8970,6 +9650,560 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(reconstructed, source)
+
+    def test_mapper_allows_explanatory_metadata_without_weakening_lineage(
+        self,
+    ) -> None:
+        digest = (
+            "d674ba10bb17d62062c8bf2fc7271a08"
+            "eaf493b36c7658b061886bcd0f1592b3"
+        )
+        units, _manifest = _flatten_final_input_payload(
+            {"answer_corpus_manifest": {"critic_rows_sha256": digest}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["observations"][0]["statement"] = (
+            "Поле critic_rows_sha256 содержит технический 64-символьный "
+            "идентификатор; само по себе оно не измеряет AI visibility."
+        )
+        packet["observations"][0]["exact_values"] = []
+
+        normalized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths={
+                str(unit["source_unit_id"]): str(unit["source_path"])
+                for unit in units
+            },
+            allowed_claims={
+                str(claim["claim_id"]): claim for claim in claim_rows
+            },
+            claim_objects=claim_objects,
+        )
+
+        self.assertEqual(
+            normalized["observations"][0]["evidence_excerpt"],
+            digest[:40],
+        )
+        self.assertEqual(
+            normalized["observations"][0]["source_claim_ids"],
+            [str(claim_rows[0]["claim_id"])],
+        )
+
+    def test_mapper_still_rejects_ungrounded_assertion_grade_literals(
+        self,
+    ) -> None:
+        digest = (
+            "d674ba10bb17d62062c8bf2fc7271a08"
+            "eaf493b36c7658b061886bcd0f1592b3"
+        )
+        units, _manifest = _flatten_final_input_payload(
+            {"answer_corpus_manifest": {"critic_rows_sha256": digest}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        base = self._packet_for_units(units, source_claims=claim_rows)
+        base["observations"][0]["exact_values"] = []
+
+        for statement in (
+            "Видимость достигла 99,9%.",
+            "Бюджет составил 5000 ₽.",
+            "Источник: https://invented.example/report.",
+            "Статус проверки complete.",
+            "Ответ дала модель openai/gpt-99-invented.",
+        ):
+            with self.subTest(statement=statement):
+                packet = copy.deepcopy(base)
+                packet["observations"][0]["statement"] = statement
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "invented an exact literal or state",
+                ):
+                    _normalize_final_evidence_packet(
+                        packet,
+                        allowed_unit_paths={
+                            str(unit["source_unit_id"]): str(unit["source_path"])
+                            for unit in units
+                        },
+                        allowed_claims={
+                            str(claim["claim_id"]): claim for claim in claim_rows
+                        },
+                        claim_objects=claim_objects,
+                    )
+
+    def test_typed_literal_grounding_uses_exact_semantic_classes(self) -> None:
+        self.assertTrue(
+            _final_root_tokens_are_grounded(
+                (
+                    "GEMINI показывает 66,7%; источник "
+                    "https://example.com/audit. Пояснение про AI-доступность "
+                    "может быть сформулировано свободно."
+                ),
+                source_texts=[
+                    (
+                        "Google Gemini: 66.7%. Источник "
+                        "https://example.com/audit"
+                    )
+                ],
+            )
+        )
+        self.assertTrue(
+            _final_root_tokens_are_grounded(
+                "Хэш описан как технический 64-символьный идентификатор.",
+                source_texts=["d674ba10bb17d62062c8bf2fc7271a08"],
+            )
+        )
+        self.assertTrue(
+            _final_root_tokens_are_grounded(
+                "Получено 1500 ответов; пара web/memory обработана.",
+                source_texts=[
+                    "Получено 1\u202f500 ответов; режим web/memory сравнивается."
+                ],
+            )
+        )
+        self.assertTrue(
+            _final_root_tokens_are_grounded(
+                (
+                    "Сдвиг 5 p. p.; бюджет 100 USD; статус unavailable; "
+                    "модель openai/gpt-5.6-terra."
+                ),
+                source_texts=[
+                    (
+                        "Сдвиг 5 percentage points; бюджет $100; "
+                        "статус not available; модель openai/gpt-5.6-terra."
+                    )
+                ],
+            )
+        )
+        self.assertTrue(
+            _final_root_tokens_are_grounded(
+                "Бюджет 1 000 ₽; служебный путь foo/bar учтён.",
+                source_texts=["Бюджет RUB 1\u2009000; путь foo/bar сохранён."],
+            )
+        )
+        self.assertTrue(
+            _final_root_tokens_are_grounded(
+                "Путь foo/bar обработан; состояние available.",
+                source_texts=["Результат not only available; путь сохранён."],
+            )
+        )
+
+        mismatches = (
+            ("Доля 67%.", "Доля 7%."),
+            ("Изменение 5 процентных пунктов.", "Изменение 5%."),
+            ("Состояние unavailable.", "Состояние available."),
+            ("Бюджет 100 $.", "Бюджет 100 ₽."),
+            ("Бюджет $100.", "Бюджет ₽100."),
+            ("Ответ дала ChatGPT.", "Ответ дала Gemini."),
+            ("Google Search доступен.", "Ответ дала Gemini."),
+            ("Источник rw.plus.", "Источник aiv.example."),
+            (
+                "Источник https://example.com/a.",
+                "Источник https://example.com/b.",
+            ),
+            ("Измерено 42 ответа.", "Доля составляет 42%."),
+            (
+                "Модель google/gemini-3.6-flash-preview.",
+                "Модель google/gemini-3.6-flash.",
+            ),
+            ("Источник example.com.", "Источник x.ai."),
+            ("Проверка ещё не подтверждена.", "Состояние verified."),
+            ("Проверка не доступна.", "Состояние available."),
+            ("Проверка not failed.", "Состояние failed."),
+            ("Проверка not currently available.", "Состояние available."),
+            ("Проверка not unavailable.", "Состояние unavailable."),
+            ("Проверка not necessarily available.", "Состояние available."),
+            ("Проверка не всегда доступно.", "Состояние доступно."),
+            ("Бюджет 100 USD.", "Бюджет $100 EUR."),
+            ("Изменение -5%.", "Изменение +5%."),
+            ("Бюджет -100 USD.", "Бюджет +100 USD."),
+            ("Бюджет -$100.", "Бюджет $100."),
+            ("Получено 1\n000 ответов.", "Получено 1000 ответов."),
+            (
+                "Модель openai/gpt-5.6-terra:online.",
+                "Модель openai/gpt-5.6-terra:free.",
+            ),
+            ("Ответ сохранён.", "Получено 7 ответов."),
+        )
+        for source, statement in mismatches:
+            with self.subTest(source=source, statement=statement):
+                self.assertFalse(
+                    _final_root_tokens_are_grounded(
+                        statement,
+                        source_texts=[source],
+                    )
+                )
+
+    def test_mapper_filters_auxiliary_literals_without_losing_hard_evidence(
+        self,
+    ) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"note": "Доля 7%."}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in units
+        }
+        allowed_claims = {
+            str(claim["claim_id"]): claim for claim in claim_rows
+        }
+
+        cases = {
+            "exact_values": {
+                "mutate": lambda packet: packet["observations"][0].update(
+                    exact_values=["99,9%"]
+                ),
+                "operation": "drop_ungrounded_exact_value",
+                "assert_sanitized": lambda packet: self.assertEqual(
+                    packet["observations"][0]["exact_values"],
+                    [],
+                ),
+            },
+            "uncertainties": {
+                "mutate": lambda packet: packet.update(
+                    uncertainties=[
+                        "Видимость 99,9% по модели "
+                        "openai/gpt-99-invented."
+                    ]
+                ),
+                "operation": "drop_ungrounded_uncertainty",
+                "assert_sanitized": lambda packet: self.assertEqual(
+                    packet["uncertainties"],
+                    [],
+                ),
+            },
+            "report_focus": {
+                "mutate": lambda packet: packet.update(
+                    report_focus=["Бюджет $5000, статус complete."]
+                ),
+                "operation": "drop_ungrounded_report_focus",
+                "assert_sanitized": lambda packet: self.assertEqual(
+                    packet["report_focus"],
+                    [],
+                ),
+            },
+            "unit_coverage": {
+                "mutate": lambda packet: packet["unit_coverage"][0].update(
+                    rationale="Gemini показывает 88,8%."
+                ),
+                "operation": "replace_ungrounded_unit_coverage_rationale",
+                "assert_sanitized": lambda packet: self.assertEqual(
+                    packet["unit_coverage"][0]["rationale"],
+                    "Исходная единица учтена в покрытии.",
+                ),
+            },
+            "claim_coverage": {
+                "mutate": lambda packet: packet["claim_coverage"][0].update(
+                    rationale="Источник https://invented.example/report."
+                ),
+                "operation": "replace_ungrounded_claim_coverage_rationale",
+                "assert_sanitized": lambda packet: self.assertEqual(
+                    packet["claim_coverage"][0]["rationale"],
+                    "Исходный фрагмент учтён в покрытии.",
+                ),
+            },
+        }
+        for field, case in cases.items():
+            with self.subTest(field=field):
+                packet = self._packet_for_units(
+                    units,
+                    source_claims=claim_rows,
+                )
+                case["mutate"](packet)
+                normalized = _normalize_final_evidence_packet(
+                    packet,
+                    allowed_unit_paths=allowed_paths,
+                    allowed_claims=allowed_claims,
+                    claim_objects=claim_objects,
+                )
+                case["assert_sanitized"](normalized)
+                audit = normalized["_aiv_final_input_grounding_filter"]
+                self.assertEqual(audit["quality_state"], "degraded")
+                self.assertEqual(audit["operation_count"], 1)
+                self.assertEqual(
+                    audit["operations"][0]["operation"],
+                    case["operation"],
+                )
+                self.assertNotIn(
+                    "99,9%",
+                    json.dumps(audit, ensure_ascii=False),
+                )
+
+    def test_mapper_keeps_structural_and_statement_failures_hard(self) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"note": "Доля 7%."}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in units
+        }
+        allowed_claims = {
+            str(claim["claim_id"]): claim for claim in claim_rows
+        }
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["observations"][0]["exact_values"] = [7]
+        with self.assertRaisesRegex(OpenRouterError, "invalid exact values"):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                claim_objects=claim_objects,
+            )
+
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["observations"][0]["statement"] = "Доля 99,9%."
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "observation invented an exact literal or state",
+        ):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                claim_objects=claim_objects,
+            )
+
+    def test_mapper_auxiliary_filter_audit_is_idempotent_through_union(
+        self,
+    ) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"note": "Доля 7%."}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in units
+        }
+        allowed_claims = {
+            str(claim["claim_id"]): claim for claim in claim_rows
+        }
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["unit_coverage"][0]["rationale"] = "Статус complete."
+        normalized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            claim_objects=claim_objects,
+        )
+        audit = normalized["_aiv_final_input_grounding_filter"]
+
+        renormalized = _normalize_final_evidence_packet(
+            normalized,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            claim_objects=claim_objects,
+        )
+        self.assertEqual(renormalized, normalized)
+        self.assertEqual(
+            renormalized["_aiv_final_input_grounding_filter"],
+            audit,
+        )
+
+        union = _preserve_final_evidence_reduction(
+            {
+                "observations": [],
+                "uncertainties": [],
+                "report_focus": [],
+                "unit_coverage": [],
+                "claim_coverage": [],
+            },
+            [normalized],
+        )
+        union = _normalize_final_evidence_packet(
+            union,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            claim_objects=claim_objects,
+        )
+        self.assertEqual(
+            union["_aiv_final_input_grounding_filter"],
+            audit,
+        )
+
+        tampered = copy.deepcopy(normalized)
+        tampered["_aiv_final_input_grounding_filter"]["operation_count"] = 2
+        with self.assertRaisesRegex(OpenRouterError, "filter audit is invalid"):
+            _normalize_final_evidence_packet(
+                tampered,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                claim_objects=claim_objects,
+            )
+
+    def test_bounded_root_exact_excerpt_cannot_strip_literal_context(self) -> None:
+        cases = (
+            ("Status: not available.", "available"),
+            ("Бюджет $100.", "100"),
+            ("Доля 5%.", "5"),
+            ("Модель openai/gpt-5.6-terra.", "gpt-5.6"),
+        )
+        for source_text, excerpt in cases:
+            with self.subTest(source_text=source_text, excerpt=excerpt):
+                packet = {
+                    "observations": [
+                        {
+                            "category": "context",
+                            "statement": excerpt,
+                            "source_node_ids": ["node-1"],
+                            "exact_values": [],
+                            "fact_binding_ids": [],
+                            "evidence_excerpts": [
+                                {
+                                    "source_node_id": "node-1",
+                                    "excerpt": excerpt,
+                                }
+                            ],
+                            "importance": "supporting",
+                        }
+                    ],
+                    "uncertainties": [],
+                    "report_focus": [],
+                    "node_coverage": [
+                        {
+                            "source_node_id": "node-1",
+                            "disposition": "supporting_context",
+                            "rationale": "Источник учтён.",
+                        }
+                    ],
+                }
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "invented an exact literal or state",
+                ):
+                    _normalize_final_root_summary_packet(
+                        packet,
+                        allowed_node_text={"node-1": source_text},
+                        allowed_node_fact_bindings={"node-1": []},
+                    )
+
+    def test_bounded_root_replaces_ungrounded_coverage_rationale(self) -> None:
+        packet = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": "Доля 7%.",
+                    "source_node_ids": ["node-1"],
+                    "exact_values": ["7%"],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {"source_node_id": "node-1", "excerpt": "Доля 7%."}
+                    ],
+                    "importance": "important",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-1",
+                    "disposition": "material_observation",
+                    "rationale": (
+                        "Gemini показывает 99,9%; источник "
+                        "https://invented.example."
+                    ),
+                }
+            ],
+        }
+        normalized = _normalize_final_root_summary_packet(
+            packet,
+            allowed_node_text={"node-1": "Доля 7%."},
+            allowed_node_fact_bindings={"node-1": []},
+        )
+        self.assertEqual(
+            normalized["node_coverage"][0]["rationale"],
+            "Дочерний узел учтён в покрытии.",
+        )
+        audit = normalized["_aiv_final_input_grounding_filter"]
+        self.assertEqual(audit["operation_count"], 1)
+        self.assertEqual(audit["replacement_count"], 1)
+        self.assertEqual(
+            audit["operations"][0]["operation"],
+            "replace_ungrounded_node_coverage_rationale",
+        )
+        self.assertEqual(
+            _normalize_final_root_summary_packet(
+                normalized,
+                allowed_node_text={"node-1": "Доля 7%."},
+                allowed_node_fact_bindings={"node-1": []},
+            ),
+            normalized,
+        )
+
+    def test_bounded_root_drops_only_ungrounded_auxiliary_items(self) -> None:
+        packet = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": "Доля 7%.",
+                    "source_node_ids": ["node-1"],
+                    "exact_values": ["7%", "99,9%"],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {"source_node_id": "node-1", "excerpt": "Доля 7%."}
+                    ],
+                    "importance": "important",
+                }
+            ],
+            "uncertainties": [
+                {"text": "Доля 7%.", "source_node_ids": ["node-1"]},
+                {"text": "Статус complete.", "source_node_ids": ["node-1"]},
+            ],
+            "report_focus": [
+                {"text": "Бюджет $5000.", "source_node_ids": ["node-1"]}
+            ],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-1",
+                    "disposition": "material_observation",
+                    "rationale": "Доля 7%.",
+                }
+            ],
+        }
+        normalized = _normalize_final_root_summary_packet(
+            packet,
+            allowed_node_text={"node-1": "Доля 7%."},
+            allowed_node_fact_bindings={"node-1": []},
+        )
+        self.assertEqual(normalized["observations"][0]["exact_values"], ["7%"])
+        self.assertEqual(
+            normalized["uncertainties"],
+            [{"text": "Доля 7%.", "source_node_ids": ["node-1"]}],
+        )
+        self.assertEqual(normalized["report_focus"], [])
+        audit = normalized["_aiv_final_input_grounding_filter"]
+        self.assertEqual(audit["operation_count"], 3)
+        self.assertEqual(audit["drop_count"], 3)
+        self.assertEqual(
+            {
+                item["operation"] for item in audit["operations"]
+            },
+            {
+                "drop_ungrounded_exact_value",
+                "drop_ungrounded_uncertainty",
+                "drop_ungrounded_report_focus",
+            },
+        )
 
     def test_reducer_cannot_replace_atomic_claim_rows_with_rephrases(
         self,
@@ -9316,7 +10550,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertGreater(plan["source_claim_count"], 1)
-        self.assertGreater(
+        self.assertEqual(
             plan["source_claim_count"],
             plan["source_unit_count"],
         )
@@ -9341,7 +10575,10 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             str(claim["excerpt"])
             for claim in sorted(
                 seen_source_claims,
-                key=lambda claim: int(claim["fragment_index"]),
+                key=lambda claim: (
+                    int(claim["source_core_start_char"]),
+                    int(claim["fragment_index"]),
+                ),
             )
         )
         self.assertEqual(reconstructed, narrative)
@@ -9351,7 +10588,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         narrative = "x" * 14_000 + "TAIL-CLAIM-FAIL-CLOSED"
 
         for fault, expected in (
-            ("missing", "does not map every source claim exactly once"),
+            ("missing", "incomplete dependent coverage"),
             ("tampered", "Coverage digest mismatch"),
         ):
             with self.subTest(fault=fault):
@@ -9361,7 +10598,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     **kwargs: Any,
                 ) -> dict[str, Any]:
                     source_claims = kwargs["user_payload"]["source_claims"]
-                    self.assertGreater(len(source_claims), 1)
+                    self.assertGreaterEqual(len(source_claims), 1)
                     packet = self._packet_for_units(
                         kwargs["user_payload"]["source_units"],
                         source_claims=source_claims,
@@ -9938,7 +11175,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.analyzer._structured_artifact",
                 new_callable=AsyncMock,
                 side_effect=verbose_mapper,
-            ),
+            ) as structured_artifact,
         ):
             model_payload, plan = await _prepare_final_model_payload(
                 "run-id",
@@ -9950,6 +11187,12 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             plan["terminal_reducer_mode"],
             "deterministic_lossless_union",
+        )
+        self.assertFalse(
+            any(
+                "evidence_packets" in (call.kwargs.get("user_payload") or {})
+                for call in structured_artifact.await_args_list
+            )
         )
         self.assertIn(
             plan["mode"],
@@ -10451,6 +11694,21 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             "actions": [{"title": "Действие", "why": marker}],
         }
 
+    def test_reviewer_outage_is_fail_soft_but_audit_corruption_is_not(self) -> None:
+        self.assertTrue(
+            _semantic_reviewer_failure_is_fail_soft(
+                OpenRouterError("semantic reviewer provider unavailable")
+            )
+        )
+        self.assertFalse(
+            _semantic_reviewer_failure_is_fail_soft(
+                OpenRouterAuditCheckpointError(
+                    "Stored semantic physical receipt is corrupt",
+                    event={},
+                )
+            )
+        )
+
     async def test_structure_repair_is_repreflighted_before_provider_call(
         self,
     ) -> None:
@@ -10834,65 +12092,48 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_semantic_block_invalidates_author_cache_for_next_run(
+    async def test_semantic_block_requests_bounded_repair_without_cache_invalidation(
         self,
     ) -> None:
         payload = self._payload()
         blocked_candidate = self._candidate("Заблокированный кандидат")
         replacement_candidate = self._candidate("Новый кандидат")
-        artifacts: dict[str, dict[str, Any]] = {}
-
-        async def artifact_output(
-            _run_id: str,
-            artifact_key: str,
-            **kwargs: Any,
-        ) -> dict[str, Any] | None:
-            artifact = artifacts.get(artifact_key)
-            if not artifact or artifact.get("status") != "completed":
-                return None
-            if artifact.get("input_json") != kwargs.get("input_json"):
-                return None
-            if artifact.get("model") != kwargs.get("model"):
-                return None
-            if artifact.get("prompt_version") != kwargs.get("prompt_version"):
-                return None
-            return copy.deepcopy(artifact.get("output_json"))
-
-        async def save_artifact(
-            _run_id: str,
-            **kwargs: Any,
-        ) -> None:
-            artifacts[str(kwargs["artifact_key"])] = copy.deepcopy(kwargs)
-
         with (
             patch(
                 "app.services.analyzer._final_report_payload",
                 return_value=payload,
             ),
             patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ({"prepared": "initial"}, self._window_plan()),
+                    ({"prepared": "repair"}, self._window_plan()),
+                ],
+            ),
+            patch(
                 "app.services.analyzer._artifact_output",
-                new=AsyncMock(side_effect=artifact_output),
+                new_callable=AsyncMock,
+                return_value=None,
             ),
             patch(
                 "app.services.analyzer._save_artifact",
-                new=AsyncMock(side_effect=save_artifact),
-            ),
-            patch(
-                "app.services.analyzer.chat_continuable_structured",
                 new_callable=AsyncMock,
-                side_effect=[
-                    SimpleNamespace(
-                        parsed=blocked_candidate,
-                        text="blocked",
-                        usage={"candidate": 1},
-                    ),
-                    SimpleNamespace(
-                        parsed=replacement_candidate,
-                        text="replacement",
-                        usage={"candidate": 2},
-                    ),
-                ],
-            ) as final_chat,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(blocked_candidate, "blocked", {"candidate": 1}),
+            ) as author,
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(
+                    parsed=replacement_candidate,
+                    text="replacement",
+                    usage={"candidate": 2},
+                ),
+            ) as repair,
             patch(
                 "app.services.analyzer._final_report_semantic_review_artifact",
                 new_callable=AsyncMock,
@@ -10910,31 +12151,6 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
             ),
         ):
-            with self.assertRaisesRegex(
-                OpenRouterError,
-                "semantic gate blocked publication",
-            ):
-                await _final_report(
-                    "run-id",
-                    payload["report_data"],
-                    {"manifest": {"digest": "corpus"}, "answers": [{}]},
-                )
-
-            invalidated = artifacts[FINAL_REPORT_AUTHOR_ARTIFACT_KEY]
-            self.assertEqual(invalidated["status"], "failed")
-            self.assertEqual(
-                invalidated["output_json"]["state"],
-                "semantic_block",
-            )
-            self.assertEqual(
-                invalidated["output_json"]["semantic_verdict"],
-                "block",
-            )
-            self.assertEqual(
-                invalidated["output_json"]["blockers"],
-                ["Неподтверждённое утверждение."],
-            )
-
             result = await _final_report(
                 "run-id",
                 payload["report_data"],
@@ -10942,7 +12158,8 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, replacement_candidate)
-        self.assertEqual(final_chat.await_count, 2)
+        author.assert_awaited_once()
+        repair.assert_awaited_once()
         self.assertEqual(semantic_review.await_count, 2)
         reviewed_candidates = [
             call.kwargs["candidate_report"] for call in semantic_review.await_args_list
@@ -10951,6 +12168,453 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             reviewed_candidates,
             [blocked_candidate, replacement_candidate],
         )
+        author_failures = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == FINAL_REPORT_AUTHOR_ARTIFACT_KEY
+            and call.kwargs.get("status") == "failed"
+        ]
+        self.assertEqual(author_failures, [])
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "pass")
+        self.assertFalse(admissions[-1]["reviewer_has_hard_veto"])
+
+    async def test_semantic_reviewer_outage_publishes_deterministic_candidate_degraded(
+        self,
+    ) -> None:
+        payload = self._payload()
+        candidate = self._candidate("Детерминированно безопасный кандидат")
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                return_value=({"prepared": "initial"}, self._window_plan()),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "raw", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+            ) as repair,
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                side_effect=_FinalSemanticReviewerUnavailable("provider outage"),
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
+            ),
+        ):
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus"}, "answers": [{}]},
+            )
+
+        self.assertEqual(result, candidate)
+        repair.assert_not_awaited()
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "degraded_safe")
+        self.assertEqual(admissions[-1]["reviewer_state"], "unavailable")
+        self.assertIn(
+            "semantic_reviewer_unavailable",
+            admissions[-1]["degraded_reason_codes"],
+        )
+
+    async def test_semantic_evidence_preparation_outage_is_degraded_not_terminal(
+        self,
+    ) -> None:
+        payload = self._payload()
+        candidate = self._candidate("Безопасный кандидат до semantic preflight")
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                return_value=({"prepared": "initial"}, self._window_plan()),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "raw", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+            ) as repair,
+            patch(
+                "app.services.analyzer._bounded_semantic_model_evidence_context",
+                new_callable=AsyncMock,
+                side_effect=OpenRouterError("semantic mapper provider outage"),
+            ) as semantic_preflight,
+            patch(
+                "app.services.analyzer.review_final_report_semantics",
+                new_callable=AsyncMock,
+            ) as semantic_provider,
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+            ) as semantic_blockers,
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
+            ),
+        ):
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus"}, "answers": [{}]},
+            )
+
+        self.assertEqual(result, candidate)
+        semantic_preflight.assert_awaited_once()
+        semantic_provider.assert_not_awaited()
+        semantic_blockers.assert_not_called()
+        repair.assert_not_awaited()
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "degraded_safe")
+        self.assertEqual(admissions[-1]["reviewer_state"], "unavailable")
+        self.assertIn(
+            "semantic_reviewer_unavailable",
+            admissions[-1]["degraded_reason_codes"],
+        )
+
+    async def test_reviewer_outage_after_finding_uses_latest_grounded_repair_degraded(
+        self,
+    ) -> None:
+        payload = self._payload()
+        candidate = self._candidate("Кандидат с неподтверждённым фактом")
+        repair_one = self._candidate("Непроверенная правка один")
+        repair_two = self._candidate("Непроверенная правка два")
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ({"prepared": "initial"}, self._window_plan()),
+                    ({"prepared": "repair-one"}, self._window_plan()),
+                    ({"prepared": "repair-two"}, self._window_plan()),
+                ],
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "initial", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                side_effect=[
+                    SimpleNamespace(parsed=repair_one, text="one", usage={}),
+                    SimpleNamespace(parsed=repair_two, text="two", usage={}),
+                ],
+            ),
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"verdict": "block"},
+                    _FinalSemanticReviewerUnavailable("provider outage"),
+                    _FinalSemanticReviewerUnavailable("provider outage"),
+                ],
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+                return_value=["Неподтверждённое числовое утверждение."],
+            ) as semantic_blockers,
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
+            ) as editor,
+        ):
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus"}, "answers": [{}]},
+            )
+
+        self.assertEqual(result, repair_two)
+        self.assertEqual(semantic_review.await_count, 3)
+        semantic_blockers.assert_called_once()
+        editor.assert_awaited_once()
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "degraded_safe")
+        self.assertIsNotNone(admissions[-1]["selected_report_sha256"])
+        self.assertTrue(
+            admissions[-1]["fallback_to_deterministically_safe_candidate"]
+        )
+        self.assertIn(
+            "semantic_reviewer_unavailable_after_findings",
+            admissions[-1]["degraded_reason_codes"],
+        )
+        self.assertIn(
+            "semantic_safe_rollback",
+            admissions[-1]["degraded_reason_codes"],
+        )
+
+    async def test_unresolved_reviewer_findings_publish_latest_grounded_candidate_degraded(
+        self,
+    ) -> None:
+        payload = self._payload()
+        payload["report_data"]["discovery"] = {"mention_rate": 66.7}
+        candidate = self._candidate("Первый безопасный кандидат: 66,7%")
+        repair_one = self._candidate("Первая безопасная правка: 66,7%")
+        repair_two = self._candidate("Вторая безопасная правка: 66,7%")
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ({"prepared": "initial"}, self._window_plan()),
+                    ({"prepared": "repair-one"}, self._window_plan()),
+                    ({"prepared": "repair-two"}, self._window_plan()),
+                ],
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "initial", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                side_effect=[
+                    SimpleNamespace(parsed=repair_one, text="one", usage={}),
+                    SimpleNamespace(parsed=repair_two, text="two", usage={}),
+                ],
+            ) as repair,
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"verdict": "block"},
+                    {"verdict": "block"},
+                    {"verdict": "block"},
+                ],
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+                side_effect=[
+                    ["Модель не смогла доказать утверждение."],
+                    ["Модель не смогла доказать утверждение."],
+                    ["Модель не смогла доказать утверждение."],
+                ],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
+            ),
+        ):
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus"}, "answers": [{}]},
+            )
+
+        self.assertEqual(result, repair_two)
+        self.assertEqual(repair.await_count, 2)
+        self.assertEqual(semantic_review.await_count, 3)
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "degraded_safe")
+        self.assertEqual(admissions[-1]["repair_attempts_used"], 2)
+        self.assertTrue(
+            admissions[-1]["fallback_to_deterministically_safe_candidate"]
+        )
+        self.assertIsNotNone(admissions[-1]["selected_report_sha256"])
+        self.assertIn(
+            "Модель не смогла доказать утверждение.",
+            admissions[-1]["reviewer_findings"],
+        )
+        self.assertIn(
+            "semantic_repair_exhausted",
+            admissions[-1]["degraded_reason_codes"],
+        )
+        self.assertIn(
+            "semantic_safe_rollback",
+            admissions[-1]["degraded_reason_codes"],
+        )
+        final_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == "final_report"
+        ]
+        self.assertEqual(final_writes[-1]["status"], "completed")
+
+    async def test_unsupported_exact_percentage_blocks_after_bounded_repairs(
+        self,
+    ) -> None:
+        payload = self._payload()
+        candidate = self._candidate("Неподтверждённое значение: 777%")
+        repair_one = self._candidate("Первая правка всё ещё утверждает 777%")
+        repair_two = self._candidate("Вторая правка всё ещё утверждает 777%")
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ({"prepared": "initial"}, self._window_plan()),
+                    ({"prepared": "repair-one"}, self._window_plan()),
+                    ({"prepared": "repair-two"}, self._window_plan()),
+                ],
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "initial", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                side_effect=[
+                    SimpleNamespace(parsed=repair_one, text="one", usage={}),
+                    SimpleNamespace(parsed=repair_two, text="two", usage={}),
+                ],
+            ) as repair,
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                return_value={"verdict": "pass"},
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+                return_value=[],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new_callable=AsyncMock,
+            ) as editor,
+        ):
+            with self.assertRaisesRegex(
+                OpenRouterError,
+                "Final report semantic admission failed",
+            ):
+                await _final_report(
+                    "run-id",
+                    payload["report_data"],
+                    {"manifest": {"digest": "corpus"}, "answers": [{}]},
+                )
+
+        self.assertEqual(repair.await_count, 2)
+        semantic_review.assert_awaited_once()
+        editor.assert_not_awaited()
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "block")
+        self.assertIsNone(admissions[-1]["selected_report_sha256"])
+        self.assertTrue(
+            any(
+                "неподтверждённый точный" in error
+                for error in admissions[-1]["deterministic_errors"]
+            )
+        )
+        final_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == "final_report"
+        ]
+        self.assertEqual(final_writes[-1]["status"], "failed")
 
 
 class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):

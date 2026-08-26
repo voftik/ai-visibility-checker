@@ -11,11 +11,15 @@ from sqlalchemy import delete, func, select
 from app.db import SessionLocal, init_db
 from app.models import Run, RunArtifact, RunStatus
 from app.services.analyzer import (
+    FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+    _FinalSemanticAuditIntegrityError,
     _eligible_illustration_answer_context,
     _final_report,
+    _final_report_semantic_admission_artifact_errors,
     _load_final_semantic_part_checkpoint,
     _load_final_semantic_physical_result,
     _persist_final_semantic_audit_event,
+    _save_final_report_semantic_admission,
     _select_final_answer_context,
 )
 from app.services.openrouter import (
@@ -2183,6 +2187,108 @@ class SemanticPartitionCoverageTests(unittest.TestCase):
                     )
 
 
+class FinalSemanticAdmissionReceiptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admission_recomputes_deterministic_errors_before_publish(
+        self,
+    ) -> None:
+        with patch(
+            "app.services.analyzer._save_artifact",
+            new_callable=AsyncMock,
+        ) as save_artifact:
+            with self.assertRaises(_FinalSemanticAuditIntegrityError):
+                await _save_final_report_semantic_admission(
+                    "run-semantic-admission-unsafe",
+                    decision="degraded_safe",
+                    selected_report={},
+                    reviewed_candidate={},
+                    public_report={},
+                    semantic_evidence_document={"report_data": {}},
+                    deterministic_errors=[],
+                    review=None,
+                    reviewer_state="unavailable",
+                    reviewer_findings=[],
+                    degraded_reason_codes=["semantic_reviewer_unavailable"],
+                    repair_attempts_used=0,
+                    fallback_used=True,
+                )
+
+        saved = save_artifact.await_args.kwargs
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["output_json"]["decision"], "block")
+        self.assertFalse(
+            saved["output_json"]["deterministic_checks_passed"]
+        )
+        self.assertTrue(saved["output_json"]["deterministic_errors"])
+
+    async def test_admission_artifact_binds_exact_selected_and_public_snapshots(
+        self,
+    ) -> None:
+        run_id = "run-semantic-admission-bound"
+        selected_report = _candidate("Подтверждённый вывод.")
+        full_public_report = {
+            "brand": {"name": "Example"},
+            "_analysis_foundation": {"facts": ["private evidence"]},
+        }
+        public_snapshot = copy.deepcopy(full_public_report)
+        public_snapshot.pop("_analysis_foundation")
+        with patch(
+            "app.services.analyzer._save_artifact",
+            new_callable=AsyncMock,
+        ) as save_artifact:
+            receipt = await _save_final_report_semantic_admission(
+                run_id,
+                decision="pass",
+                selected_report=selected_report,
+                reviewed_candidate=selected_report,
+                public_report=full_public_report,
+                semantic_evidence_document={"report_data": full_public_report},
+                deterministic_errors=["caller value is ignored"],
+                review={"verdict": "pass", "violations": []},
+                reviewer_state="completed",
+                reviewer_findings=[],
+                degraded_reason_codes=[],
+                repair_attempts_used=0,
+                fallback_used=False,
+            )
+
+        saved = save_artifact.await_args.kwargs
+        artifact = RunArtifact(
+            run_id=run_id,
+            stage_key=saved["stage_key"],
+            artifact_key=saved["artifact_key"],
+            status=saved["status"],
+            model=saved["model"],
+            prompt_version=saved["prompt_version"],
+            input_json=copy.deepcopy(saved["input_json"]),
+            output_json=copy.deepcopy(saved["output_json"]),
+        )
+        self.assertEqual(
+            artifact.prompt_version,
+            FINAL_REPORT_SEMANTIC_ADMISSION_VERSION,
+        )
+        self.assertEqual(receipt["deterministic_errors"], [])
+        self.assertEqual(
+            _final_report_semantic_admission_artifact_errors(
+                artifact,
+                run_id=run_id,
+                selected_report=selected_report,
+                public_report=public_snapshot,
+            ),
+            [],
+        )
+
+        tampered_report = copy.deepcopy(selected_report)
+        tampered_report["headline"] = "Подменённый заголовок"
+        errors = _final_report_semantic_admission_artifact_errors(
+            artifact,
+            run_id=run_id,
+            selected_report=tampered_report,
+            public_report=public_snapshot,
+        )
+        self.assertIn("final_report_semantic_admission_report_mismatch", errors)
+        self.assertIn("final_report_semantic_admission_input_mismatch", errors)
+
+
 class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_finding_ledger_shards_more_than_one_context_without_omission(
         self,
@@ -3788,7 +3894,19 @@ class FinalReportSemanticGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(final_chat.await_count, 3)
-        self.assertEqual(semantic_review.await_count, 3)
+        self.assertEqual(semantic_review.await_count, 1)
+        admission_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admission_writes[-1]["status"], "failed")
+        self.assertEqual(admission_writes[-1]["output_json"]["decision"], "block")
+        self.assertFalse(
+            admission_writes[-1]["output_json"]["deterministic_checks_passed"]
+        )
         final_writes = [
             call.kwargs
             for call in save_artifact.await_args_list
