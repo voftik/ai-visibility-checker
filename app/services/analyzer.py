@@ -35308,7 +35308,13 @@ def _normalize_final_evidence_packet(
                 )
             observation["exact_values"] = grounded_exact_values
             if not _final_root_tokens_are_grounded(
-                str(observation.get("statement") or ""),
+                _final_grounding_strip_code_owned_path_locator(
+                    str(observation.get("statement") or ""),
+                    source_path=claim_source_path,
+                ),
+                # A source path can be mentioned as a locator, but it is not
+                # factual evidence. Only the exact scalar excerpt may ground
+                # the statement that remains after the locator is masked.
                 source_texts=[claim_excerpt],
             ):
                 raise OpenRouterError(
@@ -35982,6 +35988,114 @@ def _final_root_literal_tokens(value: Any) -> list[str]:
         ):
             ordered.append(token)
     return list(dict.fromkeys(ordered))
+
+
+_FINAL_GROUNDING_STRONG_PATH_PREFIX = re.compile(
+    r"(?:^|[^\w])(?:"
+    r"путь|пути|source[_ -]?path|json[_ -]?pointer|path"
+    r")\s*[`\"'«]?\s*$",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_FIELD_PATH_PREFIX = re.compile(
+    r"(?:^|[^\w])(?:"
+    r"в|из|по|путь|пути|source[_ -]?path|json[_ -]?pointer|path|at|in|from"
+    r")\s*[`\"'«]?\s*$",
+    re.IGNORECASE,
+)
+_FINAL_GROUNDING_PATH_FIELD = re.compile(
+    r"^\s+(?:поле|ключ|field|key)\s*[`\"'«]?\s*{field}"
+    r"(?=$|[^\w])",
+    re.IGNORECASE,
+)
+
+
+def _final_grounding_strip_code_owned_path_locator(
+    statement: str,
+    *,
+    source_path: str,
+) -> str:
+    """Mask only an explicit locator for the already-verified JSON pointer.
+
+    A pointer index is lineage, not evidence. It may therefore be ignored
+    when the mapper literally says where a scalar came from, but it must not
+    become a source for an otherwise unsupported number, state or model name.
+    The accepted forms are deliberately narrow:
+
+    * the exact absolute JSON pointer;
+    * an exact pointer suffix in an explicit path context;
+    * a parent suffix followed by ``field <leaf>`` / ``поле <leaf>``.
+
+    Everything outside the matched locator is still grounded exclusively
+    against the scalar claim excerpt.
+    """
+
+    if not statement or not source_path.startswith("/"):
+        return statement
+    segments = [segment for segment in source_path.split("/") if segment]
+    if len(segments) < 2:
+        return statement
+
+    spans: list[tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(
+            start < prior_end and end > prior_start
+            for prior_start, prior_end in spans
+        )
+
+    def add_matches(candidate: str, *, absolute: bool = False) -> None:
+        pattern = re.compile(
+            rf"(?<![\w~]){re.escape(candidate)}(?![\w~])",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(statement):
+            if overlaps(match.start(), match.end()):
+                continue
+            prefix = statement[max(0, match.start() - 48) : match.start()]
+            if absolute or _FINAL_GROUNDING_STRONG_PATH_PREFIX.search(prefix):
+                spans.append((match.start(), match.end()))
+
+    # An absolute pointer is unambiguously a technical locator. Exact
+    # suffixes are accepted only after an explicit path/preposition marker.
+    add_matches(source_path, absolute=True)
+    for start_index in range(len(segments) - 1):
+        add_matches("/".join(segments[start_index:]))
+
+    # Models commonly render ``expected_cells/7 поле model`` instead of the
+    # canonical ``expected_cells/7/model``. Validate the parent and leaf as
+    # one locator so that the bare index can never be laundered elsewhere in
+    # the sentence.
+    leaf = segments[-1]
+    field_pattern = _FINAL_GROUNDING_PATH_FIELD.pattern.format(
+        field=re.escape(leaf)
+    )
+    for start_index in range(len(segments) - 2):
+        parent = "/".join(segments[start_index:-1])
+        parent_pattern = re.compile(
+            rf"(?<![\w~]){re.escape(parent)}(?![\w~])",
+            re.IGNORECASE,
+        )
+        for match in parent_pattern.finditer(statement):
+            prefix = statement[max(0, match.start() - 48) : match.start()]
+            if not _FINAL_GROUNDING_FIELD_PATH_PREFIX.search(prefix):
+                continue
+            field_match = re.match(
+                field_pattern,
+                statement[match.end() :],
+                re.IGNORECASE,
+            )
+            if field_match is None:
+                continue
+            end = match.end() + field_match.end()
+            if not overlaps(match.start(), end):
+                spans.append((match.start(), end))
+
+    if not spans:
+        return statement
+    masked = list(statement)
+    for start, end in sorted(spans):
+        masked[start:end] = " " * (end - start)
+    return "".join(masked)
 
 
 def _final_root_tokens_are_grounded(

@@ -9694,6 +9694,127 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             [str(claim_rows[0]["claim_id"])],
         )
 
+    def test_mapper_statement_may_quote_its_code_owned_source_path(self) -> None:
+        expected_cells = [
+            {"model": f"example/model-{index}"} for index in range(8)
+        ]
+        expected_cells[7]["model"] = "openai/gpt-chat-latest"
+        units, _manifest = _flatten_final_input_payload(
+            {"answer_corpus_manifest": {"expected_cells": expected_cells}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claim = next(
+            item
+            for item in claim_rows
+            if str(item["source_path"]).endswith("expected_cells/7/model")
+        )
+        unit = next(
+            item
+            for item in units
+            if item["source_unit_id"] == claim["source_unit_id"]
+        )
+        packet = self._packet_for_units([unit], source_claims=[claim])
+        packet["observations"][0]["statement"] = (
+            "В expected_cells/7 поле model содержит "
+            "«openai/gpt-chat-latest»."
+        )
+
+        normalized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths={
+                str(unit["source_unit_id"]): str(unit["source_path"])
+            },
+            allowed_claims={str(claim["claim_id"]): claim},
+            claim_objects={
+                str(claim["claim_id"]): claim_objects[str(claim["claim_id"])]
+            },
+        )
+
+        self.assertEqual(
+            normalized["observations"][0]["statement"],
+            packet["observations"][0]["statement"],
+        )
+
+        fabricated = copy.deepcopy(packet)
+        for fabricated_statement in (
+            "Получено 7 ответов.",
+            packet["observations"][0]["statement"] + " Видимость 777%.",
+        ):
+            with self.subTest(statement=fabricated_statement):
+                fabricated["observations"][0]["statement"] = fabricated_statement
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "invented an exact literal or state",
+                ):
+                    _normalize_final_evidence_packet(
+                        fabricated,
+                        allowed_unit_paths={
+                            str(unit["source_unit_id"]): str(unit["source_path"])
+                        },
+                        allowed_claims={str(claim["claim_id"]): claim},
+                        claim_objects={
+                            str(claim["claim_id"]): claim_objects[
+                                str(claim["claim_id"])
+                            ]
+                        },
+                    )
+
+    def test_mapper_source_path_tokens_cannot_launder_assertions(self) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {
+                "report_data": {
+                    "available": False,
+                    "openai": False,
+                    "provider": {
+                        "openai": {"gpt-99-invented": "нейтрально"}
+                    },
+                }
+            },
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claims_by_path = {
+            str(claim["source_path"]): claim for claim in claim_rows
+        }
+        units_by_path = {str(unit["source_path"]): unit for unit in units}
+
+        for source_path, fabricated_statement in (
+            ("/report_data/available", "Статус available."),
+            ("/report_data/openai", "Ответ дала OpenAI."),
+            (
+                "/report_data/provider/openai/gpt-99-invented",
+                "Ответ сгенерирован в openai/gpt-99-invented.",
+            ),
+        ):
+            with self.subTest(source_path=source_path):
+                claim = claims_by_path[source_path]
+                unit = units_by_path[source_path]
+                packet = self._packet_for_units([unit], source_claims=[claim])
+                packet["observations"][0]["statement"] = fabricated_statement
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "invented an exact literal or state",
+                ):
+                    _normalize_final_evidence_packet(
+                        packet,
+                        allowed_unit_paths={
+                            str(unit["source_unit_id"]): str(unit["source_path"])
+                        },
+                        allowed_claims={str(claim["claim_id"]): claim},
+                        claim_objects={
+                            str(claim["claim_id"]): claim_objects[
+                                str(claim["claim_id"])
+                            ]
+                        },
+                    )
+
     def test_mapper_still_rejects_ungrounded_assertion_grade_literals(
         self,
     ) -> None:
