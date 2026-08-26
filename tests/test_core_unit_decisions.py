@@ -7,6 +7,7 @@ import unittest
 
 from app.services.analyzer import (
     CORE_UNIT_DECISION_LEDGER_VERSION,
+    ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
     ENTITY_CATALOG_LEAF_SCHEMA,
     SITE_PROFILE_LEAF_SCHEMA,
     _attach_core_decisions,
@@ -20,13 +21,16 @@ from app.services.analyzer import (
     _normalize_core_dispositions,
     _preserve_entity_catalog_core_decisions,
     _preserve_site_profile_core_decisions,
+    _sanitize_recovered_entity_catalog_evidence,
     _stable_json_sha256,
     _validate_core_decision_receipt,
+    _validate_entity_catalog_leaf_evidence_binding,
     _validate_final_core_decisions,
     _validate_reducer_core_decisions,
 )
 from app.services.long_response import partition_text_records
 from app.services.openrouter import OpenRouterError
+from app.services.recovery_state import stable_digest
 
 
 def _blank_profile() -> dict[str, object]:
@@ -70,9 +74,9 @@ def _decision(
 
 
 class CoreUnitDecisionContractTests(unittest.TestCase):
-    def _one_site_unit(self, text: str = "Example продаёт Atlas One") -> tuple[
-        dict[str, object], dict[str, object]
-    ]:
+    def _one_site_unit(
+        self, text: str = "Example продаёт Atlas One"
+    ) -> tuple[dict[str, object], dict[str, object]]:
         units, _manifests = partition_text_records(
             [{"url": "https://example.test/", "main_text": text}],
             text_key="main_text",
@@ -158,9 +162,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             )
 
     def test_unique_markdown_emphasis_quote_is_repaired_losslessly(self) -> None:
-        core_text = (
-            "Среди альтернатив названы *ST Tattoo*, *Tattoo Roko* и другие."
-        )
+        core_text = "Среди альтернатив названы *ST Tattoo*, *Tattoo Roko* и другие."
         units, _manifests = partition_text_records(
             [{"answer_id": 614, "answer": core_text}],
             text_key="answer",
@@ -244,9 +246,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
         coordinate_tamper = copy.deepcopy(receipt)
         coordinate_tamper["evidence_quote_repair"]["core_start_char"] += 1
         coordinate_tamper.pop("decision_sha256")
-        coordinate_tamper["decision_sha256"] = _stable_json_sha256(
-            coordinate_tamper
-        )
+        coordinate_tamper["decision_sha256"] = _stable_json_sha256(coordinate_tamper)
         with self.assertRaisesRegex(OpenRouterError, "coordinates"):
             _validate_core_decision_receipt(coordinate_tamper)
 
@@ -275,18 +275,15 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
 
     def test_markdown_quote_repair_keeps_absolute_partition_offsets(self) -> None:
         answer = (
-            ("Служебный контекст без сущностей. " * 40)
-            + "Альтернативы: *ST Tattoo*, *Tattoo Roko*."
-        )
+            "Служебный контекст без сущностей. " * 40
+        ) + "Альтернативы: *ST Tattoo*, *Tattoo Roko*."
         units, _manifests = partition_text_records(
             [{"answer_id": 614, "answer": answer}],
             text_key="answer",
             id_key="answer_id",
             target_chars=256,
         )
-        unit = next(
-            item for item in units if "ST Tattoo" in str(item["_lr_core_text"])
-        )
+        unit = next(item for item in units if "ST Tattoo" in str(item["_lr_core_text"]))
         claim = _core_unit_claims([unit])[0]
         self.assertGreater(claim["start_char"], 0)
         submitted_quote = "ST Tattoo, Tattoo Roko"
@@ -316,17 +313,632 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             claim["start_char"] + repair["core_end_char"],
         )
         self.assertEqual(
-            answer[
-                repair["source_start_char"] : repair["source_end_char"]
-            ],
+            answer[repair["source_start_char"] : repair["source_end_char"]],
             receipt["evidence_quote"],
         )
 
-    def test_markdown_quote_repair_rejects_ambiguity_and_invention(self) -> None:
-        repeated = (
-            "*ST Tattoo*, *Tattoo Roko*; "
-            "*ST Tattoo*, *Tattoo Roko*"
+    def test_entity_catalog_keeps_compound_core_quote_in_final_ledger(self) -> None:
+        core_text = "Для сравнения используйте Google Maps, Instagram, TripAdvisor."
+        units, _manifests = partition_text_records(
+            [{"answer_id": 620, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
         )
+        claim = _core_unit_claims(units)[0]
+        representative_quote = "Google Maps, Instagram, TripAdvisor"
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                {
+                    "canonical_name": "Google Maps",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "other",
+                    "commercially_relevant": False,
+                    "mention_policy": "standalone",
+                    "evidence": "Google Maps",
+                },
+                {
+                    "canonical_name": "Instagram",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "other",
+                    "commercially_relevant": False,
+                    "mention_policy": "standalone",
+                    "evidence": "Instagram",
+                },
+                {
+                    "canonical_name": "TripAdvisor",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "other",
+                    "commercially_relevant": False,
+                    "mention_policy": "standalone",
+                    "evidence": "TripAdvisor",
+                },
+            ],
+            "uncertainties": [],
+        }
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote=representative_quote,
+                    reason="В core дословно перечислены три площадки.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+        preserved = _preserve_entity_catalog_core_decisions(catalog, receipts)
+
+        self.assertTrue(
+            any(representative_quote in value for value in preserved["uncertainties"])
+        )
+        _validate_final_core_decisions(
+            preserved,
+            receipts,
+            output_kind="entity_catalog",
+        )
+
+    def test_entity_catalog_repairs_prompt_name_to_exact_core_entity(self) -> None:
+        core_text = (
+            "NotGoogle MapsFake. Об этой студии точных данных нет. "
+            "Проверьте отзывы в Google Maps "
+            "и TripAdvisor."
+        )
+        units, _manifests = partition_text_records(
+            [{"answer_id": 648, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        raw_dispositions = [
+            _decision(
+                claim,
+                disposition="grounded_fact",
+                quote="Makarska Tattoo & Piercing Studio",
+                reason="Модель ошибочно скопировала название из запроса.",
+            )
+        ]
+        original_dispositions = copy.deepcopy(raw_dispositions)
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                {
+                    "canonical_name": "Google Maps",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "Площадка отзывов «Google Maps».",
+                },
+                {
+                    "canonical_name": "TripAdvisor",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "Площадка отзывов «TripAdvisor».",
+                },
+            ],
+            "uncertainties": [],
+        }
+
+        receipts = _normalize_core_dispositions(
+            raw_dispositions,
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+        receipt = receipts[0]
+        repair = receipt["evidence_quote_repair"]
+
+        self.assertEqual(raw_dispositions, original_dispositions)
+        self.assertEqual(receipt["evidence_quote"], "Google Maps")
+        self.assertEqual(repair["version"], ENTITY_CATALOG_QUOTE_REPAIR_VERSION)
+        self.assertEqual(repair["method"], "exact_catalog_name_from_same_core")
+        self.assertEqual(
+            repair["core_start_char"],
+            core_text.rindex("Google Maps"),
+        )
+        self.assertEqual(
+            core_text[repair["source_start_char"] : repair["source_end_char"]],
+            receipt["evidence_quote"],
+        )
+        _validate_core_decision_receipt(receipt)
+        _validate_entity_catalog_leaf_evidence_binding(
+            catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        injected = copy.deepcopy(catalog)
+        injected["entities"] = [
+            {
+                "canonical_name": "OMEGA",
+                "aliases": [],
+                "category": "competitor",
+                "target_relationship": "competitor",
+                "commercially_relevant": True,
+                "mention_policy": "standalone",
+                "evidence": "Площадка отзывов «Google Maps».",
+            }
+        ]
+        with self.assertRaisesRegex(OpenRouterError, "not an exact core substring"):
+            _normalize_core_dispositions(
+                raw_dispositions,
+                expected_claims=[claim],
+                analytic_output=injected,
+                output_kind="entity_catalog",
+            )
+
+    def test_target_alias_alone_cannot_repair_representative_quote(self) -> None:
+        _unit, claim = self._one_site_unit("ALPHA source")
+        catalog = {
+            "target_aliases": ["ALPHA"],
+            "entities": [],
+            "uncertainties": [],
+        }
+        with self.assertRaisesRegex(OpenRouterError, "not an exact core substring"):
+            _normalize_core_dispositions(
+                [
+                    _decision(
+                        claim,
+                        disposition="grounded_fact",
+                        quote="BETA",
+                        reason="Модель скопировала имя из запроса.",
+                    )
+                ],
+                expected_claims=[claim],
+                analytic_output=catalog,
+                output_kind="entity_catalog",
+            )
+
+    def test_quote_repair_source_pointer_survives_prior_entity_removal(self) -> None:
+        grounded_names = [f"Source-{index}" for index in range(9)]
+        core_text = ", ".join(grounded_names)
+        units, _manifests = partition_text_records(
+            [{"answer_id": 648, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                {
+                    "canonical_name": "OMEGA",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "evidence": "Source-0",
+                },
+                *[
+                    {
+                        "canonical_name": name,
+                        "aliases": [],
+                        "category": "other",
+                        "target_relationship": "unrelated",
+                        "evidence": name,
+                    }
+                    for name in grounded_names
+                ],
+            ],
+            "uncertainties": [],
+        }
+        original = copy.deepcopy(catalog)
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Prompt Brand",
+                    reason="Название из запроса не является source quote.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+        repair = receipts[0]["evidence_quote_repair"]
+        self.assertEqual(repair["source_catalog_sha256"], stable_digest(catalog))
+        self.assertEqual(repair["source_entity_index"], 1)
+        self.assertEqual(repair["source_name_index"], 0)
+
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        self.assertEqual(catalog, original)
+        self.assertEqual(accepted["entities"][0]["canonical_name"], "Source-0")
+        self.assertEqual(receipts[0]["evidence_quote"], "Source-0")
+        self.assertEqual(repair["source_entity_index"], 1)
+
+    def test_recovery_filter_removes_only_ungrounded_entity(self) -> None:
+        grounded_names = [f"Source-{index}" for index in range(9)]
+        core_text = "Проверить источники: " + ", ".join(grounded_names) + "."
+        units, _manifests = partition_text_records(
+            [{"answer_id": 648, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                *[
+                    {
+                        "canonical_name": name,
+                        "aliases": [],
+                        "category": "other",
+                        "target_relationship": "unrelated",
+                        "commercially_relevant": True,
+                        "mention_policy": "standalone",
+                        "evidence": f"«{name}»",
+                    }
+                    for name in grounded_names
+                ],
+                {
+                    "canonical_name": "OMEGA",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "«Google Maps»",
+                },
+            ],
+            "uncertainties": [],
+        }
+        original = copy.deepcopy(catalog)
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Source-0",
+                    reason="В core дословно перечислены источники.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        self.assertEqual(catalog, original)
+        self.assertEqual(
+            [entity["canonical_name"] for entity in accepted["entities"]],
+            grounded_names,
+        )
+        audit = accepted["_aiv_entity_catalog_filter"]
+        self.assertEqual(audit["removal_count"], 1)
+        self.assertEqual(audit["removals"][0]["path"], "entities[9]")
+        self.assertNotIn("OMEGA", json.dumps(audit, ensure_ascii=False))
+        _validate_entity_catalog_leaf_evidence_binding(
+            accepted,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+    def test_recovery_filter_repairs_literal_entity_instead_of_deleting(self) -> None:
+        grounded_names = [f"Source-{index}" for index in range(9)]
+        core_text = (
+            "Проверить источники: " + ", ".join(grounded_names) + "; maketattoo.eu."
+        )
+        units, _manifests = partition_text_records(
+            [{"answer_id": 648, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                *[
+                    {
+                        "canonical_name": name,
+                        "aliases": [],
+                        "category": "other",
+                        "target_relationship": "unrelated",
+                        "commercially_relevant": True,
+                        "mention_policy": "standalone",
+                        "evidence": f"«{name}»",
+                    }
+                    for name in grounded_names
+                ],
+                {
+                    "canonical_name": "Maketattoo.eu",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    "evidence": "«maketattoo.eu»",
+                },
+            ],
+            "uncertainties": [],
+        }
+        original = copy.deepcopy(catalog)
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Source-0",
+                    reason="В core дословно перечислены источники.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        self.assertEqual(catalog, original)
+        self.assertEqual(len(accepted["entities"]), 10)
+        repaired = accepted["entities"][9]
+        self.assertEqual(repaired["canonical_name"], "maketattoo.eu")
+        self.assertEqual(repaired["evidence"], "maketattoo.eu")
+        audit = accepted["_aiv_entity_catalog_filter"]
+        self.assertEqual(audit["removal_count"], 0)
+        self.assertEqual(audit["operation_count"], 1)
+        operation = audit["operations"][0]
+        self.assertEqual(operation["operation"], "repair_from_grounded_core")
+        self.assertEqual(operation["match"], "nfkc_case_equivalent")
+        self.assertTrue(operation["canonical_replaced"])
+        self.assertEqual(
+            core_text[operation["core_start_char"] : operation["core_end_char"]],
+            repaired["canonical_name"],
+        )
+        self.assertNotIn("Maketattoo", json.dumps(audit, ensure_ascii=False))
+        _validate_entity_catalog_leaf_evidence_binding(
+            accepted,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+    def test_recovery_filter_repairs_full_width_nfkc_spelling(self) -> None:
+        grounded_names = [f"Source-{index}" for index in range(9)]
+        source_spelling = "Ｍａｋｅｔａｔｔｏｏ．ｅｕ"
+        core_text = ", ".join([*grounded_names, source_spelling])
+        units, _manifests = partition_text_records(
+            [{"answer_id": 648, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                *[
+                    {
+                        "canonical_name": name,
+                        "aliases": [],
+                        "category": "other",
+                        "target_relationship": "unrelated",
+                        "evidence": name,
+                    }
+                    for name in grounded_names
+                ],
+                {
+                    "canonical_name": "Maketattoo.eu",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "evidence": source_spelling,
+                },
+            ],
+            "uncertainties": [],
+        }
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Source-0",
+                    reason="В core дословно перечислены источники.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        self.assertEqual(accepted["entities"][9]["canonical_name"], source_spelling)
+        audit = accepted["_aiv_entity_catalog_filter"]
+        self.assertEqual(audit["repair_count"], 1)
+        self.assertEqual(audit["removal_count"], 0)
+
+    def test_recovery_filter_never_deletes_grounded_alias_or_owned_name(self) -> None:
+        grounded_names = [f"Source-{index}" for index in range(9)]
+        core_text = ", ".join(grounded_names)
+        units, _manifests = partition_text_records(
+            [{"answer_id": 648, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        base_entities = [
+            {
+                "canonical_name": name,
+                "aliases": [],
+                "category": "other",
+                "target_relationship": "unrelated",
+                "evidence": name,
+            }
+            for name in grounded_names
+        ]
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Source-0",
+                    reason="В core дословно перечислены источники.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output={
+                "target_aliases": [],
+                "entities": base_entities,
+                "uncertainties": [],
+            },
+            output_kind="entity_catalog",
+        )
+
+        alias_catalog = {
+            "target_aliases": [],
+            "entities": [
+                *base_entities,
+                {
+                    "canonical_name": "OMEGA",
+                    "aliases": ["Source-8"],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "evidence": "Source-8",
+                },
+            ],
+            "uncertainties": [],
+        }
+        with self.assertRaisesRegex(OpenRouterError, "canonical_name is not grounded"):
+            _sanitize_recovered_entity_catalog_evidence(
+                alias_catalog,
+                receipts,
+                expected_claims=[claim],
+                profile={},
+            )
+
+        owned_catalog = {
+            "target_aliases": [],
+            "entities": [
+                *base_entities,
+                {
+                    "canonical_name": "Realweb",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "evidence": "Source-0",
+                },
+            ],
+            "uncertainties": [],
+        }
+        with self.assertRaisesRegex(OpenRouterError, "canonical_name is not grounded"):
+            _sanitize_recovered_entity_catalog_evidence(
+                owned_catalog,
+                receipts,
+                expected_claims=[claim],
+                profile={"brand_name": "Realweb", "brand_aliases": []},
+            )
+
+    def test_recovery_filter_scans_core_marked_no_fact_before_deletion(self) -> None:
+        grounded_names = [f"Source-{index}" for index in range(9)]
+        units, _manifests = partition_text_records(
+            [
+                {
+                    "answer_id": 1,
+                    "answer": ", ".join(grounded_names),
+                },
+                {
+                    "answer_id": 2,
+                    "answer": "OMEGA is a named source.",
+                },
+            ],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claims = _core_unit_claims(units)
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                *[
+                    {
+                        "canonical_name": name,
+                        "aliases": [],
+                        "category": "other",
+                        "target_relationship": "unrelated",
+                        "evidence": name,
+                    }
+                    for name in grounded_names
+                ],
+                {
+                    "canonical_name": "OMEGA",
+                    "aliases": [],
+                    "category": "other",
+                    "target_relationship": "unrelated",
+                    "evidence": "OMEGA",
+                },
+            ],
+            "uncertainties": [],
+        }
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claims[0],
+                    disposition="grounded_fact",
+                    quote="Source-0",
+                    reason="В core дословно перечислены источники.",
+                ),
+                _decision(
+                    claims[1],
+                    disposition="explicit_no_fact",
+                    quote="",
+                    reason=("Модель ошибочно сочла второй core служебным текстом."),
+                ),
+            ],
+            expected_claims=claims,
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+
+        with self.assertRaisesRegex(OpenRouterError, "canonical_name is not grounded"):
+            _sanitize_recovered_entity_catalog_evidence(
+                catalog,
+                receipts,
+                expected_claims=claims,
+                profile={},
+            )
+
+    def test_markdown_quote_repair_rejects_ambiguity_and_invention(self) -> None:
+        repeated = "*ST Tattoo*, *Tattoo Roko*; *ST Tattoo*, *Tattoo Roko*"
         _unit, repeated_claim = self._one_site_unit(repeated)
         profile = _blank_profile()
         profile["brand_name"] = "ST Tattoo"
@@ -346,9 +958,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                 output_kind="site_profile",
             )
 
-        _unit, claim = self._one_site_unit(
-            "Альтернативы: *ST Tattoo*, *Tattoo Roko*."
-        )
+        _unit, claim = self._one_site_unit("Альтернативы: *ST Tattoo*, *Tattoo Roko*.")
         for invented_quote in (
             "ST Tattoo, Tattoo Moko",
             "ST tattoo, Tattoo Roko",
@@ -368,9 +978,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                                 claim,
                                 disposition="grounded_fact",
                                 quote=invented_quote,
-                                reason=(
-                                    "Ответ модели содержит изменённую цитату."
-                                ),
+                                reason=("Ответ модели содержит изменённую цитату."),
                             )
                         ],
                         expected_claims=[claim],
@@ -402,9 +1010,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                     disposition="explicit_no_fact",
                     quote="",
                     reason=(
-                        "Core содержит только настройки cookie и "
-                        "служебную "
-                        "навигацию."
+                        "Core содержит только настройки cookie и служебную навигацию."
                     ),
                 )
             ],
@@ -444,10 +1050,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                         claim,
                         disposition="grounded_fact",
                         quote=quote,
-                        reason=(
-                            "В core буквально назван "
-                            "отдельный продукт."
-                        ),
+                        reason=("В core буквально назван отдельный продукт."),
                     )
                 ],
                 expected_claims=[claim],
@@ -468,9 +1071,9 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                 [leaves[0], leaves[0]],
             )
         tampered = copy.deepcopy(leaves[0])
-        tampered["_aiv_core_unit_decision_shards"][0][
-            "evidence_quote_sha256"
-        ] = "0" * 64
+        tampered["_aiv_core_unit_decision_shards"][0]["evidence_quote_sha256"] = (
+            "0" * 64
+        )
         with self.assertRaisesRegex(OpenRouterError, "digest mismatch"):
             _core_decisions_from_inputs([tampered])
 
@@ -501,10 +1104,7 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
                             claim,
                             disposition="grounded_fact",
                             quote=quote,
-                            reason=(
-                                "В core буквально назван "
-                                "отдельный бренд."
-                            ),
+                            reason=("В core буквально назван отдельный бренд."),
                         )
                     ],
                     expected_claims=[claim],
@@ -567,10 +1167,7 @@ class CoreUnitDecisionScaleTests(unittest.TestCase):
                     claim,
                     disposition="grounded_fact",
                     quote=marker,
-                    reason=(
-                        "В tail core буквально назван "
-                        "продукт клиента."
-                    ),
+                    reason=("В tail core буквально назван продукт клиента."),
                 )
             else:
                 raw = _decision(
@@ -578,9 +1175,7 @@ class CoreUnitDecisionScaleTests(unittest.TestCase):
                     disposition="explicit_no_fact",
                     quote="",
                     reason=(
-                        "Core содержит только нумерованную "
-                        "служебную строку "
-                        "навигации."
+                        "Core содержит только нумерованную служебную строку навигации."
                     ),
                 )
             receipts = _normalize_core_dispositions(
@@ -635,7 +1230,11 @@ class CoreUnitDecisionScaleTests(unittest.TestCase):
         claims = _core_unit_claims(units)
         leaves: list[dict[str, object]] = []
         for index, claim in enumerate(claims):
-            name = marker if marker in str(claim["core_text"]) else f"Competitor-{index:04d}"
+            name = (
+                marker
+                if marker in str(claim["core_text"])
+                else f"Competitor-{index:04d}"
+            )
             quote = str(claim["core_text"])
             catalog = {
                 "target_aliases": [],
@@ -658,10 +1257,7 @@ class CoreUnitDecisionScaleTests(unittest.TestCase):
                         claim,
                         disposition="grounded_fact",
                         quote=quote,
-                        reason=(
-                            "В core буквально назван коммерческий "
-                            "конкурент."
-                        ),
+                        reason=("В core буквально назван коммерческий конкурент."),
                     )
                 ],
                 expected_claims=[claim],

@@ -10,13 +10,17 @@ from app.services.analyzer import (
     ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS,
     ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE,
     ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY,
+    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256,
     PROCESSING_MODEL,
     _deterministic_entity_catalog_union,
     _entity_catalog,
     _entity_catalog_quote_recovery_incident,
+    _entity_catalog_recovery_checkpoint_identity,
+    _entity_catalog_recovery_checkpoint_key,
     _entity_catalog_recovery_stage_key,
 )
-from app.services.long_response import text_sha256
+from app.services.long_response import partition_text_records, text_sha256
 from app.services.openrouter import (
     ChatResult,
     OpenRouterError,
@@ -24,6 +28,8 @@ from app.services.openrouter import (
 )
 from app.services.recovery_orchestrator import (
     ACTION_RETRY_WITH_GUIDANCE,
+    CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
+    CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
     CHECK_PROMPT_CONTRACT_VALID,
     CHECK_RAW_CORPUS_UNCHANGED,
     OrchestratorContractError,
@@ -101,6 +107,8 @@ def _retry_plan(*, reused: bool = False) -> SimpleNamespace:
         "acceptance_checks": [
             CHECK_PROMPT_CONTRACT_VALID,
             CHECK_RAW_CORPUS_UNCHANGED,
+            CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+            CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
         ],
         "invalidate_artifact_keys": [],
     }
@@ -340,6 +348,28 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             planner_kwargs["allowed_actions"],
             {ACTION_RETRY_WITH_GUIDANCE, "stop_and_preserve_checkpoint"},
         )
+        facts = planner_kwargs["facts"]
+        self.assertEqual(
+            facts["acceptance_policy_sha256"],
+            ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256,
+        )
+        self.assertEqual(
+            facts["acceptance_policy"],
+            ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY,
+        )
+        self.assertEqual(
+            set(
+                facts["executor_contract"][ACTION_RETRY_WITH_GUIDANCE][
+                    "acceptance_checks"
+                ]
+            ),
+            {
+                CHECK_PROMPT_CONTRACT_VALID,
+                CHECK_RAW_CORPUS_UNCHANGED,
+                CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+                CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
+            },
+        )
         reserve.assert_awaited_once()
         self.assertEqual(
             reserve.await_args.kwargs["stage_execution_limit"],
@@ -348,9 +378,18 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         finish.assert_awaited_once()
         self.assertTrue(finish.await_args.kwargs["succeeded"])
         self.assertTrue(finish.await_args.kwargs["details"]["raw_source_unchanged"])
+        self.assertEqual(
+            set(finish.await_args.kwargs["details"]["executed_acceptance_checks"]),
+            {
+                CHECK_PROMPT_CONTRACT_VALID,
+                CHECK_RAW_CORPUS_UNCHANGED,
+                CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+                CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
+            },
+        )
         save.assert_awaited_once()
         saved = save.await_args.kwargs
-        self.assertTrue(saved["artifact_key"].endswith("_recovery_accepted"))
+        self.assertTrue(saved["artifact_key"].endswith("_accepted"))
         self.assertEqual(saved["status"], "completed")
         self.assertIsNone(saved["model"])
         self.assertEqual(
@@ -361,7 +400,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(completion_order, ["checkpoint", "finish"])
 
-    async def test_absent_output_quote_uses_one_plan_and_strict_retry(
+    async def test_compound_representative_quote_is_preserved_without_retry(
         self,
     ) -> None:
         calls: list[str] = []
@@ -373,11 +412,6 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             artifact_key = str(kwargs["artifact_key"])
             calls.append(artifact_key)
             payload = kwargs["user_payload"]
-            if artifact_key.endswith("_recovery_e4_a1"):
-                return _catalog_candidate(
-                    payload["answers"][0]["core_claim"],
-                    quote="ALPHA",
-                )
             if "answers" in payload:
                 invalid = _catalog_candidate(
                     payload["answers"][0]["core_claim"],
@@ -393,15 +427,13 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertTrue(any(key.endswith("_recovery_e4_a1") for key in calls))
-        planner.assert_awaited_once()
-        self.assertEqual(
-            planner.await_args.kwargs["failure_code"],
-            "core_quote_absent_from_analytic_output",
+        self.assertFalse(any("_recovery_" in key for key in calls))
+        planner.assert_not_awaited()
+        reserve.assert_not_awaited()
+        finish.assert_not_awaited()
+        self.assertTrue(
+            any("ALPHA source" in value for value in result.get("uncertainties", []))
         )
-        reserve.assert_awaited_once()
-        finish.assert_awaited_once()
-        self.assertTrue(finish.await_args.kwargs["succeeded"])
 
     async def test_evidence_binding_failure_uses_strict_recovery(
         self,
@@ -488,7 +520,12 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             set(fallback_kwargs["decision"]["acceptance_checks"]),
-            {CHECK_PROMPT_CONTRACT_VALID, CHECK_RAW_CORPUS_UNCHANGED},
+            {
+                CHECK_PROMPT_CONTRACT_VALID,
+                CHECK_RAW_CORPUS_UNCHANGED,
+                CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+                CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
+            },
         )
         reserve.assert_awaited_once()
         finish.assert_awaited_once()
@@ -559,7 +596,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         planner.assert_awaited_once()
         fallback.assert_not_awaited()
 
-    def test_absent_output_incident_rejects_spoofed_candidates(self) -> None:
+    def test_obsolete_absent_output_incident_is_not_admitted(self) -> None:
         core_text = "ALPHA source"
         claim = {
             "claim_id": "claim-1",
@@ -572,12 +609,13 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         valid_incident = _catalog_candidate(claim, quote=core_text)
         valid_incident["catalog"]["target_aliases"] = ["ALPHA"]
-        admitted = _entity_catalog_quote_recovery_incident(
-            error,
-            candidate=valid_incident,
-            expected_claims=[claim],
+        self.assertIsNone(
+            _entity_catalog_quote_recovery_incident(
+                error,
+                candidate=valid_incident,
+                expected_claims=[claim],
+            )
         )
-        self.assertIsNotNone(admitted)
 
         quote_not_in_core = _catalog_candidate(claim, quote="BETA")
         quote_not_in_core["catalog"]["target_aliases"] = ["ALPHA"]
@@ -654,6 +692,41 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         },
                     )
                 )
+
+    def test_policy_digest_versions_checkpoint_identity_key_and_stage(self) -> None:
+        units, _manifests = partition_text_records(
+            [{"answer_id": 1, "answer": "ALPHA"}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        job = {
+            "artifact_key": "entity_catalog_chunk_1_test",
+            "answers": units,
+            "model_answers": [{"answer_id": 1, "answer": "ALPHA"}],
+        }
+        target = {"brand_name": "ALPHA", "aliases": [], "products": []}
+        identity = _entity_catalog_recovery_checkpoint_identity(
+            job=job,
+            target=target,
+        )
+        checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
+        stage_key = _entity_catalog_recovery_stage_key(job)
+
+        with patch(
+            "app.services.analyzer.ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256",
+            "f" * 64,
+        ):
+            changed_identity = _entity_catalog_recovery_checkpoint_identity(
+                job=job,
+                target=target,
+            )
+            changed_checkpoint_key = _entity_catalog_recovery_checkpoint_key(job)
+            changed_stage_key = _entity_catalog_recovery_stage_key(job)
+
+        self.assertNotEqual(identity, changed_identity)
+        self.assertNotEqual(checkpoint_key, changed_checkpoint_key)
+        self.assertNotEqual(stage_key, changed_stage_key)
 
     async def _assert_restart_resumes_reserved_attempt(
         self,
@@ -970,7 +1043,7 @@ class EntityCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
             first_processing,
             save_mock=AsyncMock(side_effect=capture_checkpoint),
         )
-        self.assertTrue(stored["artifact_key"].endswith("_recovery_accepted"))
+        self.assertTrue(stored["artifact_key"].endswith("_accepted"))
 
         async def saved_artifacts(
             _run_id: str,

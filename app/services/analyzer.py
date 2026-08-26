@@ -172,6 +172,8 @@ from app.services.recovery_orchestrator import (
     CHECK_CHECKPOINT_PRESERVED,
     CHECK_CRITIC_GATE_PASSED,
     CHECK_DERIVED_METRICS_RECOMPUTED,
+    CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
+    CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
     CHECK_PROMPT_CONTRACT_VALID,
     CHECK_RAW_CORPUS_UNCHANGED,
     CHECK_SEMANTIC_REVIEW_PASSED,
@@ -239,9 +241,26 @@ ENTITY_CATALOG_CHUNK_VERSION = f"{PROMPT_VERSION}-entities-v9"
 ENTITY_CATALOG_VERSION = f"{PROMPT_VERSION}-entities-v11"
 CORE_UNIT_DECISION_LEDGER_VERSION = "aiv-core-unit-decision-ledger-v1"
 CORE_UNIT_QUOTE_REPAIR_VERSION = "aiv-core-unit-quote-markdown-v1"
-ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = "aiv-entity-catalog-contract-recovery-v1"
+ENTITY_CATALOG_QUOTE_REPAIR_VERSION = "aiv-entity-catalog-representative-quote-v2"
+ENTITY_CATALOG_GROUNDING_FILTER_VERSION = "aiv-entity-catalog-grounding-filter-v2"
+ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION = "aiv-entity-catalog-contract-recovery-v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE = "entity_catalog_contract_v2"
 ENTITY_CATALOG_CONTRACT_RECOVERY_MAX_ATTEMPTS = 2
+ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY = {
+    "version": "aiv-entity-catalog-recovery-acceptance-v2",
+    "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
+    "grounding_filter_version": ENTITY_CATALOG_GROUNDING_FILTER_VERSION,
+    "ordered_gates": [
+        "normalize_core_dispositions",
+        "validate_source_catalog_quote_repair_binding",
+        "source_and_profile_grounding_guard",
+        "validate_entity_catalog_leaf_evidence_binding",
+        "attach_core_decision_receipts",
+    ],
+}
+ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256 = stable_digest(
+    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY
+)
 ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v18"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v20"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
@@ -3426,6 +3445,78 @@ def _unique_markdown_emphasis_quote_repair(
     }
 
 
+def _entity_catalog_exact_representative_quote_repair(
+    catalog: dict[str, Any],
+    core_text: str,
+    submitted_quote: str,
+) -> dict[str, Any] | None:
+    """Replace an invented representative quote with exact catalog evidence.
+
+    A disposition is one decision per source core, whereas a catalog contains
+    independently evidence-bound names.  Models occasionally copy the brand
+    from the prompt into ``evidence_quote`` even when the answer itself says
+    only "эта студия".  Rejecting the whole 81-answer analysis is unnecessary
+    when the same immutable core contains another catalog name whose literal
+    spelling is present in that entity's evidence.  Select the first such name
+    in stable catalog order and record exact source coordinates.  This helper
+    never invents, normalises or fuzzy-matches text; the ordinary per-entity
+    evidence validator still runs afterwards.
+    """
+
+    candidates: list[tuple[str, int, int, int, int]] = []
+
+    def literal_name_match(text: str, name: str) -> re.Match[str] | None:
+        if not name:
+            return None
+        return re.search(
+            rf"(?<![\w]){re.escape(name)}(?![\w])",
+            text,
+            re.UNICODE,
+        )
+
+    for entity_index, raw_entity in enumerate(catalog.get("entities") or []):
+        if not isinstance(raw_entity, dict):
+            continue
+        evidence = str(raw_entity.get("evidence") or "")
+        raw_names: list[Any] = [raw_entity.get("canonical_name")]
+        raw_names.extend(raw_entity.get("aliases") or [])
+        for name_index, raw_name in enumerate(raw_names):
+            name = (
+                str(raw_name.get("value") or "").strip()
+                if isinstance(raw_name, dict)
+                else str(raw_name or "").strip()
+            )
+            core_match = literal_name_match(core_text, name)
+            if core_match is None or literal_name_match(evidence, name) is None:
+                continue
+            candidates.append(
+                (
+                    name,
+                    entity_index,
+                    name_index,
+                    core_match.start(),
+                    core_match.end(),
+                )
+            )
+
+    if not candidates:
+        return None
+    source_quote, entity_index, name_index, core_start, core_end = candidates[0]
+    return {
+        "version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
+        "method": "exact_catalog_name_from_same_core",
+        "source_catalog_sha256": stable_digest(catalog),
+        "submitted_quote": submitted_quote,
+        "submitted_quote_sha256": text_sha256(submitted_quote),
+        "source_quote": source_quote,
+        "source_quote_sha256": text_sha256(source_quote),
+        "core_start_char": core_start,
+        "core_end_char": core_end,
+        "source_entity_index": entity_index,
+        "source_name_index": name_index,
+    }
+
+
 def _normalize_core_dispositions(
     raw_dispositions: Any,
     *,
@@ -3479,6 +3570,12 @@ def _normalize_core_dispositions(
                     )
                 except OpenRouterError as exc:
                     raise OpenRouterError(f"{exc}: {claim['unit_id']}") from exc
+                if quote_repair is None and output_kind == "entity_catalog":
+                    quote_repair = _entity_catalog_exact_representative_quote_repair(
+                        analytic_output,
+                        core_text,
+                        submitted_quote,
+                    )
                 if quote_repair is None:
                     raise OpenRouterError(
                         "Core-unit quote is not an exact core substring: "
@@ -3496,20 +3593,37 @@ def _normalize_core_dispositions(
                 raise OpenRouterError(
                     f"Grounded core-unit output is blank: {claim['unit_id']}"
                 )
-            quote_visible = any(submitted_quote in value for value in output_strings)
-            if quote_repair is not None and not quote_visible:
-                canonical_quote, _positions, _pairs = _markdown_emphasis_view(
-                    submitted_quote
-                )
+            # A site-profile leaf has one core and its representative quote
+            # must therefore be visible in the leaf itself.  An entity-catalog
+            # leaf is different: one core can name several entities while the
+            # disposition carries only one representative quote.  Requiring
+            # that complete quote to survive entity normalization is invalid,
+            # for example when ``Google Maps, Instagram, TripAdvisor`` is
+            # split into separate catalog rows or ``Tattoo Točka`` is retained
+            # as the grounded alias ``Točka``.  Catalog names are instead
+            # checked individually by
+            # ``_validate_entity_catalog_leaf_evidence_binding`` against the
+            # immutable grounded core.  The reducer later copies every
+            # representative quote that is not otherwise visible into the
+            # uncertainty ledger, so the source fact is still preserved and
+            # the final lossless check remains strict.
+            if output_kind == "site_profile":
                 quote_visible = any(
-                    canonical_quote in _markdown_emphasis_view(value)[0]
-                    for value in output_strings
+                    submitted_quote in value for value in output_strings
                 )
-            if not quote_visible:
-                raise OpenRouterError(
-                    "Grounded core-unit quote is absent from the analytic output: "
-                    + str(claim["unit_id"])
-                )
+                if quote_repair is not None and not quote_visible:
+                    canonical_quote, _positions, _pairs = _markdown_emphasis_view(
+                        submitted_quote
+                    )
+                    quote_visible = any(
+                        canonical_quote in _markdown_emphasis_view(value)[0]
+                        for value in output_strings
+                    )
+                if not quote_visible:
+                    raise OpenRouterError(
+                        "Grounded core-unit quote is absent from the analytic output: "
+                        + str(claim["unit_id"])
+                    )
             if not reason:
                 raise OpenRouterError(
                     f"Grounded core-unit disposition has no reason: {claim['unit_id']}"
@@ -3597,10 +3711,21 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
     if repair is not None:
         if not isinstance(repair, dict):
             raise OpenRouterError("Core-unit quote repair is not an object")
+        repair_version = repair.get("version")
+        repair_method = repair.get("method")
         if (
-            repair.get("version") != CORE_UNIT_QUOTE_REPAIR_VERSION
-            or repair.get("method") != "unique_markdown_emphasis_coordinate_map"
-        ):
+            repair_version,
+            repair_method,
+        ) not in {
+            (
+                CORE_UNIT_QUOTE_REPAIR_VERSION,
+                "unique_markdown_emphasis_coordinate_map",
+            ),
+            (
+                ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
+                "exact_catalog_name_from_same_core",
+            ),
+        }:
             raise OpenRouterError("Core-unit quote repair contract mismatch")
         submitted_quote = str(repair.get("submitted_quote") or "")
         if (
@@ -3610,15 +3735,31 @@ def _validate_core_decision_receipt(value: Any) -> dict[str, Any]:
             != str(repair.get("submitted_quote_sha256") or "")
         ):
             raise OpenRouterError("Core-unit submitted quote digest mismatch")
-        canonical_quote, _positions, _pairs = _markdown_emphasis_view(submitted_quote)
-        source_canonical, _source_positions, _source_pairs = _markdown_emphasis_view(
-            quote
-        )
-        if (
-            canonical_quote != source_canonical
-            or text_sha256(canonical_quote)
-            != str(repair.get("canonical_quote_sha256") or "")
-            or text_sha256(quote) != str(repair.get("source_quote_sha256") or "")
+        if repair_method == "unique_markdown_emphasis_coordinate_map":
+            canonical_quote, _positions, _pairs = _markdown_emphasis_view(
+                submitted_quote
+            )
+            source_canonical, _source_positions, _source_pairs = (
+                _markdown_emphasis_view(quote)
+            )
+            if (
+                canonical_quote != source_canonical
+                or text_sha256(canonical_quote)
+                != str(repair.get("canonical_quote_sha256") or "")
+                or text_sha256(quote) != str(repair.get("source_quote_sha256") or "")
+            ):
+                raise OpenRouterError("Core-unit quote repair evidence mismatch")
+        elif (
+            text_sha256(quote) != str(repair.get("source_quote_sha256") or "")
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(repair.get("source_catalog_sha256") or ""),
+            )
+            is None
+            or not isinstance(repair.get("source_entity_index"), int)
+            or int(repair["source_entity_index"]) < 0
+            or not isinstance(repair.get("source_name_index"), int)
+            or int(repair["source_name_index"]) < 0
         ):
             raise OpenRouterError("Core-unit quote repair evidence mismatch")
         try:
@@ -12415,6 +12556,9 @@ def _entity_catalog_recovery_checkpoint_identity(
     claims = _core_unit_claims(job["answers"])
     return {
         "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
+        "grounding_filter_version": ENTITY_CATALOG_GROUNDING_FILTER_VERSION,
+        "acceptance_policy_sha256": (ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256),
         "base_artifact_key": str(job["artifact_key"]),
         "base_prompt_version": ENTITY_CATALOG_CHUNK_VERSION,
         "source_units_sha256": stable_digest(job["answers"]),
@@ -12425,14 +12569,16 @@ def _entity_catalog_recovery_checkpoint_identity(
 
 
 def _entity_catalog_recovery_checkpoint_key(job: dict[str, Any]) -> str:
-    return str(job["artifact_key"]) + "_recovery_accepted"
+    policy_digest = ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256[:12]
+    return f"{job['artifact_key']}_recovery_{policy_digest}_accepted"
 
 
 def _entity_catalog_recovery_stage_key(job: dict[str, Any]) -> str:
     """Give each concurrent catalog chunk its own bounded planner stage."""
 
     artifact_digest = text_sha256(str(job["artifact_key"]))[:16]
-    return f"{ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE}:{artifact_digest}"
+    policy_digest = ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256[:12]
+    return f"{ENTITY_CATALOG_CONTRACT_RECOVERY_STAGE}:{artifact_digest}:{policy_digest}"
 
 
 def _validate_entity_catalog_leaf_evidence_binding(
@@ -12471,6 +12617,8 @@ def _validate_entity_catalog_leaf_evidence_binding(
         for claim in expected_claims
         if isinstance(claim, dict)
     }
+    if len(claims_by_identity) != len(expected_claims):
+        raise OpenRouterError("Entity-catalog expected-claim coverage mismatch")
     grounded_cores: list[str] = []
     for receipt in receipts:
         if receipt.get("disposition") != "grounded_fact":
@@ -12626,6 +12774,424 @@ def _validate_entity_catalog_leaf_evidence_binding(
         )
 
 
+def _sanitize_recovered_entity_catalog_evidence(
+    catalog: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    *,
+    expected_claims: list[dict[str, Any]],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Repair or drop only names proven against immutable grounded cores.
+
+    This function is deliberately available only after the bounded recovery
+    model has returned a complete candidate. Model-authored category labels
+    never authorize deletion by themselves. A name that occurs in a
+    content-addressed grounded core is repaired to that exact source span (or
+    remains fail-closed); a site/profile-confirmed name is never removed. A
+    small minority of ``other/unrelated`` rows may be removed only when the
+    canonical name and every alias are absent from every grounded core and
+    none is code-owned. The provider artifact remains immutable, while the
+    accepted checkpoint contains only hashes and source coordinates for each
+    deterministic operation.
+    """
+
+    try:
+        _validate_entity_catalog_leaf_evidence_binding(
+            catalog,
+            receipts,
+            expected_claims=expected_claims,
+            profile=profile,
+        )
+        return copy.deepcopy(catalog)
+    except OpenRouterError as error:
+        prefix = "Entity-catalog evidence binding failed: "
+        message = str(error)
+        if not message.startswith(prefix):
+            raise
+        binding_error = error
+        failures = [
+            item.strip() for item in message[len(prefix) :].split(";") if item.strip()
+        ]
+
+    entity_pattern = re.compile(r"entities\[(\d+)\]\.canonical_name is not grounded")
+    entity_indexes: set[int] = set()
+    for failure in failures:
+        if match := entity_pattern.fullmatch(failure):
+            entity_indexes.add(int(match.group(1)))
+            continue
+        raise binding_error
+    if not entity_indexes:
+        raise binding_error
+
+    claims_by_identity = {
+        (
+            str(claim.get("claim_id") or ""),
+            str(claim.get("unit_id") or ""),
+            str(claim.get("core_sha256") or ""),
+        ): claim
+        for claim in expected_claims
+        if isinstance(claim, dict)
+    }
+    if len(claims_by_identity) != len(expected_claims):
+        raise OpenRouterError(
+            "Recovered entity-catalog filter expected-claim coverage mismatch"
+        ) from binding_error
+    all_cores: list[dict[str, Any]] = []
+    cores_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for identity, claim in claims_by_identity.items():
+        core_text = str(claim.get("core_text") or "")
+        if not core_text or text_sha256(core_text) != identity[2]:
+            raise OpenRouterError(
+                "Recovered entity-catalog filter core digest mismatch"
+            ) from binding_error
+        core = {
+            "claim_id": identity[0],
+            "unit_id": identity[1],
+            "core_sha256": identity[2],
+            "source_sha256": str(claim.get("source_sha256") or ""),
+            "source_start_char": int(claim.get("start_char") or 0),
+            "core_text": core_text,
+        }
+        all_cores.append(core)
+        cores_by_identity[identity] = core
+
+    grounded_cores: list[dict[str, Any]] = []
+    seen_receipts: set[tuple[str, str, str]] = set()
+    for raw_receipt in receipts:
+        receipt = _validate_core_decision_receipt(raw_receipt)
+        receipt_claim = receipt.get("claim")
+        if not isinstance(receipt_claim, dict):
+            raise OpenRouterError(
+                "Recovered entity-catalog filter receipt has no claim"
+            ) from binding_error
+        identity = (
+            str(receipt_claim.get("claim_id") or ""),
+            str(receipt_claim.get("unit_id") or ""),
+            str(receipt_claim.get("core_sha256") or ""),
+        )
+        if identity in seen_receipts or identity not in claims_by_identity:
+            raise OpenRouterError(
+                "Recovered entity-catalog filter receipt coverage mismatch"
+            ) from binding_error
+        seen_receipts.add(identity)
+        claim = claims_by_identity[identity]
+        if receipt.get("disposition") != "grounded_fact":
+            continue
+        grounded_cores.append(cores_by_identity[identity])
+    if seen_receipts != set(claims_by_identity):
+        raise OpenRouterError(
+            "Recovered entity-catalog filter receipt coverage mismatch"
+        ) from binding_error
+
+    def identity_text(value: str) -> str:
+        return re.sub(
+            r"\s+",
+            " ",
+            unicodedata.normalize("NFKC", value).casefold().replace("ё", "е").strip(),
+        )
+
+    def source_projection(value: str) -> tuple[str, list[int], list[int]]:
+        """Return a case/NFKC view with exact source-coordinate mapping."""
+
+        normalized: list[str] = []
+        starts: list[int] = []
+        ends: list[int] = []
+        cluster_start = 0
+        while cluster_start < len(value):
+            cluster_end = cluster_start + 1
+            while cluster_end < len(value) and unicodedata.combining(
+                value[cluster_end]
+            ):
+                cluster_end += 1
+            cluster = (
+                unicodedata.normalize("NFKC", value[cluster_start:cluster_end])
+                .casefold()
+                .replace("ё", "е")
+            )
+            for character in cluster:
+                normalized.append(character)
+                starts.append(cluster_start)
+                ends.append(cluster_end)
+            cluster_start = cluster_end
+        return "".join(normalized), starts, ends
+
+    def word_character(value: str) -> bool:
+        return bool(value and re.match(r"\w", value, re.UNICODE))
+
+    evidence_quote_patterns = (
+        re.compile(r"«([^«»]+)»", re.DOTALL),
+        re.compile(r"“([^“”]+)”", re.DOTALL),
+        re.compile(r"„([^„“]+)“", re.DOTALL),
+        re.compile(r"‘([^‘’]+)’", re.DOTALL),
+        re.compile(r'"([^"\r\n]+)"'),
+        re.compile(r"`([^`\r\n]+)`"),
+    )
+
+    def equivalent_name_is_present(value: str, name: str) -> bool:
+        normalized_name = (
+            unicodedata.normalize("NFKC", name).casefold().replace("ё", "е")
+        )
+        if not normalized_name:
+            return False
+        projected, starts, ends = source_projection(value)
+        offset = 0
+        while True:
+            normalized_start = projected.find(normalized_name, offset)
+            if normalized_start < 0:
+                return False
+            normalized_end = normalized_start + len(normalized_name)
+            source_start = starts[normalized_start]
+            source_end = ends[normalized_end - 1]
+            source_quote = value[source_start:source_end]
+            before = value[source_start - 1] if source_start else ""
+            after = value[source_end] if source_end < len(value) else ""
+            if not (
+                (word_character(source_quote[:1]) and word_character(before))
+                or (word_character(source_quote[-1:]) and word_character(after))
+            ):
+                return True
+            offset = normalized_start + 1
+
+    def submitted_evidence_supports_name(evidence: str, name: str) -> bool:
+        for pattern in evidence_quote_patterns:
+            spans = [
+                match.group(1) for match in pattern.finditer(evidence) if match.group(1)
+            ]
+            if spans:
+                return any(equivalent_name_is_present(span, name) for span in spans)
+        return equivalent_name_is_present(evidence, name)
+
+    def first_source_occurrence(
+        name: str,
+        cores: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        normalized_name = (
+            unicodedata.normalize("NFKC", name).casefold().replace("ё", "е")
+        )
+        if not normalized_name:
+            return None
+        for core in cores:
+            source_text = str(core["core_text"])
+            projected, starts, ends = source_projection(source_text)
+            offset = 0
+            while True:
+                normalized_start = projected.find(normalized_name, offset)
+                if normalized_start < 0:
+                    break
+                normalized_end = normalized_start + len(normalized_name)
+                source_start = starts[normalized_start]
+                source_end = ends[normalized_end - 1]
+                source_quote = source_text[source_start:source_end]
+                before = source_text[source_start - 1] if source_start else ""
+                after = source_text[source_end] if source_end < len(source_text) else ""
+                starts_with_word = word_character(source_quote[:1])
+                ends_with_word = word_character(source_quote[-1:])
+                boundary_ok = not (
+                    (starts_with_word and word_character(before))
+                    or (ends_with_word and word_character(after))
+                )
+                equivalent = (
+                    unicodedata.normalize("NFKC", source_quote)
+                    .casefold()
+                    .replace("ё", "е")
+                    == normalized_name
+                )
+                if boundary_ok and equivalent:
+                    source_origin = int(core["source_start_char"])
+                    return {
+                        "claim_id": str(core["claim_id"]),
+                        "unit_id": str(core["unit_id"]),
+                        "core_sha256": str(core["core_sha256"]),
+                        "source_sha256": str(core["source_sha256"]),
+                        "core_start_char": source_start,
+                        "core_end_char": source_end,
+                        "source_start_char": source_origin + source_start,
+                        "source_end_char": source_origin + source_end,
+                        "source_quote": source_quote,
+                        "match": (
+                            "exact_literal"
+                            if source_quote == name
+                            else "nfkc_case_equivalent"
+                        ),
+                    }
+                offset = normalized_start + 1
+        return None
+
+    sanitized = copy.deepcopy(catalog)
+    entities = sanitized.get("entities")
+    if not isinstance(entities, list):
+        raise OpenRouterError(
+            "Recovered entity-catalog filter received malformed entities"
+        ) from binding_error
+
+    operations: list[dict[str, Any]] = []
+    removable_indexes: set[int] = set()
+    for index in sorted(entity_indexes):
+        if index >= len(entities) or not isinstance(entities[index], dict):
+            raise OpenRouterError(
+                "Recovered entity-catalog filter entity index is stale"
+            ) from binding_error
+        entity = entities[index]
+        canonical = str(entity.get("canonical_name") or "").strip()
+        aliases: list[str] = []
+        raw_aliases = entity.get("aliases")
+        if not isinstance(raw_aliases, list):
+            raise binding_error
+        for raw_alias in raw_aliases:
+            alias = (
+                str(raw_alias.get("value") or "").strip()
+                if isinstance(raw_alias, dict)
+                else str(raw_alias or "").strip()
+            )
+            if alias:
+                aliases.append(alias)
+
+        trusted_names = [
+            *_target_aliases(profile, catalog),
+            *_profile_confirmed_names_for_entity(entity, profile),
+        ]
+        trusted_keys = {identity_text(value) for value in trusted_names if value}
+        entity_names = [canonical, *aliases]
+        canonical_code_owned = identity_text(canonical) in trusted_keys
+        code_owned = any(
+            identity_text(name) in trusted_keys for name in entity_names if name
+        )
+        occurrences = [
+            (name_index, name, first_source_occurrence(name, grounded_cores))
+            for name_index, name in enumerate(entity_names)
+        ]
+        grounded_occurrences = [item for item in occurrences if item[2] is not None]
+        any_source_occurrence = any(
+            first_source_occurrence(name, all_cores) is not None
+            for name in entity_names
+        )
+
+        repair_occurrence: tuple[int, str, dict[str, Any]] | None = None
+        if grounded_occurrences:
+            canonical_occurrence = next(
+                (item for item in grounded_occurrences if item[0] == 0),
+                None,
+            )
+            if canonical_occurrence is not None:
+                repair_occurrence = canonical_occurrence  # type: ignore[assignment]
+            elif canonical_code_owned:
+                independently_owned_alias = next(
+                    (
+                        item
+                        for item in grounded_occurrences
+                        if identity_text(item[1]) in trusted_keys
+                    ),
+                    None,
+                )
+                if independently_owned_alias is not None:
+                    repair_occurrence = independently_owned_alias  # type: ignore[assignment]
+                else:
+                    raise binding_error
+            else:
+                # An answer-derived alias cannot prove its ungrounded
+                # canonical owner. It still blocks deletion; recovery must
+                # return a semantically coherent entity instead.
+                raise binding_error
+
+        if repair_occurrence is not None:
+            name_index, matched_name, occurrence = repair_occurrence
+            source_quote = str(occurrence["source_quote"])
+            original_evidence = str(entity.get("evidence") or "")
+            original_canonical = canonical
+            if not submitted_evidence_supports_name(
+                original_evidence,
+                matched_name,
+            ):
+                # Exact source occurrence protects the entity from deletion,
+                # but unrelated model-authored evidence cannot be silently
+                # rebound to convenient sibling material.
+                raise binding_error
+            entity["evidence"] = source_quote
+            canonical_replaced = bool(name_index == 0 and source_quote != canonical)
+            if canonical_replaced:
+                entity["canonical_name"] = source_quote
+            operations.append(
+                {
+                    "operation": "repair_from_grounded_core",
+                    "path": f"entities[{index}]",
+                    "name_path": (
+                        f"entities[{index}].canonical_name"
+                        if name_index == 0
+                        else f"entities[{index}].aliases[{name_index - 1}]"
+                    ),
+                    "match": str(occurrence["match"]),
+                    "claim_id": str(occurrence["claim_id"]),
+                    "unit_id": str(occurrence["unit_id"]),
+                    "core_sha256": str(occurrence["core_sha256"]),
+                    "source_sha256": str(occurrence["source_sha256"]),
+                    "core_start_char": int(occurrence["core_start_char"]),
+                    "core_end_char": int(occurrence["core_end_char"]),
+                    "source_start_char": int(occurrence["source_start_char"]),
+                    "source_end_char": int(occurrence["source_end_char"]),
+                    "source_quote_sha256": text_sha256(source_quote),
+                    "original_evidence_sha256": text_sha256(original_evidence),
+                    "replacement_evidence_sha256": text_sha256(source_quote),
+                    "canonical_replaced": canonical_replaced,
+                    "original_canonical_sha256": text_sha256(original_canonical),
+                    "replacement_canonical_sha256": text_sha256(
+                        str(entity.get("canonical_name") or "")
+                    ),
+                }
+            )
+            continue
+
+        if any_source_occurrence:
+            # A model-authored explicit_no_fact disposition cannot authorize
+            # deletion of a name that is literally present in that immutable
+            # core. Only grounded cores can support automatic evidence repair;
+            # all other disposition contradictions remain fail-closed.
+            raise binding_error
+        if code_owned:
+            raise binding_error
+        category = str(entity.get("category") or "").casefold()
+        relationship = str(entity.get("target_relationship") or "").casefold()
+        if category != "other" or relationship not in {"other", "unrelated"}:
+            raise binding_error
+        removable_indexes.add(index)
+
+    allowed_count = min(5, max(1, len(entities) // 10))
+    if removable_indexes and (
+        len(entities) < 10 or len(removable_indexes) > allowed_count
+    ):
+        raise binding_error
+
+    removed: list[dict[str, Any]] = []
+    for index in sorted(removable_indexes, reverse=True):
+        value = entities.pop(index)
+        removal = {
+            "operation": "remove_absent_unowned_other",
+            "path": f"entities[{index}]",
+            "value_sha256": stable_digest(value),
+        }
+        removed.append(removal)
+        operations.append(copy.deepcopy(removal))
+
+    _validate_entity_catalog_leaf_evidence_binding(
+        sanitized,
+        receipts,
+        expected_claims=expected_claims,
+        profile=profile,
+    )
+    sanitized["_aiv_entity_catalog_filter"] = {
+        "version": ENTITY_CATALOG_GROUNDING_FILTER_VERSION,
+        "source_catalog_sha256": stable_digest(catalog),
+        "accepted_catalog_sha256": stable_digest(sanitized),
+        "operation_count": len(operations),
+        "operations": sorted(operations, key=lambda item: str(item["path"])),
+        "repair_count": sum(
+            item.get("operation") == "repair_from_grounded_core" for item in operations
+        ),
+        "removal_count": len(removed),
+        "removals": sorted(removed, key=lambda item: str(item["path"])),
+    }
+    return sanitized
+
+
 def _validated_recovered_entity_catalog_leaf(
     recovered: dict[str, Any],
     *,
@@ -12642,16 +13208,65 @@ def _validated_recovered_entity_catalog_leaf(
         analytic_output=recovered_catalog,
         output_kind="entity_catalog",
     )
+    source_catalog_sha256 = stable_digest(recovered_catalog)
+    source_entities = recovered_catalog.get("entities")
+    if not isinstance(source_entities, list):
+        raise OpenRouterError("Recovered entity-catalog leaf has malformed entities")
+    for receipt in receipts:
+        repair = receipt.get("evidence_quote_repair")
+        if not isinstance(repair, dict) or repair.get("method") != (
+            "exact_catalog_name_from_same_core"
+        ):
+            continue
+        if repair.get("source_catalog_sha256") != source_catalog_sha256:
+            raise OpenRouterError(
+                "Recovered entity-catalog quote repair source digest mismatch"
+            )
+        entity_index = int(repair["source_entity_index"])
+        name_index = int(repair["source_name_index"])
+        if entity_index >= len(source_entities) or not isinstance(
+            source_entities[entity_index], dict
+        ):
+            raise OpenRouterError(
+                "Recovered entity-catalog quote repair entity index is stale"
+            )
+        source_entity = source_entities[entity_index]
+        source_names: list[Any] = [source_entity.get("canonical_name")]
+        raw_aliases = source_entity.get("aliases")
+        if not isinstance(raw_aliases, list):
+            raise OpenRouterError(
+                "Recovered entity-catalog quote repair aliases are malformed"
+            )
+        source_names.extend(raw_aliases)
+        if name_index >= len(source_names):
+            raise OpenRouterError(
+                "Recovered entity-catalog quote repair name index is stale"
+            )
+        raw_name = source_names[name_index]
+        source_name = (
+            str(raw_name.get("value") or "").strip()
+            if isinstance(raw_name, dict)
+            else str(raw_name or "").strip()
+        )
+        source_evidence = str(source_entity.get("evidence") or "")
+        if source_name != str(receipt.get("evidence_quote") or "") or not re.search(
+            rf"(?<![\w]){re.escape(source_name)}(?![\w])",
+            source_evidence,
+            re.UNICODE,
+        ):
+            raise OpenRouterError(
+                "Recovered entity-catalog quote repair source binding mismatch"
+            )
+    recovered_catalog = _sanitize_recovered_entity_catalog_evidence(
+        recovered_catalog,
+        receipts,
+        expected_claims=claims,
+        profile=profile,
+    )
     accepted = _attach_core_decisions(
         recovered_catalog,
         receipts,
         [str(item.get("_lr_unit_id") or "") for item in job["answers"]],
-    )
-    _validate_entity_catalog_leaf_evidence_binding(
-        accepted,
-        receipts,
-        expected_claims=claims,
-        profile=profile,
     )
     return accepted
 
@@ -12791,6 +13406,13 @@ async def _validate_entity_catalog_recovery_epoch_binding(
         != str(facts.get("invalid_candidate_sha256") or "")
         or str(recovery_contract.get("source_units_sha256") or "")
         != str(facts.get("source_units_sha256") or "")
+        or str(recovery_contract.get("quote_repair_version") or "")
+        != str(facts.get("quote_repair_version") or "")
+        or str(recovery_contract.get("grounding_filter_version") or "")
+        != str(facts.get("grounding_filter_version") or "")
+        or str(recovery_contract.get("acceptance_policy_sha256") or "")
+        != str(facts.get("acceptance_policy_sha256") or "")
+        or recovery_contract.get("acceptance_policy") != facts.get("acceptance_policy")
     ):
         raise OpenRouterError(
             "Entity-catalog recovery checkpoint planner provenance mismatch"
@@ -12814,6 +13436,15 @@ async def _validate_entity_catalog_recovery_epoch_binding(
             != checkpoint.get("recovery_artifact_key")
             or details.get("execution_attempt") != attempt
             or details.get("raw_source_unchanged") is not True
+            or details.get("executed_acceptance_checks")
+            != sorted(
+                {
+                    CHECK_PROMPT_CONTRACT_VALID,
+                    CHECK_RAW_CORPUS_UNCHANGED,
+                    CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+                    CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
+                }
+            )
         ):
             raise OpenRouterError("Entity-catalog recovery checkpoint outcome mismatch")
     return (
@@ -12934,6 +13565,14 @@ async def _validate_entity_catalog_recovery_checkpoint(
         or recovery_contract.get("execution_attempt") != execution_attempt
         or str(recovery_contract.get("source_units_sha256") or "")
         != str(identity["source_units_sha256"])
+        or recovery_contract.get("quote_repair_version")
+        != identity["quote_repair_version"]
+        or recovery_contract.get("grounding_filter_version")
+        != identity["grounding_filter_version"]
+        or recovery_contract.get("acceptance_policy_sha256")
+        != identity["acceptance_policy_sha256"]
+        or recovery_contract.get("acceptance_policy")
+        != ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY
     ):
         raise OpenRouterError(
             "Entity-catalog recovery checkpoint input provenance mismatch"
@@ -12980,6 +13619,8 @@ async def _validate_entity_catalog_recovery_checkpoint(
                     {
                         CHECK_PROMPT_CONTRACT_VALID,
                         CHECK_RAW_CORPUS_UNCHANGED,
+                        CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+                        CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
                     }
                 ),
             },
@@ -13016,9 +13657,15 @@ async def _recover_entity_catalog_chunk_contract(
     required_retry_checks = {
         CHECK_PROMPT_CONTRACT_VALID,
         CHECK_RAW_CORPUS_UNCHANGED,
+        CHECK_ENTITY_CATALOG_SOURCE_BINDING_VALID,
+        CHECK_ENTITY_CATALOG_GROUNDING_FILTER_VALID,
     }
     facts = {
         "version": ENTITY_CATALOG_CONTRACT_RECOVERY_VERSION,
+        "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
+        "grounding_filter_version": ENTITY_CATALOG_GROUNDING_FILTER_VERSION,
+        "acceptance_policy": copy.deepcopy(ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY),
+        "acceptance_policy_sha256": (ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256),
         "immutable_core_claims": copy.deepcopy(claims),
         "immutable_core_claims_sha256": stable_digest(claims),
         "source_units_sha256": source_digest,
@@ -13031,8 +13678,8 @@ async def _recover_entity_catalog_chunk_contract(
                 ),
                 "source_mutation": "forbidden",
                 "acceptance_checks": sorted(required_retry_checks),
-                "acceptance_gate": (
-                    "same strict _normalize_core_dispositions validator"
+                "acceptance_gate": copy.deepcopy(
+                    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY["ordered_gates"]
                 ),
             },
             ACTION_STOP: {
@@ -13235,6 +13882,14 @@ async def _recover_entity_catalog_chunk_contract(
                     incident.get("binding_failures") or []
                 ),
                 "source_units_sha256": source_digest,
+                "quote_repair_version": ENTITY_CATALOG_QUOTE_REPAIR_VERSION,
+                "grounding_filter_version": (ENTITY_CATALOG_GROUNDING_FILTER_VERSION),
+                "acceptance_policy": copy.deepcopy(
+                    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY
+                ),
+                "acceptance_policy_sha256": (
+                    ENTITY_CATALOG_RECOVERY_ACCEPTANCE_POLICY_SHA256
+                ),
                 "invalid_candidate_sha256": incident["candidate_sha256"],
                 "orchestrator_guidance": str(plan.decision.get("guidance") or ""),
                 "immutable_contract": (
