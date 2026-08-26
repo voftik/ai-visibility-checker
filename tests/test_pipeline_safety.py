@@ -154,6 +154,8 @@ from app.services.analyzer import (
     _final_model_input_window,
     _normalize_final_evidence_packet,
     _normalize_final_root_summary_packet,
+    _precheck_final_mapper_exact_coverage,
+    _reconcile_final_mapper_observation_claim_ids,
     _final_root_tokens_are_grounded,
     _final_root_fact_refs,
     _final_root_fact_table,
@@ -10288,6 +10290,107 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 allowed_claims={claim_id: corrupt_claim},
                 claim_objects={claim_id: claim_objects[claim_id]},
             )
+
+    def test_mapper_rebinds_observation_claim_id_from_exact_local_anchors(
+        self,
+    ) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"mode": "anthropic/claude-sonnet-5"}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claim = claim_rows[0]
+        claim_id = str(claim["claim_id"])
+        typo_id = claim_id[:36] + claim_id[38:]
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["observations"][0]["source_claim_ids"] = [typo_id]
+        allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in units
+        }
+        allowed_claims = {claim_id: claim}
+
+        reconciled = _reconcile_final_mapper_observation_claim_ids(
+            packet,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            global_claim_ids={claim_id},
+        )
+
+        self.assertEqual(
+            reconciled["observations"][0]["source_claim_ids"],
+            [claim_id],
+        )
+        audit = reconciled["_aiv_final_input_grounding_filter"]
+        self.assertEqual(audit["operation_count"], 1)
+        self.assertEqual(
+            audit["operations"][0]["operation"],
+            "replace_invalid_observation_claim_id",
+        )
+        self.assertNotIn(typo_id, json.dumps(audit, ensure_ascii=False))
+        _precheck_final_mapper_exact_coverage(
+            reconciled,
+            expected_unit_ids=list(allowed_paths),
+            expected_claim_ids=[claim_id],
+        )
+        normalized = _normalize_final_evidence_packet(
+            reconciled,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            claim_objects={claim_id: claim_objects[claim_id]},
+        )
+        self.assertEqual(
+            _reconcile_final_mapper_observation_claim_ids(
+                normalized,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids={claim_id},
+            ),
+            normalized,
+        )
+
+        cross_leaf = copy.deepcopy(packet)
+        cross_leaf_id = "clm_" + "f" * 64
+        cross_leaf["observations"][0]["source_claim_ids"] = [cross_leaf_id]
+        with self.assertRaisesRegex(OpenRouterError, "another immutable map subset"):
+            _reconcile_final_mapper_observation_claim_ids(
+                cross_leaf,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids={claim_id, cross_leaf_id},
+            )
+
+        invented = copy.deepcopy(packet)
+        invented["observations"][0]["source_claim_ids"] = ["invented-claim"]
+        with self.assertRaisesRegex(OpenRouterError, "invented source identities"):
+            _reconcile_final_mapper_observation_claim_ids(
+                invented,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids={claim_id},
+            )
+
+        for fault in ("excerpt", "digest", "duplicate"):
+            with self.subTest(fault=fault):
+                broken = copy.deepcopy(packet)
+                if fault == "excerpt":
+                    broken["observations"][0]["evidence_excerpt"] = "partial"
+                elif fault == "digest":
+                    broken["claim_coverage"][0]["excerpt_sha256"] = "f" * 64
+                else:
+                    broken["observations"].append(
+                        copy.deepcopy(broken["observations"][0])
+                    )
+                with self.assertRaises(OpenRouterError):
+                    _reconcile_final_mapper_observation_claim_ids(
+                        broken,
+                        allowed_unit_paths=allowed_paths,
+                        allowed_claims=allowed_claims,
+                        global_claim_ids={claim_id},
+                    )
 
     def test_generic_mapper_ack_cannot_retain_material_priority(self) -> None:
         units, _manifest = _flatten_final_input_payload(

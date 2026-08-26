@@ -34978,6 +34978,184 @@ def _precheck_final_mapper_exact_coverage(
         )
 
 
+def _reconcile_final_mapper_observation_claim_ids(
+    packet: dict[str, Any],
+    *,
+    allowed_unit_paths: dict[str, str],
+    allowed_claims: dict[str, dict[str, Any]],
+    global_claim_ids: set[str],
+) -> dict[str, Any]:
+    """Rebind a copied observation claim id only from exact local anchors.
+
+    Claim ids are code-owned hashes, but the mapper must echo them. A copied
+    id may lose characters while the independent unit, path, full excerpt,
+    digest and canonical coverage row remain exact. In that one case the id is
+    redundant metadata and can be re-attested. No fuzzy hash matching is used.
+
+    Cross-pack ids, ambiguous anchors, partial excerpts, wrong digests and any
+    result that does not restore exact-once observation/coverage counters stay
+    hard failures.
+    """
+
+    output = copy.deepcopy(packet)
+    observations = output.get("observations")
+    claim_coverage = output.get("claim_coverage")
+    if not isinstance(observations, list) or not isinstance(
+        claim_coverage,
+        list,
+    ):
+        return output
+
+    expected_claim_ids = list(allowed_claims)
+    expected_claim_set = set(expected_claim_ids)
+    coverage_by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    coverage_ids: list[str] = []
+    for item in claim_coverage:
+        if not isinstance(item, dict) or not isinstance(item.get("claim_id"), str):
+            continue
+        claim_id = str(item["claim_id"])
+        coverage_ids.append(claim_id)
+        coverage_by_id[claim_id].append(item)
+
+    replacements: list[tuple[int, int, str, str]] = []
+    replacement_targets: set[str] = set()
+    observed_after: list[str] = []
+    for observation_index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            continue
+        claim_ids = observation.get("source_claim_ids")
+        if not isinstance(claim_ids, list) or any(
+            not isinstance(claim_id, str) for claim_id in claim_ids
+        ):
+            continue
+        for claim_position, supplied_claim_id in enumerate(claim_ids):
+            if supplied_claim_id in expected_claim_set:
+                observed_after.append(supplied_claim_id)
+                continue
+            if supplied_claim_id in global_claim_ids:
+                raise OpenRouterError(
+                    "Final evidence mapper referenced a claim from another "
+                    "immutable map subset"
+                )
+            if not re.fullmatch(r"clm_[0-9a-f]{60,68}", supplied_claim_id):
+                raise OpenRouterError(
+                    "Final evidence mapper invented source identities: "
+                    f"units=[], claims={[supplied_claim_id]}"
+                )
+            if len(claim_ids) != 1:
+                raise OpenRouterError(
+                    "Final evidence mapper unknown claim cannot be reconciled "
+                    "from a multi-claim observation"
+                )
+            unit_ids = observation.get("source_unit_ids")
+            paths = observation.get("source_paths")
+            evidence_excerpt = observation.get("evidence_excerpt")
+            exact_values = observation.get("exact_values")
+            if (
+                not isinstance(unit_ids, list)
+                or len(unit_ids) != 1
+                or not isinstance(unit_ids[0], str)
+                or not isinstance(paths, list)
+                or len(paths) != 1
+                or not isinstance(paths[0], str)
+                or not isinstance(evidence_excerpt, str)
+                or not evidence_excerpt
+                or not isinstance(exact_values, list)
+                or any(not isinstance(value, str) for value in exact_values)
+            ):
+                raise OpenRouterError(
+                    "Final evidence mapper unknown claim has incomplete exact anchors"
+                )
+
+            candidates: list[str] = []
+            for canonical_claim_id, claim in allowed_claims.items():
+                if not isinstance(claim, dict):
+                    continue
+                unit_id = str(claim.get("source_unit_id") or "")
+                path = str(claim.get("source_path") or "")
+                excerpt = str(claim.get("excerpt") or "")
+                digest = str(claim.get("excerpt_sha256") or "")
+                coverage_rows = coverage_by_id.get(canonical_claim_id, [])
+                if (
+                    unit_ids != [unit_id]
+                    or paths != [path]
+                    or allowed_unit_paths.get(unit_id) != path
+                    or evidence_excerpt != excerpt
+                    or digest != text_sha256(excerpt)
+                    or len(coverage_rows) != 1
+                    or coverage_rows[0].get("excerpt_sha256") != digest
+                    or any(
+                        not value.strip()
+                        or value not in excerpt
+                        or not _final_root_tokens_are_grounded(
+                            value,
+                            source_texts=[excerpt],
+                        )
+                        for value in exact_values
+                    )
+                ):
+                    continue
+                candidates.append(canonical_claim_id)
+            if len(candidates) != 1:
+                raise OpenRouterError(
+                    "Final evidence mapper unknown claim is not uniquely "
+                    "attested by code-owned anchors"
+                )
+            canonical_claim_id = candidates[0]
+            if canonical_claim_id in replacement_targets:
+                raise OpenRouterError(
+                    "Final evidence mapper reconciled multiple unknown claims "
+                    "to one canonical claim"
+                )
+            replacement_targets.add(canonical_claim_id)
+            replacements.append(
+                (
+                    observation_index,
+                    claim_position,
+                    supplied_claim_id,
+                    canonical_claim_id,
+                )
+            )
+            observed_after.append(canonical_claim_id)
+
+    if not replacements:
+        return output
+    if Counter(observed_after) != Counter(expected_claim_ids) or Counter(
+        coverage_ids
+    ) != Counter(expected_claim_ids):
+        raise OpenRouterError(
+            "Final evidence mapper claim reconciliation did not restore "
+            "exact-once local coverage"
+        )
+
+    operations: list[dict[str, Any]] = []
+    for observation_index, claim_position, supplied_claim_id, canonical_claim_id in (
+        replacements
+    ):
+        output["observations"][observation_index]["source_claim_ids"][
+            claim_position
+        ] = canonical_claim_id
+        operations.append(
+            _final_input_grounding_filter_operation(
+                scope="mapper",
+                operation="replace_invalid_observation_claim_id",
+                path=(
+                    f"observations[{observation_index}]."
+                    f"source_claim_ids[{claim_position}]"
+                ),
+                binding_sha256=text_sha256(canonical_claim_id),
+                value=supplied_claim_id,
+                replacement=canonical_claim_id,
+            )
+        )
+    _record_final_input_grounding_filter(
+        output,
+        scope="mapper",
+        operations=operations,
+    )
+    return output
+
+
 _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
     {
         "drop_ungrounded_exact_value",
@@ -34989,6 +35167,7 @@ _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
         "replace_quarantined_observation_importance",
         "replace_quarantined_unit_coverage_disposition",
         "replace_quarantined_claim_coverage_disposition",
+        "replace_invalid_observation_claim_id",
         "replace_invalid_claim_coverage_digest",
         "replace_ungrounded_unit_coverage_rationale",
         "replace_ungrounded_claim_coverage_rationale",
@@ -35012,6 +35191,8 @@ _FINAL_INPUT_TRANSPORT_ACTION_TOKEN = re.compile(
     r"accounted|acknowledged|covered|processed|recorded|preserved|retained)$",
     re.IGNORECASE,
 )
+
+
 def _final_input_statement_is_transport_ack(
     statement: str,
 ) -> bool:
@@ -38861,20 +39042,28 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             prompt_version=prompt_version,
         )
         try:
-            _precheck_final_mapper_exact_coverage(
+            allowed_unit_paths = {
+                str(item["source_unit_id"]): str(item["source_path"])
+                for item in pack
+            }
+            allowed_claims = {
+                str(item["claim_id"]): item for item in claim_rows_for_pack
+            }
+            reconciled = _reconcile_final_mapper_observation_claim_ids(
                 result,
+                allowed_unit_paths=allowed_unit_paths,
+                allowed_claims=allowed_claims,
+                global_claim_ids=set(claim_objects_by_id),
+            )
+            _precheck_final_mapper_exact_coverage(
+                reconciled,
                 expected_unit_ids=unit_ids,
                 expected_claim_ids=claim_ids,
             )
             normalized = _normalize_final_evidence_packet(
-                result,
-                allowed_unit_paths={
-                    str(item["source_unit_id"]): str(item["source_path"])
-                    for item in pack
-                },
-                allowed_claims={
-                    str(item["claim_id"]): item for item in claim_rows_for_pack
-                },
+                reconciled,
+                allowed_unit_paths=allowed_unit_paths,
+                allowed_claims=allowed_claims,
                 claim_objects={
                     claim_id: claim_objects_by_id[claim_id]
                     for item in pack
