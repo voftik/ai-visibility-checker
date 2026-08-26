@@ -34983,10 +34983,14 @@ _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
         "drop_ungrounded_exact_value",
         "drop_ungrounded_uncertainty",
         "drop_ungrounded_report_focus",
+        "replace_ungrounded_observation_statement",
         "replace_ungrounded_unit_coverage_rationale",
         "replace_ungrounded_claim_coverage_rationale",
         "replace_ungrounded_node_coverage_rationale",
     }
+)
+_FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK = (
+    "Исходный фрагмент сохранён без дополнительной интерпретации."
 )
 _FINAL_INPUT_UNIT_COVERAGE_RATIONALE = (
     "Исходная единица учтена в покрытии."
@@ -35307,9 +35311,10 @@ def _normalize_final_evidence_packet(
                     )
                 )
             observation["exact_values"] = grounded_exact_values
+            statement = str(observation.get("statement") or "")
             if not _final_root_tokens_are_grounded(
                 _final_grounding_strip_code_owned_path_locator(
-                    str(observation.get("statement") or ""),
+                    statement,
                     source_path=claim_source_path,
                 ),
                 # A source path can be mentioned as a locator, but it is not
@@ -35317,9 +35322,31 @@ def _normalize_final_evidence_packet(
                 # the statement that remains after the locator is masked.
                 source_texts=[claim_excerpt],
             ):
-                raise OpenRouterError(
-                    "Final evidence observation invented an exact literal or state"
+                # Mapper prose is auxiliary: the exact source claim, scalar
+                # ledger, evidence excerpt and lineage are code-owned and are
+                # transported independently. One unsupported literal must not
+                # veto the whole report. Replace only the prose with a neutral
+                # statement and retain a raw-free audit receipt; malformed or
+                # incomplete lineage remains hard-failing above and below.
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation="replace_ungrounded_observation_statement",
+                        path=f"observations[{observation_index}].statement",
+                        binding_sha256=text_sha256(claim_id),
+                        value=statement,
+                        replacement=_FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK,
+                    )
                 )
+                observation["statement"] = (
+                    _FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK
+                )
+                # Quarantined prose must not retain model-authored priority.
+                # The exact claim remains an independent bounded-root source,
+                # so this only prevents a neutral fallback from dominating
+                # the author; it does not remove or down-rank the source fact.
+                observation["category"] = "context"
+                observation["importance"] = "supporting"
             # Keep a one-to-one semantic receipt for every exact source claim.
             # The complete excerpt remains byte-exact in the code-owned claim
             # ledger and the bounded-root path; this packet keeps the model's

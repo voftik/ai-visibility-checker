@@ -157,6 +157,7 @@ from app.services.analyzer import (
     _final_root_tokens_are_grounded,
     _final_root_fact_refs,
     _final_root_fact_table,
+    _final_root_semantic_entries,
     _final_root_parent_node,
     _final_root_node_receipt,
     _verify_final_root_tree,
@@ -9746,22 +9747,36 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(statement=fabricated_statement):
                 fabricated["observations"][0]["statement"] = fabricated_statement
-                with self.assertRaisesRegex(
-                    OpenRouterError,
-                    "invented an exact literal or state",
-                ):
-                    _normalize_final_evidence_packet(
-                        fabricated,
-                        allowed_unit_paths={
-                            str(unit["source_unit_id"]): str(unit["source_path"])
-                        },
-                        allowed_claims={str(claim["claim_id"]): claim},
-                        claim_objects={
-                            str(claim["claim_id"]): claim_objects[
-                                str(claim["claim_id"])
-                            ]
-                        },
-                    )
+                sanitized = _normalize_final_evidence_packet(
+                    fabricated,
+                    allowed_unit_paths={
+                        str(unit["source_unit_id"]): str(unit["source_path"])
+                    },
+                    allowed_claims={str(claim["claim_id"]): claim},
+                    claim_objects={
+                        str(claim["claim_id"]): claim_objects[
+                            str(claim["claim_id"])
+                        ]
+                    },
+                )
+                self.assertEqual(
+                    sanitized["observations"][0]["statement"],
+                    "Исходный фрагмент сохранён без дополнительной интерпретации.",
+                )
+                self.assertEqual(
+                    sanitized["observations"][0]["importance"],
+                    "supporting",
+                )
+                self.assertEqual(
+                    sanitized["observations"][0]["category"],
+                    "context",
+                )
+                self.assertEqual(
+                    sanitized["_aiv_final_input_grounding_filter"]["operations"][
+                        0
+                    ]["operation"],
+                    "replace_ungrounded_observation_statement",
+                )
 
     def test_mapper_source_path_tokens_cannot_launder_assertions(self) -> None:
         units, _manifest = _flatten_final_input_payload(
@@ -9798,24 +9813,30 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 unit = units_by_path[source_path]
                 packet = self._packet_for_units([unit], source_claims=[claim])
                 packet["observations"][0]["statement"] = fabricated_statement
-                with self.assertRaisesRegex(
-                    OpenRouterError,
-                    "invented an exact literal or state",
-                ):
-                    _normalize_final_evidence_packet(
-                        packet,
-                        allowed_unit_paths={
-                            str(unit["source_unit_id"]): str(unit["source_path"])
-                        },
-                        allowed_claims={str(claim["claim_id"]): claim},
-                        claim_objects={
-                            str(claim["claim_id"]): claim_objects[
-                                str(claim["claim_id"])
-                            ]
-                        },
-                    )
+                sanitized = _normalize_final_evidence_packet(
+                    packet,
+                    allowed_unit_paths={
+                        str(unit["source_unit_id"]): str(unit["source_path"])
+                    },
+                    allowed_claims={str(claim["claim_id"]): claim},
+                    claim_objects={
+                        str(claim["claim_id"]): claim_objects[
+                            str(claim["claim_id"])
+                        ]
+                    },
+                )
+                self.assertEqual(
+                    sanitized["observations"][0]["statement"],
+                    "Исходный фрагмент сохранён без дополнительной интерпретации.",
+                )
+                audit = sanitized["_aiv_final_input_grounding_filter"]
+                self.assertEqual(audit["replacement_count"], 1)
+                self.assertNotIn(
+                    fabricated_statement,
+                    json.dumps(audit, ensure_ascii=False),
+                )
 
-    def test_mapper_still_rejects_ungrounded_assertion_grade_literals(
+    def test_mapper_sanitizes_ungrounded_assertion_grade_literals(
         self,
     ) -> None:
         digest = (
@@ -9843,21 +9864,24 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(statement=statement):
                 packet = copy.deepcopy(base)
                 packet["observations"][0]["statement"] = statement
-                with self.assertRaisesRegex(
-                    OpenRouterError,
-                    "invented an exact literal or state",
-                ):
-                    _normalize_final_evidence_packet(
-                        packet,
-                        allowed_unit_paths={
-                            str(unit["source_unit_id"]): str(unit["source_path"])
-                            for unit in units
-                        },
-                        allowed_claims={
-                            str(claim["claim_id"]): claim for claim in claim_rows
-                        },
-                        claim_objects=claim_objects,
-                    )
+                sanitized = _normalize_final_evidence_packet(
+                    packet,
+                    allowed_unit_paths={
+                        str(unit["source_unit_id"]): str(unit["source_path"])
+                        for unit in units
+                    },
+                    allowed_claims={
+                        str(claim["claim_id"]): claim for claim in claim_rows
+                    },
+                    claim_objects=claim_objects,
+                )
+                self.assertEqual(
+                    sanitized["observations"][0]["statement"],
+                    "Исходный фрагмент сохранён без дополнительной интерпретации.",
+                )
+                audit = sanitized["_aiv_final_input_grounding_filter"]
+                self.assertEqual(audit["replacement_count"], 1)
+                self.assertNotIn(statement, json.dumps(audit, ensure_ascii=False))
 
     def test_typed_literal_grounding_uses_exact_semantic_classes(self) -> None:
         self.assertTrue(
@@ -9982,6 +10006,16 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
         }
 
         cases = {
+            "statement": {
+                "mutate": lambda packet: packet["observations"][0].update(
+                    statement="Gemini показывает 88,8%."
+                ),
+                "operation": "replace_ungrounded_observation_statement",
+                "assert_sanitized": lambda packet: self.assertEqual(
+                    packet["observations"][0]["statement"],
+                    "Исходный фрагмент сохранён без дополнительной интерпретации.",
+                ),
+            },
             "exact_values": {
                 "mutate": lambda packet: packet["observations"][0].update(
                     exact_values=["99,9%"]
@@ -10062,7 +10096,9 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     json.dumps(audit, ensure_ascii=False),
                 )
 
-    def test_mapper_keeps_structural_and_statement_failures_hard(self) -> None:
+    def test_mapper_keeps_structural_failures_hard_and_statement_fail_soft(
+        self,
+    ) -> None:
         units, _manifest = _flatten_final_input_payload(
             {"report_data": {"note": "Доля 7%."}},
             target_chars=20_000,
@@ -10090,16 +10126,44 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
 
         packet = self._packet_for_units(units, source_claims=claim_rows)
         packet["observations"][0]["statement"] = "Доля 99,9%."
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "observation invented an exact literal or state",
-        ):
-            _normalize_final_evidence_packet(
-                packet,
-                allowed_unit_paths=allowed_paths,
-                allowed_claims=allowed_claims,
-                claim_objects=claim_objects,
-            )
+        sanitized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims=allowed_claims,
+            claim_objects=claim_objects,
+        )
+        self.assertEqual(
+            sanitized["observations"][0]["statement"],
+            "Исходный фрагмент сохранён без дополнительной интерпретации.",
+        )
+        self.assertEqual(
+            sanitized["_aiv_final_input_grounding_filter"]["operations"][0][
+                "operation"
+            ],
+            "replace_ungrounded_observation_statement",
+        )
+        root_entries = _final_root_semantic_entries(
+            {
+                "evidence_digest": sanitized,
+                "deterministic_passthrough": {"values": []},
+                "long_input_contract": {
+                    "source_claim_count": len(claim_rows)
+                },
+            },
+            source_claim_rows=claim_rows,
+        )
+        self.assertEqual(
+            [
+                entry["value"]
+                for entry in root_entries
+                if entry["kind"] == "exact_source_claim"
+            ],
+            ["Доля 7%."],
+        )
+        self.assertNotIn(
+            "99,9%",
+            json.dumps(root_entries, ensure_ascii=False),
+        )
 
     def test_mapper_auxiliary_filter_audit_is_idempotent_through_union(
         self,
