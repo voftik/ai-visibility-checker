@@ -35167,8 +35167,10 @@ _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
         "replace_quarantined_observation_importance",
         "replace_quarantined_unit_coverage_disposition",
         "replace_quarantined_claim_coverage_disposition",
+        "replace_invalid_observation_excerpt",
         "replace_invalid_observation_claim_id",
         "replace_invalid_claim_coverage_digest",
+        "replace_generic_observation_statement",
         "replace_ungrounded_unit_coverage_rationale",
         "replace_ungrounded_claim_coverage_rationale",
         "replace_ungrounded_node_coverage_rationale",
@@ -35237,6 +35239,7 @@ def _final_input_statement_has_claim_anchor(
     normalized = statement.strip()
     if not normalized or _final_input_statement_is_transport_ack(normalized):
         return False
+
     def meaningful_exact_text(value: str) -> bool:
         return any(
             len(token) >= 3 or (len(token) >= 2 and token.isupper())
@@ -35420,6 +35423,43 @@ def _normalize_final_evidence_packet(
     output = copy.deepcopy(packet)
     allowed_unit_ids = set(allowed_unit_paths)
     allowed_paths = set(allowed_unit_paths.values())
+    if allowed_claims is not None:
+        if claim_objects is None or set(claim_objects) != set(allowed_claims):
+            raise OpenRouterError(
+                "Final evidence packet has no exact code-owned claim objects"
+            )
+        for claim_id, claim in allowed_claims.items():
+            claim_object = claim_objects.get(claim_id)
+            if not isinstance(claim, dict) or not isinstance(
+                claim_object,
+                SourceClaim,
+            ):
+                raise OpenRouterError(
+                    "Final evidence packet has a corrupt code-owned claim"
+                )
+            source_unit_id = claim.get("source_unit_id")
+            source_path = claim.get("source_path")
+            claim_excerpt = claim.get("excerpt")
+            claim_digest = claim.get("excerpt_sha256")
+            if (
+                claim.get("claim_id") != claim_id
+                or not isinstance(source_unit_id, str)
+                or allowed_unit_paths.get(source_unit_id) != source_path
+                or claim_object.document_id != f"{source_unit_id}:claims"
+                or any(
+                    claim.get(field) != value
+                    for field, value in claim_object.as_dict().items()
+                )
+                or not isinstance(claim_excerpt, str)
+                or not isinstance(claim_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", claim_digest)
+                or claim_object.excerpt != claim_excerpt
+                or claim_object.excerpt_sha256 != claim_digest
+                or text_sha256(claim_excerpt) != claim_digest
+            ):
+                raise OpenRouterError(
+                    "Final evidence packet has a corrupt code-owned claim digest"
+                )
     claim_excerpt_by_id = {
         str(claim_id): str(claim.get("excerpt") or "")
         for claim_id, claim in (allowed_claims or {}).items()
@@ -35527,17 +35567,38 @@ def _normalize_final_evidence_packet(
                     "Final evidence observation mismatches its code-owned "
                     "source claim path"
                 )
-            evidence_excerpt = str(observation.get("evidence_excerpt") or "")
-            claim_excerpt = str(claim.get("excerpt") or "")
-            if evidence_excerpt and evidence_excerpt not in claim_excerpt:
+            evidence_excerpt = observation.get("evidence_excerpt")
+            if not isinstance(evidence_excerpt, str):
                 raise OpenRouterError(
-                    "Final evidence observation excerpt is not an exact "
-                    "substring of its source claim"
+                    "Final evidence observation has an invalid source claim excerpt"
                 )
-            if not evidence_excerpt and claim_excerpt:
-                raise OpenRouterError(
-                    "Final evidence observation omitted its exact source claim excerpt"
+            claim_excerpt = str(claim["excerpt"])
+            excerpt_was_repaired = False
+            if evidence_excerpt != claim_excerpt and (
+                not evidence_excerpt or evidence_excerpt not in claim_excerpt
+            ):
+                # The mapper only echoes this quote. The complete excerpt is
+                # already bound to the exact canonical claim id, unit, path
+                # and digest. A transcription error in the redundant echo
+                # must not veto the report: restore the immutable excerpt and
+                # quarantine the mapper's interpretation below. Unknown or
+                # mismatched lineage remains a hard failure above.
+                grounding_filter_operations.append(
+                    _final_input_grounding_filter_operation(
+                        scope="mapper",
+                        operation="replace_invalid_observation_excerpt",
+                        path=(
+                            f"observations[{observation_index}]."
+                            "evidence_excerpt"
+                        ),
+                        binding_sha256=text_sha256(claim_id),
+                        value=evidence_excerpt,
+                        replacement=claim_excerpt,
+                    )
                 )
+                observation["evidence_excerpt"] = claim_excerpt
+                evidence_excerpt = claim_excerpt
+                excerpt_was_repaired = True
             exact_values = observation.get("exact_values")
             if not isinstance(exact_values, list) or any(
                 not isinstance(value, str) for value in exact_values
@@ -35577,58 +35638,59 @@ def _normalize_final_evidence_packet(
                     source_path=claim_source_path,
                 )
             )
-            statement_is_grounded = _final_root_tokens_are_grounded(
-                grounding_statement,
-                # A source path can be mentioned as a locator, but it is not
-                # factual evidence. Only the exact scalar excerpt may ground
-                # the statement that remains after the locator is masked.
-                source_texts=[claim_excerpt],
+            statement_is_grounded = (
+                not excerpt_was_repaired
+                and _final_root_tokens_are_grounded(
+                    grounding_statement,
+                    # A source path can be mentioned as a locator, but it is
+                    # not factual evidence. Only the exact scalar excerpt may
+                    # ground the statement that remains after the locator is
+                    # masked.
+                    source_texts=[claim_excerpt],
+                )
             )
             statement_is_generic = not _final_input_statement_has_claim_anchor(
                 grounding_statement,
                 claim_excerpt=claim_excerpt,
             )
-            if not statement_is_grounded:
+            if not statement_is_grounded or statement_is_generic:
                 # Mapper prose is auxiliary: the exact source claim, scalar
                 # ledger, evidence excerpt and lineage are code-owned and are
-                # transported independently. One unsupported literal must not
-                # veto the whole report. Replace only the prose with a neutral
+                # transported independently. Unsupported or semantically
+                # empty prose must not veto the whole report and must not leak
+                # into later reducers. Replace only that prose with a neutral
                 # statement and retain a raw-free audit receipt; malformed or
                 # incomplete lineage remains hard-failing above and below.
-                grounding_filter_operations.append(
-                    _final_input_grounding_filter_operation(
-                        scope="mapper",
-                        operation="replace_ungrounded_observation_statement",
-                        path=f"observations[{observation_index}].statement",
-                        binding_sha256=text_sha256(claim_id),
-                        value=statement,
-                        replacement=_FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK,
+                if statement != _FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK:
+                    grounding_filter_operations.append(
+                        _final_input_grounding_filter_operation(
+                            scope="mapper",
+                            operation=(
+                                "replace_ungrounded_observation_statement"
+                                if not statement_is_grounded
+                                else "replace_generic_observation_statement"
+                            ),
+                            path=f"observations[{observation_index}].statement",
+                            binding_sha256=text_sha256(claim_id),
+                            value=statement,
+                            replacement=(
+                                _FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK
+                            ),
+                        )
                     )
-                )
+                    grounding_filter_operations.append(
+                        _final_input_grounding_filter_operation(
+                            scope="mapper",
+                            operation="mark_generic_observation_quarantined",
+                            path=f"observations[{observation_index}].statement",
+                            binding_sha256=text_sha256(claim_id),
+                            value=(
+                                _FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK
+                            ),
+                        )
+                    )
                 observation["statement"] = (
                     _FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK
-                )
-                grounding_filter_operations.append(
-                    _final_input_grounding_filter_operation(
-                        scope="mapper",
-                        operation="mark_generic_observation_quarantined",
-                        path=f"observations[{observation_index}].statement",
-                        binding_sha256=text_sha256(claim_id),
-                        value=_FINAL_INPUT_OBSERVATION_STATEMENT_FALLBACK,
-                    )
-                )
-            elif statement_is_generic and (
-                observation.get("category") != "context"
-                or observation.get("importance") != "supporting"
-            ):
-                grounding_filter_operations.append(
-                    _final_input_grounding_filter_operation(
-                        scope="mapper",
-                        operation="mark_generic_observation_quarantined",
-                        path=f"observations[{observation_index}].statement",
-                        binding_sha256=text_sha256(claim_id),
-                        value=statement,
-                    )
                 )
             if not statement_is_grounded or statement_is_generic:
                 # Quarantined prose must not retain model-authored priority.
@@ -35791,10 +35853,6 @@ def _normalize_final_evidence_packet(
         coverage = output.get("claim_coverage")
         if not isinstance(coverage, list):
             raise OpenRouterError("Final evidence packet has no claim coverage")
-        if claim_objects is None or set(claim_objects) != set(allowed_claims):
-            raise OpenRouterError(
-                "Final evidence packet has no exact code-owned claim objects"
-            )
         for claim_coverage_index, item in enumerate(coverage):
             if not isinstance(item, dict):
                 raise OpenRouterError(
@@ -39266,6 +39324,58 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
     )
     final_packet = copy.deepcopy(packets[0])
     final_packet.pop(_LONG_RESPONSE_LINEAGE_KEY, None)
+    grounding_filter = final_packet.pop(
+        FINAL_INPUT_GROUNDING_FILTER_KEY,
+        None,
+    )
+    grounding_filter_receipt: dict[str, Any]
+    grounding_filter_artifact_key: str | None = None
+    if grounding_filter is not None:
+        grounding_filter_operations = _final_input_grounding_filter_operations(
+            {FINAL_INPUT_GROUNDING_FILTER_KEY: grounding_filter}
+        )
+        grounding_filter_audit = _final_input_grounding_filter_audit(
+            grounding_filter_operations
+        )
+        grounding_filter_artifact_key = (
+            f"{artifact_namespace}_grounding_filter_"
+            f"{grounding_filter_audit['operations_sha256'][:20]}"
+        )
+        await _save_artifact(
+            run_id,
+            stage_key=stage_key,
+            artifact_key=grounding_filter_artifact_key,
+            status="completed",
+            input_json={
+                "version": FINAL_INPUT_GROUNDING_FILTER_VERSION,
+                "source_payload_sha256": manifest["source_payload_sha256"],
+                "operations_sha256": grounding_filter_audit[
+                    "operations_sha256"
+                ],
+            },
+            output_json=grounding_filter_audit,
+            prompt_version=prompt_version,
+        )
+        grounding_filter_receipt = {
+            key: value
+            for key, value in grounding_filter_audit.items()
+            if key != "operations"
+        }
+        grounding_filter_receipt["artifact_key"] = (
+            grounding_filter_artifact_key
+        )
+        grounding_filter_receipt["contract"] = (
+            "auxiliary_mapper_fields_sanitized_without_source_fact_loss"
+        )
+    else:
+        grounding_filter_receipt = {
+            "version": FINAL_INPUT_GROUNDING_FILTER_VERSION,
+            "quality_state": "clean",
+            "operation_count": 0,
+            "drop_count": 0,
+            "replacement_count": 0,
+            "applicable": False,
+        }
     model_payload = {
         "long_input_contract": {
             "version": FINAL_INPUT_HARNESS_VERSION,
@@ -39283,6 +39393,11 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
             "deterministic_passthrough_sha256": _stable_json_sha256(
                 deterministic_passthrough
             ),
+            # The complete raw-free operation ledger is control-plane data.
+            # Persist it separately and give the model only a compact receipt
+            # so hundreds of harmless mapper repairs cannot consume semantic
+            # context or force a deeper reduction route.
+            "grounding_filter": grounding_filter_receipt,
             "source_manifest": {
                 "artifact_key": manifest_artifact_key,
                 "source_unit_ids_sha256": manifest["source_unit_ids_sha256"],
@@ -39402,6 +39517,10 @@ web/memory, INTENT и citations. domain_context_id связывает prompt, о
         "reducer_request_window_utf8_bytes": reducer_window_bytes,
         "reducer_max_request_utf8_bytes": max_reducer_request_bytes,
         "terminal_reducer_mode": terminal_reducer_mode,
+        "grounding_filter_artifact_key": grounding_filter_artifact_key,
+        "grounding_filter_operation_count": grounding_filter_receipt[
+            "operation_count"
+        ],
         "source_manifest_artifact_key": manifest_artifact_key,
         "claim_ledger_artifact_key": claim_ledger_artifact_key,
         "answer_accounting_artifact_key": answer_accounting_artifact_key,

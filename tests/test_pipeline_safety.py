@@ -10392,6 +10392,161 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                         global_claim_ids={claim_id},
                     )
 
+    def test_mapper_repairs_redundant_excerpt_and_quarantines_interpretation(
+        self,
+    ) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"mode": "anthropic/claude-sonnet-5"}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claim = claim_rows[0]
+        claim_id = str(claim["claim_id"])
+        canonical_excerpt = str(claim["excerpt"])
+        allowed_paths = {
+            str(unit["source_unit_id"]): str(unit["source_path"])
+            for unit in units
+        }
+
+        for supplied_excerpt in ("altered mapper quote", ""):
+            with self.subTest(supplied_excerpt=supplied_excerpt):
+                packet = self._packet_for_units(
+                    units,
+                    source_claims=claim_rows,
+                )
+                packet["observations"][0].update(
+                    evidence_excerpt=supplied_excerpt,
+                    statement="Unsupported interpretation 999",
+                    exact_values=["999"],
+                    category="visibility",
+                    importance="critical",
+                )
+                original_packet = copy.deepcopy(packet)
+                normalized = _normalize_final_evidence_packet(
+                    packet,
+                    allowed_unit_paths=allowed_paths,
+                    allowed_claims={claim_id: claim},
+                    claim_objects={claim_id: claim_objects[claim_id]},
+                )
+                self.assertEqual(packet, original_packet)
+
+                observation = normalized["observations"][0]
+                self.assertEqual(
+                    observation["evidence_excerpt"],
+                    canonical_excerpt,
+                )
+                self.assertEqual(
+                    observation["statement"],
+                    "Исходный фрагмент сохранён без дополнительной "
+                    "интерпретации.",
+                )
+                self.assertEqual(observation["exact_values"], [])
+                self.assertEqual(observation["category"], "context")
+                self.assertEqual(observation["importance"], "supporting")
+                operations = normalized[
+                    "_aiv_final_input_grounding_filter"
+                ]["operations"]
+                self.assertIn(
+                    "replace_invalid_observation_excerpt",
+                    {item["operation"] for item in operations},
+                )
+                if supplied_excerpt:
+                    self.assertNotIn(
+                        supplied_excerpt,
+                        json.dumps(operations, ensure_ascii=False),
+                    )
+                self.assertEqual(
+                    _normalize_final_evidence_packet(
+                        normalized,
+                        allowed_unit_paths=allowed_paths,
+                        allowed_claims={claim_id: claim},
+                        claim_objects={claim_id: claim_objects[claim_id]},
+                    ),
+                    normalized,
+                )
+
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        del packet["observations"][0]["evidence_excerpt"]
+        with self.assertRaisesRegex(OpenRouterError, "invalid source claim excerpt"):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims={claim_id: claim},
+                claim_objects={claim_id: claim_objects[claim_id]},
+            )
+
+        for invalid_excerpt in (None, [canonical_excerpt]):
+            with self.subTest(invalid_excerpt=invalid_excerpt):
+                packet = self._packet_for_units(units, source_claims=claim_rows)
+                packet["observations"][0]["evidence_excerpt"] = invalid_excerpt
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "invalid source claim excerpt",
+                ):
+                    _normalize_final_evidence_packet(
+                        packet,
+                        allowed_unit_paths=allowed_paths,
+                        allowed_claims={claim_id: claim},
+                        claim_objects={claim_id: claim_objects[claim_id]},
+                    )
+
+        packet = self._packet_for_units(units, source_claims=claim_rows)
+        packet["observations"][0]["evidence_excerpt"] = "altered mapper quote"
+        corrupt_claim = copy.deepcopy(claim)
+        corrupt_claim["excerpt_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "corrupt code-owned claim digest",
+        ):
+            _normalize_final_evidence_packet(
+                packet,
+                allowed_unit_paths=allowed_paths,
+                allowed_claims={claim_id: corrupt_claim},
+                claim_objects={claim_id: claim_objects[claim_id]},
+            )
+
+    def test_mapper_accepts_exact_empty_code_owned_excerpt(self) -> None:
+        units, _manifest = _flatten_final_input_payload(
+            {"report_data": {"note": ""}},
+            target_chars=20_000,
+            context_overlap_chars=0,
+        )
+        claim_rows, claim_objects, _ids_by_unit, _ledger = (
+            _final_input_claim_ledger(units)
+        )
+        claim = next(item for item in claim_rows if item["excerpt"] == "")
+        claim_id = str(claim["claim_id"])
+        unit = next(
+            item
+            for item in units
+            if item["source_unit_id"] == claim["source_unit_id"]
+        )
+        packet = self._packet_for_units([unit], source_claims=[claim])
+        packet["observations"][0]["statement"] = "Пустое исходное значение."
+        normalized = _normalize_final_evidence_packet(
+            packet,
+            allowed_unit_paths={
+                str(unit["source_unit_id"]): str(unit["source_path"])
+            },
+            allowed_claims={claim_id: claim},
+            claim_objects={claim_id: claim_objects[claim_id]},
+        )
+
+        self.assertEqual(normalized["observations"][0]["evidence_excerpt"], "")
+        self.assertNotIn(
+            "replace_invalid_observation_excerpt",
+            {
+                item["operation"]
+                for item in normalized.get(
+                    "_aiv_final_input_grounding_filter",
+                    {},
+                ).get("operations", [])
+            },
+        )
+
     def test_generic_mapper_ack_cannot_retain_material_priority(self) -> None:
         units, _manifest = _flatten_final_input_payload(
             {"report_data": {"mode": "web"}},
@@ -10464,6 +10619,11 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     "supporting",
                 )
                 self.assertEqual(
+                    normalized["observations"][0]["statement"],
+                    "Исходный фрагмент сохранён без дополнительной "
+                    "интерпретации.",
+                )
+                self.assertEqual(
                     normalized["unit_coverage"][0]["disposition"],
                     "supporting_context",
                 )
@@ -10474,6 +10634,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(
                     {
                         "mark_generic_observation_quarantined",
+                        "replace_generic_observation_statement",
                         "replace_quarantined_observation_category",
                         "replace_quarantined_observation_importance",
                         "replace_quarantined_unit_coverage_disposition",
@@ -10496,6 +10657,37 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     normalized,
                 )
+        generic_supporting = self._packet_for_units(
+            units,
+            source_claims=claim_rows,
+        )
+        generic_supporting["observations"][0].update(
+            statement="Сайт полностью доступен.",
+            category="context",
+            importance="supporting",
+            exact_values=[],
+            evidence_excerpt="web",
+        )
+        generic_supporting_normalized = _normalize_final_evidence_packet(
+            generic_supporting,
+            allowed_unit_paths=allowed_paths,
+            allowed_claims={claim_id: claim},
+            claim_objects={claim_id: claim_objects[claim_id]},
+        )
+        self.assertEqual(
+            generic_supporting_normalized["observations"][0]["statement"],
+            "Исходный фрагмент сохранён без дополнительной "
+            "интерпретации.",
+        )
+        self.assertIn(
+            "replace_generic_observation_statement",
+            {
+                item["operation"]
+                for item in generic_supporting_normalized[
+                    "_aiv_final_input_grounding_filter"
+                ]["operations"]
+            },
+        )
         material_packet = self._packet_for_units(
             units,
             source_claims=claim_rows,
@@ -11234,7 +11426,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.analyzer._save_artifact",
                 new_callable=AsyncMock,
-            ),
+            ) as save_artifact,
             patch(
                 "app.services.analyzer._structured_artifact",
                 new_callable=AsyncMock,
@@ -11257,9 +11449,30 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             plan["covered_claim_count"],
             plan["source_claim_count"],
         )
-        self.assertIn(
+        self.assertNotIn(
             "replace_invalid_claim_coverage_digest",
             json.dumps(model_payload, ensure_ascii=False),
+        )
+        receipt = model_payload["long_input_contract"]["grounding_filter"]
+        self.assertEqual(
+            receipt["artifact_key"],
+            plan["grounding_filter_artifact_key"],
+        )
+        self.assertNotIn("operations", receipt)
+        audit_calls = [
+            call
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == receipt["artifact_key"]
+        ]
+        self.assertEqual(len(audit_calls), 1)
+        full_audit = audit_calls[0].kwargs["output_json"]
+        self.assertEqual(
+            full_audit["operations_sha256"],
+            receipt["operations_sha256"],
+        )
+        self.assertIn(
+            "replace_invalid_claim_coverage_digest",
+            {item["operation"] for item in full_audit["operations"]},
         )
 
     async def test_compact_overflow_builds_bounded_transitive_root(self) -> None:
@@ -12211,7 +12424,7 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=self._successful_mapper(hide_values=True),
             ),
         ):
-            _model_context, plan = await _bounded_semantic_model_evidence_context(
+            model_context, plan = await _bounded_semantic_model_evidence_context(
                 "run-id",
                 review_input=review_input,
                 attempt=1,
@@ -12219,6 +12432,26 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan["input_utf8_window"], expected_window)
         self.assertEqual(plan["mode"], "hierarchical_evidence_tree")
+        self.assertNotIn(
+            "_aiv_final_input_grounding_filter",
+            model_context["evidence_digest"],
+        )
+        grounding_receipt = model_context["long_input_contract"][
+            "grounding_filter"
+        ]
+        self.assertEqual(grounding_receipt["quality_state"], "degraded")
+        self.assertGreater(grounding_receipt["operation_count"], 0)
+        self.assertNotIn("operations", grounding_receipt)
+        self.assertTrue(
+            grounding_receipt["artifact_key"].startswith(
+                "final_report_semantic_gate_semantic_input_a1_"
+                "grounding_filter_"
+            )
+        )
+        self.assertEqual(
+            plan["grounding_filter_artifact_key"],
+            grounding_receipt["artifact_key"],
+        )
         self.assertLessEqual(
             plan["model_request_utf8_bytes"],
             plan["input_utf8_window"],
