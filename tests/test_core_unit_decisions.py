@@ -973,6 +973,63 @@ class CoreUnitDecisionContractTests(unittest.TestCase):
             1,
         )
 
+    def test_recovery_filter_does_not_bind_name_to_nearby_quote(self) -> None:
+        core_text = (
+            "Makarska Tattoo & Piercing Studio принимает гостей. "
+            "Короткое название: Makarska Tattoo."
+        )
+        units, _manifests = partition_text_records(
+            [{"answer_id": 650, "answer": core_text}],
+            text_key="answer",
+            id_key="answer_id",
+            target_chars=1_000,
+        )
+        claim = _core_unit_claims(units)[0]
+        catalog = {
+            "target_aliases": [],
+            "entities": [
+                {
+                    "canonical_name": "Makarska Tattoo & Piercing Studio",
+                    "aliases": ["Makarska Tattoo"],
+                    "category": "target",
+                    "target_relationship": "exact_target",
+                    "commercially_relevant": True,
+                    "mention_policy": "standalone",
+                    # This quote is genuine and is in the same core, but it
+                    # does not contain the canonical identity. The old repair
+                    # incorrectly treated proximity as evidence binding and
+                    # then failed the entire aggregate catalog on revalidation.
+                    "evidence": "Makarska Tattoo",
+                }
+            ],
+            "uncertainties": [],
+        }
+        receipts = _normalize_core_dispositions(
+            [
+                _decision(
+                    claim,
+                    disposition="grounded_fact",
+                    quote="Makarska Tattoo",
+                    reason="В core буквально присутствует короткое название.",
+                )
+            ],
+            expected_claims=[claim],
+            analytic_output=catalog,
+            output_kind="entity_catalog",
+        )
+
+        accepted = _sanitize_recovered_entity_catalog_evidence(
+            catalog,
+            receipts,
+            expected_claims=[claim],
+            profile={},
+        )
+
+        self.assertEqual(accepted["entities"], [])
+        audit = accepted["_aiv_entity_catalog_filter"]
+        self.assertEqual(audit["quarantine_count"], 1)
+        self.assertEqual(audit["quality_state"], "degraded")
+
     def test_recovery_filter_scans_core_marked_no_fact_before_deletion(self) -> None:
         grounded_names = [f"Source-{index}" for index in range(9)]
         units, _manifests = partition_text_records(

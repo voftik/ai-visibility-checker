@@ -14447,35 +14447,53 @@ def _sanitize_recovered_entity_catalog_evidence(
                     repair_occurrence = independently_owned_alias  # type: ignore[assignment]
 
         if repair_occurrence is not None:
-            name_index, matched_name, occurrence = repair_occurrence
+            name_index, matched_name, _occurrence = repair_occurrence
             original_evidence = str(entity.get("evidence") or "")
             original_canonical = canonical
-            evidence_occurrence = next(
-                (
-                    candidate
-                    for evidence_span in submitted_evidence_spans(original_evidence)
-                    if (
-                        candidate := first_source_occurrence(
-                            evidence_span,
-                            grounded_cores,
-                        )
-                    )
-                    is not None
-                    and candidate["claim_id"] == occurrence["claim_id"]
-                    and candidate["unit_id"] == occurrence["unit_id"]
-                    and candidate["core_sha256"] == occurrence["core_sha256"]
-                ),
-                None,
-            )
-            if evidence_occurrence is None:
+            evidence_binding: tuple[dict[str, Any], dict[str, Any]] | None = None
+            for evidence_span in submitted_evidence_spans(original_evidence):
+                evidence_occurrence = first_source_occurrence(
+                    evidence_span,
+                    grounded_cores,
+                )
+                if evidence_occurrence is None:
+                    continue
+                # The exact submitted evidence span must itself contain the
+                # repaired identity. Merely finding both strings somewhere in
+                # one answer core is not a binding: a merger can otherwise
+                # attach a nearby but unrelated quote to the entity and make
+                # the final validation fail after an apparently successful
+                # repair.
+                name_occurrence = first_source_occurrence(
+                    matched_name,
+                    [
+                        {
+                            "claim_id": str(evidence_occurrence["claim_id"]),
+                            "unit_id": str(evidence_occurrence["unit_id"]),
+                            "core_sha256": str(evidence_occurrence["core_sha256"]),
+                            "source_sha256": str(
+                                evidence_occurrence["source_sha256"]
+                            ),
+                            "source_start_char": int(
+                                evidence_occurrence["source_start_char"]
+                            ),
+                            "core_text": str(evidence_occurrence["source_quote"]),
+                        }
+                    ],
+                )
+                if name_occurrence is not None:
+                    evidence_binding = (evidence_occurrence, name_occurrence)
+                    break
+            if evidence_binding is None:
                 # A convenient homonym elsewhere in the corpus cannot transfer
                 # a model-authored category or relationship. Repair is allowed
                 # only when the complete submitted evidence span is recoverable
-                # from the same immutable grounded core as the name.
+                # from an immutable grounded core and contains the name itself.
                 quarantined_indexes.add(index)
                 continue
+            evidence_occurrence, name_occurrence = evidence_binding
             evidence_source_quote = str(evidence_occurrence["source_quote"])
-            name_source_quote = str(occurrence["source_quote"])
+            name_source_quote = str(name_occurrence["source_quote"])
             entity["evidence"] = evidence_source_quote
             canonical_replaced = bool(
                 name_index == 0 and name_source_quote != canonical
@@ -14491,7 +14509,7 @@ def _sanitize_recovered_entity_catalog_evidence(
                         if name_index == 0
                         else f"entities[{index}].aliases[{name_index - 1}]"
                     ),
-                    "match": str(occurrence["match"]),
+                    "match": str(name_occurrence["match"]),
                     "claim_id": str(evidence_occurrence["claim_id"]),
                     "unit_id": str(evidence_occurrence["unit_id"]),
                     "core_sha256": str(evidence_occurrence["core_sha256"]),
@@ -14503,10 +14521,16 @@ def _sanitize_recovered_entity_catalog_evidence(
                     ),
                     "source_end_char": int(evidence_occurrence["source_end_char"]),
                     "source_quote_sha256": text_sha256(evidence_source_quote),
-                    "name_core_start_char": int(occurrence["core_start_char"]),
-                    "name_core_end_char": int(occurrence["core_end_char"]),
-                    "name_source_start_char": int(occurrence["source_start_char"]),
-                    "name_source_end_char": int(occurrence["source_end_char"]),
+                    "name_core_start_char": int(
+                        evidence_occurrence["core_start_char"]
+                    )
+                    + int(name_occurrence["core_start_char"]),
+                    "name_core_end_char": int(evidence_occurrence["core_start_char"])
+                    + int(name_occurrence["core_end_char"]),
+                    "name_source_start_char": int(
+                        name_occurrence["source_start_char"]
+                    ),
+                    "name_source_end_char": int(name_occurrence["source_end_char"]),
                     "name_source_quote_sha256": text_sha256(name_source_quote),
                     "original_evidence_sha256": text_sha256(original_evidence),
                     "replacement_evidence_sha256": text_sha256(
