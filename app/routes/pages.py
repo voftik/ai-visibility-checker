@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 router = APIRouter()
 
 INDEX_HTML = Path(__file__).resolve().parent.parent.parent / "static" / "index.html"
-UI_BUILD_ID = "2026-07-31.29"
+UI_BUILD_ID = "2026-07-31.30"
 NO_STORE_HEADERS = {
     "Cache-Control": "no-store, max-age=0",
     "Pragma": "no-cache",

@@ -1383,6 +1383,30 @@
       margin-bottom: 0;
     }
 
+    .chart-card-head--wide {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .chart-card-head--wide .chart-title,
+    .chart-card-head--wide .chart-kicker {
+      width: 100%;
+      max-width: none;
+      overflow-wrap: anywhere;
+    }
+
+    .chart-card-head--wide .chart-kicker {
+      margin-top: 0;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      line-height: 1.45;
+      text-align: left;
+      text-transform: none;
+      text-wrap: pretty;
+    }
+
     .chart-title-domain {
       color: var(--accent);
       overflow-wrap: anywhere;
@@ -5319,7 +5343,7 @@
         toastTimer: null,
         uiVersionTimer: null
       };
-      const uiBuildId = "2026-07-31.29";
+      const uiBuildId = "2026-07-31.30";
       const supportedReportVersions = new Set([
         "2026-07",
         "2026-07-v2",
@@ -10710,21 +10734,20 @@
               <div class="report-aside">
                 <h2 class="section-title" id="visibility-title">Кого модели упоминают сами</h2>
                 <p>
-                  Это органическое обнаружение: в пользовательских вопросах не
-                  называли исследуемый бренд и его варианты. Считаем, какие
-                  сущности ИИ сами упомянули в режиме с веб-поиском.
+                  Видимость в выбранных безбрендовых сценариях: пользователи не
+                  называли исследуемый бренд и его варианты, а модели отвечали
+                  с веб-поиском. Это не оценка всего рынка.
                 </p>
               </div>
               <div>
                 <div class="chart-card">
-                  <div class="chart-card-head">
+                  <div class="chart-card-head chart-card-head--wide">
                     <h3 class="chart-title">
-                      Кого ИИ называет, когда бренда
-                      «${escapeHTML(viewModel.brandName)}» нет в вопросе
+                      Кого ИИ называет без упоминания бренда
                     </h3>
                     <p class="chart-kicker">
-                      Без «${escapeHTML(viewModel.brandName)}» и его вариантов в запросах
-                      · с веб-поиском
+                      В запросах нет «${escapeHTML(viewModel.brandName)}» и его вариантов
+                      · веб-поиск
                       ${competitorAnswerBase(viewModel, competitorRows) === null
                         ? ""
                         : ` · ${escapeHTML(pluralizeValidAnswers(

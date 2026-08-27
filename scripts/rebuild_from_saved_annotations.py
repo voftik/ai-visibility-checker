@@ -263,25 +263,155 @@ async def rebuild_from_saved_annotations(
         run_id,
         "analysis_critic_policy",
     )
-    if policy_history:
+    annotation_context_payload = critic_gate.get("annotation_context")
+    if policy_history or annotation_context_payload is not None:
+        policy_steps = (
+            critic_policy.get("policy_history")
+            if isinstance(critic_policy, dict)
+            else None
+        )
+        exact_policy = policy_steps == policy_history
+        recovery_suffix = (
+            isinstance(policy_steps, list)
+            and len(policy_history) == len(policy_steps) + 1
+            and policy_history[: len(policy_steps)] == policy_steps
+            and isinstance(policy_history[-1], dict)
+            and policy_history[-1].get("kind")
+            == "orchestrated_targeted_annotation_repair"
+            and isinstance(critic_policy.get("executing_recovery"), dict)
+            and critic_policy["executing_recovery"].get("orchestrator_epoch")
+            == policy_history[-1].get("orchestrator_epoch")
+            and critic_policy["executing_recovery"].get("target_answer_ids")
+            == policy_history[-1].get("target_answer_ids")
+        )
         if (
             not isinstance(critic_policy, dict)
             or not isinstance(critic_policy.get("effective_catalog"), dict)
-            or critic_policy.get("policy_history") != policy_history
+            or (
+                annotation_context_payload is not None
+                and not isinstance(
+                    critic_policy.get("effective_profile"),
+                    dict,
+                )
+            )
+            or not (exact_policy or recovery_suffix)
+            or (
+                annotation_context_payload is not None
+                and (
+                    critic_policy.get("annotation_context")
+                    != annotation_context_payload
+                    or critic_policy.get("annotation_context_sha256")
+                    != critic_gate.get("annotation_context_sha256")
+                )
+            )
         ):
             raise RebuildGuardError(
                 "Не найдена политика, подтверждённая текущим critic gate."
             )
+        if annotation_context_payload is not None:
+            profile = dict(critic_policy["effective_profile"])
         catalog = dict(critic_policy["effective_catalog"])
-    annotation_input_sha256 = analyzer._annotation_context_sha256(
-        profile,
-        catalog,
-        analyzer._critic_policy_guidance(policy_history),
+    research_guidance = analyzer._critic_policy_guidance(policy_history)
+    raw_rows = await analyzer._metric_rows(
+        run_id,
+        annotation_input_sha256="saved-rebuild-raw-receipt-validation",
     )
+    if annotation_context_payload is not None:
+        try:
+            annotation_context = analyzer._validated_annotation_context_manifest(
+                annotation_context_payload,
+                rows=raw_rows,
+                profile=profile,
+                catalog=catalog,
+            )
+        except analyzer.OrchestratorContractError as exc:
+            raise RebuildGuardError(
+                "Annotation context critic gate не совпадает с raw."
+            ) from exc
+        if (
+            critic_gate.get("annotation_context_sha256")
+            != analyzer._stable_json_sha256(annotation_context)
+        ):
+            raise RebuildGuardError(
+                "Digest annotation context critic gate не совпадает."
+            )
+        annotation_input_sha256 = annotation_context[
+            "annotation_input_sha256"
+        ]
+    else:
+        # Historical gates predate the explicit annotation-context receipt.
+        # Keep their previous deterministic reconstruction path intact.
+        receipt_payload = critic_gate.get("target_mention_receipts", [])
+        if not isinstance(receipt_payload, list):
+            raise RebuildGuardError("Некорректный receipt manifest critic gate.")
+        target_mention_receipts = (
+            analyzer._validated_target_mention_receipt_manifest(
+                receipt_payload,
+                rows=raw_rows,
+                profile=profile,
+                catalog=catalog,
+            )
+        )
+        if "target_mention_receipts_sha256" in critic_gate and (
+            analyzer._stable_json_sha256(target_mention_receipts)
+            != critic_gate.get("target_mention_receipts_sha256")
+        ):
+            raise RebuildGuardError(
+                "Receipt manifest critic gate не совпадает с raw."
+            )
+        annotation_input_sha256 = analyzer._annotation_context_sha256(
+            profile,
+            catalog,
+            research_guidance,
+            target_mention_receipts=target_mention_receipts,
+        )
+    stored_digest_map = critic_gate.get("annotation_input_sha256_by_answer_id")
+    annotation_input_sha256_by_answer_id = None
+    if stored_digest_map is not None:
+        if not isinstance(stored_digest_map, dict):
+            raise RebuildGuardError("Некорректная карта annotation digest critic gate.")
+        try:
+            annotation_input_sha256_by_answer_id = {
+                int(answer_id): str(digest)
+                for answer_id, digest in stored_digest_map.items()
+            }
+        except (TypeError, ValueError) as exc:
+            raise RebuildGuardError(
+                "Некорректная карта annotation digest critic gate."
+            ) from exc
+        if (
+            any(answer_id <= 0 for answer_id in annotation_input_sha256_by_answer_id)
+            or any(
+                len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                for digest in annotation_input_sha256_by_answer_id.values()
+            )
+            or {
+                str(answer_id): digest
+                for answer_id, digest in sorted(
+                    annotation_input_sha256_by_answer_id.items()
+                )
+            }
+            != stored_digest_map
+        ):
+            raise RebuildGuardError(
+                "Некорректная карта annotation digest critic gate."
+            )
     rows = await analyzer._metric_rows(
         run_id,
         annotation_input_sha256=annotation_input_sha256,
+        annotation_input_sha256_by_answer_id=(
+            annotation_input_sha256_by_answer_id
+        ),
     )
+    if (
+        annotation_input_sha256_by_answer_id is not None
+        and analyzer._current_annotation_input_digests(rows)
+        != annotation_input_sha256_by_answer_id
+    ):
+        raise RebuildGuardError(
+            "Сохранённые аннотации не совпадают с картой critic gate."
+        )
     metrics = analyzer._compute_metrics(rows, profile, catalog)
     expected_corpus_cells = await analyzer._expected_corpus_cells(
         run_id,

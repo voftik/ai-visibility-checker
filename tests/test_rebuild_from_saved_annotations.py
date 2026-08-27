@@ -40,6 +40,152 @@ METRICS = {
 
 
 class SavedAnnotationRebuildGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_gate_context_drives_exact_metric_reload(self) -> None:
+        class StopAfterMetricReload(RuntimeError):
+            pass
+
+        run_id = str(uuid.uuid4())
+        effective_profile = {
+            **PROFILE,
+            "_offer_identity_policy": {
+                "version": "fixture-policy-v1",
+                "output_digest": "f" * 64,
+            },
+        }
+        context = analyzer._annotation_context_manifest(
+            profile=effective_profile,
+            catalog=CATALOG,
+            rows=ROWS,
+            research_guidance="Persisted guidance, not policy reconstruction.",
+            target_mention_receipts=[],
+        )
+        gate = {
+            "passed": True,
+            "policy_history": [],
+            "annotation_context": context,
+            "annotation_context_sha256": analyzer._stable_json_sha256(context),
+            "annotation_input_sha256_by_answer_id": {"1": "a" * 64},
+        }
+
+        async def artifact(_run_id: str, key: str) -> dict:
+            self.assertEqual(_run_id, run_id)
+            return {
+                "site_profile": PROFILE,
+                "entity_catalog": CATALOG,
+                "analysis_critic_gate": gate,
+            }[key]
+
+        with (
+            patch.object(
+                rebuild_cli,
+                "_validate_saved_inputs",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                rebuild_cli,
+                "_artifact_dict",
+                new=AsyncMock(side_effect=artifact),
+            ),
+            patch.object(
+                rebuild_cli,
+                "_optional_artifact_dict",
+                new=AsyncMock(
+                    return_value={
+                        "policy_history": [],
+                        "effective_profile": effective_profile,
+                        "effective_catalog": CATALOG,
+                        "annotation_context": context,
+                        "annotation_context_sha256": (
+                            analyzer._stable_json_sha256(context)
+                        ),
+                    }
+                ),
+            ),
+            patch.object(
+                rebuild_cli.analyzer,
+                "_metric_rows",
+                new=AsyncMock(
+                    side_effect=[ROWS, StopAfterMetricReload]
+                ),
+            ) as metric_rows,
+        ):
+            with self.assertRaises(StopAfterMetricReload):
+                await rebuild_cli.rebuild_from_saved_annotations(run_id)
+
+        self.assertEqual(metric_rows.await_count, 2)
+        self.assertEqual(
+            metric_rows.await_args_list[1].kwargs,
+            {
+                "annotation_input_sha256": context[
+                    "annotation_input_sha256"
+                ],
+                "annotation_input_sha256_by_answer_id": {1: "a" * 64},
+            },
+        )
+
+    async def test_tampered_explicit_gate_context_is_rejected_before_reload(
+        self,
+    ) -> None:
+        run_id = str(uuid.uuid4())
+        context = analyzer._annotation_context_manifest(
+            profile=PROFILE,
+            catalog=CATALOG,
+            rows=ROWS,
+            research_guidance="Persisted guidance.",
+            target_mention_receipts=[],
+        )
+        gate = {
+            "passed": True,
+            "policy_history": [],
+            "annotation_context": context,
+            "annotation_context_sha256": "0" * 64,
+        }
+
+        async def artifact(_run_id: str, key: str) -> dict:
+            return {
+                "site_profile": PROFILE,
+                "entity_catalog": CATALOG,
+                "analysis_critic_gate": gate,
+            }[key]
+
+        with (
+            patch.object(
+                rebuild_cli,
+                "_validate_saved_inputs",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                rebuild_cli,
+                "_artifact_dict",
+                new=AsyncMock(side_effect=artifact),
+            ),
+            patch.object(
+                rebuild_cli,
+                "_optional_artifact_dict",
+                new=AsyncMock(
+                    return_value={
+                        "policy_history": [],
+                        "effective_profile": PROFILE,
+                        "effective_catalog": CATALOG,
+                        "annotation_context": context,
+                        "annotation_context_sha256": "0" * 64,
+                    }
+                ),
+            ),
+            patch.object(
+                rebuild_cli.analyzer,
+                "_metric_rows",
+                new=AsyncMock(return_value=ROWS),
+            ) as metric_rows,
+        ):
+            with self.assertRaisesRegex(
+                rebuild_cli.RebuildGuardError,
+                "Digest annotation context",
+            ):
+                await rebuild_cli.rebuild_from_saved_annotations(run_id)
+
+        self.assertEqual(metric_rows.await_count, 1)
+
     async def _assert_rebuild_rejects(
         self,
         *,
@@ -94,12 +240,23 @@ class SavedAnnotationRebuildGuardTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await rebuild_cli.rebuild_from_saved_annotations(run_id)
 
-        metric_rows.assert_awaited_once_with(
-            run_id,
-            annotation_input_sha256=analyzer._annotation_context_sha256(
-                PROFILE,
-                CATALOG,
-            ),
+        self.assertEqual(metric_rows.await_count, 2)
+        self.assertEqual(
+            metric_rows.await_args_list[0].kwargs,
+            {
+                "annotation_input_sha256": (
+                    "saved-rebuild-raw-receipt-validation"
+                )
+            },
+        )
+        self.assertEqual(
+            metric_rows.await_args_list[1].kwargs,
+            {
+                "annotation_input_sha256": (
+                    analyzer._annotation_context_sha256(PROFILE, CATALOG)
+                ),
+                "annotation_input_sha256_by_answer_id": None,
+            },
         )
         technical.assert_not_awaited()
 

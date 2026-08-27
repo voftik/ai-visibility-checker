@@ -20210,8 +20210,8 @@ class DatabaseSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(discovery["annotated_answers"], 1)
             self.assertEqual(discovery["valid_answers"], 1)
             self.assertEqual(discovery["mention_count"], 1)
-            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v21"))
-            self.assertTrue(METRICS_VERSION.endswith("metrics-v23"))
+            self.assertTrue(ANNOTATION_VERSION.endswith("annotations-v22"))
+            self.assertTrue(METRICS_VERSION.endswith("metrics-v24"))
         finally:
             async with SessionLocal() as session:
                 await session.execute(delete(Run).where(Run.id == run_id))

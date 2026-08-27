@@ -185,8 +185,16 @@ class FrontendStaticTests(unittest.TestCase):
 
     def test_entity_ranking_explains_scope_formula_and_meaning(self) -> None:
         for marker in (
-            "Кого ИИ называет, когда бренда",
-            "и его вариантов в запросах",
+            "Кого ИИ называет без упоминания бренда",
+            'class="chart-card-head chart-card-head--wide"',
+            ".chart-card-head--wide {",
+            ".chart-card-head--wide .chart-kicker {",
+            "grid-template-columns: minmax(0, 1fr);",
+            "overflow-wrap: anywhere;",
+            "text-transform: none;",
+            "В запросах нет",
+            "и его вариантов",
+            "Это не оценка всего рынка.",
             "competitorChartExplainerHTML(viewModel, competitorRows)",
             "Пользовательские задачи без названия",
             "Ответы из режима с веб-поиском.",
@@ -605,12 +613,12 @@ assert.match(excluded.copy, /Служебные страницы/);
         )
         self.assertIn("data-hard-refresh", self.html)
         self.assertIn('cache: options.cache || "no-store"', self.html)
-        self.assertIn('const uiBuildId = "2026-07-31.29"', self.html)
+        self.assertIn('const uiBuildId = "2026-07-31.30"', self.html)
         self.assertIn('"2026-07-v3"', self.html)
         self.assertIn("checkUIVersion", self.html)
 
     def test_html_shell_is_never_reused_after_a_ui_contract_change(self) -> None:
-        self.assertIn('UI_BUILD_ID = "2026-07-31.29"', self.pages)
+        self.assertIn('UI_BUILD_ID = "2026-07-31.30"', self.pages)
         self.assertIn('"Cache-Control": "no-store, max-age=0"', self.pages)
         self.assertIn('"X-AIV-UI-Version": UI_BUILD_ID', self.pages)
         self.assertIn('@router.get("/api/ui-version"', self.pages)

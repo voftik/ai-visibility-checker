@@ -398,8 +398,8 @@ class _FinalSemanticAuditIntegrityError(OpenRouterError):
     """A persisted semantic receipt or checkpoint violates its code contract."""
 
 
-ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v21"
-METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v23"
+ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v22"
+METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v24"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
 FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v30"
@@ -21814,7 +21814,21 @@ def _reconcile_annotation(
         for entity in catalog.get("entities") or []
         if isinstance(entity, dict) and entity.get("canonical_name")
     }
-    for receipt in target_mention_receipts or []:
+    pending_answer_id = pending_answer.get("answer_id")
+    allowed_receipt_answer_ids = (
+        {pending_answer_id}
+        if isinstance(pending_answer_id, int)
+        and not isinstance(pending_answer_id, bool)
+        else set()
+    )
+    receipt_candidates = _validated_target_mention_receipt_manifest(
+        list(target_mention_receipts or []),
+        rows=[pending_answer],
+        profile=profile,
+        catalog=catalog,
+        allowed_answer_ids=allowed_receipt_answer_ids,
+    )
+    for receipt in receipt_candidates:
         if not isinstance(receipt, dict):
             continue
         entity = catalog_entities_by_name.get(
@@ -21822,11 +21836,11 @@ def _reconcile_annotation(
         )
         alias = str(receipt.get("alias") or "")
         expected_receipt = (
-            _target_mention_receipt(
+            _expected_target_mention_receipt(
+                receipt,
                 profile=profile,
                 catalog=catalog,
                 entity=entity,
-                alias=alias,
                 row=pending_answer,
             )
             if entity is not None and alias
@@ -22126,6 +22140,7 @@ def _reconcile_annotation(
     profile_direct_alias_present = any(
         _alias_is_present(answer_text, alias) for alias in profile_direct_aliases
     )
+    reconciled.pop("_target_mention_receipt_only", None)
     direct_alias_present = any(
         _alias_is_present(answer_text, alias) for alias in direct_aliases
     )
@@ -22145,7 +22160,8 @@ def _reconcile_annotation(
             # required before either may affect recommendation/top-3 metrics.
             reconciled["target_role"] = "mentioned"
             reconciled["target_position"] = None
-            reconciled["sentiment"] = "neutral"
+            reconciled["sentiment"] = "unknown"
+            reconciled["_target_mention_receipt_only"] = True
             reconciliation_notes.append(
                 "Scoped-квитанция подтвердила только упоминание цели; "
                 "роль рекомендации и позиция не переносились."
@@ -22958,6 +22974,25 @@ async def _annotate_answers(
             raise OpenRouterError(
                 "Targeted annotation repair requires positive answer ids"
             )
+    explicit_target_receipts = list(target_mention_receipts or [])
+    if explicit_target_receipts:
+        receipt_source_rows = await _metric_rows(
+            run_id,
+            annotation_input_sha256=_annotation_context_sha256(
+                profile,
+                catalog,
+                research_guidance,
+                repair_mode=repair_mode,
+            ),
+        )
+        explicit_target_receipts = _validated_target_mention_receipt_manifest(
+            explicit_target_receipts,
+            rows=receipt_source_rows,
+            profile=profile,
+            catalog=catalog,
+            allowed_answer_ids=normalized_target_ids,
+        )
+    target_mention_receipts = explicit_target_receipts
     annotation_input_sha256 = _annotation_context_sha256(
         profile,
         catalog,
@@ -23827,7 +23862,7 @@ def _visibility_slice(
             **evidence_state,
         }
 
-    def outcome(row: dict[str, Any]) -> tuple[bool, int | None, str]:
+    def outcome(row: dict[str, Any]) -> tuple[bool, int | None, str, bool]:
         annotation = row["annotation"]
         mentioned = bool(
             row.get(
@@ -23843,8 +23878,13 @@ def _visibility_slice(
         role = str(annotation.get("target_role") or "absent")
         if scope != "portfolio":
             if not mentioned:
-                return False, None, "absent"
-            return mentioned, position, role
+                return False, None, "absent", False
+            return (
+                mentioned,
+                position,
+                role,
+                annotation.get("_target_mention_receipt_only") is True,
+            )
 
         mentioned = False
         position = None
@@ -23882,24 +23922,31 @@ def _visibility_slice(
             mention_role = str(mention.get("role") or "mentioned")
             if role_priority.get(mention_role, 0) > role_priority.get(role, 0):
                 role = mention_role
-        return mentioned, position, role
+        return mentioned, position, role, False
 
     outcomes = [outcome(row) for row in valid_rows]
     denominator = valid
-    mentions = sum(mentioned for mentioned, _position, _role in outcomes)
+    mentions = sum(mentioned for mentioned, _position, _role, _receipt_only in outcomes)
     top3_denominator = sum(
-        not mentioned or isinstance(position, int)
-        for mentioned, position, _role in outcomes
+        not mentioned or isinstance(position, int) or receipt_only
+        for mentioned, position, _role, receipt_only in outcomes
     )
     top3 = sum(
         mentioned and isinstance(position, int) and position <= 3
-        for mentioned, position, _role in outcomes
+        for mentioned, position, _role, _receipt_only in outcomes
     )
-    recommended = sum(role == "recommended" for _mentioned, _position, role in outcomes)
-    conditional = sum(role == "conditional" for _mentioned, _position, role in outcomes)
+    recommended = sum(
+        role == "recommended"
+        for _mentioned, _position, role, _receipt_only in outcomes
+    )
+    conditional = sum(
+        role == "conditional"
+        for _mentioned, _position, role, _receipt_only in outcomes
+    )
     mention_rate = _rate(mentions, denominator)
-    # A known absence is a valid non-top-3 outcome. A literal mention whose
-    # global ordinal became unknowable after long-answer partitioning is not.
+    # A known absence and a receipt-only identity match are valid non-top-3
+    # outcomes. A literal mention whose global ordinal became unknowable after
+    # long-answer partitioning remains excluded from this denominator.
     top3_rate = _rate(top3, top3_denominator)
     recommendation_rate = _rate(recommended, denominator)
     score = (
@@ -25484,6 +25531,7 @@ def _deterministic_annotation_warnings(
                         entity=exact_target,
                         alias=target_alias,
                         row=row,
+                        require_local_coreference=True,
                     )
                     if target_receipt is not None:
                         break
@@ -27476,6 +27524,8 @@ def _require_alias_attribution(
 
 
 CRITIC_TARGET_MENTION_RECEIPT_VERSION = "aiv-critic-target-mention-receipt-v1"
+CODE_OWNED_TARGET_MENTION_GROUNDING_MODE = "code_owned_local_coreference_v2"
+ANNOTATION_CONTEXT_MANIFEST_VERSION = "aiv-annotation-context-manifest-v1"
 
 
 def _critic_row_answer_text(row: dict[str, Any]) -> str:
@@ -27646,6 +27696,65 @@ def _literal_identity_sequence_is_present(text: str, identity: str) -> bool:
     )
 
 
+def _identity_variant_tokens(value: str) -> list[str]:
+    """Return identity tokens suitable for a bounded reorder/subset check."""
+
+    normalized = (
+        unicodedata.normalize("NFKC", _decoded_identity_text(value))
+        .casefold()
+        .replace("ё", "е")
+        .replace("&", " and ")
+    )
+    connectors = {"and", "the", "и"}
+    return [
+        token
+        for token in re.findall(r"[a-zа-я0-9]+", normalized, re.UNICODE)
+        if token not in connectors
+    ]
+
+
+def _alias_is_bounded_profile_identity_variant(
+    alias: str,
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> bool:
+    """Allow only a shortened/reordered form of a profile-owned identity.
+
+    A catalog is partly answer-derived, so its aliases cannot expand target
+    identity.  The catalog may only suggest a phrase whose complete token
+    multiset is already present in one independently built profile identity.
+    Requiring at least three tokens and allowing at most one omitted profile
+    token prevents a geographic phrase such as ``New York`` from becoming the
+    brand ``New York Tattoo Studio`` merely because an answer linked to the
+    client domain.  A one-token shortening must also reorder the remaining
+    tokens: a plain geographic prefix such as ``New York City`` cannot become
+    ``New York City Studio`` by dropping only the business descriptor.
+    """
+
+    alias_tokens = _identity_variant_tokens(alias)
+    if len(alias_tokens) < 3:
+        return False
+    alias_counts = Counter(alias_tokens)
+    for trusted_identity in _target_aliases(profile, catalog):
+        trusted_tokens = _identity_variant_tokens(trusted_identity)
+        trusted_counts = Counter(trusted_tokens)
+        if not trusted_counts or not all(
+            count <= trusted_counts.get(token, 0)
+            for token, count in alias_counts.items()
+        ):
+            continue
+        omitted_count = len(trusted_tokens) - len(alias_tokens)
+        if omitted_count == 0:
+            return True
+        if omitted_count == 1 and not any(
+            alias_tokens == trusted_tokens[:index] + trusted_tokens[index + 1 :]
+            for index in range(len(trusted_tokens))
+        ):
+            return True
+    return False
+
+
 def _local_citation_reference(
     claim_line: str,
     *,
@@ -27748,6 +27857,193 @@ def _exact_target_entity_matches_profile(
     return bool(canonical and canonical in profile_identities)
 
 
+def _target_alias_occurrence_is_metalinguistic_or_denied(
+    claim_line: str,
+    *,
+    alias_start_in_line: int,
+    alias_end_in_line: int,
+) -> bool:
+    """Reject an alias used as syntax, a query or an explicit non-name."""
+
+    prefix = claim_line[max(0, alias_start_in_line - 96) : alias_start_in_line]
+    suffix = claim_line[alias_end_in_line : alias_end_in_line + 192]
+    backticks = [
+        match.start()
+        for match in re.finditer(r"(?<!\\)`", claim_line, re.UNICODE)
+    ]
+    if any(
+        start < alias_start_in_line and end >= alias_end_in_line
+        for start, end in zip(backticks[::2], backticks[1::2], strict=False)
+    ):
+        return True
+    normalized_prefix = _normalized_evidence_text(prefix)
+    normalized_suffix = _normalized_evidence_text(suffix)
+    return bool(
+        re.search(
+            r"(?:^|[.!?]\s)(?:запрос|поиск|название\s+(?:для\s+поиска|"
+            r"запроса)|результат\s+поиска|(?:ключевая|поисковая)\s+фраза)"
+            r"\s*:?\s*$",
+            normalized_prefix,
+            re.IGNORECASE | re.UNICODE,
+        )
+        or re.search(
+            r"(?:^|[.!?]\s)(?:не\s+(?:бренд|название|студия|компания)"
+            r"\s*,?\s*а|это\s+не\s+(?:бренд|название|студия|компания))"
+            r"\s*$",
+            normalized_prefix,
+            re.IGNORECASE | re.UNICODE,
+        )
+        or re.match(
+            r"^\s*(?:\([^)]{1,160}\)\s*)?"
+            r"(?:—|-|:|это\b|означает\b|является\b|is\b|means\b)\s*"
+            r"(?:лишь|только|просто|only|just|merely)?\s*"
+            r"(?:категори\w*|тип\w*|строк\w*|назван\w*|термин\w*|"
+            r"фраз\w*|category|type|label|term|phrase)\b",
+            normalized_suffix,
+            re.IGNORECASE | re.UNICODE,
+        )
+        or
+        re.search(
+            r"\b(?:поисков\w*\s+(?:запрос\w*|фраз\w*|термин\w*)|"
+            r"ключев\w*\s+слов\w*|ищ(?:ите|ут|ем)\s+(?:по|через)\s+"
+            r"(?:запрос\w*|фраз\w*|ключев\w*)|"
+            r"(?:введите|наберите|вбейте|поищите|загуглите)(?:\s+в)?|"
+            r"search\s+(?:query|term|phrase|for)|"
+            r"(?:enter|type)(?:\s+in)?|keyword(?:s|\s+phrase)?)\b",
+            normalized_prefix,
+            re.IGNORECASE | re.UNICODE,
+        )
+        or re.search(
+            r"\b(?:это|является|означает|считается|is|means|denotes)\s+"
+            r"(?:лишь|только|просто|only|just|merely)?\s*"
+            r"(?:поисков\w*|запрос\w*|фраз\w*|термин\w*|"
+            r"search\s+(?:query|term|phrase)|keyword)\b",
+            normalized_suffix,
+            re.IGNORECASE | re.UNICODE,
+        )
+        or re.search(
+            r"\b(?:а\s+не|но\s+не|не\s+является|не|not|rather\s+than)\s+"
+            r"(?:назван\w*|имен\w*|бренд\w*|студи\w*|компан\w*|"
+            r"name|brand|studio|company)\b",
+            normalized_suffix,
+            re.IGNORECASE | re.UNICODE,
+        )
+        or re.search(
+            r"^\s*(?:\([^)]{1,160}\)\s*)?"
+            r"(?:—|-|:|,)?\s*(?:здесь\s+)?"
+            r"(?:не\s+(?:означает|обозначает|относится\s+к|"
+            r"имеется\s+в\s+виду)|does\s+not\s+(?:mean|refer\s+to))\b",
+            normalized_suffix,
+            re.IGNORECASE | re.UNICODE,
+        )
+    )
+
+
+def _target_alias_occurrence_local_coreference_end(
+    claim_line: str,
+    *,
+    alias_start_in_line: int,
+    alias_end_in_line: int,
+    alias: str,
+    entity: dict[str, Any],
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> int | None:
+    """Return the end of a second spelling in one parenthetical apposition."""
+
+    trusted_token_sets = [
+        Counter(_identity_variant_tokens(identity))
+        for identity in _target_aliases(profile, catalog)
+        if _identity_variant_tokens(identity)
+    ]
+    generic_identity_tokens = {
+        "and",
+        "company",
+        "group",
+        "studio",
+        "the",
+        "бренд",
+        "группа",
+        "компания",
+        "сервис",
+        "студия",
+        "piercing",
+        "tattoo",
+    }
+    trusted_distinctive_tokens = {
+        token
+        for trusted_counts in trusted_token_sets
+        for token in trusted_counts
+        if len(token) >= 4 and token not in generic_identity_tokens
+    }
+    for corroborating_alias in _entity_alias_values(entity):
+        if corroborating_alias.casefold().replace("ё", "е") == alias.casefold().replace(
+            "ё", "е"
+        ):
+            continue
+        corroborating_tokens = _identity_variant_tokens(corroborating_alias)
+        corroborating_counts = Counter(corroborating_tokens)
+        if (
+            len(corroborating_tokens) < 2
+            or not any(
+                token in trusted_distinctive_tokens
+                for token in corroborating_tokens
+            )
+            or not any(
+                all(
+                    count <= trusted_counts.get(token, 0)
+                    for token, count in corroborating_counts.items()
+                )
+                for trusted_counts in trusted_token_sets
+            )
+        ):
+            continue
+        for other_start, other_end in _alias_spans(
+            claim_line,
+            [corroborating_alias],
+        ):
+            if not (
+                other_end <= alias_start_in_line or other_start >= alias_end_in_line
+            ):
+                continue
+            if alias_end_in_line <= other_start:
+                between = claim_line[alias_end_in_line:other_start]
+                after = claim_line[other_end:]
+            else:
+                between = claim_line[other_end:alias_start_in_line]
+                after = claim_line[alias_end_in_line:]
+            closing = re.match(r"^[\s*_]*(?:\)|\]|»)[*_]*", after)
+            if (
+                re.fullmatch(r"[\s*_]*(?:\(|\[|«)[\s*_]*", between)
+                and closing is not None
+            ):
+                closing_base = other_end if alias_end_in_line <= other_start else alias_end_in_line
+                return closing_base + closing.end()
+    return None
+
+
+def _code_owned_reference_gap_is_safe(
+    claim_line: str,
+    *,
+    identity_end_in_line: int,
+    reference_start_in_line: int,
+) -> bool:
+    """Keep an official citation locally bound to the full identity pair."""
+
+    between = claim_line[identity_end_in_line:reference_start_in_line]
+    return bool(
+        len(between) <= 160
+        and len(re.findall(r"\w+", between, re.UNICODE)) <= 24
+        and ";" not in between
+        and re.search(
+            r",\s*(?:а|но|однако|but|however)\b",
+            between,
+            re.IGNORECASE | re.UNICODE,
+        )
+        is None
+    )
+
+
 def _target_mention_receipt(
     *,
     profile: dict[str, Any],
@@ -27755,6 +28051,7 @@ def _target_mention_receipt(
     entity: dict[str, Any],
     alias: str,
     row: dict[str, Any],
+    require_local_coreference: bool = False,
 ) -> dict[str, Any] | None:
     """Issue one answer-bound identity receipt from independent evidence."""
 
@@ -27865,14 +28162,35 @@ def _target_mention_receipt(
         if claim_line_end < 0:
             claim_line_end = len(raw_answer)
         claim_line = raw_answer[claim_line_start:claim_line_end]
+        alias_start_in_line = alias_start - claim_line_start
         alias_end_in_line = alias_end - claim_line_start
+        if _target_alias_occurrence_is_metalinguistic_or_denied(
+            claim_line,
+            alias_start_in_line=alias_start_in_line,
+            alias_end_in_line=alias_end_in_line,
+        ):
+            continue
+        identity_end_in_line = alias_end_in_line
+        if require_local_coreference:
+            coreference_end = _target_alias_occurrence_local_coreference_end(
+                claim_line,
+                alias_start_in_line=alias_start_in_line,
+                alias_end_in_line=alias_end_in_line,
+                alias=declared_alias,
+                entity=entity,
+                profile=profile,
+                catalog=catalog,
+            )
+            if coreference_end is None:
+                continue
+            identity_end_in_line = coreference_end
         linked_citations = [
             (citation_index, citation, reference)
             for citation_index, citation in official_citations
             if (
                 reference := _local_citation_reference(
                     claim_line,
-                    alias_end_in_line=alias_end_in_line,
+                    alias_end_in_line=identity_end_in_line,
                     citation_index=citation_index,
                     citation_url=str(citation.get("url") or ""),
                     client_domain=client_domain,
@@ -27881,6 +28199,16 @@ def _target_mention_receipt(
             )
             is not None
         ]
+        if require_local_coreference:
+            linked_citations = [
+                (citation_index, citation, reference)
+                for citation_index, citation, reference in linked_citations
+                if _code_owned_reference_gap_is_safe(
+                    claim_line,
+                    identity_end_in_line=identity_end_in_line,
+                    reference_start_in_line=reference[0],
+                )
+            ]
         if linked_citations:
             citation_index, citation, reference = linked_citations[0]
             linked_occurrence = (
@@ -27907,7 +28235,7 @@ def _target_mention_receipt(
     reference_start, reference_end, reference_kind = reference
     citation_url = str(citation.get("url") or "")
     citation_sources = _critic_row_citation_sources(row)
-    return {
+    receipt = {
         "version": CRITIC_TARGET_MENTION_RECEIPT_VERSION,
         "answer_id": answer_id,
         "entity_name": str(entity.get("canonical_name") or "").strip(),
@@ -27935,6 +28263,352 @@ def _target_mention_receipt(
             "exact_alias_first_character_in_owned_raw_core_and_official_domain_citation"
         ),
     }
+    if require_local_coreference:
+        receipt["grounding_mode"] = CODE_OWNED_TARGET_MENTION_GROUNDING_MODE
+        receipt["ownership_rule"] = (
+            "exact_alias_and_profile_bounded_coreference_in_owned_raw_core_"
+            "with_official_domain_citation"
+        )
+    return receipt
+
+
+def _code_owned_target_mention_receipts(
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Derive answer-bound target identity without trusting critic prose.
+
+    Direct profile aliases are reconciled elsewhere.  This path exists only for
+    shortened/reordered catalog aliases and still requires the complete receipt
+    contract: an unbranded completed answer, a locally linked official-domain
+    citation, prompt non-disclosure, exact raw/citation manifests and a profile-
+    confirmed exact-target canonical.  At most one strongest alias is admitted
+    for each exact target in one answer.
+    """
+
+    raw_answer = _critic_row_answer_text(row)
+    if not raw_answer or any(
+        _alias_is_present(raw_answer, alias)
+        for alias in _target_aliases(profile, catalog)
+    ):
+        return []
+
+    receipts: list[dict[str, Any]] = []
+    entities = sorted(
+        (
+            entity
+            for entity in catalog.get("entities") or []
+            if isinstance(entity, dict)
+            and _exact_target_entity_matches_profile(entity, profile, catalog)
+        ),
+        key=lambda entity: str(entity.get("canonical_name") or "").casefold(),
+    )
+    for entity in entities:
+        aliases = sorted(
+            _entity_alias_values(entity),
+            key=lambda alias: (
+                -len(_identity_variant_tokens(alias)),
+                -len(alias),
+                alias.casefold(),
+            ),
+        )
+        for alias in aliases:
+            if not _alias_is_bounded_profile_identity_variant(
+                alias,
+                profile=profile,
+                catalog=catalog,
+            ):
+                continue
+            receipt = _target_mention_receipt(
+                profile=profile,
+                catalog=catalog,
+                entity=entity,
+                alias=alias,
+                row=row,
+                require_local_coreference=True,
+            )
+            if receipt is not None:
+                receipts.append(receipt)
+                break
+    return _canonical_target_mention_receipts(receipts)
+
+
+def _expected_target_mention_receipt(
+    receipt: dict[str, Any],
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    entity: dict[str, Any],
+    row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Re-derive a receipt under the exact grounding contract it declares."""
+
+    grounding_mode = str(receipt.get("grounding_mode") or "")
+    if grounding_mode not in {"", CODE_OWNED_TARGET_MENTION_GROUNDING_MODE}:
+        return None
+    return _target_mention_receipt(
+        profile=profile,
+        catalog=catalog,
+        entity=entity,
+        alias=str(receipt.get("alias") or ""),
+        row=row,
+        require_local_coreference=(
+            grounding_mode == CODE_OWNED_TARGET_MENTION_GROUNDING_MODE
+        ),
+    )
+
+
+def _validated_target_mention_receipt_manifest(
+    receipts: list[dict[str, Any]],
+    *,
+    rows: list[dict[str, Any]],
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    allowed_answer_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate an explicit, canonical receipt manifest or fail loudly."""
+
+    semantic_keys: set[tuple[int, str, str]] = set()
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            raise OrchestratorContractError(
+                "Target mention receipt manifest contains a non-object"
+            )
+        answer_id = receipt.get("answer_id")
+        entity_name = receipt.get("entity_name")
+        alias = receipt.get("alias")
+        grounding_mode = receipt.get("grounding_mode", "")
+        if (
+            not isinstance(answer_id, int)
+            or isinstance(answer_id, bool)
+            or answer_id <= 0
+            or not isinstance(entity_name, str)
+            or not entity_name.strip()
+            or not isinstance(alias, str)
+            or not alias.strip()
+            or receipt.get("version") != CRITIC_TARGET_MENTION_RECEIPT_VERSION
+            or grounding_mode
+            not in {"", CODE_OWNED_TARGET_MENTION_GROUNDING_MODE}
+            or (
+                allowed_answer_ids is not None
+                and answer_id not in allowed_answer_ids
+            )
+        ):
+            raise OrchestratorContractError(
+                "Target mention receipt manifest has an invalid schema or scope"
+            )
+        semantic_key = (
+            answer_id,
+            entity_name.strip().casefold(),
+            alias.strip().casefold(),
+        )
+        if semantic_key in semantic_keys:
+            raise OrchestratorContractError(
+                "Target mention receipt manifest has a semantic duplicate"
+            )
+        semantic_keys.add(semantic_key)
+
+    canonical = _canonical_target_mention_receipts(
+        receipts,
+        allowed_answer_ids=allowed_answer_ids,
+    )
+    if receipts != canonical:
+        raise OrchestratorContractError(
+            "Target mention receipt manifest is not canonical or is out of scope"
+        )
+    rows_by_id = {
+        int(row["answer_id"]): row
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("answer_id"), int)
+        and not isinstance(row.get("answer_id"), bool)
+    }
+    entities = {
+        str(entity.get("canonical_name") or "").casefold(): entity
+        for entity in catalog.get("entities") or []
+        if isinstance(entity, dict) and entity.get("canonical_name")
+    }
+    for receipt in canonical:
+        answer_id = receipt.get("answer_id")
+        entity = entities.get(str(receipt.get("entity_name") or "").casefold())
+        row = rows_by_id.get(answer_id) if isinstance(answer_id, int) else None
+        expected = (
+            _expected_target_mention_receipt(
+                receipt,
+                profile=profile,
+                catalog=catalog,
+                entity=entity,
+                row=row,
+            )
+            if entity is not None and row is not None
+            else None
+        )
+        if expected != receipt:
+            raise OrchestratorContractError(
+                "Target mention receipt failed deterministic revalidation"
+            )
+    return canonical
+
+
+def _annotation_context_manifest(
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    research_guidance: str,
+    target_mention_receipts: list[dict[str, Any]],
+    repair_mode: str | None = None,
+    allowed_answer_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Build one exact, receipt-bound annotation context checkpoint."""
+
+    validated_receipts = _validated_target_mention_receipt_manifest(
+        list(target_mention_receipts),
+        rows=rows,
+        profile=profile,
+        catalog=catalog,
+        allowed_answer_ids=allowed_answer_ids,
+    )
+    normalized_guidance = str(research_guidance or "")
+    normalized_repair_mode = str(repair_mode or "")
+    return {
+        "version": ANNOTATION_CONTEXT_MANIFEST_VERSION,
+        "research_guidance": normalized_guidance,
+        "repair_mode": normalized_repair_mode,
+        "target_mention_receipts": validated_receipts,
+        "target_mention_receipts_sha256": _stable_json_sha256(
+            validated_receipts
+        ),
+        "annotation_input_sha256": _annotation_context_sha256(
+            profile,
+            catalog,
+            normalized_guidance,
+            repair_mode=normalized_repair_mode,
+            target_mention_receipts=validated_receipts,
+        ),
+    }
+
+
+def _validated_annotation_context_manifest(
+    payload: dict[str, Any],
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+    expected_repair_mode: str | None = None,
+    allowed_answer_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Rebuild an annotation context and require byte-exact equivalence."""
+
+    if not isinstance(payload, dict):
+        raise OrchestratorContractError(
+            "Annotation context checkpoint is not an object"
+        )
+    receipts = payload.get("target_mention_receipts")
+    if not isinstance(receipts, list):
+        raise OrchestratorContractError(
+            "Annotation context checkpoint has no receipt manifest"
+        )
+    repair_mode = str(payload.get("repair_mode") or "")
+    normalized_expected_repair_mode = str(expected_repair_mode or "")
+    if repair_mode != normalized_expected_repair_mode:
+        raise OrchestratorContractError(
+            "Annotation context checkpoint has an unexpected repair mode"
+        )
+    expected = _annotation_context_manifest(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        research_guidance=str(payload.get("research_guidance") or ""),
+        target_mention_receipts=receipts,
+        repair_mode=repair_mode or None,
+        allowed_answer_ids=allowed_answer_ids,
+    )
+    if payload != expected:
+        raise OrchestratorContractError(
+            "Annotation context checkpoint failed deterministic revalidation"
+        )
+    return expected
+
+
+def _code_owned_target_mention_receipt_manifest(
+    *,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Derive and validate the deterministic receipt manifest for raw rows."""
+
+    receipts = _canonical_target_mention_receipts(
+        [
+            receipt
+            for row in rows
+            for receipt in _code_owned_target_mention_receipts(
+                profile=profile,
+                catalog=catalog,
+                row=row,
+            )
+        ]
+    )
+    return _validated_target_mention_receipt_manifest(
+        receipts,
+        rows=rows,
+        profile=profile,
+        catalog=catalog,
+    )
+
+
+def _refresh_target_mention_receipt_manifest(
+    receipts: list[dict[str, Any]],
+    *,
+    rows: list[dict[str, Any]],
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Rebind an explicit receipt plan to an intentionally changed catalog."""
+
+    rows_by_id = {
+        int(row["answer_id"]): row
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("answer_id"), int)
+        and not isinstance(row.get("answer_id"), bool)
+    }
+    entities = {
+        str(entity.get("canonical_name") or "").casefold(): entity
+        for entity in catalog.get("entities") or []
+        if isinstance(entity, dict) and entity.get("canonical_name")
+    }
+    refreshed: list[dict[str, Any]] = []
+    for receipt in _canonical_target_mention_receipts(receipts):
+        answer_id = receipt.get("answer_id")
+        entity = entities.get(str(receipt.get("entity_name") or "").casefold())
+        row = rows_by_id.get(answer_id) if isinstance(answer_id, int) else None
+        expected = (
+            _expected_target_mention_receipt(
+                receipt,
+                profile=profile,
+                catalog=catalog,
+                entity=entity,
+                row=row,
+            )
+            if entity is not None and row is not None
+            else None
+        )
+        if expected is None:
+            raise OrchestratorContractError(
+                "Target mention receipt cannot be rebound to the changed catalog"
+            )
+        refreshed.append(expected)
+    canonical = _canonical_target_mention_receipts(refreshed)
+    return _validated_target_mention_receipt_manifest(
+        canonical,
+        rows=rows,
+        profile=profile,
+        catalog=catalog,
+    )
 
 
 def _critic_target_mention_receipts(
@@ -27977,6 +28651,36 @@ def _canonical_target_mention_receipts(
     )
 
 
+def _merge_target_mention_receipt_manifests(
+    *manifests: list[dict[str, Any]],
+    allowed_answer_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Merge semantic duplicates, preferring the stronger code-owned proof."""
+
+    by_identity: dict[tuple[int, str, str], dict[str, Any]] = {}
+    for receipt in _canonical_target_mention_receipts(
+        [receipt for manifest in manifests for receipt in manifest],
+        allowed_answer_ids=allowed_answer_ids,
+    ):
+        key = (
+            int(receipt.get("answer_id") or 0),
+            str(receipt.get("entity_name") or "").casefold(),
+            str(receipt.get("alias") or "").casefold(),
+        )
+        existing = by_identity.get(key)
+        if existing is None or (
+            receipt.get("grounding_mode")
+            == CODE_OWNED_TARGET_MENTION_GROUNDING_MODE
+            and existing.get("grounding_mode")
+            != CODE_OWNED_TARGET_MENTION_GROUNDING_MODE
+        ):
+            by_identity[key] = receipt
+    return _canonical_target_mention_receipts(
+        list(by_identity.values()),
+        allowed_answer_ids=allowed_answer_ids,
+    )
+
+
 def _validated_persisted_target_mention_receipts(
     rows: list[dict[str, Any]],
     *,
@@ -28009,11 +28713,11 @@ def _validated_persisted_target_mention_receipts(
             entity = entities.get(str(receipt.get("entity_name") or "").casefold())
             alias = str(receipt.get("alias") or "")
             expected = (
-                _target_mention_receipt(
+                _expected_target_mention_receipt(
+                    receipt,
                     profile=profile,
                     catalog=catalog,
                     entity=entity,
-                    alias=alias,
                     row=row,
                 )
                 if entity is not None and alias
@@ -28059,11 +28763,11 @@ def _row_target_mention_is_grounded(
         entity = entities.get(str(receipt.get("entity_name") or "").casefold())
         alias = str(receipt.get("alias") or "")
         expected_receipt = (
-            _target_mention_receipt(
+            _expected_target_mention_receipt(
+                receipt,
                 profile=profile,
                 catalog=catalog,
                 entity=entity,
-                alias=alias,
                 row=row,
             )
             if entity is not None and alias
@@ -28168,6 +28872,7 @@ def _apply_critic_policy(
                 entity=entity,
                 alias=alias,
                 row=rows_by_id.get(answer_id) or {},
+                require_local_coreference=True,
             )
             for answer_id in sorted(answer_ids)
         ]
@@ -28259,6 +28964,7 @@ async def _save_critic_gate(
     quality_state: str | None = None,
     reason_codes: list[str] | None = None,
     critic_outcome: str | None = None,
+    annotation_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provenance = _critic_provenance_digests(
         profile=profile,
@@ -28356,6 +29062,33 @@ async def _save_critic_gate(
         normalized_quality_state = "complete"
     if normalized_quality_state == "degraded" and not normalized_reason_codes:
         normalized_reason_codes = ["critic_auxiliary_degraded"]
+    target_mention_receipts = _validated_target_mention_receipt_manifest(
+        _canonical_target_mention_receipts(
+            [
+                copy.deepcopy(receipt)
+                for row in rows
+                for receipt in (row.get("annotation") or {}).get(
+                    "_critic_target_mention_receipts"
+                )
+                or []
+                if isinstance(receipt, dict)
+            ]
+        ),
+        rows=rows,
+        profile=profile,
+        catalog=catalog,
+    )
+    annotation_input_sha256_by_answer_id = _current_annotation_input_digests(rows)
+    validated_annotation_context = (
+        _validated_annotation_context_manifest(
+            annotation_context,
+            profile=profile,
+            catalog=catalog,
+            rows=rows,
+        )
+        if annotation_context is not None
+        else None
+    )
     output = {
         "passed": passed,
         "quality_state": normalized_quality_state,
@@ -28371,8 +29104,23 @@ async def _save_critic_gate(
             "admission_sha256"
         ],
         "policy_history": policy_history,
+        "target_mention_receipts": target_mention_receipts,
+        "target_mention_receipts_sha256": _stable_json_sha256(
+            target_mention_receipts
+        ),
+        "annotation_input_sha256_by_answer_id": {
+            str(answer_id): digest
+            for answer_id, digest in sorted(
+                annotation_input_sha256_by_answer_id.items()
+            )
+        },
         "reason": reason,
     }
+    if validated_annotation_context is not None:
+        output["annotation_context"] = validated_annotation_context
+        output["annotation_context_sha256"] = _stable_json_sha256(
+            validated_annotation_context
+        )
     await _save_artifact(
         run_id,
         stage_key="knowledge_gap",
@@ -28389,6 +29137,21 @@ async def _save_critic_gate(
             "quality_state": normalized_quality_state,
             "reason_codes": normalized_reason_codes,
             "critic_outcome": output["critic_outcome"],
+            "target_mention_receipts_sha256": output[
+                "target_mention_receipts_sha256"
+            ],
+            "annotation_input_sha256_by_answer_id_sha256": _stable_json_sha256(
+                output["annotation_input_sha256_by_answer_id"]
+            ),
+            **(
+                {
+                    "annotation_context_sha256": output[
+                        "annotation_context_sha256"
+                    ]
+                }
+                if validated_annotation_context is not None
+                else {}
+            ),
         },
         output_json=output,
         error_message=None if passed else output["reason"],
@@ -28487,6 +29250,7 @@ async def _save_degraded_critic_gate(
     critic_outcome: str,
     expected_corpus_cells: list[dict[str, Any]] | None = None,
     integrity_payload: dict[str, Any] | None = None,
+    annotation_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Publish deterministic-safe analytics with an explicit critic limitation."""
 
@@ -28524,6 +29288,7 @@ async def _save_degraded_critic_gate(
             expected_corpus_cells=expected_corpus_cells,
             reason_codes=confirmed_reason_codes,
             critic_outcome="confirmed_integrity_block",
+            annotation_context=annotation_context,
         )
         raise _ConfirmedCriticIntegrityBlock(
             "A degraded critic gate cannot override code-owned integrity proof",
@@ -28544,11 +29309,15 @@ async def _save_degraded_critic_gate(
         quality_state="degraded",
         reason_codes=reason_codes,
         critic_outcome=critic_outcome,
+        annotation_context=annotation_context,
     )
 
 
 ANALYSIS_CRITIC_RECOVERY_STAGE = "analysis_critic"
 ANALYSIS_CRITIC_TARGETED_REPAIR_MODE = "analysis_critic_targeted_v1"
+ANALYSIS_CRITIC_RECOVERY_CHECKPOINT_VERSION = (
+    "aiv-analysis-critic-recovery-checkpoint-v2"
+)
 ANALYSIS_CRITIC_TERMINAL_SCOPE_VERSION = (
     "aiv-analysis-critic-terminal-scope-v2"
 )
@@ -28559,6 +29328,46 @@ ANALYSIS_CRITIC_RECOVERY_POLICY_VERSION = (
 
 class _AnalysisCriticRecoveryBlocked(OpenRouterError):
     """A terminal targeted recovery failure already persisted its gate."""
+
+
+async def _persist_prepared_analysis_critic_recovery(
+    run_id: str,
+    *,
+    plan: Any,
+    profile: dict[str, Any],
+    catalog: dict[str, Any],
+    policy_history: list[dict[str, Any]],
+    resume_annotation_context: dict[str, Any],
+    checkpoint: dict[str, Any],
+) -> None:
+    """Write the exact replay intent before consuming the one execution slot."""
+
+    await _save_artifact(
+        run_id,
+        stage_key="knowledge_gap",
+        artifact_key="analysis_critic_policy",
+        status="completed",
+        model=CRITIC_MODEL,
+        input_json={
+            "iteration": MAX_CRITIC_ITERATIONS + 1,
+            "executing_recovery_checkpoint_sha256": _stable_json_sha256(
+                checkpoint
+            ),
+        },
+        output_json={
+            "base_catalog_version": ENTITY_CATALOG_VERSION,
+            "policy_history": policy_history,
+            "effective_profile": profile,
+            "effective_catalog": catalog,
+            "annotation_context": resume_annotation_context,
+            "annotation_context_sha256": _stable_json_sha256(
+                resume_annotation_context
+            ),
+            "executing_recovery": checkpoint,
+        },
+        prompt_version=ANALYSIS_CRITIC_VERSION,
+    )
+    await mark_recovery_executing(plan, stage_execution_limit=1)
 
 
 def _critic_issue_answer_ids(
@@ -29254,9 +30063,31 @@ async def _resume_executing_analysis_critic_recovery(
         raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
     persisted_receipts_sha256 = _stable_json_sha256(persisted_receipts)
     targeted_guidance = str(recovery_policy_step.get("annotation_guidance") or "")
-    resume_annotation_input_sha256 = _annotation_context_sha256(
-        profile,
-        catalog,
+    resume_annotation_context = facts.get("resume_annotation_context")
+    if not isinstance(resume_annotation_context, dict):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery checkpoint has no resume annotation context"
+        )
+    try:
+        resume_annotation_context = _validated_annotation_context_manifest(
+            resume_annotation_context,
+            rows=rows,
+            profile=profile,
+            catalog=catalog,
+        )
+    except OrchestratorContractError as exc:
+        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+    resume_research_guidance = str(
+        resume_annotation_context["research_guidance"]
+    )
+    resume_target_mention_receipts = list(
+        resume_annotation_context["target_mention_receipts"]
+    )
+    resume_target_mention_receipts_sha256 = _stable_json_sha256(
+        resume_target_mention_receipts
+    )
+    resume_annotation_input_sha256 = str(
+        resume_annotation_context["annotation_input_sha256"]
     )
     repair_annotation_input_sha256 = _annotation_context_sha256(
         profile,
@@ -29268,10 +30099,16 @@ async def _resume_executing_analysis_critic_recovery(
     guidance_sha256 = hashlib.sha256(targeted_guidance.encode("utf-8")).hexdigest()
     if (
         persisted_receipts_sha256 != expected_receipts_sha256
+        or resume_annotation_context.get("annotation_input_sha256")
+        != resume_annotation_input_sha256
+        or recovery_policy_step.get("resume_target_mention_receipts_sha256")
+        != resume_target_mention_receipts_sha256
         or recovery_policy_step.get("target_mention_receipts_sha256")
         != expected_receipts_sha256
         or any(
             provenance.get("target_mention_receipts_sha256") != expected_receipts_sha256
+            or provenance.get("resume_target_mention_receipts_sha256")
+            != resume_target_mention_receipts_sha256
             or provenance.get("repair_annotation_input_sha256")
             != repair_annotation_input_sha256
             or provenance.get("resume_annotation_input_sha256")
@@ -29393,6 +30230,12 @@ async def _resume_executing_analysis_critic_recovery(
                 and gate_input.get("corpus_manifest_digest")
                 == expected_manifest["digest"]
                 and gate_input.get("iteration") == final_iteration
+                and gate_output.get("annotation_context")
+                == resume_annotation_context
+                and gate_output.get("annotation_context_sha256")
+                == _stable_json_sha256(resume_annotation_context)
+                and gate_input.get("annotation_context_sha256")
+                == _stable_json_sha256(resume_annotation_context)
             )
         if final_artifact is None and exact_gate_without_primary:
             gate = copy.deepcopy(gate_output)
@@ -29472,6 +30315,7 @@ async def _resume_executing_analysis_critic_recovery(
                     or "Финальная проверка восстановления пройдена."
                 ),
                 expected_corpus_cells=expected_corpus_cells,
+                annotation_context=resume_annotation_context,
             )
         else:
             fallback_reason_codes = (
@@ -29507,6 +30351,7 @@ async def _resume_executing_analysis_critic_recovery(
                 critic_outcome="final_review_degraded",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=final_payload,
+                annotation_context=resume_annotation_context,
             )
     except asyncio.CancelledError:
         raise
@@ -29544,6 +30389,7 @@ async def _resume_executing_analysis_critic_recovery(
                 expected_corpus_cells=expected_corpus_cells,
                 reason_codes=exc.reason_codes,
                 critic_outcome="confirmed_integrity_block",
+                annotation_context=resume_annotation_context,
             )
             await finish_recovery(
                 plan,
@@ -29580,6 +30426,7 @@ async def _resume_executing_analysis_critic_recovery(
             critic_outcome="final_review_degraded",
             expected_corpus_cells=expected_corpus_cells,
             integrity_payload=final_payload,
+            annotation_context=resume_annotation_context,
         )
         await finish_recovery(
             plan,
@@ -29660,11 +30507,47 @@ async def _recover_analysis_critic_exhaustion(
         raise OrchestratorContractError(
             "Targeted critic recovery cannot apply a catalog-wide adjustment"
         )
-    target_mention_receipts = _canonical_target_mention_receipts(
-        [
-            *accumulated_target_mention_receipts,
-            *_critic_target_mention_receipts(applied_adjustments),
-        ],
+    resume_target_mention_receipts = _validated_target_mention_receipt_manifest(
+        _canonical_target_mention_receipts(accumulated_target_mention_receipts),
+        rows=rows,
+        profile=profile,
+        catalog=catalog,
+    )
+    resume_research_guidance = "\n\n".join(accumulated_guidance)
+    expected_resume_annotation_input_sha256 = _annotation_context_sha256(
+        profile,
+        catalog,
+        resume_research_guidance,
+        target_mention_receipts=resume_target_mention_receipts,
+    )
+    if resume_annotation_input_sha256 != expected_resume_annotation_input_sha256:
+        raise OrchestratorContractError(
+            "Analysis critic recovery resume annotation context is not exact"
+        )
+    resume_annotation_context = _annotation_context_manifest(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        research_guidance=resume_research_guidance,
+        target_mention_receipts=resume_target_mention_receipts,
+    )
+    if (
+        resume_annotation_context["annotation_input_sha256"]
+        != resume_annotation_input_sha256
+    ):
+        raise OrchestratorContractError(
+            "Analysis critic recovery resume checkpoint is not exact"
+        )
+    target_mention_receipts = _merge_target_mention_receipt_manifests(
+        accumulated_target_mention_receipts,
+        _critic_target_mention_receipts(applied_adjustments),
+        allowed_answer_ids=issue_answer_ids,
+    )
+    target_mention_receipts = _validated_target_mention_receipt_manifest(
+        target_mention_receipts,
+        rows=rows,
+        profile=profile,
+        catalog=catalog,
         allowed_answer_ids=issue_answer_ids,
     )
     target_mention_receipts_sha256 = _stable_json_sha256(target_mention_receipts)
@@ -29703,6 +30586,7 @@ async def _recover_analysis_critic_exhaustion(
         "critic_review": review,
         "prior_policy_history": policy_history,
         "target_mention_receipts_sha256": (target_mention_receipts_sha256),
+        "resume_annotation_context": resume_annotation_context,
         "issue_rows": issue_rows,
         "raw_corpus_sha256": raw_digest_before,
         "analysis_state_sha256": before_digest,
@@ -29802,8 +30686,6 @@ async def _recover_analysis_critic_exhaustion(
                 ),
             },
         )
-    await mark_recovery_executing(plan, stage_execution_limit=1)
-
     action = str(plan.decision.get("action") or "")
     requested_checks = set(plan.decision.get("acceptance_checks") or [])
     required_checks = (
@@ -29818,6 +30700,7 @@ async def _recover_analysis_critic_exhaustion(
     missing_checks = sorted(required_checks - requested_checks)
     unsupported_checks = sorted(requested_checks - required_checks)
     if missing_checks or unsupported_checks:
+        await mark_recovery_executing(plan, stage_execution_limit=1)
         after_digest = stable_digest(
             {
                 "before_digest": before_digest,
@@ -29841,6 +30724,7 @@ async def _recover_analysis_critic_exhaustion(
             "Analysis critic recovery acceptance checks do not match the executor"
         )
     if action == ACTION_STOP:
+        await mark_recovery_executing(plan, stage_execution_limit=1)
         await finish_recovery(
             plan,
             succeeded=False,
@@ -29856,6 +30740,7 @@ async def _recover_analysis_critic_exhaustion(
             str(plan.decision.get("rationale") or "Analysis critic recovery stopped")
         )
     if action != ACTION_TARGETED_ANNOTATION_REPAIR:
+        await mark_recovery_executing(plan, stage_execution_limit=1)
         await finish_recovery(
             plan,
             succeeded=False,
@@ -29873,6 +30758,7 @@ async def _recover_analysis_critic_exhaustion(
 
     target_answer_ids = set(plan.decision.get("target_answer_ids") or [])
     if not target_answer_ids or target_answer_ids != issue_answer_ids:
+        await mark_recovery_executing(plan, stage_execution_limit=1)
         await finish_recovery(
             plan,
             succeeded=False,
@@ -29889,6 +30775,7 @@ async def _recover_analysis_critic_exhaustion(
         )
     planner_guidance = str(plan.decision.get("guidance") or "").strip()
     if not planner_guidance:
+        await mark_recovery_executing(plan, stage_execution_limit=1)
         await finish_recovery(
             plan,
             succeeded=False,
@@ -29927,16 +30814,25 @@ async def _recover_analysis_critic_exhaustion(
         "annotation_guidance": targeted_guidance,
         "raw_corpus_sha256": raw_digest_before,
         "target_mention_receipts_sha256": (target_mention_receipts_sha256),
+        "resume_target_mention_receipts_sha256": _stable_json_sha256(
+            resume_target_mention_receipts
+        ),
     }
 
-    expected_annotation_digests = _current_annotation_input_digests(rows)
-    repair_annotation_digest = _annotation_context_sha256(
-        profile,
-        catalog,
-        targeted_guidance,
-        repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+    repair_annotation_context = _annotation_context_manifest(
+        profile=profile,
+        catalog=catalog,
+        rows=rows,
+        research_guidance=targeted_guidance,
         target_mention_receipts=target_mention_receipts,
+        repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+        allowed_answer_ids=target_answer_ids,
     )
+    repair_annotation_digest = repair_annotation_context[
+        "annotation_input_sha256"
+    ]
+    resume_annotation_digests = _current_annotation_input_digests(rows)
+    expected_annotation_digests = copy.deepcopy(resume_annotation_digests)
     for answer_id in target_answer_ids:
         expected_annotation_digests[answer_id] = repair_annotation_digest
     annotation_repair_provenance = {
@@ -29951,12 +30847,43 @@ async def _recover_analysis_critic_exhaustion(
         ).hexdigest(),
         "critic_review_sha256": stable_digest(review),
         "target_mention_receipts_sha256": (target_mention_receipts_sha256),
+        "resume_target_mention_receipts_sha256": _stable_json_sha256(
+            resume_target_mention_receipts
+        ),
         # This deterministic step is persisted atomically with every targeted
         # annotation.  It is the restart checkpoint needed to reconstruct the
         # one allowed r3 payload after a crash between annotation CAS and the
         # r3 artifact reservation; no second annotation/Fable call is needed.
         "recovery_policy_step": copy.deepcopy(recovery_policy_step),
     }
+
+    executing_recovery_checkpoint = {
+        "version": ANALYSIS_CRITIC_RECOVERY_CHECKPOINT_VERSION,
+        "phase": "prepared",
+        "orchestrator_epoch": plan.epoch,
+        "orchestrator_plan_digest": plan.plan_digest,
+        "target_answer_ids": sorted(target_answer_ids),
+        "resume_annotation_context": resume_annotation_context,
+        "repair_annotation_context": repair_annotation_context,
+        "annotation_repair_provenance": annotation_repair_provenance,
+        "resume_annotation_input_sha256_by_answer_id": {
+            str(answer_id): digest
+            for answer_id, digest in sorted(resume_annotation_digests.items())
+        },
+        "annotation_input_sha256_by_answer_id": {
+            str(answer_id): digest
+            for answer_id, digest in sorted(expected_annotation_digests.items())
+        },
+    }
+    await _persist_prepared_analysis_critic_recovery(
+        run_id,
+        plan=plan,
+        profile=profile,
+        catalog=catalog,
+        policy_history=policy_history,
+        resume_annotation_context=resume_annotation_context,
+        checkpoint=executing_recovery_checkpoint,
+    )
 
     after_digest = before_digest
     gate_rows = rows
@@ -30032,6 +30959,7 @@ async def _recover_analysis_critic_exhaustion(
                 critic_outcome="repair_failed",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=no_progress_payload,
+                annotation_context=resume_annotation_context,
             )
             await finish_recovery(
                 plan,
@@ -30103,6 +31031,7 @@ async def _recover_analysis_critic_exhaustion(
                     or "Финальная проверка восстановления пройдена."
                 ),
                 expected_corpus_cells=expected_corpus_cells,
+                annotation_context=resume_annotation_context,
             )
         else:
             fallback_reason_codes = (
@@ -30138,6 +31067,7 @@ async def _recover_analysis_critic_exhaustion(
                 critic_outcome="final_review_degraded",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=final_payload,
+                annotation_context=resume_annotation_context,
             )
     except asyncio.CancelledError:
         raise
@@ -30240,6 +31170,7 @@ async def _recover_analysis_critic_exhaustion(
                 critic_outcome="repair_failed",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=gate_integrity_payload,
+                annotation_context=resume_annotation_context,
             )
             await finish_recovery(
                 plan,
@@ -30286,6 +31217,7 @@ async def _recover_analysis_critic_exhaustion(
                 expected_corpus_cells=expected_corpus_cells,
                 reason_codes=list(exc.reason_codes),
                 critic_outcome="confirmed_integrity_block",
+                annotation_context=resume_annotation_context,
             )
         except RunLeaseLostError:
             raise
@@ -30327,6 +31259,8 @@ async def _run_analysis_critic_loop(
     catalog: dict[str, Any],
     rows: list[dict[str, Any]],
     metrics: dict[str, Any],
+    initial_target_mention_receipts: list[dict[str, Any]] | None = None,
+    initial_annotation_context: dict[str, Any] | None = None,
     expected_corpus_cells: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, Any],
@@ -30337,15 +31271,44 @@ async def _run_analysis_critic_loop(
     """Gate metrics with at most one repair and two independent reviews."""
 
     current_catalog = _scope_entity_catalog_to_profile(catalog, profile)
-    resume_annotation_input_sha256 = _annotation_context_sha256(
-        profile,
-        current_catalog,
+    if initial_annotation_context is not None:
+        current_annotation_context = _validated_annotation_context_manifest(
+            initial_annotation_context,
+            profile=profile,
+            catalog=current_catalog,
+            rows=rows,
+        )
+        supplied_receipts = list(initial_target_mention_receipts or [])
+        if (
+            initial_target_mention_receipts is not None
+            and supplied_receipts
+            != current_annotation_context["target_mention_receipts"]
+        ):
+            raise OrchestratorContractError(
+                "Initial receipt manifest does not match annotation context"
+            )
+    else:
+        current_annotation_context = _annotation_context_manifest(
+            profile=profile,
+            catalog=current_catalog,
+            rows=rows,
+            research_guidance="",
+            target_mention_receipts=list(initial_target_mention_receipts or []),
+        )
+    current_target_mention_receipts = list(
+        current_annotation_context["target_mention_receipts"]
     )
+    current_annotation_input_sha256 = current_annotation_context[
+        "annotation_input_sha256"
+    ]
     current_rows = rows
     current_metrics = metrics
     policy_history: list[dict[str, Any]] = []
-    accumulated_guidance: list[str] = []
-    accumulated_target_mention_receipts: list[dict[str, Any]] = []
+    initial_guidance = str(current_annotation_context["research_guidance"])
+    accumulated_guidance: list[str] = (
+        [initial_guidance] if initial_guidance else []
+    )
+    accumulated_critic_target_mention_receipts: list[dict[str, Any]] = []
     valid_answer_ids = {
         int(row["answer_id"])
         for row in rows
@@ -30454,6 +31417,7 @@ async def _run_analysis_critic_loop(
                 critic_outcome="unavailable",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=payload,
+                annotation_context=current_annotation_context,
             )
             logger.warning(
                 "Analysis critic is unavailable for %s; continuing degraded: %s",
@@ -30490,6 +31454,7 @@ async def _run_analysis_critic_loop(
                 critic_outcome="repair_failed",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=payload,
+                annotation_context=current_annotation_context,
             )
             return current_catalog, current_rows, current_metrics, gate
 
@@ -30506,6 +31471,7 @@ async def _run_analysis_critic_loop(
                 policy_history=policy_history,
                 reason=str(review.get("summary") or "Проверка пройдена."),
                 expected_corpus_cells=expected_corpus_cells,
+                annotation_context=current_annotation_context,
             )
             return current_catalog, current_rows, current_metrics, gate
 
@@ -30528,6 +31494,7 @@ async def _run_analysis_critic_loop(
                     expected_corpus_cells=expected_corpus_cells,
                     reason_codes=reason_codes,
                     critic_outcome="confirmed_integrity_block",
+                    annotation_context=current_annotation_context,
                 )
                 raise _ConfirmedCriticIntegrityBlock(
                     "Analysis critic confirmed a code-owned integrity block: "
@@ -30551,6 +31518,7 @@ async def _run_analysis_critic_loop(
                 critic_outcome="advisory_block",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=payload,
+                annotation_context=current_annotation_context,
             )
             return current_catalog, current_rows, current_metrics, gate
 
@@ -30570,10 +31538,12 @@ async def _run_analysis_critic_loop(
                         policy_history=policy_history,
                         accumulated_guidance=accumulated_guidance,
                         accumulated_target_mention_receipts=(
-                            accumulated_target_mention_receipts
+                            current_target_mention_receipts
                         ),
                         valid_answer_ids=valid_answer_ids,
-                        resume_annotation_input_sha256=(resume_annotation_input_sha256),
+                        resume_annotation_input_sha256=(
+                            current_annotation_input_sha256
+                        ),
                         expected_corpus_cells=expected_corpus_cells,
                     )
                 except RunLeaseLostError:
@@ -30603,6 +31573,7 @@ async def _run_analysis_critic_loop(
                     expected_corpus_cells=expected_corpus_cells,
                     reason_codes=confirmed_reason_codes,
                     critic_outcome="confirmed_integrity_block",
+                    annotation_context=current_annotation_context,
                 )
                 raise _ConfirmedCriticIntegrityBlock(
                     "Analysis critic repair exhausted with a confirmed integrity "
@@ -30622,6 +31593,7 @@ async def _run_analysis_critic_loop(
                 critic_outcome="non_convergent",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=payload,
+                annotation_context=current_annotation_context,
             )
             return current_catalog, current_rows, current_metrics, gate
 
@@ -30634,7 +31606,7 @@ async def _run_analysis_critic_loop(
         )
         if guidance:
             accumulated_guidance.append(guidance)
-        accumulated_target_mention_receipts.extend(
+        accumulated_critic_target_mention_receipts.extend(
             _critic_target_mention_receipts(applied)
         )
         if not applied and not accumulated_guidance:
@@ -30659,6 +31631,7 @@ async def _run_analysis_critic_loop(
                     expected_corpus_cells=expected_corpus_cells,
                     reason_codes=confirmed_reason_codes,
                     critic_outcome="confirmed_integrity_block",
+                    annotation_context=current_annotation_context,
                 )
                 raise _ConfirmedCriticIntegrityBlock(
                     reason,
@@ -30677,6 +31650,7 @@ async def _run_analysis_critic_loop(
                 critic_outcome="repair_failed",
                 expected_corpus_cells=expected_corpus_cells,
                 integrity_payload=payload,
+                annotation_context=current_annotation_context,
             )
             return current_catalog, current_rows, current_metrics, gate
 
@@ -30688,6 +31662,37 @@ async def _run_analysis_critic_loop(
         }
         policy_history.append(policy_step)
         current_catalog = tightened
+        code_owned_target_mention_receipts = (
+            _code_owned_target_mention_receipt_manifest(
+                profile=profile,
+                catalog=current_catalog,
+                rows=current_rows,
+            )
+        )
+        accumulated_critic_target_mention_receipts = (
+            _refresh_target_mention_receipt_manifest(
+                accumulated_critic_target_mention_receipts,
+                rows=current_rows,
+                profile=profile,
+                catalog=current_catalog,
+            )
+        )
+        current_target_mention_receipts = _validated_target_mention_receipt_manifest(
+            _merge_target_mention_receipt_manifests(
+                code_owned_target_mention_receipts,
+                accumulated_critic_target_mention_receipts,
+            ),
+            rows=current_rows,
+            profile=profile,
+            catalog=current_catalog,
+        )
+        current_annotation_context = _annotation_context_manifest(
+            profile=profile,
+            catalog=current_catalog,
+            rows=current_rows,
+            research_guidance="\n\n".join(accumulated_guidance),
+            target_mention_receipts=current_target_mention_receipts,
+        )
         await _save_artifact(
             run_id,
             stage_key="knowledge_gap",
@@ -30698,7 +31703,12 @@ async def _run_analysis_critic_loop(
             output_json={
                 "base_catalog_version": ENTITY_CATALOG_VERSION,
                 "policy_history": policy_history,
+                "effective_profile": profile,
                 "effective_catalog": current_catalog,
+                "annotation_context": current_annotation_context,
+                "annotation_context_sha256": _stable_json_sha256(
+                    current_annotation_context
+                ),
             },
             prompt_version=ANALYSIS_CRITIC_VERSION,
         )
@@ -30707,16 +31717,14 @@ async def _run_analysis_critic_loop(
             profile,
             current_catalog,
             research_guidance="\n\n".join(accumulated_guidance),
-            target_mention_receipts=accumulated_target_mention_receipts,
+            target_mention_receipts=current_target_mention_receipts,
         )
+        current_annotation_input_sha256 = current_annotation_context[
+            "annotation_input_sha256"
+        ]
         current_rows = await _metric_rows(
             run_id,
-            annotation_input_sha256=_annotation_context_sha256(
-                profile,
-                current_catalog,
-                "\n\n".join(accumulated_guidance),
-                target_mention_receipts=(accumulated_target_mention_receipts),
-            ),
+            annotation_input_sha256=current_annotation_input_sha256,
         )
         current_metrics = _compute_metrics(
             current_rows,
@@ -47214,6 +48222,331 @@ async def _assert_saved_answer_marker_raw_corpus(
         )
 
 
+async def _load_executing_analysis_critic_checkpoint(
+    run_id: str,
+    *,
+    profile: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+] | None:
+    """Load a mixed resume/repair annotation state without re-annotating.
+
+    A process may stop after the targeted CAS committed but before r3 was
+    reserved.  The ordinary finish path must not rebuild the base catalog and
+    overwrite those rows.  This checkpoint is written before the targeted
+    annotation call and binds both manifests, every expected per-answer digest
+    and the durable recovery epoch.
+    """
+
+    async with SessionLocal() as session:
+        epoch = (
+            (
+                await session.execute(
+                    select(RecoveryEpoch)
+                    .where(
+                        RecoveryEpoch.run_id == run_id,
+                        RecoveryEpoch.stage_key == ANALYSIS_CRITIC_RECOVERY_STAGE,
+                        RecoveryEpoch.status == "executing",
+                    )
+                    .order_by(RecoveryEpoch.epoch.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        artifact = (
+            await session.execute(
+                select(RunArtifact).where(
+                    RunArtifact.run_id == run_id,
+                    RunArtifact.artifact_key == "analysis_critic_policy",
+                )
+            )
+        ).scalar_one_or_none()
+    if epoch is None:
+        return None
+    if (
+        artifact is None
+        or artifact.status != "completed"
+        or artifact.model != CRITIC_MODEL
+        or artifact.prompt_version != ANALYSIS_CRITIC_VERSION
+        or not isinstance(artifact.input_json, dict)
+        or not isinstance(artifact.output_json, dict)
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery has no exact annotation checkpoint"
+        )
+    plan = epoch.plan_json
+    recovery_input = epoch.input_json
+    incident = (
+        recovery_input.get("incident")
+        if isinstance(recovery_input, dict)
+        else None
+    )
+    facts = incident.get("facts") if isinstance(incident, dict) else None
+    if (
+        not isinstance(plan, dict)
+        or plan.get("action") != ACTION_TARGETED_ANNOTATION_REPAIR
+        or epoch.plan_digest != stable_digest(plan)
+        or not isinstance(facts, dict)
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery has an invalid durable checkpoint scope"
+        )
+    output = artifact.output_json
+    checkpoint = output.get("executing_recovery")
+    catalog_payload = output.get("effective_catalog")
+    if not isinstance(checkpoint, dict) or not isinstance(catalog_payload, dict):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery policy has no annotation checkpoint"
+        )
+    catalog = _scope_entity_catalog_to_profile(catalog_payload, profile)
+    target_answer_ids = {
+        value
+        for value in plan.get("target_answer_ids") or []
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    }
+    if (
+        catalog != catalog_payload
+        or facts.get("entity_catalog") != catalog
+        or facts.get("site_profile") != profile
+        or not target_answer_ids
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery catalog or profile checkpoint is not exact"
+        )
+
+    raw_rows = await _metric_rows(
+        run_id,
+        annotation_input_sha256=_annotation_context_sha256(profile, catalog),
+    )
+    try:
+        resume_context = _validated_annotation_context_manifest(
+            checkpoint.get("resume_annotation_context"),
+            profile=profile,
+            catalog=catalog,
+            rows=raw_rows,
+        )
+        repair_context = _validated_annotation_context_manifest(
+            checkpoint.get("repair_annotation_context"),
+            profile=profile,
+            catalog=catalog,
+            rows=raw_rows,
+            expected_repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+            allowed_answer_ids=target_answer_ids,
+        )
+    except OrchestratorContractError as exc:
+        raise _AnalysisCriticRecoveryBlocked(str(exc)) from exc
+    digest_payload = checkpoint.get("annotation_input_sha256_by_answer_id")
+    resume_digest_payload = checkpoint.get(
+        "resume_annotation_input_sha256_by_answer_id"
+    )
+    if not isinstance(digest_payload, dict) or not isinstance(
+        resume_digest_payload,
+        dict,
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery checkpoint has no complete annotation digest maps"
+        )
+    try:
+        annotation_digests = {
+            int(answer_id): str(digest)
+            for answer_id, digest in digest_payload.items()
+        }
+        resume_annotation_digests = {
+            int(answer_id): str(digest)
+            for answer_id, digest in resume_digest_payload.items()
+        }
+    except (TypeError, ValueError) as exc:
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery checkpoint has an invalid annotation digest map"
+        ) from exc
+    raw_answer_ids = {
+        int(row["answer_id"])
+        for row in raw_rows
+        if isinstance(row.get("answer_id"), int)
+        and not isinstance(row.get("answer_id"), bool)
+    }
+    resume_digest = str(resume_context["annotation_input_sha256"])
+    repair_digest = str(repair_context["annotation_input_sha256"])
+    if (
+        not target_answer_ids.issubset(annotation_digests)
+        or set(resume_annotation_digests) != set(annotation_digests)
+        or not set(annotation_digests).issubset(raw_answer_ids)
+        or any(
+            digest != resume_digest
+            for digest in resume_annotation_digests.values()
+        )
+        or any(
+            digest
+            != (repair_digest if answer_id in target_answer_ids else resume_digest)
+            for answer_id, digest in annotation_digests.items()
+        )
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery annotation digest map is out of scope"
+        )
+    canonical_digest_payload = {
+        str(answer_id): digest
+        for answer_id, digest in sorted(annotation_digests.items())
+    }
+    canonical_resume_digest_payload = {
+        str(answer_id): digest
+        for answer_id, digest in sorted(resume_annotation_digests.items())
+    }
+    annotation_repair_provenance = checkpoint.get(
+        "annotation_repair_provenance"
+    )
+    recovery_policy_step = (
+        annotation_repair_provenance.get("recovery_policy_step")
+        if isinstance(annotation_repair_provenance, dict)
+        else None
+    )
+    target_receipts_sha256 = _stable_json_sha256(
+        repair_context["target_mention_receipts"]
+    )
+    resume_receipts_sha256 = _stable_json_sha256(
+        resume_context["target_mention_receipts"]
+    )
+    targeted_guidance = str(repair_context["research_guidance"])
+    if (
+        not isinstance(annotation_repair_provenance, dict)
+        or not isinstance(recovery_policy_step, dict)
+        or annotation_repair_provenance.get("version")
+        != "analysis-critic-targeted-repair-v1"
+        or annotation_repair_provenance.get("orchestrator_epoch") != epoch.epoch
+        or annotation_repair_provenance.get("orchestrator_plan_digest")
+        != epoch.plan_digest
+        or set(annotation_repair_provenance.get("target_answer_ids") or [])
+        != target_answer_ids
+        or annotation_repair_provenance.get(
+            "repair_annotation_input_sha256"
+        )
+        != repair_digest
+        or annotation_repair_provenance.get(
+            "resume_annotation_input_sha256"
+        )
+        != resume_digest
+        or annotation_repair_provenance.get("guidance_sha256")
+        != hashlib.sha256(targeted_guidance.encode("utf-8")).hexdigest()
+        or annotation_repair_provenance.get("critic_review_sha256")
+        != stable_digest(facts.get("critic_review"))
+        or annotation_repair_provenance.get(
+            "target_mention_receipts_sha256"
+        )
+        != target_receipts_sha256
+        or annotation_repair_provenance.get(
+            "resume_target_mention_receipts_sha256"
+        )
+        != resume_receipts_sha256
+        or recovery_policy_step.get("iteration") != MAX_CRITIC_ITERATIONS + 1
+        or recovery_policy_step.get("kind")
+        != "orchestrated_targeted_annotation_repair"
+        or recovery_policy_step.get("orchestrator_epoch") != epoch.epoch
+        or set(recovery_policy_step.get("target_answer_ids") or [])
+        != target_answer_ids
+        or recovery_policy_step.get("annotation_guidance") != targeted_guidance
+        or recovery_policy_step.get("raw_corpus_sha256")
+        != facts.get("raw_corpus_sha256")
+        or recovery_policy_step.get("target_mention_receipts_sha256")
+        != target_receipts_sha256
+        or recovery_policy_step.get(
+            "resume_target_mention_receipts_sha256"
+        )
+        != resume_receipts_sha256
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery annotation provenance is not exact"
+        )
+    expected_checkpoint = {
+        "version": ANALYSIS_CRITIC_RECOVERY_CHECKPOINT_VERSION,
+        "phase": "prepared",
+        "orchestrator_epoch": epoch.epoch,
+        "orchestrator_plan_digest": epoch.plan_digest,
+        "target_answer_ids": sorted(target_answer_ids),
+        "resume_annotation_context": resume_context,
+        "repair_annotation_context": repair_context,
+        "annotation_repair_provenance": annotation_repair_provenance,
+        "resume_annotation_input_sha256_by_answer_id": (
+            canonical_resume_digest_payload
+        ),
+        "annotation_input_sha256_by_answer_id": canonical_digest_payload,
+    }
+    checkpoint_sha256 = _stable_json_sha256(expected_checkpoint)
+    if (
+        checkpoint != expected_checkpoint
+        or artifact.input_json.get("executing_recovery_checkpoint_sha256")
+        != checkpoint_sha256
+        or output.get("annotation_context") != resume_context
+        or output.get("effective_profile") != profile
+        or output.get("annotation_context_sha256")
+        != _stable_json_sha256(resume_context)
+        or output.get("policy_history") != facts.get("prior_policy_history")
+        or facts.get("resume_annotation_context") != resume_context
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery annotation checkpoint failed revalidation"
+        )
+
+    committed_rows = await _metric_rows(
+        run_id,
+        annotation_input_sha256=resume_digest,
+        annotation_input_sha256_by_answer_id=annotation_digests,
+    )
+    if (
+        _current_annotation_input_digests(committed_rows) == annotation_digests
+        and _raw_corpus_digest(committed_rows) == facts.get("raw_corpus_sha256")
+    ):
+        rows = committed_rows
+    else:
+        resume_rows = await _metric_rows(
+            run_id,
+            annotation_input_sha256=resume_digest,
+            annotation_input_sha256_by_answer_id=resume_annotation_digests,
+        )
+        outcome = epoch.outcome_json
+        if (
+            not isinstance(outcome, dict)
+            or outcome.get("execution_attempts") != 1
+            or outcome.get("stage_execution_attempts") != 1
+            or outcome.get("stage_execution_limit") != 1
+            or _current_annotation_input_digests(resume_rows)
+            != resume_annotation_digests
+            or _raw_corpus_digest(resume_rows) != facts.get("raw_corpus_sha256")
+        ):
+            raise _AnalysisCriticRecoveryBlocked(
+                "Executing recovery annotations are neither prepared nor committed"
+            )
+        await _annotate_answers(
+            run_id,
+            profile,
+            catalog,
+            research_guidance=targeted_guidance,
+            target_answer_ids=target_answer_ids,
+            repair_mode=ANALYSIS_CRITIC_TARGETED_REPAIR_MODE,
+            annotation_repair_provenance=annotation_repair_provenance,
+            target_mention_receipts=list(
+                repair_context["target_mention_receipts"]
+            ),
+            _completion_attempt=ANNOTATION_COMPLETION_ATTEMPTS,
+        )
+        rows = await _metric_rows(
+            run_id,
+            annotation_input_sha256=resume_digest,
+            annotation_input_sha256_by_answer_id=annotation_digests,
+        )
+    if (
+        _current_annotation_input_digests(rows) != annotation_digests
+        or _raw_corpus_digest(rows) != facts.get("raw_corpus_sha256")
+    ):
+        raise _AnalysisCriticRecoveryBlocked(
+            "Executing recovery annotations do not match the checkpoint"
+        )
+    return catalog, rows, _compute_metrics(rows, profile, catalog), resume_context
+
+
 async def _finish_saved_answer_analysis(
     run_id: str,
     *,
@@ -47228,16 +48561,74 @@ async def _finish_saved_answer_analysis(
         _coverage_admission,
     ) = await _admit_panel_metric_coverage(run_id)
     profile = await _attach_offer_identity_policy(run_id, profile)
-    catalog_answers = await _answers_for_catalog(run_id)
-    if not catalog_answers:
-        raise OpenRouterError("No saved model answers are available for reanalysis")
-    catalog = await _entity_catalog(run_id, profile, catalog_answers)
-    await _annotate_answers(run_id, profile, catalog)
-    rows = await _metric_rows(
+    executing_checkpoint = await _load_executing_analysis_critic_checkpoint(
         run_id,
-        annotation_input_sha256=_annotation_context_sha256(profile, catalog),
+        profile=profile,
     )
-    metrics = _compute_metrics(rows, profile, catalog)
+    if executing_checkpoint is not None:
+        catalog, rows, metrics, annotation_context = executing_checkpoint
+        target_mention_receipts = list(
+            annotation_context["target_mention_receipts"]
+        )
+    else:
+        catalog_answers = await _answers_for_catalog(run_id)
+        if not catalog_answers:
+            raise OpenRouterError(
+                "No saved model answers are available for reanalysis"
+            )
+        catalog = _scope_entity_catalog_to_profile(
+            await _entity_catalog(run_id, profile, catalog_answers),
+            profile,
+        )
+        target_mention_receipts = _code_owned_target_mention_receipt_manifest(
+            profile=profile,
+            catalog=catalog,
+            rows=_coverage_rows,
+        )
+        annotation_context = _annotation_context_manifest(
+            profile=profile,
+            catalog=catalog,
+            rows=_coverage_rows,
+            research_guidance="",
+            target_mention_receipts=target_mention_receipts,
+        )
+        await _save_artifact(
+            run_id,
+            stage_key="knowledge_gap",
+            artifact_key="analysis_critic_policy",
+            status="completed",
+            model=CRITIC_MODEL,
+            input_json={
+                "iteration": 0,
+                "annotation_context_sha256": _stable_json_sha256(
+                    annotation_context
+                ),
+            },
+            output_json={
+                "base_catalog_version": ENTITY_CATALOG_VERSION,
+                "policy_history": [],
+                "effective_profile": profile,
+                "effective_catalog": catalog,
+                "annotation_context": annotation_context,
+                "annotation_context_sha256": _stable_json_sha256(
+                    annotation_context
+                ),
+            },
+            prompt_version=ANALYSIS_CRITIC_VERSION,
+        )
+        await _annotate_answers(
+            run_id,
+            profile,
+            catalog,
+            target_mention_receipts=target_mention_receipts,
+        )
+        rows = await _metric_rows(
+            run_id,
+            annotation_input_sha256=annotation_context[
+                "annotation_input_sha256"
+            ],
+        )
+        metrics = _compute_metrics(rows, profile, catalog)
     # The corpus topology was admitted before any semantic model work.  The
     # annotations below cannot add, remove or rename raw panel cells.
     catalog, rows, metrics, critic_gate = await _run_analysis_critic_loop(
@@ -47246,6 +48637,8 @@ async def _finish_saved_answer_analysis(
         catalog=catalog,
         rows=rows,
         metrics=metrics,
+        initial_target_mention_receipts=target_mention_receipts,
+        initial_annotation_context=annotation_context,
         expected_corpus_cells=expected_corpus_cells,
     )
     await _save_artifact(
