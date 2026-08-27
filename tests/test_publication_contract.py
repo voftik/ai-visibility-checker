@@ -34,6 +34,7 @@ from app.services.publication_contract import (
     PUBLICATION_RECEIPT_VERSION,
     READER_COPY_MANIFEST_VERSION,
     PublicationContractError,
+    _editorial_cache_proof_reasons,
     build_publication_receipt,
     ensure_publication_contract,
     publication_snapshot,
@@ -158,6 +159,57 @@ async def _valid_editorial_receipt() -> dict:
     }
 
 
+def _retarget_editorial_receipt(
+    receipt: dict,
+    *,
+    receipt_name: str,
+) -> dict:
+    """Give the shared fixture the exact input contract of one branch."""
+
+    contracts = {
+        "final_report": (
+            "final_report",
+            "final_report_editorial",
+            "source_report_sha256",
+        ),
+        "technical_review": (
+            "technical_review",
+            "technical_review_editorial",
+            "source_review_sha256",
+        ),
+        "illustrations": (
+            "illustration_concepts",
+            "illustration_copy_editorial",
+            "source_copy_sha256",
+        ),
+    }
+    source_artifact_key, editorial_artifact_key, source_digest_key = contracts[
+        receipt_name
+    ]
+    output = copy.deepcopy(receipt)
+    proof = output["cache_proof"]
+    source_sha256 = proof["source_sha256"]
+    editorial_input = copy.deepcopy(proof["editorial_input"])
+    for key in (
+        "source_report_sha256",
+        "source_review_sha256",
+        "source_copy_sha256",
+    ):
+        editorial_input.pop(key, None)
+    editorial_input[source_digest_key] = source_sha256
+    proof["source_artifact_key"] = source_artifact_key
+    proof["editorial_artifact_key"] = editorial_artifact_key
+    proof["editorial_input"] = editorial_input
+    proof["editorial_input_sha256"] = stable_json_sha256(editorial_input)
+    proof_core = {
+        key: value for key, value in proof.items() if key != "proof_sha256"
+    }
+    proof["proof_sha256"] = stable_json_sha256(proof_core)
+    output["artifact_key"] = editorial_artifact_key
+    output["cache_proof_sha256"] = proof["proof_sha256"]
+    return output
+
+
 async def _reader_copy_manifest(
     report_json: dict,
     markdown: str,
@@ -168,6 +220,14 @@ async def _reader_copy_manifest(
 ) -> dict:
     published_count = len(report_json.get("illustrations") or [])
     editorial_receipt = await _valid_editorial_receipt()
+    final_editorial_receipt = _retarget_editorial_receipt(
+        editorial_receipt,
+        receipt_name="final_report",
+    )
+    technical_editorial_receipt = _retarget_editorial_receipt(
+        editorial_receipt,
+        receipt_name="technical_review",
+    )
     publication = {
         "checks": {"exact_public_snapshot": True},
         "blocking_reasons": [],
@@ -176,7 +236,7 @@ async def _reader_copy_manifest(
             markdown.encode("utf-8")
         ).hexdigest(),
     }
-    final_editorial_proof = editorial_receipt["cache_proof"]
+    final_editorial_proof = final_editorial_receipt["cache_proof"]
     selected_report_sha256 = final_editorial_proof["source_sha256"]
     published_report_sha256 = final_editorial_proof["result_sha256"]
     public_snapshot_sha256 = stable_json_sha256(
@@ -285,11 +345,14 @@ async def _reader_copy_manifest(
         "final_report_semantic_admission": semantic_admission,
         "final_report_semantic_admission_sha256": semantic_admission_sha256,
         "editorial_receipts": {
-            "final_report": copy.deepcopy(editorial_receipt),
-            "technical_review": copy.deepcopy(editorial_receipt),
+            "final_report": copy.deepcopy(final_editorial_receipt),
+            "technical_review": copy.deepcopy(technical_editorial_receipt),
             "illustrations": {
                 **(
-                    copy.deepcopy(editorial_receipt)
+                    _retarget_editorial_receipt(
+                        editorial_receipt,
+                        receipt_name="illustrations",
+                    )
                     if published_count
                     else {
                         "accepted": True,
@@ -693,6 +756,94 @@ class OptionalAssetAdmissionContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReaderCopyDegradedContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_editorial_source_binding_uses_exact_branch_contract(self) -> None:
+        base = await _valid_editorial_receipt()
+        source_keys = {
+            "final_report": "source_report_sha256",
+            "technical_review": "source_review_sha256",
+            "illustrations": "source_copy_sha256",
+        }
+
+        def reasons(receipt_name: str, receipt: dict) -> list[str]:
+            return _editorial_cache_proof_reasons(
+                receipt_name=receipt_name,
+                receipt=receipt,
+                canonical_policy_manifest=(
+                    LIVE_RUSSIAN_POLICY_MANIFEST.as_dict()
+                ),
+                historical_read=False,
+            )
+
+        def reseal(receipt: dict) -> None:
+            proof = receipt["cache_proof"]
+            editorial_input = proof["editorial_input"]
+            proof["editorial_input_sha256"] = stable_json_sha256(
+                editorial_input
+            )
+            proof_core = {
+                key: value
+                for key, value in proof.items()
+                if key != "proof_sha256"
+            }
+            proof["proof_sha256"] = stable_json_sha256(proof_core)
+            receipt["cache_proof_sha256"] = proof["proof_sha256"]
+
+        for receipt_name, source_key in source_keys.items():
+            with self.subTest(receipt=receipt_name, case="valid"):
+                valid = _retarget_editorial_receipt(
+                    base,
+                    receipt_name=receipt_name,
+                )
+                self.assertEqual(reasons(receipt_name, valid), [])
+
+            with self.subTest(receipt=receipt_name, case="missing"):
+                missing = _retarget_editorial_receipt(
+                    base,
+                    receipt_name=receipt_name,
+                )
+                missing["cache_proof"]["editorial_input"].pop(source_key)
+                reseal(missing)
+                self.assertIn(
+                    f"reader_copy_{receipt_name}_cache_editorial_source_mismatch",
+                    reasons(receipt_name, missing),
+                )
+
+            with self.subTest(receipt=receipt_name, case="wrong_role"):
+                wrong_role = _retarget_editorial_receipt(
+                    base,
+                    receipt_name=receipt_name,
+                )
+                wrong_input = wrong_role["cache_proof"]["editorial_input"]
+                wrong_input.pop(source_key)
+                other_key = next(
+                    value for value in source_keys.values() if value != source_key
+                )
+                wrong_input[other_key] = wrong_role["cache_proof"][
+                    "source_sha256"
+                ]
+                reseal(wrong_role)
+                self.assertIn(
+                    f"reader_copy_{receipt_name}_cache_editorial_source_mismatch",
+                    reasons(receipt_name, wrong_role),
+                )
+
+            with self.subTest(receipt=receipt_name, case="conflicting"):
+                conflicting = _retarget_editorial_receipt(
+                    base,
+                    receipt_name=receipt_name,
+                )
+                other_key = next(
+                    value for value in source_keys.values() if value != source_key
+                )
+                conflicting["cache_proof"]["editorial_input"][other_key] = (
+                    "f" * 64
+                )
+                reseal(conflicting)
+                self.assertIn(
+                    f"reader_copy_{receipt_name}_cache_editorial_source_mismatch",
+                    reasons(receipt_name, conflicting),
+                )
+
     async def test_lint_and_incomplete_editorial_receipt_are_publishable_degradation(
         self,
     ) -> None:

@@ -308,6 +308,37 @@ def publication_receipt_key(snapshot: dict[str, Any]) -> str:
     return PUBLICATION_RECEIPT_PREFIX + publication_snapshot_digest(snapshot)
 
 
+_EDITORIAL_SOURCE_DIGEST_KEY_BY_RECEIPT = {
+    "final_report": "source_report_sha256",
+    "technical_review": "source_review_sha256",
+    "illustrations": "source_copy_sha256",
+}
+
+
+def _editorial_input_binds_source(
+    *,
+    receipt_name: str,
+    editorial_input: dict[str, Any],
+    source_sha256: str,
+) -> bool:
+    """Bind each editorial artifact's role-specific input to frozen source.
+
+    The three editorial branches intentionally use different cache identities.
+    Treating every branch as a final report made valid technical-review proofs
+    fail closed, while illustration proofs could never satisfy the contract.
+    Keep a closed role-to-field map instead of accepting arbitrary digest keys.
+    """
+
+    expected_key = _EDITORIAL_SOURCE_DIGEST_KEY_BY_RECEIPT.get(receipt_name)
+    if expected_key is None or editorial_input.get(expected_key) != source_sha256:
+        return False
+    for key in _EDITORIAL_SOURCE_DIGEST_KEY_BY_RECEIPT.values():
+        value = editorial_input.get(key)
+        if key != expected_key and value is not None and value != source_sha256:
+            return False
+    return True
+
+
 def _editorial_cache_proof_reasons(
     *,
     receipt_name: str,
@@ -382,9 +413,11 @@ def _editorial_cache_proof_reasons(
         return reasons
     if proof.get("source_sha256") != stable_json_sha256(source):
         reasons.append(f"reader_copy_{receipt_name}_cache_source_mismatch")
-    if isinstance(editorial_input, dict) and editorial_input.get(
-        "source_report_sha256"
-    ) != stable_json_sha256(source):
+    if isinstance(editorial_input, dict) and not _editorial_input_binds_source(
+        receipt_name=receipt_name,
+        editorial_input=editorial_input,
+        source_sha256=stable_json_sha256(source),
+    ):
         reasons.append(
             f"reader_copy_{receipt_name}_cache_editorial_source_mismatch"
         )
@@ -494,9 +527,11 @@ def _editorial_cache_integrity_reasons(
         reasons.append(f"{prefix}_cache_proof_terms_invalid")
     if proof.get("source_sha256") != stable_json_sha256(source):
         reasons.append(f"{prefix}_cache_source_mismatch")
-    if isinstance(editorial_input, dict) and editorial_input.get(
-        "source_report_sha256"
-    ) != stable_json_sha256(source):
+    if isinstance(editorial_input, dict) and not _editorial_input_binds_source(
+        receipt_name=receipt_name,
+        editorial_input=editorial_input,
+        source_sha256=stable_json_sha256(source),
+    ):
         reasons.append(f"{prefix}_cache_editorial_source_mismatch")
     if proof.get("result_sha256") != stable_json_sha256(result):
         reasons.append(f"{prefix}_cache_result_mismatch")

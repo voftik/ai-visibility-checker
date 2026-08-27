@@ -44382,6 +44382,7 @@ async def _edit_illustration_copy_language(
             model=PROCESSING_MODEL,
             input_json={
                 "source_concepts_sha256": _stable_json_sha256(source_concepts),
+                "source_copy_sha256": _stable_json_sha256(source),
                 "public_report_sha256": _stable_json_sha256(public_report),
                 "policy_version": REPORT_EDITOR_POLICY_VERSION,
                 "policy_sha256": fallback_audit["policy_sha256"],
@@ -44399,6 +44400,7 @@ async def _edit_illustration_copy_language(
 
     cache_input = {
         "source_concepts_sha256": _stable_json_sha256(source_concepts),
+        "source_copy_sha256": _stable_json_sha256(source),
         "public_report_sha256": _stable_json_sha256(public_report),
         "policy_version": REPORT_EDITOR_POLICY_VERSION,
         "policy_sha256": editorial_policy_sha256(),
