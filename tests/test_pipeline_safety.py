@@ -153,6 +153,7 @@ from app.services.analyzer import (
     _final_input_preflight,
     _flatten_final_input_payload,
     _final_model_input_window,
+    _final_report_typed_grounding_errors,
     _normalize_final_evidence_packet,
     _normalize_final_root_summary_packet,
     _normalize_final_root_summary_packet_or_fallback,
@@ -13970,6 +13971,86 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                     "Stored semantic physical receipt is corrupt",
                     event={},
                 )
+            )
+        )
+
+    def test_typed_grounding_accepts_equivalent_metric_rendering(self) -> None:
+        report_data = {
+            "key_metrics": {
+                "parent_discovery": {"value": 92.0},
+                "scale_max": 100,
+            },
+            "discovery": {
+                "sentiment": {
+                    "positive": 82.8,
+                    "neutral": 13.8,
+                    "mixed": 3.4,
+                }
+            },
+            "brand_knowledge": {
+                "web": {
+                    "specific_rate": 40.0,
+                    "contradiction_rate": 60.0,
+                }
+            },
+            "competitors": [{"mention_share": 10.0}],
+        }
+        candidate = {
+            "sections": [
+                {
+                    "heading": "Проверенные показатели",
+                    "body": (
+                        "Индекс видимости бренда 92 из 100. "
+                        "Тональность: 82,8 % положительной, "
+                        "13,8 % нейтральной, 3,4 % смешанной. "
+                        "Конкретика есть в 40 % ответов, расхождения — "
+                        "в 60 %. Доля соперника ниже 10 %."
+                    ),
+                }
+            ]
+        }
+
+        self.assertEqual(
+            _final_report_typed_grounding_errors(
+                candidate,
+                public_report=report_data,
+                evidence_document=None,
+            ),
+            [],
+        )
+
+        wrong_unit = copy.deepcopy(candidate)
+        wrong_unit["sections"][0]["body"] = "Индекс видимости бренда 92 %."
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                wrong_unit,
+                public_report=report_data,
+                evidence_document=None,
+            )
+        )
+
+        invented = copy.deepcopy(candidate)
+        invented["sections"][0]["body"] = "Упоминание достигает 777 %."
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                invented,
+                public_report=report_data,
+                evidence_document=None,
+            )
+        )
+
+        sentiment_count = {
+            "technical": {"sentiment": {"positive": 82.8}}
+        }
+        count_as_percentage = copy.deepcopy(candidate)
+        count_as_percentage["sections"][0]["body"] = (
+            "Технический счётчик тональности равен 82,8 %."
+        )
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                count_as_percentage,
+                public_report=sentiment_count,
+                evidence_document=None,
             )
         )
 

@@ -21,6 +21,7 @@ import unicodedata
 import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterable
@@ -401,7 +402,7 @@ ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v21"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v23"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
-FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v29"
+FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v30"
 FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v4"
 TECHNICAL_EDITORIAL_VERSION = f"{TECHNICAL_REVIEW_VERSION}-ru-editor-v3"
 FINAL_REPORT_SHARD_PLAN_VERSION = "aiv-final-report-shards-v5"
@@ -36639,11 +36640,20 @@ def _final_root_tokens_are_grounded(
     """Allow semantic prose while source-binding assertion-grade literals."""
 
     def canonical_number(value: str) -> str:
-        return re.sub(
+        normalized = re.sub(
             r"[ \u00a0\u2007\u2009\u202f]",
             "",
             value,
         ).replace(",", ".").replace("−", "-")
+        try:
+            decimal_value = Decimal(normalized)
+        except InvalidOperation:
+            return normalized
+        if not decimal_value.is_finite():
+            return normalized
+        if decimal_value == 0:
+            return "0"
+        return format(decimal_value.normalize(), "f")
 
     def canonical_unit(value: str) -> str:
         folded = re.sub(
@@ -42505,9 +42515,21 @@ def _final_report_grounding_source_texts(value: Any) -> list[str]:
             literal = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
             output.append(literal)
             field = path[-1].casefold() if path else ""
-            if any(
-                marker in field
-                for marker in ("rate", "percent", "percentage", "share")
+            normalized_path = tuple(segment.casefold() for segment in path)
+            percentage_parent_pairs = {
+                ("discovery", "sentiment"),
+                ("visibility", "sentiment"),
+            }
+            sentiment_percentage = any(
+                normalized_path[index : index + 2] in percentage_parent_pairs
+                for index in range(max(0, len(normalized_path) - 1))
+            )
+            if (
+                any(
+                    marker in field
+                    for marker in ("rate", "percent", "percentage", "share")
+                )
+                or sentiment_percentage
             ):
                 output.append(f"{literal}%")
             if any(
