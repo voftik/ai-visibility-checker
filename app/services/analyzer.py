@@ -44062,6 +44062,123 @@ def _final_report_typed_grounding_errors(
     return errors
 
 
+_FINAL_REPORT_PROSE_CLAUSE_BOUNDARY = re.compile(
+    r"[!?;]+(?:\s+|$)|\.(?:\s+|$)|\n+"
+)
+_FINAL_REPORT_UNIT_LITERAL = re.compile(
+    _FINAL_GROUNDING_UNIT_LITERAL.pattern.removeprefix("^"),
+    _FINAL_GROUNDING_UNIT_LITERAL.flags,
+)
+_FINAL_REPORT_QUARANTINE_REVIEW_REQUIRED = (
+    "Удаление неподтверждённой state-фразы требует успешной семантической "
+    "проверки изменённого отчёта."
+)
+
+
+def _final_report_mask_state_literals(text: str) -> str:
+    masked = _FINAL_ROOT_STATE_LITERAL.sub(" ", text)
+    for state in _FINAL_GROUNDING_STATE_CANONICAL:
+        if state not in {"n/a", "na"}:
+            masked = re.sub(
+                rf"(?<![\w-]){re.escape(state)}(?![\w-])",
+                " ",
+                masked,
+                flags=re.IGNORECASE,
+            )
+    return masked
+
+
+def _final_report_has_non_state_assertion_literal(text: str) -> bool:
+    return any(
+        pattern.search(text)
+        for pattern in (
+            _FINAL_ROOT_URL_LITERAL,
+            _FINAL_GROUNDING_EMAIL_LITERAL,
+            _FINAL_GROUNDING_DOMAIN_LITERAL,
+            _FINAL_GROUNDING_MODEL_ID_LITERAL,
+            _FINAL_GROUNDING_MODEL_VERSION_LITERAL,
+            _FINAL_GROUNDING_MODEL_ALIAS_LITERAL,
+            _FINAL_GROUNDING_UUID_LITERAL,
+            _FINAL_GROUNDING_HEX_LITERAL,
+            _FINAL_GROUNDING_NUMBER_LITERAL,
+            _FINAL_REPORT_UNIT_LITERAL,
+        )
+    )
+
+
+def _final_report_prose_clauses(text: str) -> list[str]:
+    clauses: list[str] = []
+    start = 0
+    for match in _FINAL_REPORT_PROSE_CLAUSE_BOUNDARY.finditer(text):
+        clauses.append(text[start : match.end()])
+        start = match.end()
+    if start < len(text):
+        clauses.append(text[start:])
+    return clauses or [text]
+
+
+def _quarantine_final_report_state_only_clauses(
+    candidate: dict[str, Any],
+    *,
+    public_report: dict[str, Any],
+    evidence_document: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Drop only an isolated state-only sentence from a nonempty section body."""
+
+    source_document = (
+        evidence_document
+        if isinstance(evidence_document, dict)
+        else {"report_data": public_report}
+    )
+    source_texts = _final_report_grounding_source_texts(
+        {
+            "report_data": public_report,
+            "evidence_document": source_document,
+        }
+    )
+    result = copy.deepcopy(candidate)
+    sections = result.get("sections")
+    if not isinstance(sections, list):
+        return result, False
+
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        text = section.get("body")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        clauses = _final_report_prose_clauses(text)
+        for clause_index, clause in enumerate(clauses):
+            if not clause.strip() or _final_root_tokens_are_grounded(
+                clause,
+                source_texts=source_texts,
+            ):
+                continue
+            masked = _final_report_mask_state_literals(clause)
+            if (
+                masked == clause
+                or _final_report_has_non_state_assertion_literal(masked)
+                or not _final_root_tokens_are_grounded(
+                    masked,
+                    source_texts=source_texts,
+                )
+            ):
+                continue
+            repaired = "".join(
+                value for index, value in enumerate(clauses) if index != clause_index
+            ).strip()
+            # Never erase the field or use quarantine to hide a second hard
+            # literal. The ordinary bounded repair loop handles those cases.
+            if repaired and _final_root_tokens_are_grounded(
+                repaired,
+                source_texts=source_texts,
+            ):
+                section["body"] = repaired
+                return result, True
+
+    return result, False
+
+
 def _deterministic_final_report_errors(
     candidate: dict[str, Any],
     public_report: dict[str, Any],
@@ -44886,6 +45003,7 @@ provider_limited_prefix: raw сохранён для квалифицирова�
     try:
         candidate_raw_text: str | None = None
         candidate_usage: dict[str, Any] | None = None
+        candidate_was_quarantined = False
         if final_cache_candidate is None:
             (
                 candidate,
@@ -44896,8 +45014,16 @@ provider_limited_prefix: raw сохранён для квалифицирова�
                 system=system,
                 payload=model_payload,
             )
+            candidate, candidate_was_quarantined = (
+                _quarantine_final_report_state_only_clauses(
+                    candidate,
+                    public_report=public_report,
+                    evidence_document=semantic_evidence_document,
+                )
+            )
         else:
             candidate = final_cache_candidate
+        quarantine_review_required = candidate_was_quarantined
 
         async def complete_report(
             value: dict[str, Any],
@@ -44921,10 +45047,9 @@ provider_limited_prefix: raw сохранён для квалифицирова�
                 )
             return await finalize_language(value)
 
-        # The reviewer is advisory.  Every candidate that passes the code-owned
-        # structure, semantic-state and typed-literal guards is a safe fallback;
-        # model findings may spend the bounded repair budget, but they cannot
-        # veto that candidate after the budget is exhausted.
+        # The reviewer is advisory for untouched candidates. A projection
+        # changed by state-clause quarantine additionally requires its explicit
+        # pass and can never become an outage fallback.
         deterministic_errors = _deterministic_final_report_errors(
             candidate,
             public_report,
@@ -44943,7 +45068,7 @@ provider_limited_prefix: raw сохранён для квалифицирова�
             dict[str, Any] | None,
             bool,
         ] | None = None
-        if not deterministic_errors:
+        if not deterministic_errors and not quarantine_review_required:
             last_safe = (
                 copy.deepcopy(candidate),
                 candidate_raw_text,
@@ -44983,6 +45108,9 @@ provider_limited_prefix: raw сохранён для квалифицирова�
             reviewer_state = "unavailable"
             degraded_reason_codes.append("semantic_reviewer_unavailable")
 
+        if quarantine_review_required and reviewer_state != "completed":
+            reviewer_findings = [_FINAL_REPORT_QUARANTINE_REVIEW_REQUIRED]
+            degraded_reason_codes.append("state_clause_quarantine_unreviewed")
         if reviewer_findings:
             concrete_reviewer_findings_seen = True
             unresolved_reviewer_findings = list(reviewer_findings)
@@ -45073,6 +45201,16 @@ provider_limited_prefix: raw сохранён для квалифицирова�
                 degraded_reason_codes.append("semantic_repair_invalid_candidate")
                 continue
             repaired = _sanitize_headline_emphasis(result.parsed)
+            repaired, repaired_was_quarantined = (
+                _quarantine_final_report_state_only_clauses(
+                    repaired,
+                    public_report=public_report,
+                    evidence_document=semantic_evidence_document,
+                )
+            )
+            quarantine_review_required = (
+                quarantine_review_required or repaired_was_quarantined
+            )
             reviewed_candidate = repaired
             deterministic_errors = _deterministic_final_report_errors(
                 repaired,
@@ -45096,12 +45234,10 @@ provider_limited_prefix: raw сохранён для квалифицирова�
                 result.usage,
                 False,
             )
-            # Keep the newest machine-verified candidate before consulting the
-            # advisory reviewer.  A later reviewer outage or an unresolved
-            # model-only finding can then roll back without losing a valid
-            # report; a candidate with any deterministic error never reaches
-            # this assignment.
-            last_safe = deterministic_candidate
+            # A quarantined projection is safe only after the reviewer has
+            # inspected those exact bytes. It never becomes an outage fallback.
+            if not quarantine_review_required:
+                last_safe = deterministic_candidate
             semantic_attempt += 1
             try:
                 semantic_review = await _final_report_semantic_review_artifact(
@@ -45137,6 +45273,9 @@ provider_limited_prefix: raw сохранён для квалифицирова�
                     continue
                 reviewer_findings = []
 
+            if quarantine_review_required and reviewer_state != "completed":
+                reviewer_findings = [_FINAL_REPORT_QUARANTINE_REVIEW_REQUIRED]
+                degraded_reason_codes.append("state_clause_quarantine_unreviewed")
             if not reviewer_findings:
                 if reviewer_state == "completed":
                     last_safe = deterministic_candidate

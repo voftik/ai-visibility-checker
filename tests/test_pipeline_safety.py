@@ -158,6 +158,7 @@ from app.services.analyzer import (
     _normalize_final_root_summary_packet,
     _normalize_final_root_summary_packet_or_fallback,
     _precheck_final_mapper_exact_coverage,
+    _quarantine_final_report_state_only_clauses,
     _reconcile_final_mapper_observation_claim_ids,
     _final_root_tokens_are_grounded,
     _final_root_fact_refs,
@@ -13959,6 +13960,32 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             "actions": [{"title": "Действие", "why": marker}],
         }
 
+    @staticmethod
+    def _partial_access_report() -> dict[str, Any]:
+        return {
+            "technical": {
+                "state": "available",
+                "coverage_state": "limited",
+                "coverage_rate": 99.9,
+                "pages": [{"body_truncated": True}],
+            }
+        }
+
+    @staticmethod
+    def _state_quarantine_candidate() -> dict[str, Any]:
+        candidate = FinalReportStructureRepairTests._candidate(
+            "Сайт открыт для краулеров"
+        )
+        candidate["sections"][0] = {
+            "heading": "Техническая доступность",
+            "body": (
+                "Серверный HTML доступен краулеру. "
+                "Авторизация не требуется, чтение открытого текста "
+                "ничем не ограничено."
+            ),
+        }
+        return candidate
+
     def test_reviewer_outage_is_fail_soft_but_audit_corruption_is_not(self) -> None:
         self.assertTrue(
             _semantic_reviewer_failure_is_fail_soft(
@@ -14343,6 +14370,74 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_state_clause_quarantine_removes_only_isolated_state_sentence(
+        self,
+    ) -> None:
+        public_report = self._partial_access_report()
+        candidate = self._state_quarantine_candidate()
+
+        repaired, changed = _quarantine_final_report_state_only_clauses(
+            candidate,
+            public_report=public_report,
+            evidence_document=None,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            repaired["sections"][0]["body"],
+            "Серверный HTML доступен краулеру.",
+        )
+        self.assertIn("ничем не ограничено", candidate["sections"][0]["body"])
+        self.assertEqual(
+            _final_report_typed_grounding_errors(
+                repaired,
+                public_report=public_report,
+                evidence_document=None,
+            ),
+            [],
+        )
+
+    def test_state_clause_quarantine_keeps_hard_failures(self) -> None:
+        public_report = self._partial_access_report()
+        for body in (
+            (
+                "Авторизация не требуется, чтение открытого текста ничем "
+                "не ограничено."
+            ),
+            (
+                "Авторизация не требуется. Чтение открытого текста ничем "
+                "не ограничено: охват 99,9 %."
+            ),
+            (
+                "Авторизация не требуется. Чтение открытого текста ничем "
+                "не ограничено: источник invented.example."
+            ),
+            (
+                "Авторизация не требуется. Чтение открытого текста ничем "
+                "не ограничено: модель openai/gpt-99-invented."
+            ),
+        ):
+            with self.subTest(body=body):
+                candidate = {
+                    "sections": [
+                        {"heading": "Техническая доступность", "body": body}
+                    ]
+                }
+                repaired, changed = _quarantine_final_report_state_only_clauses(
+                    candidate,
+                    public_report=public_report,
+                    evidence_document=None,
+                )
+                self.assertFalse(changed)
+                self.assertEqual(repaired, candidate)
+                self.assertTrue(
+                    _final_report_typed_grounding_errors(
+                        repaired,
+                        public_report=public_report,
+                        evidence_document=None,
+                    )
+                )
+
     async def test_structure_repair_is_repreflighted_before_provider_call(
         self,
     ) -> None:
@@ -14480,6 +14575,165 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             "input_utf8_window": 192_000,
             "mode": "direct",
         }
+
+    async def test_state_only_clause_is_repaired_before_paid_semantic_repair(
+        self,
+    ) -> None:
+        payload = self._payload()
+        payload["report_data"] = self._partial_access_report()
+        candidate = self._state_quarantine_candidate()
+        with (
+            patch(
+                "app.services.analyzer._final_report_payload",
+                return_value=payload,
+            ),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                return_value=({"prepared": "initial"}, self._window_plan()),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(
+                    candidate,
+                    "unsafe-author-raw",
+                    {"provider_tokens": 321},
+                ),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+            ) as paid_repair,
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                return_value={"verdict": "pass"},
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer.report_semantic_blockers",
+                return_value=[],
+            ),
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new=AsyncMock(side_effect=lambda _run_id, **kwargs: kwargs["report"]),
+            ),
+        ):
+            result = await _final_report(
+                "run-id",
+                payload["report_data"],
+                {"manifest": {"digest": "corpus"}, "answers": [{}]},
+            )
+
+        paid_repair.assert_not_awaited()
+        semantic_review.assert_awaited_once()
+        self.assertEqual(
+            result["sections"][0]["body"],
+            "Серверный HTML доступен краулеру.",
+        )
+        self.assertEqual(
+            semantic_review.await_args.kwargs["candidate_report"],
+            result,
+        )
+        final_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == "final_report"
+            and call.kwargs.get("status") == "completed"
+        ]
+        self.assertEqual(len(final_writes), 1)
+        self.assertEqual(final_writes[0]["raw_text"], "unsafe-author-raw")
+        self.assertEqual(final_writes[0]["usage_json"], {"provider_tokens": 321})
+
+    async def test_quarantined_clause_never_uses_reviewer_outage_fallback(
+        self,
+    ) -> None:
+        payload = self._payload()
+        payload["report_data"] = self._partial_access_report()
+        candidate = self._state_quarantine_candidate()
+        sanitized = copy.deepcopy(candidate)
+        sanitized["sections"][0]["body"] = "Серверный HTML доступен краулеру."
+        with (
+            patch("app.services.analyzer._final_report_payload", return_value=payload),
+            patch(
+                "app.services.analyzer._prepare_final_model_payload",
+                new_callable=AsyncMock,
+                return_value=({"prepared": "initial"}, self._window_plan()),
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ) as save_artifact,
+            patch(
+                "app.services.analyzer._final_report_author_candidate",
+                new_callable=AsyncMock,
+                return_value=(candidate, "raw", {}),
+            ),
+            patch(
+                "app.services.analyzer._final_report_structured_attempt",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(
+                    parsed=sanitized,
+                    text="repair-raw",
+                    usage={},
+                ),
+            ) as repair,
+            patch(
+                "app.services.analyzer._final_report_semantic_review_artifact",
+                new_callable=AsyncMock,
+                side_effect=_FinalSemanticReviewerUnavailable("provider outage"),
+            ) as semantic_review,
+            patch(
+                "app.services.analyzer._edit_final_report_language",
+                new_callable=AsyncMock,
+            ) as editor,
+        ):
+            with self.assertRaisesRegex(OpenRouterError, "требует успешной"):
+                await _final_report(
+                    "run-id",
+                    payload["report_data"],
+                    {"manifest": {"digest": "corpus"}, "answers": [{}]},
+                )
+
+        repair.assert_awaited()
+        self.assertGreater(semantic_review.await_count, 1)
+        self.assertEqual(
+            semantic_review.await_args.kwargs["candidate_report"]["sections"][0][
+                "body"
+            ],
+            "Серверный HTML доступен краулеру.",
+        )
+        editor.assert_not_awaited()
+        final_writes = [
+            call.kwargs
+            for call in save_artifact.await_args_list
+            if call.kwargs.get("artifact_key") == "final_report"
+        ]
+        self.assertFalse(
+            any(item.get("status") == "completed" for item in final_writes)
+        )
+        admissions = [
+            call.kwargs["output_json"]
+            for call in save_artifact.await_args_list
+            if str(call.kwargs.get("artifact_key") or "").startswith(
+                "final_report_semantic_admission_"
+            )
+        ]
+        self.assertEqual(admissions[-1]["decision"], "block")
 
     async def test_structure_repair_keeps_semantic_repair_budget(self) -> None:
         payload = self._payload()
