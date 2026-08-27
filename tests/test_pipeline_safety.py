@@ -13985,7 +13985,15 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                     "positive": 82.8,
                     "neutral": 13.8,
                     "mixed": 3.4,
-                }
+                },
+                "paired_web_lift": {
+                    "parent": {
+                        "observed_difference": 100.0,
+                        "observed_difference_metric": (
+                            "mention_rate_percentage_points"
+                        ),
+                    }
+                },
             },
             "brand_knowledge": {
                 "web": {
@@ -14004,7 +14012,8 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
                         "Тональность: 82,8 % положительной, "
                         "13,8 % нейтральной, 3,4 % смешанной. "
                         "Конкретика есть в 40 % ответов, расхождения — "
-                        "в 60 %. Доля соперника ниже 10 %."
+                        "в 60 %. Доля соперника ниже 10 %. "
+                        "Наблюдаемая разница — 100 процентных пунктов."
                     ),
                 }
             ]
@@ -14050,6 +14059,286 @@ class FinalReportStructureRepairTests(unittest.IsolatedAsyncioTestCase):
             _final_report_typed_grounding_errors(
                 count_as_percentage,
                 public_report=sentiment_count,
+                evidence_document=None,
+            )
+        )
+
+        untyped_difference = {
+            "discovery": {
+                "paired_web_lift": {
+                    "parent": {"observed_difference": 100.0}
+                }
+            }
+        }
+        difference_as_points = copy.deepcopy(candidate)
+        difference_as_points["sections"][0]["body"] = (
+            "Наблюдаемая разница — 100 процентных пунктов."
+        )
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                difference_as_points,
+                public_report=untyped_difference,
+                evidence_document=None,
+            )
+        )
+
+        wrong_difference = copy.deepcopy(candidate)
+        wrong_difference["sections"][0]["body"] = (
+            "Наблюдаемая разница — 101 процентный пункт."
+        )
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                wrong_difference,
+                public_report=report_data,
+                evidence_document=None,
+            )
+        )
+
+        for supported_wording in (
+            (
+                "Наблюдаемая разница — 100 процентных пунктов "
+                "по частоте упоминания."
+            ),
+            "Разница по частоте упоминания — 100 п. п.",
+            "Разница между долями упоминаний — 100 п. п.",
+            "С веб-поиском доля упоминаний выше на 100 п. п.",
+            "С веб-поиском бренд упоминается на 100 п. п. чаще.",
+        ):
+            supported = copy.deepcopy(candidate)
+            supported["sections"][0]["body"] = supported_wording
+            self.assertEqual(
+                _final_report_typed_grounding_errors(
+                    supported,
+                    public_report=report_data,
+                    evidence_document=None,
+                ),
+                [],
+            )
+
+        for unrelated_wording in (
+            "Цена выросла на 100 п. п.",
+            "Изменение индекса — 100 п. п.",
+            "Ценовая разница — 100 п. п.",
+            "Price difference — 100 percentage points.",
+            "The conversion gap is 100 pp.",
+            "Цена выросла на 100 п. п. — наблюдаемая разница.",
+            "Маржа изменилась на 100 п. п.: разрыв по упоминаниям.",
+            "web-поиск добавил 100 п. п. упоминаний.",
+            "С веб-поиском доля упоминаний ниже на 100 п. п.",
+            "С веб-поиском бренд упоминается на 100 п. п. реже.",
+            "Доля упоминаний конкурента выше на 100 п. п.",
+            "Упоминания MGCom выше на 100 п. п.",
+            "Разница по частоте упоминания цены — 100 п. п.",
+            "Наблюдаемая разница — 100 п. п. по цене.",
+            "Доля упоминаний вакансий отличается на 100 п. п.",
+            (
+                "Для материнского бренда упоминания конкурента "
+                "выше на 100 п. п."
+            ),
+            (
+                "Наблюдаемая разница — 100 п. п. "
+                "Цена выросла на 100 п. п."
+            ),
+        ):
+            unrelated = copy.deepcopy(candidate)
+            unrelated["sections"][0]["body"] = unrelated_wording
+            self.assertTrue(
+                _final_report_typed_grounding_errors(
+                    unrelated,
+                    public_report=report_data,
+                    evidence_document=None,
+                )
+            )
+
+        evidence_only = copy.deepcopy(candidate)
+        evidence_only["sections"][0]["body"] = (
+            "Наблюдаемая разница — 100 п. п."
+        )
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                evidence_only,
+                public_report={},
+                evidence_document={"report_data": report_data},
+            )
+        )
+
+        scoped_report = copy.deepcopy(report_data)
+        scoped_report["brand"] = {
+            "name": "Realweb",
+            "products": ["Realweb DSP", "Продукт Realweb"],
+            "offers": [
+                {
+                    "name": "DOOH Realweb",
+                    "aliases": ["DOOH"],
+                }
+            ],
+        }
+        scoped_report["discovery"]["paired_web_lift"]["portfolio"] = {
+            "observed_difference": 25.0,
+            "observed_difference_metric": "mention_rate_percentage_points",
+        }
+        for scoped_wording in (
+            "Для материнского бренда наблюдаемая разница — 100 п. п.",
+            "Для продуктов наблюдаемая разница — 25 п. п.",
+            "С веб-поиском Realweb упоминается на 100 п. п. чаще.",
+            "С веб-поиском Realweb DSP упоминается на 25 п. п. чаще.",
+            "С веб-поиском DOOH упоминается на 25 п. п. чаще.",
+            "С веб-поиском DOOH Realweb упоминается на 25 п. п. чаще.",
+            "С веб-поиском Продукт Realweb упоминается на 25 п. п. чаще.",
+            (
+                "Для материнского бренда наблюдаемая разница — 100 п. п., "
+                "для продуктов — 25 п. п."
+            ),
+            (
+                "Для Realweb наблюдаемая разница — 100 п. п., "
+                "для Realweb DSP — 25 п. п."
+            ),
+            (
+                "For Realweb observed difference — 100 pp, "
+                "and for Realweb DSP — 25 pp."
+            ),
+        ):
+            scoped = copy.deepcopy(candidate)
+            scoped["sections"][0]["body"] = scoped_wording
+            self.assertEqual(
+                _final_report_typed_grounding_errors(
+                    scoped,
+                    public_report=scoped_report,
+                    evidence_document=None,
+                ),
+                [],
+            )
+        for wrong_scope_wording in (
+            "Для продуктов наблюдаемая разница — 100 п. п.",
+            "Для материнского бренда наблюдаемая разница — 25 п. п.",
+            "С веб-поиском бренд упоминается на 25 п. п. чаще.",
+            "С веб-поиском Realweb упоминается на 25 п. п. чаще.",
+            "Для продуктов упоминания конкурента выше на 25 п. п.",
+            (
+                "Для материнского бренда наблюдаемая разница — 25 п. п., "
+                "для продуктов — 100 п. п."
+            ),
+        ):
+            wrong_scope = copy.deepcopy(candidate)
+            wrong_scope["sections"][0]["body"] = wrong_scope_wording
+            self.assertTrue(
+                _final_report_typed_grounding_errors(
+                    wrong_scope,
+                    public_report=scoped_report,
+                    evidence_document=None,
+                )
+            )
+
+        contextual_cases = (
+            ("Продукты", "Наблюдаемая разница — 25 п. п.", False),
+            ("Продукты", "Наблюдаемая разница — 100 п. п.", True),
+            ("Realweb DSP", "Наблюдаемая разница — 25 п. п.", False),
+            ("Realweb DSP", "Наблюдаемая разница — 100 п. п.", True),
+            ("Сравнение", "Для продуктов. Наблюдаемая разница — 25 п. п.", False),
+            ("Сравнение", "Для продуктов. Наблюдаемая разница — 100 п. п.", True),
+            (
+                "Бренд и продукты",
+                (
+                    "Для материнского бренда наблюдаемая разница — 100 п. п. "
+                    "Для продуктов наблюдаемая разница — 25 п. п."
+                ),
+                False,
+            ),
+            (
+                "Бренд и продукты",
+                "Наблюдаемая разница — 100 п. п.",
+                True,
+            ),
+            (
+                "Продукты",
+                (
+                    "Для продуктов. Для материнского бренда "
+                    "наблюдаемая разница — 100 п. п."
+                ),
+                False,
+            ),
+        )
+        for heading, body, should_block in contextual_cases:
+            contextual = {
+                "sections": [{"heading": heading, "body": body}]
+            }
+            contextual_errors = _final_report_typed_grounding_errors(
+                contextual,
+                public_report=scoped_report,
+                evidence_document=None,
+            )
+            self.assertEqual(bool(contextual_errors), should_block)
+
+        negative_report = copy.deepcopy(report_data)
+        negative_report["discovery"]["paired_web_lift"]["parent"] = {
+            "observed_difference": -25.0,
+            "observed_difference_metric": "mention_rate_percentage_points",
+        }
+        negative_neutral = copy.deepcopy(candidate)
+        negative_neutral["sections"][0]["body"] = (
+            "Наблюдаемая разница — -25 п. п."
+        )
+        self.assertEqual(
+            _final_report_typed_grounding_errors(
+                negative_neutral,
+                public_report=negative_report,
+                evidence_document=None,
+            ),
+            [],
+        )
+        for unsafe_negative_direction in (
+            "С веб-поиском доля упоминаний выше на -25 п. п.",
+            "С веб-поиском доля упоминаний ниже на -25 п. п.",
+            "С веб-поиском бренд упоминается на -25 п. п. чаще.",
+            "С веб-поиском бренд упоминается на -25 п. п. реже.",
+        ):
+            unsafe_negative = copy.deepcopy(candidate)
+            unsafe_negative["sections"][0]["body"] = unsafe_negative_direction
+            self.assertTrue(
+                _final_report_typed_grounding_errors(
+                    unsafe_negative,
+                    public_report=negative_report,
+                    evidence_document=None,
+                )
+            )
+
+        unrelated_score = {
+            "discovery": {
+                "paired_web_lift": {
+                    "parent": {
+                        "score_lift": 100.0,
+                        "observed_difference": 25.0,
+                        "observed_difference_metric": (
+                            "mention_rate_percentage_points"
+                        ),
+                    }
+                }
+            }
+        }
+        score_as_points = copy.deepcopy(candidate)
+        score_as_points["sections"][0]["body"] = (
+            "Изменение индекса — 100 процентных пунктов."
+        )
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                score_as_points,
+                public_report=unrelated_score,
+                evidence_document=None,
+            )
+        )
+
+        substring_fields = {
+            "generated_count": 12,
+            "support_count": 8,
+        }
+        substring_as_units = copy.deepcopy(candidate)
+        substring_as_units["sections"][0]["body"] = (
+            "Сгенерировано 12 %, поддержка выросла на 8 процентных пунктов."
+        )
+        self.assertTrue(
+            _final_report_typed_grounding_errors(
+                substring_as_units,
+                public_report=substring_fields,
                 evidence_document=None,
             )
         )

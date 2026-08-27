@@ -42449,40 +42449,52 @@ async def _invalidate_blocked_final_report_author_candidate(
 
 def _final_report_reader_text_rows(
     report: dict[str, Any],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     """Return every reader-visible prose field with its exact JSON path."""
 
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, str]] = []
     for field in ("headline", "verdict", "executive_summary"):
         value = report.get(field)
         if isinstance(value, str) and value.strip():
-            rows.append((f"/{field}", value))
+            rows.append((f"/{field}", value, ""))
     emphasis = report.get("headline_emphasis")
     if isinstance(emphasis, list):
         rows.extend(
-            (f"/headline_emphasis/{index}", value)
+            (f"/headline_emphasis/{index}", value, "")
             for index, value in enumerate(emphasis)
             if isinstance(value, str) and value.strip()
         )
-    for collection, fields in (
-        ("sections", ("heading", "body")),
-        ("actions", ("title", "why", "step", "evidence")),
-    ):
-        items = report.get(collection)
-        if not isinstance(items, list):
-            continue
-        for index, item in enumerate(items):
+    sections = report.get("sections")
+    if isinstance(sections, list):
+        for index, item in enumerate(sections):
             if not isinstance(item, dict):
                 continue
-            rows.extend(
-                (f"/{collection}/{index}/{field}", value)
-                for field in fields
-                if isinstance((value := item.get(field)), str) and value.strip()
-            )
+            heading = item.get("heading")
+            heading_context = heading if isinstance(heading, str) else ""
+            if heading_context.strip():
+                rows.append((f"/sections/{index}/heading", heading_context, ""))
+            body = item.get("body")
+            if isinstance(body, str) and body.strip():
+                rows.append((f"/sections/{index}/body", body, heading_context))
+    actions = report.get("actions")
+    if isinstance(actions, list):
+        for index, item in enumerate(actions):
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title")
+            title_context = title if isinstance(title, str) else ""
+            if title_context.strip():
+                rows.append((f"/actions/{index}/title", title_context, ""))
+            for field in ("why", "step", "evidence"):
+                value = item.get(field)
+                if isinstance(value, str) and value.strip():
+                    rows.append(
+                        (f"/actions/{index}/{field}", value, title_context)
+                    )
     limitations = report.get("limitations")
     if isinstance(limitations, list):
         rows.extend(
-            (f"/limitations/{index}", value)
+            (f"/limitations/{index}", value, "")
             for index, value in enumerate(limitations)
             if isinstance(value, str) and value.strip()
         )
@@ -42501,7 +42513,16 @@ def _final_report_grounding_source_texts(value: Any) -> list[str]:
 
     output: list[str] = []
 
-    def walk(current: Any, path: tuple[str, ...]) -> None:
+    explicit_metric_units = {
+        "mention_rate_percentage_points": "percentage points",
+    }
+
+    def walk(
+        current: Any,
+        path: tuple[str, ...],
+        *,
+        metric_unit: str | None = None,
+    ) -> None:
         if isinstance(current, str):
             if current:
                 output.append(current)
@@ -42514,6 +42535,11 @@ def _final_report_grounding_source_texts(value: Any) -> list[str]:
                 return
             literal = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
             output.append(literal)
+            explicit_unit = explicit_metric_units.get(
+                str(metric_unit or "").casefold()
+            )
+            if explicit_unit is not None:
+                output.append(f"{literal} {explicit_unit}")
             field = path[-1].casefold() if path else ""
             normalized_path = tuple(segment.casefold() for segment in path)
             percentage_parent_pairs = {
@@ -42524,26 +42550,35 @@ def _final_report_grounding_source_texts(value: Any) -> list[str]:
                 normalized_path[index : index + 2] in percentage_parent_pairs
                 for index in range(max(0, len(normalized_path) - 1))
             )
+            percentage_fields = {
+                "rate",
+                "share",
+                "percent",
+                "percentage",
+            }
+            percentage_suffixes = tuple(
+                f"_{suffix}" for suffix in percentage_fields
+            )
             if (
-                any(
-                    marker in field
-                    for marker in ("rate", "percent", "percentage", "share")
-                )
+                field in percentage_fields
+                or field.endswith(percentage_suffixes)
                 or sentiment_percentage
             ):
                 output.append(f"{literal}%")
-            if any(
-                marker in field
-                for marker in ("lift", "percentage_point", "percent_point", "pp")
-            ):
-                output.append(f"{literal} percentage points")
             return
         if current is None:
             output.append("null")
             return
         if isinstance(current, dict):
             for key, child in current.items():
-                walk(child, (*path, str(key)))
+                sibling_metric = current.get(f"{key}_metric")
+                walk(
+                    child,
+                    (*path, str(key)),
+                    metric_unit=(
+                        sibling_metric if isinstance(sibling_metric, str) else None
+                    ),
+                )
             return
         if isinstance(current, list):
             for index, child in enumerate(current):
@@ -42551,6 +42586,431 @@ def _final_report_grounding_source_texts(value: Any) -> list[str]:
 
     walk(value, ())
     return list(dict.fromkeys(output))
+
+
+_FINAL_REPORT_BOUND_METRIC_SOURCES = (
+    (
+        "/discovery/paired_web_lift/parent/observed_difference",
+        "/discovery/paired_web_lift/parent/observed_difference_metric",
+        "mention_rate_percentage_points",
+        "parent",
+    ),
+    (
+        "/discovery/paired_web_lift/portfolio/observed_difference",
+        "/discovery/paired_web_lift/portfolio/observed_difference_metric",
+        "mention_rate_percentage_points",
+        "portfolio",
+    ),
+)
+
+_FINAL_REPORT_METRIC_CLAUSE_BOUNDARY = re.compile(
+    r"(?<=[!?;])\s+|(?<=\.)\s+(?=[A-ZА-ЯЁ«\"]|\d)|\n+"
+)
+_FINAL_REPORT_METRIC_SCOPE_SEGMENT_BOUNDARY = re.compile(
+    r",\s*(?=(?:(?:а|и|and|but)\s+)?(?:для|for)\s+)",
+    re.IGNORECASE,
+)
+_FINAL_REPORT_METRIC_LEAD = re.compile(
+    r"наблюдаем\w*\s+(?:разниц\w*|разрыв\w*)|"
+    r"(?:разниц\w*|разрыв\w*|расхожд\w*).{0,80}?упомин\w*|"
+    r"observed\s+(?:difference|gap)|"
+    r"(?:difference|gap).{0,80}?(?:mention\s+rate|mentions?)",
+    re.IGNORECASE,
+)
+_FINAL_REPORT_PERCENTAGE_POINT_TEXT = re.compile(
+    r"(?:percentage[- ]points?|percent(?:age)?[- ]points?|"
+    r"p\.?\s*p\.?|п\.?\s*п\.?|"
+    r"процентн\w*\s+пункт\w*)",
+    re.IGNORECASE,
+)
+
+
+def _final_report_canonical_number(value: str | int | float) -> str:
+    normalized = re.sub(
+        r"[ \u00a0\u2007\u2009\u202f]",
+        "",
+        str(value),
+    ).replace(",", ".").replace("−", "-")
+    try:
+        decimal_value = Decimal(normalized)
+    except InvalidOperation:
+        return normalized
+    if not decimal_value.is_finite():
+        return normalized
+    if decimal_value == 0:
+        return "0"
+    return format(decimal_value.normalize(), "f")
+
+
+def _final_report_metric_scope_patterns(
+    public_report: dict[str, Any],
+) -> dict[str, re.Pattern[str]]:
+    """Build target-only scope anchors from the public identity contract."""
+
+    brand = public_report.get("brand")
+    brand_data = brand if isinstance(brand, dict) else {}
+    parent_names: set[str] = set()
+    portfolio_names: set[str] = set()
+
+    def add_name(target: set[str], value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            target.add(re.sub(r"\s+", " ", value.strip()))
+
+    brand_name = brand_data.get("name")
+    add_name(parent_names, brand_name)
+    for entity in brand_data.get("entity_scope") or []:
+        if not isinstance(entity, dict):
+            continue
+        canonical_name = entity.get("canonical_name")
+        if (
+            isinstance(brand_name, str)
+            and isinstance(canonical_name, str)
+            and canonical_name.casefold().strip() == brand_name.casefold().strip()
+        ):
+            for alias in entity.get("aliases") or []:
+                add_name(parent_names, alias)
+    for item in brand_data.get("products") or []:
+        if isinstance(item, str):
+            add_name(portfolio_names, item)
+        elif isinstance(item, dict):
+            add_name(
+                portfolio_names,
+                item.get("canonical_name") or item.get("name"),
+            )
+            for alias in item.get("aliases") or []:
+                add_name(portfolio_names, alias)
+    for offer in brand_data.get("offers") or []:
+        if not isinstance(offer, dict):
+            continue
+        add_name(portfolio_names, offer.get("name"))
+        for alias in offer.get("aliases") or []:
+            add_name(portfolio_names, alias)
+
+    def exact_phrase(value: str) -> str:
+        words = [re.escape(part) for part in value.split() if part]
+        return r"(?<!\w)" + r"\s+".join(words) + r"(?!\w)"
+
+    parent_sources = [
+        *(
+            exact_phrase(value)
+            for value in sorted(parent_names, key=lambda item: (-len(item), item))
+        ),
+        r"материнск\w*\s+бренд\w*",
+        r"головн\w*\s+бренд\w*",
+        r"бренд\w*",
+        r"parent\s+brand",
+        r"brand",
+    ]
+    portfolio_sources = [
+        *(
+            exact_phrase(value)
+            for value in sorted(
+                portfolio_names,
+                key=lambda item: (-len(item), item),
+            )
+        ),
+        r"продукт\w*",
+        r"портфел\w*",
+        r"направлен\w*",
+        r"услуг\w*",
+        r"products?",
+        r"portfolio",
+        r"services?",
+        r"business\s+lines?",
+    ]
+    return {
+        "parent": re.compile(
+            "(?:" + "|".join(parent_sources) + ")",
+            re.IGNORECASE,
+        ),
+        "portfolio": re.compile(
+            "(?:" + "|".join(portfolio_sources) + ")",
+            re.IGNORECASE,
+        ),
+    }
+
+
+def _final_report_bound_metric_language_matches(
+    prefix: str,
+    suffix: str,
+    *,
+    scope_patterns: dict[str, re.Pattern[str]],
+    allow_scoped_ellipsis: bool,
+    number_direction: int,
+) -> bool:
+    """Accept closed neutral renderings of the target mention-rate delta."""
+
+    target_subject = "(?:" + "|".join(
+        pattern.pattern for pattern in scope_patterns.values()
+    ) + ")"
+    optional_scope = (
+        rf"(?:(?:для\s+|for\s+)?{target_subject}\s*[:,—–-]?\s*)?"
+    )
+    punctuation_only = re.compile(r"^\s*[.,]?\s*$")
+    mention_metric_suffix = re.compile(
+        r"^\s*(?:по\s+(?:(?:дол|частот)\w*\s+)?упомин\w*|"
+        r"in\s+(?:mention\s+rate|mentions?))?\s*[.,]?\s*$",
+        re.IGNORECASE,
+    )
+    neutral_language_pairs = (
+        (
+            re.compile(
+                rf"^\s*{optional_scope}наблюдаем\w*\s+"
+                r"(?:разниц\w*|разрыв\w*)"
+                r"(?:\s+(?:состав\w*|равн\w*|достига\w*))?"
+                r"\s*[:=—–-]?\s*$",
+                re.IGNORECASE,
+            ),
+            mention_metric_suffix,
+        ),
+        (
+            re.compile(
+                rf"^\s*{optional_scope}observed\s+(?:difference|gap)"
+                r"(?:\s+(?:is|equals|reaches))?\s*[:=—–-]?\s*$",
+                re.IGNORECASE,
+            ),
+            punctuation_only,
+        ),
+        (
+            re.compile(
+                rf"^\s*{optional_scope}(?:разниц\w*|разрыв\w*|расхожд\w*)"
+                r"\s+(?:между\s+(?:режим\w*\s+)?(?:дол\w*\s+)?"
+                r"упомин\w*|по\s+(?:дол\w*|частот\w*)\s+упомин\w*|"
+                r"(?:дол\w*|частот\w*)\s+упомин\w*)"
+                r"(?:\s+(?:состав\w*|равн\w*|достига\w*))?"
+                r"\s*[:=—–-]?\s*$",
+                re.IGNORECASE,
+            ),
+            punctuation_only,
+        ),
+    )
+    if any(
+        prefix_pattern.search(prefix) and suffix_pattern.search(suffix)
+        for prefix_pattern, suffix_pattern in neutral_language_pairs
+    ):
+        return True
+    if number_direction > 0:
+        positive_direction_pairs = (
+            (
+                re.compile(
+                    rf"^\s*с\s+(?:web|веб)[- ]?поиск\w*\s+"
+                    rf"дол\w*\s+упомин\w*(?:\s+{target_subject})?\s+"
+                    r"(?:выше|higher)\s+(?:на|by)?\s*$",
+                    re.IGNORECASE,
+                ),
+                punctuation_only,
+            ),
+            (
+                re.compile(
+                    rf"^\s*дол\w*\s+упомин\w*(?:\s+{target_subject})?\s+"
+                    r"с\s+(?:web|веб)[- ]?поиск\w*\s+(?:выше|higher)"
+                    r"\s+(?:на|by)?\s*$",
+                    re.IGNORECASE,
+                ),
+                punctuation_only,
+            ),
+            (
+                re.compile(
+                    rf"^\s*с\s+(?:web|веб)[- ]?поиск\w*\s+{target_subject}"
+                    r"\s+упомина\w*\s+(?:на\s+)?$",
+                    re.IGNORECASE,
+                ),
+                re.compile(
+                    r"^\s*(?:чаще|more\s+often)\b\s*[.,]?\s*$",
+                    re.IGNORECASE,
+                ),
+            ),
+        )
+        if any(
+            prefix_pattern.search(prefix) and suffix_pattern.search(suffix)
+            for prefix_pattern, suffix_pattern in positive_direction_pairs
+        ):
+            return True
+    if not allow_scoped_ellipsis:
+        return False
+    return bool(
+        re.search(
+            rf"^\s*(?:(?:а|и|and|but)\s+)?(?:для|for)\s+{target_subject}"
+            r"\s*[:=—–-]?\s*$",
+            prefix,
+            re.IGNORECASE,
+        )
+        and punctuation_only.search(suffix)
+    )
+
+
+def _final_report_explicit_metric_bindings(
+    public_report: dict[str, Any],
+) -> dict[str, set[str]]:
+    """Return number-to-metric bindings from exact report-data contracts."""
+
+    bindings: dict[str, set[str]] = {}
+    for value_path, metric_path, expected_metric, scope in (
+        _FINAL_REPORT_BOUND_METRIC_SOURCES
+    ):
+        try:
+            value = _resolve_json_pointer(public_report, value_path)
+            metric = _resolve_json_pointer(public_report, metric_path)
+        except KeyError:
+            continue
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not isinstance(metric, str)
+            or metric.casefold() != expected_metric
+        ):
+            continue
+        bindings.setdefault(_final_report_canonical_number(value), set()).add(scope)
+    return bindings
+
+
+def _final_report_explicit_metric_binding_errors(
+    text: str,
+    *,
+    bindings: dict[str, set[str]],
+    scope_patterns: dict[str, re.Pattern[str]],
+    scope_context: str,
+) -> list[str]:
+    """Keep percentage-point quantities bound to their declared metric.
+
+    The ordinary literal gate proves that the exact quantity exists somewhere
+    in the evidence.  This additional closed-contract check prevents that
+    quantity from being reassigned to an unrelated subject in report prose.
+    """
+
+    errors: list[str] = []
+
+    def explicit_scopes_for(value: str) -> set[str]:
+        scope_matches = {
+            scope: list(pattern.finditer(value))
+            for scope, pattern in scope_patterns.items()
+        }
+        parent_matches = scope_matches.get("parent", [])
+        portfolio_matches = scope_matches.get("portfolio", [])
+        if portfolio_matches:
+            parent_matches = [
+                parent_match
+                for parent_match in parent_matches
+                if not any(
+                    portfolio_match.start() <= parent_match.start()
+                    and portfolio_match.end() >= parent_match.end()
+                    and (
+                        portfolio_match.start() < parent_match.start()
+                        or portfolio_match.end() > parent_match.end()
+                    )
+                    for portfolio_match in portfolio_matches
+                )
+            ]
+        return {
+            scope
+            for scope, matches in {
+                **scope_matches,
+                "parent": parent_matches,
+            }.items()
+            if matches
+        }
+
+    context_scopes = explicit_scopes_for(scope_context)
+    target_subject = "(?:" + "|".join(
+        pattern.pattern for pattern in scope_patterns.values()
+    ) + ")"
+    for number_match in _FINAL_GROUNDING_NUMBER_LITERAL.finditer(text):
+        unit_match = _FINAL_GROUNDING_UNIT_LITERAL.match(text[number_match.end() :])
+        if unit_match is None:
+            continue
+        folded_unit = re.sub(
+            r"[ \u00a0\u2007\u2009\u202f.]",
+            "",
+            unit_match.group(0).casefold(),
+        )
+        if not (
+            "point" in folded_unit
+            or "пункт" in folded_unit
+            or folded_unit in {"pp", "пп"}
+        ):
+            continue
+        number = _final_report_canonical_number(number_match.group(0))
+        decimal_number = Decimal(number)
+        number_direction = (
+            1 if decimal_number > 0 else -1 if decimal_number < 0 else 0
+        )
+        scopes = bindings.get(number, set())
+        if not scopes:
+            errors.append("unsupported_percentage_point_metric")
+            continue
+
+        unit_end = number_match.end() + unit_match.end()
+        clause_start = 0
+        clause_end = len(text)
+        for boundary in _FINAL_REPORT_METRIC_CLAUSE_BOUNDARY.finditer(text):
+            if boundary.end() <= number_match.start():
+                clause_start = boundary.end()
+                continue
+            if boundary.start() >= unit_end:
+                clause_end = boundary.start()
+                break
+        segment_start = clause_start
+        segment_end = clause_end
+        for boundary in _FINAL_REPORT_METRIC_SCOPE_SEGMENT_BOUNDARY.finditer(
+            text,
+            clause_start,
+            clause_end,
+        ):
+            if boundary.end() <= number_match.start():
+                segment_start = boundary.end()
+                continue
+            if boundary.start() >= unit_end:
+                segment_end = boundary.start()
+                break
+        prefix = text[segment_start : number_match.start()]
+        suffix = text[unit_end:segment_end]
+        clause = text[segment_start:segment_end]
+        lead_text = text[clause_start:segment_start]
+        allow_scoped_ellipsis = bool(
+            segment_start > clause_start
+            and _FINAL_REPORT_METRIC_LEAD.search(lead_text)
+            and _FINAL_REPORT_PERCENTAGE_POINT_TEXT.search(lead_text)
+        )
+        previous_scope_context = ""
+        if clause_start > 0:
+            preceding = text[:clause_start].rstrip()
+            preceding = re.sub(r"[.!?;:,—–-]+\s*$", "", preceding)
+            preceding_parts = re.split(
+                r"(?<=[.!?;])\s+|\n+",
+                preceding,
+            )
+            previous_sentence = preceding_parts[-1] if preceding_parts else ""
+            if re.fullmatch(
+                rf"\s*(?:(?:для|for)\s+)?{target_subject}\s*",
+                previous_sentence,
+                re.IGNORECASE,
+            ):
+                previous_scope_context = previous_sentence
+        local_scopes = explicit_scopes_for(clause)
+        previous_scopes = explicit_scopes_for(previous_scope_context)
+        if local_scopes:
+            explicit_scopes = local_scopes
+        elif previous_scopes:
+            explicit_scopes = (
+                previous_scopes
+                if not context_scopes or previous_scopes == context_scopes
+                else previous_scopes | context_scopes
+            )
+        else:
+            explicit_scopes = context_scopes
+        if explicit_scopes and not explicit_scopes.issubset(scopes):
+            errors.append("percentage_point_metric_scope_mismatch")
+            continue
+        if not _final_report_bound_metric_language_matches(
+            prefix,
+            suffix,
+            scope_patterns=scope_patterns,
+            allow_scoped_ellipsis=allow_scoped_ellipsis,
+            number_direction=number_direction,
+        ):
+            errors.append("percentage_point_metric_subject_mismatch")
+    return list(dict.fromkeys(errors))
 
 
 def _final_report_typed_grounding_errors(
@@ -42566,20 +43026,32 @@ def _final_report_typed_grounding_errors(
         if isinstance(evidence_document, dict)
         else {"report_data": public_report}
     )
-    source_texts = _final_report_grounding_source_texts(
-        {
-            "report_data": public_report,
-            "evidence_document": source_document,
-        }
-    )
-    return [
-        (
-            f"{path}: основной текст содержит неподтверждённый точный "
-            "литерал, число, единицу, идентификатор или состояние."
-        )
-        for path, text in _final_report_reader_text_rows(candidate)
-        if not _final_root_tokens_are_grounded(text, source_texts=source_texts)
-    ]
+    grounding_document = {
+        "report_data": public_report,
+        "evidence_document": source_document,
+    }
+    source_texts = _final_report_grounding_source_texts(grounding_document)
+    explicit_metric_bindings = _final_report_explicit_metric_bindings(public_report)
+    metric_scope_patterns = _final_report_metric_scope_patterns(public_report)
+    errors: list[str] = []
+    for path, text, scope_context in _final_report_reader_text_rows(candidate):
+        if not _final_root_tokens_are_grounded(text, source_texts=source_texts):
+            errors.append(
+                f"{path}: основной текст содержит неподтверждённый точный "
+                "литерал, число, единицу, идентификатор или состояние."
+            )
+            continue
+        if _final_report_explicit_metric_binding_errors(
+            text,
+            bindings=explicit_metric_bindings,
+            scope_patterns=metric_scope_patterns,
+            scope_context=scope_context,
+        ):
+            errors.append(
+                f"{path}: показатель в процентных пунктах не связан с "
+                "подтверждённой метрикой."
+            )
+    return errors
 
 
 def _deterministic_final_report_errors(
