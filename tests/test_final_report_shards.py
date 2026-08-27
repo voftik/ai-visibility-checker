@@ -142,7 +142,7 @@ class FinalReportShardProjectionTests(unittest.TestCase):
         payload = {
             "long_input_contract": {"mode": "bounded_transitive_evidence_tree"},
             "evidence_digest": {
-                "format": "aiv-final-input-bounded-root-v3",
+                "format": "aiv-final-input-bounded-root-v4",
                 "root_nodes": [
                     {
                         "source_node_id": "node-a",

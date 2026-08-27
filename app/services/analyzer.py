@@ -401,24 +401,24 @@ ANNOTATION_VERSION = f"{PROMPT_VERSION}-annotations-v21"
 METRICS_VERSION = f"{PROMPT_VERSION}-metrics-v23"
 ANALYSIS_CRITIC_VERSION = f"{PROMPT_VERSION}-{CRITIC_VERSION}"
 TECHNICAL_REVIEW_VERSION = f"{PROMPT_VERSION}-technical-v3"
-FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v28"
+FINAL_REPORT_VERSION = f"{PROMPT_VERSION}-final-v29"
 FINAL_EDITORIAL_VERSION = f"{FINAL_REPORT_VERSION}-ru-editor-v4"
 TECHNICAL_EDITORIAL_VERSION = f"{TECHNICAL_REVIEW_VERSION}-ru-editor-v3"
 FINAL_REPORT_SHARD_PLAN_VERSION = "aiv-final-report-shards-v5"
 FINAL_REPORT_SHARD_MERGE_VERSION = "aiv-final-report-merge-v5"
 FINAL_CORPUS_MANIFEST_VERSION = f"{PROMPT_VERSION}-final-corpus-v4"
-FINAL_CONTEXT_SELECTION_VERSION = f"{PROMPT_VERSION}-final-context-v5"
-# Compatibility symbol for older imports.  ``None`` is deliberate: the
-# production path supplies the complete attested corpus to the lossless final
-# input harness instead of selecting an arbitrary number of examples.
-FINAL_CONTEXT_MAX_ANSWERS: None = None
+FINAL_CONTEXT_SELECTION_VERSION = f"{PROMPT_VERSION}-final-context-v7"
+FINAL_CONTEXT_TARGET_ANSWERS = 12
+# Compatibility name retained for callers and older tests. This is a target,
+# not a hard limit: required evidence strata may expand the selected context.
+FINAL_CONTEXT_MAX_ANSWERS = FINAL_CONTEXT_TARGET_ANSWERS
 FINAL_REPORT_AUTHOR_ARTIFACT_KEY = "final_report_author_candidate"
 MAX_FINAL_STRUCTURE_REPAIRS = 1
-FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v12"
+FINAL_INPUT_HARNESS_VERSION = "aiv-final-input-evidence-tree-v13"
 FINAL_INPUT_MAP_SPLIT_VERSION = "aiv-final-input-map-split-v1"
 FINAL_INPUT_CLAIM_LEDGER_VERSION = "aiv-final-input-claim-ledger-v2"
 FINAL_ANSWER_ACCOUNTING_VERSION = "aiv-final-answer-accounting-v1"
-FINAL_INPUT_ROOT_SUMMARY_VERSION = "aiv-final-input-bounded-root-v3"
+FINAL_INPUT_ROOT_SUMMARY_VERSION = "aiv-final-input-bounded-root-v4"
 FINAL_INPUT_GROUNDING_FILTER_VERSION = "aiv-final-input-grounding-filter-v1"
 FINAL_INPUT_GROUNDING_FILTER_KEY = "_aiv_final_input_grounding_filter"
 # Per-call working windows.  They trigger more map/reduce leaves; they never
@@ -31050,19 +31050,38 @@ def _selection_dimension_values(item: dict[str, Any]) -> dict[str, str]:
         if item.get("metric_evidence_state") == "provider_limited_prefix"
         else "full_text"
     )
+    provider_mode = (
+        f"{str(item.get('provider_key') or 'unknown')}|"
+        f"{str(item.get('mode') or 'unknown')}"
+    )
+    metric_evidence_state = str(
+        item.get("metric_evidence_state") or "unknown"
+    )
+    valid = annotation.get("valid")
+    uncertainties = annotation.get("uncertainties")
+    analysis_state = (
+        "metadata_only"
+        if not context_eligible
+        else "provider_limited_prefix"
+        if context_access == "provider_limited_prefix"
+        else "critic_invalid"
+        if valid is False
+        else "critic_uncertain"
+        if isinstance(uncertainties, list) and bool(uncertainties)
+        else "critic_clean"
+    )
     dimensions = {
-        "provider_mode": (
-            f"{str(item.get('provider_key') or 'unknown')}|"
-            f"{str(item.get('mode') or 'unknown')}"
-        ),
+        "provider_mode": provider_mode,
+        "provider_mode_context": f"{provider_mode}|{context_access}",
         "intent_class": str(item.get("intent_class") or "unknown"),
         "scenario_role": str(item.get("scenario_role") or "unknown"),
         "evidence_state": str(panel_evidence.get("reason") or "unknown"),
+        "metric_evidence_state": metric_evidence_state,
         "context_access": context_access,
+        "analysis_state": analysis_state,
     }
     if not context_eligible:
         return dimensions
-    valid = annotation.get("valid")
     target_mentioned = annotation.get("target_mentioned")
     return {
         **dimensions,
@@ -31091,6 +31110,82 @@ def _selection_coverage(items: list[dict[str, Any]]) -> dict[str, list[str]]:
 
 def _selection_features(item: dict[str, Any]) -> set[tuple[str, str]]:
     return set(_selection_dimension_values(item).items())
+
+
+def _selection_enrichment_features(item: dict[str, Any]) -> set[tuple[str, str]]:
+    """Interactions used only to enrich an already complete required cover."""
+
+    dimensions = _selection_dimension_values(item)
+    return {
+        (
+            "provider_mode_intent",
+            f"{dimensions['provider_mode']}|{dimensions['intent_class']}",
+        ),
+        (
+            "provider_mode_target",
+            f"{dimensions['provider_mode']}|"
+            f"{dimensions.get('target_mentioned', 'unavailable')}",
+        ),
+        (
+            "intent_target_role",
+            f"{dimensions['intent_class']}|"
+            f"{dimensions.get('target_role', 'unavailable')}",
+        ),
+        (
+            "scenario_analysis_state",
+            f"{dimensions['scenario_role']}|{dimensions['analysis_state']}",
+        ),
+    }
+
+
+def _selection_semantic_utility(item: dict[str, Any]) -> tuple[int, ...]:
+    """Rank code-owned qualitative value before serialized size.
+
+    The final author needs representative evidence, not merely the shortest
+    exact-cover rows.  Every signal below is already attested by the corpus or
+    its current annotation; no new semantic conclusion is inferred here.
+    """
+
+    dimensions = _selection_dimension_values(item)
+    context_access = dimensions["context_access"]
+    access_priority = {
+        "full_text": 3,
+        "provider_limited_prefix": 2,
+        "metadata_only": 1,
+    }.get(context_access, 0)
+    annotation = (
+        item.get("annotation") if isinstance(item.get("annotation"), dict) else {}
+    )
+    evidence = annotation.get("evidence")
+    uncertainties = annotation.get("uncertainties")
+    citations = item.get("citations")
+    response_annotations = item.get("response_annotations")
+    usable_annotation = int(
+        context_access != "metadata_only"
+        and isinstance(annotation.get("valid"), bool)
+    )
+    explicit_target_observation = int(
+        annotation.get("target_mentioned") is True
+        or annotation.get("target_mentioned") is False
+    )
+    limitation_context = int(
+        context_access != "full_text"
+        or bool(item.get("metric_limitation"))
+        or dimensions["analysis_state"] in {"critic_invalid", "critic_uncertain"}
+    )
+    return (
+        access_priority,
+        usable_annotation,
+        int(isinstance(evidence, list) and bool(evidence)),
+        min(len(evidence), 8) if isinstance(evidence, list) else 0,
+        int(isinstance(uncertainties, list) and bool(uncertainties)),
+        min(len(uncertainties), 8) if isinstance(uncertainties, list) else 0,
+        int(isinstance(citations, list) and bool(citations)),
+        min(len(citations), 8) if isinstance(citations, list) else 0,
+        int(isinstance(response_annotations, list) and bool(response_annotations)),
+        explicit_target_observation,
+        limitation_context,
+    )
 
 
 def _selection_item_signature(item: dict[str, Any]) -> dict[str, Any]:
@@ -31171,21 +31266,19 @@ def _select_final_answer_context(
     answers: list[dict[str, Any]],
     *,
     corpus_manifest: dict[str, Any],
-    max_answers: int | None = FINAL_CONTEXT_MAX_ANSWERS,
+    max_answers: int = FINAL_CONTEXT_MAX_ANSWERS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Build deterministic context from the complete observed corpus.
+    """Select deterministic representative context without truncating raw text.
 
-    The production default has no local count or length cap: every observed
-    row enters the downstream lossless evidence tree.  Eligible rows retain
-    their full stored raw text; ineligible rows remain provenance-only so an
-    unattested requested mode cannot influence the narrative.  ``max_answers``
-    exists only to read and test the historical exact-cover contract; new
-    pipeline code must leave it as ``None``.
+    ``max_answers`` is the desired context size, never a publication barrier.
+    The required cover expands past it when evidence strata do not fit.
+    The sealed corpus manifest remains the accounting source for every row;
+    this selection is only qualitative context for the final report author.
     """
 
     if not answers:
         raise OpenRouterError("Final answer context is empty")
-    if max_answers is not None and (
+    if (
         not isinstance(max_answers, int)
         or isinstance(max_answers, bool)
         or max_answers < 1
@@ -31201,248 +31294,106 @@ def _select_final_answer_context(
             int(item.get("answer_id") or 0),
         ),
     )
-    if max_answers is None:
-        selected_context = [
-            _final_model_answer_context_item(item) for item in ordered_answers
-        ]
-        observed_features = set().union(
-            *(_selection_features(item) for item in ordered_answers)
-        )
-        selected_full_text_count = sum(
-            item.get("context_access") == "full_text" for item in selected_context
-        )
-        selected_limited_prefix_count = sum(
-            item.get("context_access") == "provider_limited_prefix"
-            for item in selected_context
-        )
-        manifest_core = {
-            "version": FINAL_CONTEXT_SELECTION_VERSION,
-            "policy": "complete_attested_corpus_no_local_cap_v1",
-            "full_corpus_digest": corpus_manifest.get("digest"),
-            "full_corpus_critic_rows_sha256": corpus_manifest.get("critic_rows_sha256"),
-            "max_answers": None,
-            "selected_count": len(ordered_answers),
-            "selected_full_text_count": selected_full_text_count,
-            "selected_limited_prefix_count": selected_limited_prefix_count,
-            "selected_metadata_only_count": (
-                len(selected_context)
-                - selected_full_text_count
-                - selected_limited_prefix_count
-            ),
-            "omitted_count": 0,
-            "selected_cells": [
-                _selection_item_signature(item) for item in ordered_answers
-            ],
-            "omitted_cells_sha256": _stable_json_sha256([]),
-            "observed_coverage": _selection_coverage(ordered_answers),
-            "selected_coverage": _selection_coverage(ordered_answers),
-            "coverage_complete": bool(observed_features) or bool(ordered_answers),
-            "selected_serialized_utf8_bytes": len(
-                json.dumps(selected_context, ensure_ascii=False).encode("utf-8")
-            ),
-        }
-        return selected_context, {
-            **manifest_core,
-            "digest": _stable_json_sha256(manifest_core),
-        }
 
     indexed = list(enumerate(ordered_answers))
-    all_features = set().union(*(_selection_features(item) for _, item in indexed))
-    ordered_features = sorted(all_features)
-    feature_bits = {
-        feature: 1 << index for index, feature in enumerate(ordered_features)
+    item_features = {
+        index: _selection_features(item) for index, item in indexed
     }
-    all_features_mask = (1 << len(ordered_features)) - 1
-    item_masks = {
-        index: sum(feature_bits[feature] for feature in _selection_features(item))
-        for index, item in indexed
-    }
+    all_features = set().union(*(item_features.values()))
+    feature_support = Counter(
+        feature
+        for features in item_features.values()
+        for feature in features
+    )
     item_serialized_bytes = {
         index: len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
         for index, item in indexed
     }
-
-    provider_mode_count = len(
-        {_selection_dimension_values(item)["provider_mode"] for item in ordered_answers}
-    )
-    if provider_mode_count > max_answers:
-        raise OpenRouterError(
-            "Final answer selection cannot represent every provider/mode "
-            f"within {max_answers} full answers"
-        )
 
     def selection_signature(indexes: tuple[int, ...]) -> tuple[int, ...]:
         return tuple(
             int(ordered_answers[index].get("answer_id") or 0) for index in indexes
         )
 
-    # Equal or strictly dominated masks can never improve coverage, byte cost
-    # or cardinality, so discard them before the exact search.
-    by_mask: dict[int, tuple[int, int]] = {}
-    for index, _item in indexed:
-        mask = item_masks[index]
-        size = item_serialized_bytes[index]
-        current = by_mask.get(mask)
-        if current is None or (
-            size,
-            selection_signature((index,)),
-        ) < (
-            current[0],
-            selection_signature((current[1],)),
-        ):
-            by_mask[mask] = (size, index)
-    candidates = [
-        (mask, size, index)
-        for mask, (size, index) in sorted(
-            by_mask.items(),
-            key=lambda item: selection_signature((item[1][1],)),
+    def candidate_order(index: int, missing: set[tuple[str, str]]) -> tuple[Any, ...]:
+        new_features = item_features[index] & missing
+        utility = _selection_semantic_utility(ordered_answers[index])
+        rarity_score = sum(
+            len(indexed) - int(feature_support[feature])
+            for feature in new_features
         )
-    ]
-    candidates = [
-        candidate
-        for candidate in candidates
-        if not any(
-            candidate[0] != other[0]
-            and candidate[0] | other[0] == other[0]
-            and candidate[1] >= other[1]
-            for other in candidates
-        )
-    ]
-    candidates_by_feature: dict[int, list[int]] = defaultdict(list)
-    for candidate_index, (mask, _size, _index) in enumerate(candidates):
-        for feature_index in range(len(ordered_features)):
-            if mask & (1 << feature_index):
-                candidates_by_feature[feature_index].append(candidate_index)
-
-    def candidate_order(
-        candidate_index: int,
-        missing_mask: int,
-    ) -> tuple[Any, ...]:
-        mask, size, index = candidates[candidate_index]
-        gain = (mask & missing_mask).bit_count()
         return (
-            size / max(gain, 1),
-            size,
-            -gain,
+            -len(new_features),
+            -rarity_score,
+            *(-value for value in utility),
+            item_serialized_bytes[index],
             selection_signature((index,)),
         )
 
-    # A deterministic greedy result supplies an early upper bound only. The
-    # recursive search below remains authoritative and explores every cover
-    # that could beat it.
-    greedy_mask = 0
-    greedy_cost = 0
-    greedy_selected: tuple[int, ...] = ()
-    while greedy_mask != all_features_mask and len(greedy_selected) < max_answers:
-        missing_mask = all_features_mask & ~greedy_mask
+    # Greedy coverage is authoritative and intentionally bounded: every
+    # iteration selects a new row and covers at least one previously missing
+    # feature, so at most ``len(answers)`` iterations are possible.  The target
+    # count never blocks publication; required strata simply expand past it.
+    covered_features: set[tuple[str, str]] = set()
+    selected_index_set: set[int] = set()
+    while covered_features != all_features:
+        missing = all_features - covered_features
         usable = [
-            candidate_index
-            for candidate_index, (mask, _size, _index) in enumerate(candidates)
-            if mask & missing_mask
+            index
+            for index, _item in indexed
+            if index not in selected_index_set and item_features[index] & missing
         ]
         if not usable:
-            break
-        selected_candidate = min(
+            raise OpenRouterError(
+                "Final answer selection lost its observed evidence strata: "
+                f"{sorted(missing)}"
+            )
+        selected_index = min(
             usable,
-            key=lambda value: candidate_order(value, missing_mask),
+            key=lambda index: candidate_order(index, missing),
         )
-        mask, size, index = candidates[selected_candidate]
-        greedy_mask |= mask
-        greedy_cost += size
-        greedy_selected = (*greedy_selected, index)
+        selected_index_set.add(selected_index)
+        covered_features.update(item_features[selected_index])
 
-    best_key: tuple[int, int, tuple[int, ...]] = (
-        (greedy_cost if greedy_mask == all_features_mask else 10**30),
-        len(greedy_selected),
-        selection_signature(tuple(sorted(greedy_selected))),
+    required_cover_count = len(selected_index_set)
+
+    # Required coverage may need fewer rows than the desired authoring context.
+    # Deterministically enrich it to the target with semantic interactions,
+    # preferring complete raw text over limited or metadata-only rows.
+    desired_count = min(max_answers, len(ordered_answers))
+    enrichment_coverage = set().union(
+        *(
+            _selection_enrichment_features(ordered_answers[index])
+            for index in selected_index_set
+        )
     )
-    best_selected: tuple[int, ...] = (
-        tuple(sorted(greedy_selected)) if greedy_mask == all_features_mask else ()
-    )
-    visited_cost: dict[tuple[int, int], int] = {}
 
-    def search(
-        covered_mask: int,
-        serialized_bytes: int,
-        selected: tuple[int, ...],
-    ) -> None:
-        nonlocal best_key, best_selected
-        if serialized_bytes > best_key[0]:
-            return
-        if covered_mask == all_features_mask:
-            normalized = tuple(sorted(selected))
-            key = (
-                serialized_bytes,
-                len(normalized),
-                selection_signature(normalized),
-            )
-            if key < best_key:
-                best_key = key
-                best_selected = normalized
-            return
-        if len(selected) >= max_answers:
-            return
-
-        state = (covered_mask, len(selected))
-        if visited_cost.get(state, 10**30) <= serialized_bytes:
-            return
-        visited_cost[state] = serialized_bytes
-
-        missing_mask = all_features_mask & ~covered_mask
-        max_gain = max(
-            ((mask & missing_mask).bit_count() for mask, _size, _index in candidates),
-            default=0,
+    def enrichment_order(index: int) -> tuple[Any, ...]:
+        item = ordered_answers[index]
+        interaction_gain = len(
+            _selection_enrichment_features(item) - enrichment_coverage
         )
-        if max_gain < 1:
-            return
-        minimum_remaining = math.ceil(missing_mask.bit_count() / max_gain)
-        missing_by_dimension = Counter(
-            ordered_features[index][0]
-            for index in range(len(ordered_features))
-            if missing_mask & (1 << index)
+        utility = _selection_semantic_utility(item)
+        return (
+            -interaction_gain,
+            *(-value for value in utility),
+            item_serialized_bytes[index],
+            selection_signature((index,)),
         )
-        if missing_by_dimension:
-            minimum_remaining = max(
-                minimum_remaining,
-                max(missing_by_dimension.values()),
-            )
-        if len(selected) + minimum_remaining > max_answers:
-            return
 
-        missing_features = [
-            index
-            for index in range(len(ordered_features))
-            if missing_mask & (1 << index)
+    while len(selected_index_set) < desired_count:
+        remaining = [
+            index for index, _item in indexed if index not in selected_index_set
         ]
-        rarest_feature = min(
-            missing_features,
-            key=lambda index: (
-                len(candidates_by_feature[index]),
-                ordered_features[index],
-            ),
+        if not remaining:
+            break
+        selected_index = min(remaining, key=enrichment_order)
+        selected_index_set.add(selected_index)
+        enrichment_coverage.update(
+            _selection_enrichment_features(ordered_answers[selected_index])
         )
-        options = sorted(
-            candidates_by_feature[rarest_feature],
-            key=lambda value: candidate_order(value, missing_mask),
-        )
-        for candidate_index in options:
-            mask, size, index = candidates[candidate_index]
-            if not mask & missing_mask:
-                continue
-            search(
-                covered_mask | mask,
-                serialized_bytes + size,
-                (*selected, index),
-            )
 
-    search(0, 0, ())
-    if not best_selected:
-        raise OpenRouterError(
-            "Final answer selection cannot cover required evidence strata "
-            f"within {max_answers} full answers: {sorted(all_features)}"
-        )
-    selected_indexes = best_selected
-    selected_index_set = set(selected_indexes)
+    selected_indexes = tuple(sorted(selected_index_set))
     selected_answers = sorted(
         (ordered_answers[index] for index in selected_indexes),
         key=lambda item: (
@@ -31459,8 +31410,8 @@ def _select_final_answer_context(
     if not coverage_complete:
         missing = sorted(all_features - selected_features)
         raise OpenRouterError(
-            "Final answer selection cannot cover required evidence strata "
-            f"within {max_answers} full answers: {missing}"
+            "Final answer selection lost required evidence strata: "
+            f"{missing}"
         )
 
     selected_context = [
@@ -31489,9 +31440,20 @@ def _select_final_answer_context(
     )
     manifest_core = {
         "version": FINAL_CONTEXT_SELECTION_VERSION,
+        "policy": "adaptive_representative_greedy_cover_v1",
         "full_corpus_digest": corpus_manifest.get("digest"),
         "full_corpus_critic_rows_sha256": corpus_manifest.get("critic_rows_sha256"),
         "max_answers": max_answers,
+        "target_answers": max_answers,
+        "required_cover_count": required_cover_count,
+        "cover_algorithm": "deterministic_greedy_until_complete_v1",
+        "cover_iterations": required_cover_count,
+        "expanded_for_required_strata": required_cover_count > max_answers,
+        "enrichment_count": len(selected_answers) - required_cover_count,
+        "selection_role": "final_author_context_only",
+        "metric_denominator": False,
+        "absence_inference_allowed": False,
+        "raw_text_policy": "selected_full_text_untruncated_v1",
         "selected_count": len(selected_answers),
         "selected_full_text_count": selected_full_text_count,
         "selected_limited_prefix_count": selected_limited_prefix_count,
@@ -34767,24 +34729,73 @@ def _final_input_deterministic_passthrough(
     return passthrough
 
 
+_FINAL_SELECTED_ANSWER_DETERMINISTIC_FIELDS = frozenset(
+    {
+        "answer_id",
+        "prompt_id",
+        "prompt_key",
+        "scenario_sequence",
+        "provider_key",
+        "system",
+        "model",
+        "mode",
+        "status",
+        "intent_class",
+        "scenario_role",
+        "metric_eligible",
+        "context_eligible",
+        "metric_evidence_state",
+        "metric_limitation",
+        "observation_state",
+        "requested_mode",
+        "verified_mode",
+        "context_access",
+    }
+)
+_FINAL_SELECTED_ANSWER_DETERMINISTIC_SUBTREES = frozenset(
+    {
+        "citations",
+        "panel_evidence",
+        "failure",
+        "provenance",
+    }
+)
+
+
+def _final_selected_answer_leaf_can_skip_semantic_mapper(
+    source_path: str,
+) -> bool:
+    """Route only the audited model-answer metadata allowlist through code."""
+
+    match = _FINAL_ANSWER_SOURCE_PATH.match(source_path)
+    if match is None:
+        return False
+    field_path = str(match.group("field") or "")
+    if field_path in _FINAL_SELECTED_ANSWER_DETERMINISTIC_FIELDS:
+        return True
+    field_root = field_path.split("/", 1)[0]
+    return field_root in _FINAL_SELECTED_ANSWER_DETERMINISTIC_SUBTREES
+
+
 def _final_input_unit_can_skip_semantic_mapper(
     unit: dict[str, Any],
 ) -> bool:
     """Return whether code can account for a unit without semantic inference.
 
     This allowlist is deliberately narrower than deterministic passthrough.
-    Names, labels, reasons, prompts and raw answers still reach the mapper even
-    though their exact values are also preserved by code.  Only typed scalar
-    facts and explicit empty/state literals can bypass semantic processing.
+    Names, labels and reasons still reach the mapper even though their exact
+    values are also preserved by code.  For selected model answers, only the
+    audited metadata/citation allowlist bypasses semantic processing; prompts,
+    rationales, raw answers and annotation subtrees always reach the mapper.
     """
 
+    source_path = str(unit.get("source_path") or "")
+    if _FINAL_ANSWER_SOURCE_PATH.match(source_path):
+        return _final_selected_answer_leaf_can_skip_semantic_mapper(source_path)
     value_type = str(unit.get("value_type") or "")
     if value_type != "string":
         return True
     if int(unit.get("unit_count") or 0) != 1 or unit.get("unit_index") != 0:
-        return False
-    source_path = str(unit.get("source_path") or "")
-    if source_path.startswith("/selected_full_answers/"):
         return False
     context_value = str(unit.get("context_value") or "")
     core_start = unit.get("core_start_in_context")
@@ -35215,6 +35226,7 @@ _FINAL_INPUT_GROUNDING_FILTER_OPERATIONS = frozenset(
         "replace_invalid_observation_claim_id",
         "replace_invalid_claim_coverage_id",
         "replace_invalid_claim_coverage_digest",
+        "replace_semantically_invalid_root_packet",
         "replace_generic_observation_statement",
         "replace_ungrounded_unit_coverage_rationale",
         "replace_ungrounded_claim_coverage_rationale",
@@ -36999,6 +37011,15 @@ def _final_root_fact_assertion_candidates(
     return []
 
 
+class _FinalRootSemanticQualityError(OpenRouterError):
+    """A structurally valid bounded-root packet has unusable model prose."""
+
+
+_FINAL_ROOT_SEMANTIC_REPAIR_VERSION = (
+    "aiv-final-input-bounded-root-semantic-repair-v1"
+)
+
+
 def _normalize_final_root_summary_packet(
     packet: dict[str, Any],
     *,
@@ -37017,6 +37038,7 @@ def _normalize_final_root_summary_packet(
     if set(fact_bindings_by_node) != allowed_node_ids:
         raise OpenRouterError("Bounded root fact ledger mismatches its child-node set")
     grounding_filter_operations: list[dict[str, Any]] = []
+    semantic_quality_errors: list[str] = []
     packet_binding_sha256 = _stable_json_sha256(sorted(allowed_node_ids))
     observed_node_ids: list[str] = []
     observations = output.get("observations")
@@ -37073,7 +37095,7 @@ def _normalize_final_root_summary_packet(
                 "asserting every mandatory atomic fact"
             )
         if _FINAL_ROOT_GENERIC_ACK.fullmatch(statement) and not expected_fact_ids:
-            raise OpenRouterError(
+            semantic_quality_errors.append(
                 "Bounded root observation is a generic acknowledgement, not "
                 "a grounded semantic summary"
             )
@@ -37091,14 +37113,19 @@ def _normalize_final_root_summary_packet(
                 or node_id not in node_ids
                 or node_id in excerpt_by_id
                 or not isinstance(excerpt, str)
-                or (allowed_node_text[node_id] and not excerpt)
+            ):
+                raise OpenRouterError(
+                    "Bounded root excerpt lost structural child provenance"
+                )
+            excerpt_by_id[node_id] = excerpt
+            if (
+                (allowed_node_text[node_id] and not excerpt)
                 or excerpt == node_id
                 or excerpt not in allowed_node_text[node_id]
             ):
-                raise OpenRouterError(
+                semantic_quality_errors.append(
                     "Bounded root excerpt is not an exact per-child substring"
                 )
-            excerpt_by_id[node_id] = excerpt
         if set(excerpt_by_id) != set(node_ids):
             raise OpenRouterError("Bounded root observation omitted a child excerpt")
         source_content_tokens = _final_root_content_tokens(
@@ -37109,7 +37136,7 @@ def _normalize_final_root_summary_packet(
             statement_content_tokens & set(source_content_tokens)
             or statement.strip() in allowed_node_text[node_ids[0]]
         ):
-            raise OpenRouterError(
+            semantic_quality_errors.append(
                 "Bounded root observation is a generic acknowledgement, not "
                 "a grounded semantic summary"
             )
@@ -37158,7 +37185,7 @@ def _normalize_final_root_summary_packet(
             statement,
             source_texts=grounding_texts,
         ):
-            raise OpenRouterError(
+            semantic_quality_errors.append(
                 "Bounded root statement invented an exact literal or state"
             )
         observation["source_node_ids"] = list(node_ids)
@@ -37280,12 +37307,136 @@ def _normalize_final_root_summary_packet(
         raise OpenRouterError(
             "Bounded root packet does not cover every child exactly once"
         )
+    if semantic_quality_errors:
+        raise _FinalRootSemanticQualityError(
+            "; ".join(dict.fromkeys(semantic_quality_errors))
+        )
     _record_final_input_grounding_filter(
         output,
         scope="bounded_root",
         operations=grounding_filter_operations,
     )
     return output
+
+
+def _normalize_final_root_summary_packet_or_fallback(
+    packet: dict[str, Any],
+    *,
+    allowed_node_text: dict[str, str],
+    allowed_node_fact_bindings: dict[str, list[dict[str, Any]]] | None = None,
+    fallback_forbidden_node_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize model output or losslessly replace only bad model prose.
+
+    The strict normalizer validates the complete packet before it raises the
+    typed semantic-quality error caught here. Structural, provenance, node
+    coverage, reference, digest and fact-ledger errors therefore remain hard.
+    A safe fallback copies every child's exact semantic text without a byte or
+    character limit; the downstream transport-progress guard remains free to
+    reject an honestly non-reducing result.
+    """
+
+    fact_bindings_by_node = (
+        {node_id: [] for node_id in allowed_node_text}
+        if allowed_node_fact_bindings is None
+        else allowed_node_fact_bindings
+    )
+    allowed_node_ids = set(allowed_node_text)
+    if not allowed_node_ids or set(fact_bindings_by_node) != allowed_node_ids:
+        raise OpenRouterError("Bounded root fact ledger mismatches its child-node set")
+    forbidden_node_ids = set(fallback_forbidden_node_ids or set())
+    if not forbidden_node_ids <= allowed_node_ids:
+        raise OpenRouterError(
+            "Bounded root fallback guard references an unknown child"
+        )
+    for node_id, source_text in allowed_node_text.items():
+        bindings = fact_bindings_by_node[node_id]
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(source_text, str)
+            or not isinstance(bindings, list)
+        ):
+            raise OpenRouterError("Bounded root fact ledger is structurally invalid")
+        if not source_text.strip():
+            raise OpenRouterError("Bounded root fallback source text is empty")
+        _final_root_fact_refs(bindings)
+    existing_grounding_operations = _final_input_grounding_filter_operations(packet)
+    try:
+        return _normalize_final_root_summary_packet(
+            packet,
+            allowed_node_text=allowed_node_text,
+            allowed_node_fact_bindings=fact_bindings_by_node,
+        )
+    except _FinalRootSemanticQualityError:
+        if any(fact_bindings_by_node.values()) or forbidden_node_ids:
+            raise OpenRouterError(
+                "Bounded root semantic fallback cannot replace a child with "
+                "mandatory fact provenance"
+            )
+
+        fallback = {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": source_text,
+                    "source_node_ids": [node_id],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {"source_node_id": node_id, "excerpt": source_text}
+                    ],
+                    "importance": "supporting",
+                }
+                for node_id, source_text in allowed_node_text.items()
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": node_id,
+                    "disposition": "supporting_context",
+                    "rationale": _FINAL_INPUT_NODE_COVERAGE_RATIONALE,
+                }
+                for node_id in allowed_node_text
+            ],
+        }
+
+        def serialized(value: dict[str, Any]) -> str:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        _record_final_input_grounding_filter(
+            fallback,
+            scope="bounded_root",
+            operations=[
+                *existing_grounding_operations,
+                _final_input_grounding_filter_operation(
+                    scope="bounded_root",
+                    operation="replace_semantically_invalid_root_packet",
+                    path="$",
+                    binding_sha256=_stable_json_sha256(
+                        {
+                            node_id: text_sha256(source_text)
+                            for node_id, source_text in allowed_node_text.items()
+                        }
+                    ),
+                    value=serialized(packet),
+                    replacement=serialized(fallback),
+                ),
+            ],
+        )
+        # The fallback is not trusted merely because code built it: rerun the
+        # same strict normalizer used for model and persisted proof packets.
+        return _normalize_final_root_summary_packet(
+            fallback,
+            allowed_node_text=allowed_node_text,
+            allowed_node_fact_bindings=fact_bindings_by_node,
+        )
 
 
 def _final_root_semantic_entries(
@@ -38365,6 +38516,15 @@ provenance фактов, но не растущую таблицу потомк�
 
 {LIVE_RUSSIAN_RULES}
 """.strip()
+    semantic_repair_system = (
+        summary_system
+        + "\n\n"
+        + "Это единственная повторная попытка после отклонения только качества "
+        "модельного текста. Перечитай source_nodes: не отвечай служебным "
+        "«узел учтён», не добавляй отсутствующие числа, состояния, URL или "
+        "сущности. Верни содержательный statement и дословный excerpt для "
+        "каждого child; все структурные правила исходного контракта неизменны."
+    )
     processing_window = await _final_model_input_window(model=PROCESSING_MODEL)
     processing_window_bytes = int(processing_window["input_utf8_window"])
     target_chars = min(
@@ -38378,20 +38538,35 @@ provenance фактов, но не растущую таблицу потомк�
         *,
         level: int,
     ) -> int:
-        return _structured_provider_request_utf8_bytes(
-            model=PROCESSING_MODEL,
-            model_envelope=processing_window["model_envelope"],
-            system=summary_system,
-            user_payload={
-                "contract_version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
-                "level": level,
-                "group_index": group_index,
-                "source_nodes": [node["model_view"] for node in group],
-            },
-            schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
-            schema_name=f"aiv_final_root_l{level}_{group_index}",
-            reasoning_effort="high",
-            temperature=0.15,
+        request_payload = {
+            "contract_version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
+            "level": level,
+            "group_index": group_index,
+            "source_nodes": [node["model_view"] for node in group],
+        }
+        return max(
+            _structured_provider_request_utf8_bytes(
+                model=PROCESSING_MODEL,
+                model_envelope=processing_window["model_envelope"],
+                system=summary_system,
+                user_payload=request_payload,
+                schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
+                schema_name=f"aiv_final_root_l{level}_{group_index}",
+                reasoning_effort="high",
+                temperature=0.15,
+            ),
+            _structured_provider_request_utf8_bytes(
+                model=PROCESSING_MODEL,
+                model_envelope=processing_window["model_envelope"],
+                system=semantic_repair_system,
+                user_payload=request_payload,
+                schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
+                schema_name=(
+                    f"aiv_final_root_semantic_repair_l{level}_{group_index}"
+                ),
+                reasoning_effort="high",
+                temperature=0.15,
+            ),
         )
 
     while True:
@@ -38567,9 +38742,23 @@ provenance фактов, но не растущую таблицу потомк�
             current_level: int = level,
         ) -> dict[str, Any]:
             child_ids = [str(node["node_id"]) for node in group]
-            child_digest = _stable_json_sha256(
-                [_final_root_node_receipt(node) for node in group]
+            child_receipts = [_final_root_node_receipt(node) for node in group]
+            child_digest = _stable_json_sha256(child_receipts)
+            fallback_forbidden_node_ids = {
+                str(receipt["node_id"])
+                for receipt in child_receipts
+                if int(receipt["mandatory_fact_count"]) > 0
+            }
+            fallback_forbidden_node_ids.update(
+                str(node["node_id"])
+                for node in group
+                if isinstance(node.get("mandatory_fact_bindings"), list)
+                and bool(node["mandatory_fact_bindings"])
             )
+            allowed_node_text = {
+                str(node["node_id"]): str(node["semantic_text"]) for node in group
+            }
+            normalization_fact_refs = {node_id: [] for node_id in child_ids}
             user_payload = {
                 "contract_version": FINAL_INPUT_ROOT_SUMMARY_VERSION,
                 "level": current_level,
@@ -38592,13 +38781,41 @@ provenance фактов, но не растущую таблицу потомк�
                     reasoning_effort="high",
                     prompt_version=prompt_version,
                 )
-            normalized = _normalize_final_root_summary_packet(
-                result,
-                allowed_node_text={
-                    str(node["node_id"]): str(node["semantic_text"]) for node in group
-                },
-                allowed_node_fact_bindings={str(node["node_id"]): [] for node in group},
-            )
+            try:
+                normalized = _normalize_final_root_summary_packet(
+                    result,
+                    allowed_node_text=allowed_node_text,
+                    allowed_node_fact_bindings=normalization_fact_refs,
+                )
+            except _FinalRootSemanticQualityError:
+                async with semaphore:
+                    repair_result = await _structured_artifact(
+                        run_id,
+                        stage_key=stage_key,
+                        artifact_key=(
+                            f"{artifact_namespace}_bounded_root_semantic_repair_v1_"
+                            f"l{current_level}_{group_index}_{child_digest[:20]}"
+                        ),
+                        schema=FINAL_INPUT_ROOT_SUMMARY_SCHEMA,
+                        schema_name=(
+                            f"aiv_final_root_semantic_repair_l"
+                            f"{current_level}_{group_index}"
+                        ),
+                        system=semantic_repair_system,
+                        user_payload=user_payload,
+                        model=PROCESSING_MODEL,
+                        reasoning_effort="high",
+                        prompt_version=(
+                            f"{prompt_version}:"
+                            f"{_FINAL_ROOT_SEMANTIC_REPAIR_VERSION}"
+                        ),
+                    )
+                normalized = _normalize_final_root_summary_packet_or_fallback(
+                    repair_result,
+                    allowed_node_text=allowed_node_text,
+                    allowed_node_fact_bindings=normalization_fact_refs,
+                    fallback_forbidden_node_ids=fallback_forbidden_node_ids,
+                )
             parent = _final_root_parent_node(
                 level=current_level,
                 children=group,
@@ -43050,35 +43267,38 @@ async def _final_report(
 содержательные страницы», «пять ответов содержат расхождения в фактах».
 Сохраняй сами числа, знаменатели и смысл доказательства.
 
-В selected_full_answers передан весь наблюдавшийся корпус, который прошёл
-независимого критика: локального лимита количества ответов или длины raw здесь
-нет. Если полный payload физически не помещается в одно окно модели, code-owned
-evidence tree предварительно обрабатывает каждый leaf и доказывает полное
-покрытие через lineage. Доступ к raw определяет
-context_eligible/context_access, а не metric_eligible. Для
-context_access=full_text связка «сценарий — raw-ответ» передана полностью и не
-обрезана. context_access=provider_limited_prefix означает, что передан весь
-фактически полученный от модели текст, но сама модель остановилась на своём
-физическом пределе вывода. Такой префикс можно использовать только как
-положительное буквальное доказательство уже названного; отсутствие сущности в
-нём ничего не доказывает, и строка не входит в знаменатели метрик. Для
-context_access=metadata_only переданы только метаданные и
-provenance: answer_text, annotation evidence и citations намеренно
-отсутствуют. requested_mode показывает лишь запрошенный режим; verified_mode
-показывает транспортно подтверждённый режим и для непроверенной строки равен
+selected_full_answers содержит детерминированную выборку связок «сценарий и
+raw-ответ» из корпуса, который прошёл независимого критика. Это контекстные
+примеры для интерпретации, а не весь корпус, не знаменатель метрик и не
+статистическая выборка. По отсутствию сущности в выбранных примерах нельзя
+делать вывод об её отсутствии во всём исследовании. answer_corpus_manifest
+описывает полный запечатанный корпус. answer_selection_manifest связывает с
+ним выбранные и пропущенные строки, фиксирует покрытие обязательных срезов и
+не разрешает использовать выборку как источник чисел. Доли и показатели не
+пересчитывай: единственный числовой источник истины здесь report_data.
+
+Для context_access=full_text связка «сценарий и raw-ответ» передана полностью,
+без обрезки по длине. Если выбранный payload физически не помещается в одно
+окно модели, code-owned evidence tree предварительно обрабатывает каждый leaf
+и сохраняет доказуемое покрытие через lineage. Доступ к raw определяет
+context_eligible/context_access, а не metric_eligible.
+context_access=provider_limited_prefix означает, что передан весь фактически
+полученный текст, но сама модель остановилась на физическом пределе вывода.
+Такой префикс можно использовать только как положительное буквальное
+доказательство уже названного. Отсутствие сущности в нём ничего не доказывает,
+и строка не входит в знаменатели метрик. Для context_access=metadata_only
+переданы только метаданные и provenance: answer_text, annotation evidence и
+citations намеренно отсутствуют. requested_mode показывает запрошенный режим,
+а verified_mode транспортно подтверждённый; у непроверенной строки он равен
 null. metric_eligible=false вместе с context_eligible=true допустимо для
 provider_limited_prefix: raw сохранён для квалифицированного контекста, но не
-для расчёта отсутствий. metric_eligible=true вместе с context_eligible=false допустимо только
-для ограниченного legacy-observational агрегата: строка участвует в
-программном числе, но не является качественным доказательством памяти модели.
-answer_corpus_manifest описывает весь корпус, а
-answer_selection_manifest доказывает, что в контекст включены все строки без
-пропусков, и связывает их с полным корпусом. Доли и показатели не пересчитывай:
-числовой источник истины —
-report_data. Строку с context_access=metadata_only разрешено использовать
-только как контекст ограничения протокола; запрещено строить по её скрытому
-содержанию вывод или причинное объяснение. Не показывай читателю внутренние
-идентификаторы, hashes, версии контрактов или размер корпуса.
+для расчёта отсутствий. metric_eligible=true вместе с context_eligible=false
+допустимо только для ограниченного legacy-observational агрегата: строка
+участвует в программном числе, но не служит качественным доказательством памяти
+модели. Строку с context_access=metadata_only используй только для описания
+ограничения протокола; не строй по скрытому содержанию вывод или причинное
+объяснение. Не показывай читателю внутренние идентификаторы, hashes, версии
+контрактов или размер корпуса.
 
 Если payload содержит semantic_review_to_fix и rejected_report, это ровно одна
 ограниченная попытка исправить отклонённый текст. Исправь перечисленные

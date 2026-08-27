@@ -809,7 +809,7 @@ assert.match(excluded.copy, /Служебные страницы/);
         self.assertNotIn("localizeAnalysisText", self.html)
         self.assertIn("deck.textContent = lead", self.html)
         self.assertNotIn("final-v6", self.analyzer)
-        self.assertIn("final-v28", self.analyzer)
+        self.assertIn("final-v29", self.analyzer)
 
     def test_intent_zeroes_show_scope_and_evidence(self) -> None:
         self.assertIn("const intentMetricPresentation =", self.html)

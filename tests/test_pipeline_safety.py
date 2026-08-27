@@ -148,12 +148,14 @@ from app.services.analyzer import (
     _expected_corpus_cells,
     _final_corpus_manifest,
     _final_input_deterministic_passthrough,
+    _final_input_unit_can_skip_semantic_mapper,
     _final_input_claim_ledger,
     _final_input_preflight,
     _flatten_final_input_payload,
     _final_model_input_window,
     _normalize_final_evidence_packet,
     _normalize_final_root_summary_packet,
+    _normalize_final_root_summary_packet_or_fallback,
     _precheck_final_mapper_exact_coverage,
     _reconcile_final_mapper_observation_claim_ids,
     _final_root_tokens_are_grounded,
@@ -7958,6 +7960,26 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             },
         )
 
+        self.assertEqual(
+            [item["answer_id"] for item in original_payload["selected_full_answers"]],
+            [item["answer_id"] for item in changed_payload["selected_full_answers"]],
+        )
+        self.assertNotIn(
+            13,
+            [item["answer_id"] for item in original_payload["selected_full_answers"]],
+        )
+        self.assertEqual(
+            original_payload["answer_selection_manifest"]["omitted_count"],
+            1,
+        )
+        self.assertNotEqual(
+            original_payload["answer_selection_manifest"][
+                "omitted_cells_sha256"
+            ],
+            changed_payload["answer_selection_manifest"][
+                "omitted_cells_sha256"
+            ],
+        )
         self.assertNotEqual(
             original_manifest["observed_cells_sha256"],
             changed_manifest["observed_cells_sha256"],
@@ -8058,14 +8080,21 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             corpus_manifest=manifest,
         )
 
-        self.assertIsNone(FINAL_CONTEXT_MAX_ANSWERS)
-        self.assertEqual(len(selected), len(items))
-        self.assertEqual(selection_manifest["omitted_count"], 0)
+        self.assertEqual(FINAL_CONTEXT_MAX_ANSWERS, 12)
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(selection_manifest["target_answers"], 12)
+        self.assertEqual(selection_manifest["omitted_count"], 8)
         self.assertEqual(
             selection_manifest["policy"],
-            "complete_attested_corpus_no_local_cap_v1",
+            "adaptive_representative_greedy_cover_v1",
         )
         self.assertTrue(selection_manifest["coverage_complete"])
+        self.assertFalse(selection_manifest["metric_denominator"])
+        self.assertFalse(selection_manifest["absence_inference_allowed"])
+        self.assertEqual(
+            selection_manifest["raw_text_policy"],
+            "selected_full_text_untruncated_v1",
+        )
         self.assertEqual(
             [item["answer_id"] for item in selected],
             [item["answer_id"] for item in reversed_selected],
@@ -8091,7 +8120,209 @@ class FinalAnswerCorpusTests(unittest.TestCase):
                 self.assertNotIn("annotation", item)
                 self.assertNotIn("citations", item)
 
-    def test_final_selection_finds_feasible_exact_cover_after_greedy_trap(
+    def test_selected_full_text_is_never_truncated(self) -> None:
+        answer_text = "НАЧАЛО-" + ("содержательный контекст " * 8_000) + "LONG-SENTINEL"
+        answer = {
+            "answer_id": 1,
+            "prompt_id": 1,
+            "provider_key": "openai",
+            "mode": "web",
+            "intent_class": "I",
+            "scenario_role": "unbranded_discovery",
+            "scenario_sequence": 1,
+            "scenario": "Как выбрать поставщика?",
+            "answer_text": answer_text,
+            "citations": [{"url": "https://example.com/source"}],
+            "metric_eligible": True,
+            "context_eligible": True,
+            "metric_evidence_state": "strict_verified",
+            "annotation": {
+                "valid": True,
+                "target_mentioned": False,
+                "target_role": "absent",
+                "sentiment": "unknown",
+                "evidence": [],
+                "uncertainties": [],
+            },
+            "panel_evidence": {"reason": "verified", "sha256": "panel-1"},
+            "provenance": {
+                "raw_answer_sha256": hashlib.sha256(
+                    answer_text.encode("utf-8")
+                ).hexdigest(),
+                "annotation_sha256": "annotation-1",
+            },
+        }
+
+        selected, selection_manifest = _select_final_answer_context(
+            [answer],
+            corpus_manifest={"digest": "full-corpus"},
+            max_answers=1,
+        )
+
+        self.assertEqual(selected[0]["answer_text"], answer_text)
+        self.assertTrue(selected[0]["answer_text"].endswith("LONG-SENTINEL"))
+        self.assertEqual(selected[0]["context_access"], "full_text")
+        self.assertEqual(selection_manifest["selected_full_text_count"], 1)
+
+    def test_metadata_only_cannot_displace_same_provider_mode_full_text(
+        self,
+    ) -> None:
+        def answer(
+            answer_id: int,
+            *,
+            provider: str,
+            context_eligible: bool,
+        ) -> dict[str, Any]:
+            return {
+                "answer_id": answer_id,
+                "prompt_id": answer_id,
+                "provider_key": provider,
+                "mode": "web",
+                "intent_class": "I",
+                "scenario_role": "unbranded_discovery",
+                "scenario_sequence": answer_id,
+                "scenario": "Как выбрать поставщика?",
+                "answer_text": f"Полный ответ {answer_id}",
+                "citations": [],
+                "metric_eligible": context_eligible,
+                "context_eligible": context_eligible,
+                "metric_evidence_state": "strict_verified",
+                "annotation": {
+                    "valid": True,
+                    "target_mentioned": False,
+                    "target_role": "absent",
+                    "sentiment": "unknown",
+                    "evidence": [],
+                    "uncertainties": [],
+                },
+                "panel_evidence": {"reason": "verified", "sha256": f"pe-{answer_id}"},
+                "provenance": {
+                    "raw_answer_sha256": f"raw-{answer_id}",
+                    "annotation_sha256": f"annotation-{answer_id}",
+                },
+            }
+
+        answers = [
+            answer(1, provider="openai", context_eligible=True),
+            answer(2, provider="openai", context_eligible=False),
+            answer(3, provider="gemini", context_eligible=True),
+        ]
+        selected, selection_manifest = _select_final_answer_context(
+            answers,
+            corpus_manifest={"digest": "full-corpus"},
+            max_answers=2,
+        )
+
+        self.assertEqual([item["answer_id"] for item in selected], [1, 2, 3])
+        self.assertTrue(selection_manifest["expanded_for_required_strata"])
+        self.assertEqual(selection_manifest["target_answers"], 2)
+        self.assertEqual(selection_manifest["selected_count"], 3)
+        openai_full = next(item for item in selected if item["answer_id"] == 1)
+        self.assertEqual(openai_full["context_access"], "full_text")
+        self.assertEqual(openai_full["answer_text"], "Полный ответ 1")
+
+    def test_selection_covers_semantic_limited_and_critic_strata(self) -> None:
+        specs = [
+            # intent, role, metric state, valid, mentioned, target role, uncertainty
+            ("I", "unbranded_discovery", "strict_verified", True, False, "absent", []),
+            (
+                "T",
+                "brand_diagnostic",
+                "strict_verified",
+                True,
+                True,
+                "recommended",
+                ["Неоднозначная формулировка"],
+            ),
+            (
+                "E",
+                "consideration",
+                "provider_limited_prefix",
+                True,
+                True,
+                "mentioned",
+                [],
+            ),
+            ("NB", "category_discovery", "strict_verified", False, False, "absent", []),
+        ]
+        answers: list[dict[str, Any]] = []
+        for answer_id, spec in enumerate(specs, start=1):
+            (
+                intent,
+                role,
+                metric_state,
+                valid,
+                target_mentioned,
+                target_role,
+                uncertainties,
+            ) = spec
+            answers.append(
+                {
+                    "answer_id": answer_id,
+                    "prompt_id": answer_id,
+                    "provider_key": "openai",
+                    "mode": "web",
+                    "intent_class": intent,
+                    "scenario_role": role,
+                    "scenario_sequence": answer_id,
+                    "answer_text": f"Ответ {answer_id}",
+                    "citations": [],
+                    "metric_eligible": metric_state != "provider_limited_prefix",
+                    "context_eligible": True,
+                    "metric_evidence_state": metric_state,
+                    "annotation": {
+                        "valid": valid,
+                        "target_mentioned": target_mentioned,
+                        "target_role": target_role,
+                        "sentiment": "positive" if target_mentioned else "unknown",
+                        "evidence": [],
+                        "uncertainties": uncertainties,
+                    },
+                    "panel_evidence": {
+                        "reason": "verified",
+                        "sha256": f"pe-{answer_id}",
+                    },
+                    "provenance": {
+                        "raw_answer_sha256": f"raw-{answer_id}",
+                        "annotation_sha256": f"annotation-{answer_id}",
+                    },
+                }
+            )
+
+        _selected, selection_manifest = _select_final_answer_context(
+            answers,
+            corpus_manifest={"digest": "full-corpus"},
+            max_answers=2,
+        )
+
+        coverage = selection_manifest["selected_coverage"]
+        self.assertEqual(coverage["intent_class"], ["E", "I", "NB", "T"])
+        self.assertEqual(
+            coverage["scenario_role"],
+            [
+                "brand_diagnostic",
+                "category_discovery",
+                "consideration",
+                "unbranded_discovery",
+            ],
+        )
+        self.assertEqual(coverage["target_mentioned"], ["false", "true"])
+        self.assertEqual(
+            coverage["metric_evidence_state"],
+            ["provider_limited_prefix", "strict_verified"],
+        )
+        self.assertEqual(
+            coverage["analysis_state"],
+            [
+                "critic_clean",
+                "critic_invalid",
+                "critic_uncertain",
+                "provider_limited_prefix",
+            ],
+        )
+        self.assertTrue(selection_manifest["expanded_for_required_strata"])
+
+    def test_greedy_selection_expands_instead_of_enforcing_exact_target(
         self,
     ) -> None:
         specs = [
@@ -8166,19 +8397,33 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             },
             max_answers=4,
         )
+        reversed_selected, reversed_manifest = _select_final_answer_context(
+            list(reversed(answers)),
+            corpus_manifest={
+                "digest": "full-corpus",
+                "critic_rows_sha256": "critic-rows",
+            },
+            max_answers=4,
+        )
 
         self.assertEqual(
             sorted(item["answer_id"] for item in selected),
-            [2, 3, 5, 6],
+            [1, 2, 3, 4, 5],
         )
         self.assertTrue(selection_manifest["coverage_complete"])
-        self.assertEqual(selection_manifest["selected_count"], 4)
+        self.assertEqual(selection_manifest["selected_count"], 5)
+        self.assertTrue(selection_manifest["expanded_for_required_strata"])
+        self.assertEqual(
+            [item["answer_id"] for item in selected],
+            [item["answer_id"] for item in reversed_selected],
+        )
+        self.assertEqual(selection_manifest["digest"], reversed_manifest["digest"])
         self.assertEqual(
             selection_manifest["full_corpus_critic_rows_sha256"],
             "critic-rows",
         )
 
-    def test_final_selection_prefers_short_equivalent_full_answer(self) -> None:
+    def test_final_selection_prefers_rich_equivalent_full_answer(self) -> None:
         def answer(answer_id: int, text: str, evidence: list[str]) -> dict[str, Any]:
             return {
                 "answer_id": answer_id,
@@ -8218,8 +8463,91 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             max_answers=1,
         )
 
-        self.assertEqual([item["answer_id"] for item in selected], [1])
-        self.assertEqual(selected[0]["answer_text"], short["answer_text"])
+        self.assertEqual([item["answer_id"] for item in selected], [2])
+        self.assertEqual(selected[0]["answer_text"], long["answer_text"])
+        self.assertEqual(selected[0]["annotation"]["evidence"], ["Формально богаче"])
+
+    def test_greedy_selection_is_bounded_for_81_required_rows(self) -> None:
+        providers = ("openai", "gemini", "perplexity", "deepseek", "claude")
+        intents = ("I", "E", "T", "NB", "NAV", "TR")
+        answers: list[dict[str, Any]] = []
+        for answer_id in range(1, 82):
+            context_eligible = answer_id % 9 != 0
+            answer_text = f"Ответ {answer_id} · " + ("контекст " * 40)
+            answers.append(
+                {
+                    "answer_id": answer_id,
+                    "prompt_id": answer_id,
+                    "provider_key": providers[(answer_id - 1) % len(providers)],
+                    "mode": "web" if answer_id % 2 else "memory",
+                    "intent_class": intents[(answer_id - 1) % len(intents)],
+                    "scenario_role": (
+                        "brand_diagnostic"
+                        if answer_id % 4 == 0
+                        else "unbranded_discovery"
+                    ),
+                    "scenario_sequence": answer_id,
+                    "answer_text": answer_text,
+                    "citations": (
+                        [{"url": f"https://example.test/{answer_id}"}]
+                        if answer_id % 5 == 0
+                        else []
+                    ),
+                    "metric_eligible": context_eligible,
+                    "context_eligible": context_eligible,
+                    "metric_evidence_state": (
+                        "unavailable"
+                        if not context_eligible
+                        else "provider_limited_prefix"
+                        if answer_id % 11 == 0
+                        else "strict_verified"
+                    ),
+                    "metric_limitation": (
+                        "mode_unverified" if not context_eligible else None
+                    ),
+                    "annotation": {
+                        "valid": answer_id % 7 != 0,
+                        "target_mentioned": answer_id % 3 == 0,
+                        "target_role": (
+                            "recommended" if answer_id % 3 == 0 else "absent"
+                        ),
+                        "sentiment": (
+                            "positive" if answer_id % 3 == 0 else "unknown"
+                        ),
+                        "evidence": [f"Фрагмент {answer_id}"],
+                        "uncertainties": (
+                            ["Нужна проверка"] if answer_id % 7 == 0 else []
+                        ),
+                    },
+                    "panel_evidence": {
+                        # A unique required state forces the bounded greedy
+                        # path to exercise its maximum 81 iterations.
+                        "reason": f"evidence-state-{answer_id}",
+                        "sha256": f"panel-{answer_id}",
+                    },
+                    "provenance": {
+                        "raw_answer_sha256": hashlib.sha256(
+                            answer_text.encode("utf-8")
+                        ).hexdigest(),
+                        "annotation_sha256": f"annotation-{answer_id}",
+                    },
+                }
+            )
+
+        selected, manifest = _select_final_answer_context(
+            answers,
+            corpus_manifest={"digest": "full-corpus"},
+            max_answers=12,
+        )
+
+        self.assertEqual(len(selected), 81)
+        self.assertEqual(manifest["cover_iterations"], 81)
+        self.assertEqual(
+            manifest["cover_algorithm"],
+            "deterministic_greedy_until_complete_v1",
+        )
+        self.assertTrue(manifest["expanded_for_required_strata"])
+        self.assertTrue(manifest["coverage_complete"])
 
     def test_public_methodology_does_not_claim_unavailable_memory_comparison(
         self,
@@ -8538,7 +8866,7 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             report["methodology"]["portfolio_scope_limit"],
         )
 
-    def test_final_selection_fails_if_required_states_exceed_limit(self) -> None:
+    def test_final_selection_expands_if_required_states_exceed_target(self) -> None:
         answers = [
             {
                 "answer_id": index,
@@ -8567,15 +8895,17 @@ class FinalAnswerCorpusTests(unittest.TestCase):
             for index in range(13)
         ]
 
-        with self.assertRaisesRegex(
-            OpenRouterError,
-            "cannot cover required evidence strata",
-        ):
-            _select_final_answer_context(
-                answers,
-                corpus_manifest={"digest": "full-corpus"},
-                max_answers=12,
-            )
+        selected, selection_manifest = _select_final_answer_context(
+            answers,
+            corpus_manifest={"digest": "full-corpus"},
+            max_answers=12,
+        )
+
+        self.assertEqual(len(selected), 13)
+        self.assertEqual(selection_manifest["target_answers"], 12)
+        self.assertEqual(selection_manifest["required_cover_count"], 13)
+        self.assertTrue(selection_manifest["expanded_for_required_strata"])
+        self.assertTrue(selection_manifest["coverage_complete"])
 
     def test_corpus_ids_and_raw_hashes_equal_critic_manifest(self) -> None:
         models = self._rows()
@@ -8826,6 +9156,344 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             metric_code,
         )
         self.assertNotIn("/report_data/long_narrative", passthrough)
+
+    def test_selected_answer_leaf_routing_uses_closed_metadata_allowlist(
+        self,
+    ) -> None:
+        payload = {
+            "selected_full_answers": [
+                {
+                    "answer_id": 11,
+                    "prompt_id": 22,
+                    "prompt_key": "prompt-key",
+                    "scenario_sequence": 3,
+                    "provider_key": "provider-key",
+                    "system": "Provider label",
+                    "model": "provider/model",
+                    "mode": "web",
+                    "status": "completed",
+                    "intent_class": "I",
+                    "scenario_role": "unbranded_discovery",
+                    "metric_eligible": True,
+                    "context_eligible": True,
+                    "metric_evidence_state": "strict_verified",
+                    "metric_limitation": None,
+                    "observation_state": "observed",
+                    "requested_mode": "web",
+                    "verified_mode": "web",
+                    "context_access": "full_text",
+                    "citations": [
+                        {
+                            "url": "https://example.test/source",
+                            "title": "Источник",
+                        }
+                    ],
+                    "panel_evidence": {
+                        "version": "v1",
+                        "reason": "transport_attested",
+                        "sha256": "a" * 64,
+                    },
+                    "failure": {
+                        "error_utf8_bytes": 0,
+                        "error_sha256": "b" * 64,
+                    },
+                    "provenance": {
+                        "raw_answer_sha256": "c" * 64,
+                        "panel_contract": {"state": "verified"},
+                    },
+                    "scenario": "Как выбрать агентство?",
+                    "scenario_rationale": "Проверяется безбрендовый выбор.",
+                    "answer_text": "Содержательный ответ модели.",
+                    "annotation": {
+                        "valid": True,
+                        "score": 7,
+                        "evidence": ["Дословное подтверждение"],
+                    },
+                    "response_annotations": [
+                        {
+                            "title": "Аннотация источника",
+                            "relevance": 0.8,
+                        }
+                    ],
+                    # Near-miss fields are intentionally not widened into the
+                    # audited allowlist merely because their values are typed.
+                    "citation_count": 1,
+                    "content_withheld_reason": "not_attested",
+                }
+            ]
+        }
+        units, _manifest = _flatten_final_input_payload(
+            payload,
+            target_chars=256,
+            context_overlap_chars=64,
+        )
+        routing_by_path: dict[str, set[bool]] = defaultdict(set)
+        for unit in units:
+            routing_by_path[str(unit["source_path"])].add(
+                _final_input_unit_can_skip_semantic_mapper(unit)
+            )
+
+        deterministic_fields = {
+            "answer_id",
+            "prompt_id",
+            "prompt_key",
+            "scenario_sequence",
+            "provider_key",
+            "system",
+            "model",
+            "mode",
+            "status",
+            "intent_class",
+            "scenario_role",
+            "metric_eligible",
+            "context_eligible",
+            "metric_evidence_state",
+            "metric_limitation",
+            "observation_state",
+            "requested_mode",
+            "verified_mode",
+            "context_access",
+        }
+        deterministic_paths = {
+            f"/selected_full_answers/0/{field}"
+            for field in deterministic_fields
+        }
+        deterministic_paths.update(
+            path
+            for path in routing_by_path
+            if path.startswith(
+                (
+                    "/selected_full_answers/0/citations/",
+                    "/selected_full_answers/0/panel_evidence/",
+                    "/selected_full_answers/0/failure/",
+                    "/selected_full_answers/0/provenance/",
+                )
+            )
+        )
+        for path in deterministic_paths:
+            self.assertEqual(routing_by_path[path], {True}, path)
+
+        semantic_paths = {
+            path
+            for path in routing_by_path
+            if path
+            in {
+                "/selected_full_answers/0/scenario",
+                "/selected_full_answers/0/scenario_rationale",
+                "/selected_full_answers/0/answer_text",
+                "/selected_full_answers/0/citation_count",
+                "/selected_full_answers/0/content_withheld_reason",
+            }
+            or path.startswith(
+                (
+                    "/selected_full_answers/0/annotation/",
+                    "/selected_full_answers/0/response_annotations/",
+                )
+            )
+        }
+        self.assertTrue(semantic_paths)
+        for path in semantic_paths:
+            self.assertEqual(routing_by_path[path], {False}, path)
+
+    def test_long_selected_answer_citation_is_losslessly_code_owned(self) -> None:
+        citation = (
+            "https://example.test/research?source="
+            + ("точный-фрагмент-🧭/" * 700)
+            + "FINAL-CITATION-SENTINEL"
+        )
+        payload = {
+            "selected_full_answers": [
+                {
+                    "citations": [{"url": citation}],
+                    "scenario": "Как выбрать агентство?",
+                    "answer_text": "Ответ модели.",
+                }
+            ]
+        }
+        units, _manifest = _flatten_final_input_payload(
+            payload,
+            target_chars=257,
+            context_overlap_chars=64,
+        )
+        citation_path = "/selected_full_answers/0/citations/0/url"
+        citation_units = [
+            unit for unit in units if unit["source_path"] == citation_path
+        ]
+        self.assertGreater(len(citation_units), 1)
+        self.assertTrue(
+            all(
+                _final_input_unit_can_skip_semantic_mapper(unit)
+                for unit in citation_units
+            )
+        )
+
+        claim_rows, _claims, _ids_by_unit, ledger = _final_input_claim_ledger(
+            units,
+            source_payload=payload,
+        )
+        citation_claims = sorted(
+            (
+                claim
+                for claim in claim_rows
+                if claim["source_path"] == citation_path
+            ),
+            key=lambda claim: (
+                int(claim["source_core_start_char"]),
+                int(claim["fragment_index"]),
+            ),
+        )
+        reconstructed = "".join(
+            str(claim["excerpt"]) for claim in citation_claims
+        )
+        self.assertEqual(reconstructed, citation)
+        self.assertTrue(reconstructed.endswith("FINAL-CITATION-SENTINEL"))
+        self.assertEqual(ledger["claim_count"], len(claim_rows))
+        self.assertEqual(
+            len({str(claim["claim_id"]) for claim in citation_claims}),
+            len(citation_claims),
+        )
+
+    async def test_selected_answer_mapper_sees_semantics_not_audited_metadata(
+        self,
+    ) -> None:
+        answer_text = "Модель подробно сравнивает агентства."
+        payload = {
+            "selected_full_answers": [
+                {
+                    "answer_id": 11,
+                    "prompt_id": 22,
+                    "prompt_key": "prompt-key",
+                    "scenario_sequence": 3,
+                    "provider_key": "openai",
+                    "system": "ChatGPT",
+                    "model": "openai/model",
+                    "mode": "web",
+                    "status": "completed",
+                    "intent_class": "I",
+                    "scenario_role": "unbranded_discovery",
+                    "metric_eligible": True,
+                    "context_eligible": True,
+                    "metric_evidence_state": "strict_verified",
+                    "metric_limitation": None,
+                    "observation_state": "observed",
+                    "requested_mode": "web",
+                    "verified_mode": "web",
+                    "context_access": "full_text",
+                    "citations": [
+                        {
+                            "url": "https://example.test/source",
+                            "title": "Источник",
+                        }
+                    ],
+                    "panel_evidence": {
+                        "version": "v1",
+                        "reason": "transport_attested",
+                        "sha256": "a" * 64,
+                    },
+                    "failure": {
+                        "error_utf8_bytes": 0,
+                        "error_sha256": "b" * 64,
+                    },
+                    "provenance": {
+                        "raw_answer_sha256": hashlib.sha256(
+                            answer_text.encode("utf-8")
+                        ).hexdigest(),
+                        "annotation_sha256": "c" * 64,
+                    },
+                    "scenario": "Как выбрать агентство?",
+                    "scenario_rationale": "Проверяется безбрендовый выбор.",
+                    "answer_text": answer_text,
+                    "annotation": {
+                        "valid": True,
+                        "score": 7,
+                        "evidence": ["Модель сравнивает агентства"],
+                    },
+                    "response_annotations": [
+                        {
+                            "title": "Аннотация источника",
+                            "relevance": 0.8,
+                        }
+                    ],
+                }
+            ]
+        }
+        mapper_payloads: list[dict[str, Any]] = []
+
+        async def capture_mapper(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            user_payload = kwargs["user_payload"]
+            mapper_payloads.append(copy.deepcopy(user_payload))
+            return self._packet_for_units(
+                user_payload["source_units"],
+                source_claims=user_payload.get("source_claims"),
+            )
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                return_value=self._window(),
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._artifact_output",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=capture_mapper,
+            ) as structured_artifact,
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+            )
+
+        self.assertGreater(structured_artifact.await_count, 0)
+        mapped_paths = {
+            str(unit["source_path"])
+            for mapper_payload in mapper_payloads
+            for unit in mapper_payload.get("source_units") or []
+        }
+        expected_semantic_paths = {
+            "/selected_full_answers/0/scenario",
+            "/selected_full_answers/0/scenario_rationale",
+            "/selected_full_answers/0/answer_text",
+            "/selected_full_answers/0/annotation/valid",
+            "/selected_full_answers/0/annotation/score",
+            "/selected_full_answers/0/annotation/evidence/0",
+            "/selected_full_answers/0/response_annotations/0/title",
+            "/selected_full_answers/0/response_annotations/0/relevance",
+        }
+        self.assertEqual(mapped_paths, expected_semantic_paths)
+        self.assertFalse(
+            any(
+                path.startswith(
+                    (
+                        "/selected_full_answers/0/citations/",
+                        "/selected_full_answers/0/panel_evidence/",
+                        "/selected_full_answers/0/failure/",
+                        "/selected_full_answers/0/provenance/",
+                    )
+                )
+                for path in mapped_paths
+            )
+        )
+        self.assertEqual(
+            plan["mapped_source_unit_count"],
+            len(expected_semantic_paths),
+        )
+        self.assertGreater(plan["code_owned_source_unit_count"], 0)
+        self.assertEqual(plan["covered_claim_count"], plan["source_claim_count"])
+        self.assertTrue(
+            model_payload["long_input_contract"]["coverage_complete"]
+        )
 
     async def test_structural_units_bypass_mapper_without_losing_coverage(
         self,
@@ -11784,6 +12452,102 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_bounded_root_semantic_retry_uses_distinct_artifact(
+        self,
+    ) -> None:
+        payload = {
+            "report_data": {
+                "note": (
+                    "Содержательный контекст без выдуманных фактов. " * 240
+                    + "SEMANTIC-REPAIR-TAIL"
+                ),
+            }
+        }
+        target_window = {
+            **self._window(),
+            "input_token_window": 45_000,
+            "input_utf8_window": 45_000,
+        }
+        worker_window = {
+            **self._window(),
+            "input_token_window": 150_000,
+            "input_utf8_window": 150_000,
+        }
+        mapper = self._successful_mapper()
+        artifact_keys: list[str] = []
+        rejected_once = False
+
+        async def reject_first_root_prose(
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            nonlocal rejected_once
+            artifact_key = str(kwargs.get("artifact_key") or "")
+            artifact_keys.append(artifact_key)
+            packet = await mapper(*args, **kwargs)
+            if "_bounded_root_l" in artifact_key and not rejected_once:
+                rejected_once = True
+                packet = copy.deepcopy(packet)
+                packet["observations"][0]["statement"] = "Узел учтён."
+            return packet
+
+        def final_request_bytes(
+            candidate: dict[str, Any],
+            _envelope: dict[str, Any],
+        ) -> int:
+            mode = str((candidate.get("long_input_contract") or {}).get("mode") or "")
+            if mode == "bounded_transitive_evidence_tree":
+                return len(
+                    json.dumps(
+                        candidate,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            return 60_000
+
+        with (
+            patch(
+                "app.services.analyzer._final_model_input_window",
+                new_callable=AsyncMock,
+                side_effect=[
+                    target_window,
+                    worker_window,
+                    worker_window,
+                    worker_window,
+                ],
+            ),
+            patch(
+                "app.services.analyzer._save_artifact",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.services.analyzer._structured_artifact",
+                new_callable=AsyncMock,
+                side_effect=reject_first_root_prose,
+            ),
+        ):
+            model_payload, plan = await _prepare_final_model_payload(
+                "run-id",
+                payload=payload,
+                system="author",
+                force_hierarchical=True,
+                final_request_utf8_bytes=final_request_bytes,
+            )
+
+        self.assertTrue(rejected_once)
+        self.assertEqual(plan["mode"], "bounded_transitive_evidence_tree")
+        self.assertTrue(
+            any(
+                "_bounded_root_semantic_repair_v1_" in artifact_key
+                for artifact_key in artifact_keys
+            )
+        )
+        self.assertNotIn(
+            "replace_semantically_invalid_root_packet",
+            json.dumps(model_payload, ensure_ascii=False),
+        )
+
     def test_bounded_root_rejects_invented_literals_and_missing_excerpts(
         self,
     ) -> None:
@@ -11899,6 +12663,472 @@ class FinalInputHarnessTests(unittest.IsolatedAsyncioTestCase):
                 allowed_node_text={
                     "node-a": "Realweb показывает содержательный результат."
                 },
+            )
+
+    def test_bounded_root_failsoft_replaces_only_semantically_bad_model_output(
+        self,
+    ) -> None:
+        source_text = (
+            "Realweb показывает содержательный результат: доля упоминаний 60%. "
+            "Контекст содержит кириллицу, emoji 🧭 и точное объяснение метрики. "
+        ) * 8
+        allowed = {"node-a": source_text}
+        base = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": "Realweb учтён.",
+                    "source_node_ids": ["node-a"],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": "node-a",
+                            "excerpt": "Realweb",
+                        }
+                    ],
+                    "importance": "important",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-a",
+                    "disposition": "material_observation",
+                    "rationale": "Realweb показывает содержательный результат.",
+                }
+            ],
+        }
+        cases = {
+            "generic": base,
+            "invented": {
+                **copy.deepcopy(base),
+                "observations": [
+                    {
+                        **copy.deepcopy(base["observations"][0]),
+                        "statement": "Realweb лидирует: 99,9%.",
+                        "exact_values": ["99,9%"],
+                    }
+                ],
+            },
+            "bad_excerpt": {
+                **copy.deepcopy(base),
+                "observations": [
+                    {
+                        **copy.deepcopy(base["observations"][0]),
+                        "statement": (
+                            "Realweb показывает содержательный результат."
+                        ),
+                        "evidence_excerpts": [
+                            {
+                                "source_node_id": "node-a",
+                                "excerpt": "этой цитаты в источнике нет",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        normalized_cases: list[dict[str, Any]] = []
+        for case_name, packet in cases.items():
+            with self.subTest(case=case_name):
+                normalized = _normalize_final_root_summary_packet_or_fallback(
+                    packet,
+                    allowed_node_text=allowed,
+                    allowed_node_fact_bindings={"node-a": []},
+                )
+                normalized_cases.append(normalized)
+                observation = normalized["observations"][0]
+                self.assertEqual(observation["category"], "context")
+                self.assertEqual(observation["importance"], "supporting")
+                self.assertEqual(observation["source_node_ids"], ["node-a"])
+                self.assertEqual(observation["fact_binding_ids"], [])
+                self.assertEqual(observation["statement"], source_text)
+                self.assertEqual(
+                    observation["evidence_excerpts"],
+                    [{"source_node_id": "node-a", "excerpt": source_text}],
+                )
+                self.assertGreater(len(source_text.encode("utf-8")), 192)
+                self.assertEqual(
+                    normalized["node_coverage"],
+                    [
+                        {
+                            "source_node_id": "node-a",
+                            "disposition": "supporting_context",
+                            "rationale": "Дочерний узел учтён в покрытии.",
+                        }
+                    ],
+                )
+
+        # Every semantic defect produces the same lossless deterministic copy;
+        # only the content-addressed hash of rejected prose differs.
+        self.assertEqual(
+            [item["observations"] for item in normalized_cases],
+            [normalized_cases[0]["observations"]] * len(normalized_cases),
+        )
+
+    def test_bounded_root_failsoft_preserves_long_url_and_parent_json(self) -> None:
+        long_url = (
+            "https://example.test/catalog?"
+            + "точный-параметр=значение%20с%20пробелом&" * 800
+            + "tail=LOSSLESS-URL-END"
+        )
+        parent_value = {
+            "summary": {
+                "brand": "Realweb",
+                "notes": ["полный контекст"] * 600,
+                "tail": "LOSSLESS-PARENT-JSON-END",
+            }
+        }
+        parent_json = json.dumps(
+            parent_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        allowed = {
+            "node-url": long_url,
+            "node-parent": parent_json,
+        }
+        packet = {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": "Узел учтён.",
+                    "source_node_ids": [node_id],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {
+                            "source_node_id": node_id,
+                            "excerpt": source_text[:1],
+                        }
+                    ],
+                    "importance": "supporting",
+                }
+                for node_id, source_text in allowed.items()
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": node_id,
+                    "disposition": "supporting_context",
+                    "rationale": "Дочерний узел учтён в покрытии.",
+                }
+                for node_id in allowed
+            ],
+        }
+
+        normalized = _normalize_final_root_summary_packet_or_fallback(
+            packet,
+            allowed_node_text=allowed,
+            allowed_node_fact_bindings={node_id: [] for node_id in allowed},
+        )
+
+        observations = {
+            item["source_node_ids"][0]: item
+            for item in normalized["observations"]
+        }
+        for node_id, source_text in allowed.items():
+            self.assertEqual(observations[node_id]["statement"], source_text)
+            self.assertEqual(
+                observations[node_id]["evidence_excerpts"],
+                [{"source_node_id": node_id, "excerpt": source_text}],
+            )
+        self.assertTrue(
+            observations["node-url"]["statement"].endswith("LOSSLESS-URL-END")
+        )
+        self.assertEqual(
+            json.loads(observations["node-parent"]["statement"]),
+            parent_value,
+        )
+
+    def test_bounded_root_failsoft_keeps_missing_structural_fields_hard(
+        self,
+    ) -> None:
+        allowed = {"node-a": "Realweb показывает содержательный результат."}
+        base = {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": "Узел учтён.",
+                    "source_node_ids": ["node-a"],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {"source_node_id": "node-a", "excerpt": "Realweb"}
+                    ],
+                    "importance": "supporting",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-a",
+                    "disposition": "supporting_context",
+                    "rationale": "Дочерний узел учтён в покрытии.",
+                }
+            ],
+        }
+        missing_field = copy.deepcopy(base)
+        missing_field.pop("report_focus")
+        with self.assertRaises(OpenRouterError):
+            _normalize_final_root_summary_packet_or_fallback(
+                missing_field,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings={"node-a": []},
+            )
+
+    def test_bounded_root_failsoft_audit_is_raw_free_and_idempotent(self) -> None:
+        allowed = {
+            "node-a": "Подтверждённая доля упоминаний Realweb составляет 60%."
+        }
+        rejected_text = "ВЫДУМАННАЯ МЕТРИКА 99,9% И https://fake.example"
+        packet = {
+            "observations": [
+                {
+                    "category": "visibility",
+                    "statement": rejected_text,
+                    "source_node_ids": ["node-a"],
+                    "exact_values": ["99,9%"],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {"source_node_id": "node-a", "excerpt": "60%"}
+                    ],
+                    "importance": "critical",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-a",
+                    "disposition": "material_observation",
+                    "rationale": "Подтверждённая доля упоминаний Realweb.",
+                }
+            ],
+        }
+        normalized = _normalize_final_root_summary_packet_or_fallback(
+            packet,
+            allowed_node_text=allowed,
+            allowed_node_fact_bindings={"node-a": []},
+        )
+        audit = normalized["_aiv_final_input_grounding_filter"]
+        self.assertEqual(audit["operation_count"], 1)
+        self.assertEqual(audit["replacement_count"], 1)
+        self.assertEqual(audit["drop_count"], 0)
+        self.assertEqual(
+            audit["operations"][0]["operation"],
+            "replace_semantically_invalid_root_packet",
+        )
+        serialized_audit = json.dumps(audit, ensure_ascii=False)
+        self.assertNotIn(rejected_text, serialized_audit)
+        self.assertNotIn("fake.example", serialized_audit)
+        self.assertEqual(
+            _normalize_final_root_summary_packet_or_fallback(
+                normalized,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings={"node-a": []},
+            ),
+            normalized,
+        )
+        tampered_audit = copy.deepcopy(normalized)
+        tampered_audit["_aiv_final_input_grounding_filter"][
+            "operation_count"
+        ] += 1
+        with self.assertRaisesRegex(OpenRouterError, "filter audit is invalid"):
+            _normalize_final_root_summary_packet_or_fallback(
+                tampered_audit,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings={"node-a": []},
+            )
+
+    def test_bounded_root_failsoft_keeps_transport_reference_defects_hard(
+        self,
+    ) -> None:
+        allowed = {
+            "node-a": "ChatGPT: mention rate 60%.",
+            "node-b": "Gemini: mention rate 30%.",
+        }
+
+        def observation(node_id: str) -> dict[str, Any]:
+            return {
+                "category": "context",
+                "statement": allowed[node_id],
+                "source_node_ids": [node_id],
+                "exact_values": [],
+                "fact_binding_ids": [],
+                "evidence_excerpts": [
+                    {"source_node_id": node_id, "excerpt": allowed[node_id]}
+                ],
+                "importance": "supporting",
+            }
+
+        base = {
+            "observations": [observation("node-a"), observation("node-b")],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": node_id,
+                    "disposition": "supporting_context",
+                    "rationale": "Дочерний узел учтён в покрытии.",
+                }
+                for node_id in allowed
+            ],
+        }
+        cases: dict[str, dict[str, Any]] = {}
+        unknown = copy.deepcopy(base)
+        unknown["observations"][0]["source_node_ids"] = ["node-unknown"]
+        cases["unknown"] = unknown
+        cross_node = copy.deepcopy(base)
+        cross_node["observations"][0]["source_node_ids"] = ["node-a", "node-b"]
+        cases["cross_node"] = cross_node
+        missing = copy.deepcopy(base)
+        missing["observations"].pop()
+        cases["missing"] = missing
+        duplicate = copy.deepcopy(base)
+        duplicate["observations"][1] = copy.deepcopy(duplicate["observations"][0])
+        cases["duplicate"] = duplicate
+        bad_coverage = copy.deepcopy(base)
+        bad_coverage["node_coverage"][1]["source_node_id"] = "node-unknown"
+        cases["unknown_coverage"] = bad_coverage
+
+        for case_name, packet in cases.items():
+            with self.subTest(case=case_name):
+                with self.assertRaises(OpenRouterError):
+                    _normalize_final_root_summary_packet_or_fallback(
+                        packet,
+                        allowed_node_text=allowed,
+                        allowed_node_fact_bindings={
+                            "node-a": [],
+                            "node-b": [],
+                        },
+                    )
+
+    def test_bounded_root_failsoft_never_replaces_mandatory_fact_refs(self) -> None:
+        binding_a = self._scalar_fact_binding(
+            source_path="/models/chatgpt/mention_rate",
+            json_literal='"60%"',
+        )
+        binding_b = self._scalar_fact_binding(
+            source_path="/models/gemini/mention_rate",
+            json_literal='"30%"',
+        )
+        allowed = {
+            "node-a": "ChatGPT: mention rate 60%.",
+            "node-b": "Gemini: mention rate 30%.",
+        }
+        ledgers = {"node-a": [binding_a], "node-b": [binding_b]}
+        refs = {
+            node_id: _final_root_fact_refs(bindings)
+            for node_id, bindings in ledgers.items()
+        }
+
+        def observation(node_id: str) -> dict[str, Any]:
+            return {
+                "category": "visibility",
+                "statement": allowed[node_id],
+                "source_node_ids": [node_id],
+                "exact_values": ["60%" if node_id == "node-a" else "30%"],
+                "fact_binding_ids": refs[node_id],
+                "evidence_excerpts": [
+                    {"source_node_id": node_id, "excerpt": allowed[node_id]}
+                ],
+                "importance": "important",
+            }
+
+        base = {
+            "observations": [observation("node-a"), observation("node-b")],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": node_id,
+                    "disposition": "material_observation",
+                    "rationale": "Факт сохранён.",
+                }
+                for node_id in allowed
+            ],
+        }
+        cases: dict[str, dict[str, Any]] = {}
+        missing = copy.deepcopy(base)
+        missing["observations"][0]["fact_binding_ids"] = []
+        cases["missing"] = missing
+        duplicate = copy.deepcopy(base)
+        duplicate["observations"][0]["fact_binding_ids"] = refs["node-a"] * 2
+        cases["duplicate"] = duplicate
+        tampered = copy.deepcopy(base)
+        tampered["observations"][0]["fact_binding_ids"] = ["f_tampered"]
+        cases["tampered"] = tampered
+        cross_node = copy.deepcopy(base)
+        cross_node["observations"][0]["fact_binding_ids"] = refs["node-b"]
+        cases["cross_node"] = cross_node
+
+        for case_name, packet in cases.items():
+            with self.subTest(case=case_name):
+                with self.assertRaisesRegex(
+                    OpenRouterError,
+                    "mandatory fact binding",
+                ):
+                    _normalize_final_root_summary_packet_or_fallback(
+                        packet,
+                        allowed_node_text=allowed,
+                        allowed_node_fact_bindings=ledgers,
+                    )
+
+        semantic_bad = copy.deepcopy(base)
+        semantic_bad["observations"][0]["statement"] = (
+            "ChatGPT: mention rate 60%. Выдуманный лидер: 99,9%."
+        )
+        semantic_bad["observations"][0]["exact_values"].append("99,9%")
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "mandatory fact provenance",
+        ):
+            _normalize_final_root_summary_packet_or_fallback(
+                semantic_bad,
+                allowed_node_text=allowed,
+                allowed_node_fact_bindings=ledgers,
+            )
+
+        parent_packet = {
+            "observations": [
+                {
+                    "category": "context",
+                    "statement": "Узел учтён.",
+                    "source_node_ids": ["node-a"],
+                    "exact_values": [],
+                    "fact_binding_ids": [],
+                    "evidence_excerpts": [
+                        {"source_node_id": "node-a", "excerpt": "ChatGPT"}
+                    ],
+                    "importance": "supporting",
+                }
+            ],
+            "uncertainties": [],
+            "report_focus": [],
+            "node_coverage": [
+                {
+                    "source_node_id": "node-a",
+                    "disposition": "supporting_context",
+                    "rationale": "Дочерний узел учтён в покрытии.",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(
+            OpenRouterError,
+            "mandatory fact provenance",
+        ):
+            _normalize_final_root_summary_packet_or_fallback(
+                parent_packet,
+                allowed_node_text={"node-a": allowed["node-a"]},
+                allowed_node_fact_bindings={"node-a": []},
+                fallback_forbidden_node_ids={"node-a"},
             )
 
     def test_bounded_root_rejects_cross_child_missing_and_tampered_fact_refs(
@@ -13941,10 +15171,15 @@ class FinalAnswerCorpusDatabaseTests(unittest.IsolatedAsyncioTestCase):
                 corpus["answers"],
                 corpus_manifest=corpus["manifest"],
             )
-            self.assertEqual(len(selected), 81)
-            self.assertEqual(selection_manifest["selected_metadata_only_count"], 9)
+            self.assertEqual(len(corpus["answers"]), 81)
+            self.assertEqual(len(selected), 12)
+            self.assertEqual(selection_manifest["target_answers"], 12)
+            self.assertEqual(selection_manifest["omitted_count"], 69)
+            self.assertEqual(selection_manifest["selected_metadata_only_count"], 1)
+            self.assertTrue(selection_manifest["coverage_complete"])
+            self.assertFalse(selection_manifest["metric_denominator"])
             failed = [item for item in selected if item["status"] == "failed"]
-            self.assertEqual(len(failed), 9)
+            self.assertEqual(len(failed), 1)
             for item in failed:
                 self.assertEqual(item["context_access"], "metadata_only")
                 self.assertEqual(
